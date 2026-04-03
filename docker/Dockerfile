@@ -7,7 +7,7 @@ COPY web/ ./
 RUN npm run build
 
 # Stage 2: Build Rust backend
-FROM --platform=$BUILDPLATFORM rust:stable-slim AS backend
+FROM --platform=$BUILDPLATFORM rust:slim-bookworm AS backend
 ARG TARGETPLATFORM
 WORKDIR /app
 
