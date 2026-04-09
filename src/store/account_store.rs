@@ -25,8 +25,21 @@ impl AccountStore {
         }
     }
 
+    fn is_pg(&self) -> bool {
+        self.driver == "postgres"
+    }
+
     fn fmt_time(&self, t: DateTime<Utc>) -> String {
         t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    /// Returns `$N` for SQLite or `$N::TIMESTAMPTZ` for Postgres
+    fn ts(&self, n: u32) -> String {
+        if self.is_pg() {
+            format!("${}::TIMESTAMPTZ", n)
+        } else {
+            format!("${}", n)
+        }
     }
 
     fn parse_time(row: &AnyRow, col: &str) -> DateTime<Utc> {
@@ -130,15 +143,17 @@ impl AccountStore {
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
 
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
-        let row: AnyRow = sqlx::query(
+        let q = format!(
             r#"INSERT INTO accounts (name, email, status, token, proxy_url,
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, auto_telemetry)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
             RETURNING id, created_at, updated_at"#,
-        )
+            self.ts(9), self.ts(10), "$11"
+        );
+        let row: AnyRow = sqlx::query(&q)
         .bind(&a.name)
         .bind(&a.email)
         .bind(a.status.to_string())
@@ -176,12 +191,12 @@ impl AccountStore {
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
-                auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at=$8, oauth_refreshed_at=$9,
+                auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid=$13, organization_uuid=$14, subscription_type=$15,
                 concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
             WHERE id=$19"#,
-            self.now_expr()
+            self.ts(8), self.ts(9), self.now_expr()
         );
         sqlx::query(&q)
             .bind(&a.name)
@@ -216,10 +231,10 @@ impl AccountStore {
         expires_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let q = format!(
-            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at=$3,
-                oauth_refreshed_at=$4, auth_error='', updated_at={}
+            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at={},
+                oauth_refreshed_at={}, auth_error='', updated_at={}
             WHERE id=$5"#,
-            self.now_expr()
+            self.ts(3), self.ts(4), self.now_expr()
         );
         sqlx::query(&q)
             .bind(access_token)
@@ -268,8 +283,8 @@ impl AccountStore {
         reset_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let q = format!(
-            "UPDATE accounts SET rate_limited_at=$1, rate_limit_reset_at=$2, updated_at={} WHERE id=$3",
-            self.now_expr()
+            "UPDATE accounts SET rate_limited_at={}, rate_limit_reset_at={}, updated_at={} WHERE id=$3",
+            self.ts(1), self.ts(2), self.now_expr()
         );
         sqlx::query(&q)
             .bind(self.fmt_time(Utc::now()))
@@ -289,9 +304,9 @@ impl AccountStore {
     ) -> Result<(), AppError> {
         let q = format!(
             r#"UPDATE accounts SET status=$1, disable_reason=$2,
-                rate_limited_at=$3, rate_limit_reset_at=$4, updated_at={}
+                rate_limited_at={}, rate_limit_reset_at={}, updated_at={}
             WHERE id=$5"#,
-            self.now_expr()
+            self.ts(3), self.ts(4), self.now_expr()
         );
         let limited_str = rate_limit_reset_at.map(|_| self.fmt_time(Utc::now()));
         let reset_str = rate_limit_reset_at.map(|t| self.fmt_time(t));
@@ -383,8 +398,8 @@ impl AccountStore {
 
     pub async fn update_usage(&self, id: i64, usage_data: &str) -> Result<(), AppError> {
         let q = format!(
-            "UPDATE accounts SET usage_data=$1, usage_fetched_at=$2, updated_at={} WHERE id=$3",
-            self.now_expr()
+            "UPDATE accounts SET usage_data=$1, usage_fetched_at={}, updated_at={} WHERE id=$3",
+            self.ts(2), self.now_expr()
         );
         sqlx::query(&q)
             .bind(usage_data)
@@ -429,3 +444,64 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn make_store(driver: &str) -> AccountStore {
+        sqlx::any::install_default_drivers();
+        let tmp = std::env::temp_dir().join(format!("ccgw_unit_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        AccountStore {
+            pool,
+            driver: driver.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ts_sqlite_plain_placeholder() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.ts(1), "$1");
+        assert_eq!(store.ts(5), "$5");
+        assert_eq!(store.ts(10), "$10");
+    }
+
+    #[tokio::test]
+    async fn test_ts_postgres_casts_to_timestamptz() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.ts(1), "$1::TIMESTAMPTZ");
+        assert_eq!(store.ts(5), "$5::TIMESTAMPTZ");
+        assert_eq!(store.ts(10), "$10::TIMESTAMPTZ");
+    }
+
+    #[tokio::test]
+    async fn test_is_pg() {
+        assert!(make_store("postgres").await.is_pg());
+        assert!(!make_store("sqlite").await.is_pg());
+    }
+
+    #[tokio::test]
+    async fn test_now_expr_sqlite() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.now_expr(), "strftime('%Y-%m-%dT%H:%M:%SZ','now')");
+    }
+
+    #[tokio::test]
+    async fn test_now_expr_postgres() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.now_expr(), "NOW()");
+    }
+
+    #[tokio::test]
+    async fn test_fmt_time_iso8601() {
+        let store = make_store("sqlite").await;
+        let t = chrono::NaiveDate::from_ymd_opt(2026, 4, 9)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap()
+            .and_utc();
+        assert_eq!(store.fmt_time(t), "2026-04-09T12:30:45Z");
+    }
+}
