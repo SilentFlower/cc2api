@@ -26,6 +26,16 @@ const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 /// 无法确定限流原因时的保守限流时长（与历史行为一致）。
 const FALLBACK_QUARANTINE: Duration = Duration::from_secs(5 * 60 * 60);
 
+/// 单个窗口的用量详情，用于前端展示计算过程。
+pub struct WindowDetail {
+    /// 原始利用率（0~100）。
+    pub utilization: f64,
+    /// 时间衰减因子（0~1，距重置越近越小）。
+    pub decay: f64,
+    /// 有效用量 = utilization × decay。
+    pub effective: f64,
+}
+
 /// 账号调度评分详情，用于前端展示。
 pub struct AccountScoreInfo {
     /// 综合得分（越低越优先）。
@@ -34,6 +44,10 @@ pub struct AccountScoreInfo {
     pub eff_7d: f64,
     /// 5 小时窗口有效用量（utilization × 时间衰减）。
     pub eff_5h: f64,
+    /// 7 天窗口计算详情。
+    pub detail_7d: WindowDetail,
+    /// 5 小时窗口计算详情。
+    pub detail_5h: WindowDetail,
     /// 并发负载百分比（当前/最大 × 100）。
     pub concurrency_pct: f64,
     /// 当前占用的并发槽位数。
@@ -453,8 +467,8 @@ impl AccountService {
         // 计算每个候选的综合得分，同时记录并发是否已满
         let mut scored: Vec<(&Account, f64, bool)> = Vec::with_capacity(best.len());
         for acc in &best {
-            let eff_5h = effective_utilization(acc, "five_hour", 5.0 * 3600.0, now);
-            let eff_7d = effective_utilization(acc, "seven_day", 7.0 * 24.0 * 3600.0, now);
+            let eff_5h = effective_utilization_detail(acc, "five_hour", 5.0 * 3600.0, now).effective;
+            let eff_7d = effective_utilization_detail(acc, "seven_day", 7.0 * 24.0 * 3600.0, now).effective;
             let key = format!("concurrency:account:{}", acc.id);
             let current = self.cache.get_slot_count(&key).await;
             let full = acc.concurrency > 0 && current >= acc.concurrency as i64;
@@ -495,8 +509,8 @@ impl AccountService {
     /// 计算单个账号的调度评分及实时状态（供 API 展示用）。
     pub async fn get_account_score_info(&self, account: &Account) -> AccountScoreInfo {
         let now = Utc::now();
-        let eff_5h = effective_utilization(account, "five_hour", 5.0 * 3600.0, now);
-        let eff_7d = effective_utilization(account, "seven_day", 7.0 * 24.0 * 3600.0, now);
+        let d5h = effective_utilization_detail(account, "five_hour", 5.0 * 3600.0, now);
+        let d7d = effective_utilization_detail(account, "seven_day", 7.0 * 24.0 * 3600.0, now);
 
         let conc_key = format!("concurrency:account:{}", account.id);
         let current_concurrency = self.cache.get_slot_count(&conc_key).await;
@@ -509,12 +523,14 @@ impl AccountService {
         let wait_key = format!("wait:account:{}", account.id);
         let queued = self.cache.get_slot_count(&wait_key).await;
 
-        let score = eff_7d * 0.5 + eff_5h * 0.3 + concurrency_pct * 0.2;
+        let score = d7d.effective * 0.5 + d5h.effective * 0.3 + concurrency_pct * 0.2;
 
         AccountScoreInfo {
             score,
-            eff_7d,
-            eff_5h,
+            eff_7d: d7d.effective,
+            eff_5h: d5h.effective,
+            detail_7d: d7d,
+            detail_5h: d5h,
             concurrency_pct,
             current_concurrency,
             queued,
@@ -522,15 +538,15 @@ impl AccountService {
     }
 }
 
-/// 计算指定窗口的有效用量：utilization × 时间衰减因子。
+/// 计算指定窗口的有效用量详情：utilization × 时间衰减因子。
 /// 快重置的窗口衰减更大，相同用量下得分更低（更优先选中）。
 /// 无 resets_at 或无用量数据时衰减因子为 1.0（最保守）。
-fn effective_utilization(
+fn effective_utilization_detail(
     account: &Account,
     window: &str,
     max_window_secs: f64,
     now: chrono::DateTime<Utc>,
-) -> f64 {
+) -> WindowDetail {
     let util = account
         .usage_data
         .get(window)
@@ -539,7 +555,7 @@ fn effective_utilization(
         .unwrap_or(0.0);
 
     if util == 0.0 {
-        return 0.0;
+        return WindowDetail { utilization: 0.0, decay: 1.0, effective: 0.0 };
     }
 
     // 解析 resets_at，计算剩余时间占窗口总时长的比例
@@ -555,7 +571,7 @@ fn effective_utilization(
         })
         .unwrap_or(1.0); // 无数据按最保守处理
 
-    util * decay
+    WindowDetail { utilization: util, decay, effective: util * decay }
 }
 enum RateLimitWindow {
     /// 7 天窗口命中，携带其 resets_at。

@@ -153,6 +153,14 @@ async fn list_accounts(
             "eff_7d": (si.eff_7d * 10.0).round() / 10.0,
             "eff_5h": (si.eff_5h * 10.0).round() / 10.0,
             "concurrency_pct": (si.concurrency_pct * 10.0).round() / 10.0,
+            "detail_7d": {
+                "utilization": (si.detail_7d.utilization * 10.0).round() / 10.0,
+                "decay": (si.detail_7d.decay * 1000.0).round() / 1000.0,
+            },
+            "detail_5h": {
+                "utilization": (si.detail_5h.utilization * 10.0).round() / 10.0,
+                "decay": (si.detail_5h.decay * 1000.0).round() / 1000.0,
+            },
         });
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
         obj["queued_requests"] = serde_json::json!(si.queued);

@@ -558,7 +558,7 @@ async function copyText(text: string) {
       <Card
         v-for="a in accounts"
         :key="a.id"
-        class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-hidden"
+        class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-visible"
         :class="(a.status === 'disabled' || isRateLimited(a)) ? 'opacity-60' : ''"
       >
         <div class="p-5 space-y-3">
@@ -586,8 +586,11 @@ async function copyText(text: string) {
                 <p class="text-sm font-medium cursor-help" :class="(a.scheduling_score ?? 0) >= 70 ? 'text-red-500' : (a.scheduling_score ?? 0) >= 40 ? 'text-amber-600' : 'text-emerald-600'">
                   {{ a.scheduling_score?.toFixed(1) ?? '0.0' }}
                 </p>
-                <div v-if="a.scheduling_detail" class="absolute z-10 hidden group-hover:block bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 -top-16 left-1/2 -translate-x-1/2 whitespace-nowrap shadow-lg">
-                  7d: {{ a.scheduling_detail.eff_7d.toFixed(1) }}×0.5 · 5h: {{ a.scheduling_detail.eff_5h.toFixed(1) }}×0.3 · 并发: {{ a.scheduling_detail.concurrency_pct.toFixed(0) }}%×0.2
+                <div v-if="a.scheduling_detail" class="absolute z-10 hidden group-hover:block bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 -top-24 left-0 whitespace-nowrap shadow-lg leading-relaxed">
+                  <div>7d: {{ a.scheduling_detail.detail_7d?.utilization?.toFixed(1) ?? '0' }}% × {{ a.scheduling_detail.detail_7d?.decay?.toFixed(3) ?? '1' }} = {{ a.scheduling_detail.eff_7d.toFixed(1) }} × 0.5</div>
+                  <div>5h: {{ a.scheduling_detail.detail_5h?.utilization?.toFixed(1) ?? '0' }}% × {{ a.scheduling_detail.detail_5h?.decay?.toFixed(3) ?? '1' }} = {{ a.scheduling_detail.eff_5h.toFixed(1) }} × 0.3</div>
+                  <div>并发: {{ a.scheduling_detail.concurrency_pct.toFixed(0) }}% × 0.2</div>
+                  <div class="border-t border-white/20 mt-1 pt-1 font-medium">= {{ a.scheduling_score?.toFixed(1) }}　<span class="text-white/50">越小越优先</span></div>
                 </div>
               </div>
               <div class="text-center">
