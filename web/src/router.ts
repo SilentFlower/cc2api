@@ -42,6 +42,7 @@ const router = createRouter({
       children: [
         { path: '', name: 'accounts', component: () => import('./components/Accounts.vue') },
         { path: 'tokens', name: 'tokens', component: () => import('./components/Tokens.vue') },
+        { path: 'settings', name: 'settings', component: () => import('./components/Settings.vue') },
       ],
     },
   ],

@@ -7,6 +7,7 @@ use claude_code_gateway::model::account::{Account, AccountAuthType, AccountStatu
 use claude_code_gateway::service::account::AccountService;
 use claude_code_gateway::store::account_store::AccountStore;
 use claude_code_gateway::store::memory::MemoryStore;
+use claude_code_gateway::store::settings_store::SettingsStore;
 
 /// 创建测试用的临时文件数据库和服务
 async fn setup() -> (Arc<AccountStore>, Arc<AccountService>) {
@@ -20,9 +21,10 @@ async fn setup() -> (Arc<AccountStore>, Arc<AccountService>) {
         .await
         .expect("failed to run migrations");
 
-    let store = Arc::new(AccountStore::new(pool, "sqlite".into()));
+    let store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
     let cache = Arc::new(MemoryStore::new());
-    let svc = Arc::new(AccountService::new(store.clone(), cache));
+    let settings_store = Arc::new(SettingsStore::new(pool));
+    let svc = Arc::new(AccountService::new(store.clone(), cache, settings_store));
     (store, svc)
 }
 

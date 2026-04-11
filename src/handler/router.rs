@@ -19,6 +19,7 @@ use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::telemetry::TelemetryService;
+use crate::store::settings_store::SettingsStore;
 use crate::store::token_store::TokenStore;
 
 #[derive(Clone)]
@@ -27,6 +28,7 @@ pub struct AppState {
     pub account_svc: Arc<AccountService>,
     pub token_tester: Arc<TokenTester>,
     pub token_store: Arc<TokenStore>,
+    pub settings_store: Arc<SettingsStore>,
     pub oauth_flow_svc: Arc<OAuthFlowService>,
     pub telemetry_svc: Arc<TelemetryService>,
     pub admin_password: String,
@@ -38,6 +40,7 @@ pub fn build_router(
     account_svc: Arc<AccountService>,
     token_tester: Arc<TokenTester>,
     token_store: Arc<TokenStore>,
+    settings_store: Arc<SettingsStore>,
     oauth_flow_svc: Arc<OAuthFlowService>,
     telemetry_svc: Arc<TelemetryService>,
 ) -> Router {
@@ -46,6 +49,7 @@ pub fn build_router(
         account_svc,
         token_tester,
         token_store,
+        settings_store,
         oauth_flow_svc,
         telemetry_svc,
         admin_password: cfg.admin.password.clone(),
@@ -57,7 +61,8 @@ pub fn build_router(
     let frontend_routes = Router::new()
         .route("/", get(spa_handler))
         .route("/login", get(spa_handler))
-        .route("/tokens", get(spa_handler));
+        .route("/tokens", get(spa_handler))
+        .route("/settings", get(spa_handler));
 
     // 前端静态资源
     let asset_routes = Router::new()
@@ -83,6 +88,7 @@ pub fn build_router(
         .route("/admin/oauth/generate-setup-token-url", post(oauth_generate_setup_token_url))
         .route("/admin/oauth/exchange-code", post(oauth_exchange_code))
         .route("/admin/oauth/exchange-setup-token-code", post(oauth_exchange_setup_token_code))
+        .route("/admin/settings", get(get_settings).put(update_settings))
         .layer(middleware::from_fn(move |req, next: Next| {
             let pwd = admin_password.clone();
             admin_auth(pwd, req, next)
@@ -160,6 +166,11 @@ async fn list_accounts(
             "detail_5h": {
                 "utilization": (si.detail_5h.utilization * 100.0).round() / 100.0,
                 "decay": (si.detail_5h.decay * 10000.0).round() / 10000.0
+            },
+            "weights": {
+                "w7d": si.weights.0,
+                "w5h": si.weights.1,
+                "wconc": si.weights.2
             },
         });
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
@@ -617,4 +628,38 @@ fn mime_from_path(path: &str) -> &'static str {
 
 fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::Utc.timestamp_millis_opt(ts).single()
+}
+
+// --- Settings Handlers ---
+
+/// 获取所有设置项。
+async fn get_settings(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let settings = state.settings_store.get_all().await?;
+    Ok(Json(serde_json::json!(settings)))
+}
+
+/// 批量更新设置项。
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(body): Json<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // 校验权重值必须是合法的非负数
+    for key in &["score_weight_7d", "score_weight_5h", "score_weight_concurrency"] {
+        if let Some(val) = body.get(*key) {
+            match val.parse::<f64>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => {}
+                _ => {
+                    return Err(AppError::BadRequest(
+                        format!("'{}' 必须是非负数", key),
+                    ));
+                }
+            }
+        }
+    }
+    state.settings_store.upsert_many(&body).await?;
+    // 通知 AccountService 刷新缓存
+    state.account_svc.reload_score_weights().await;
+    Ok(Json(serde_json::json!({"ok": true})))
 }

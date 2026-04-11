@@ -62,11 +62,15 @@ async fn main() {
 
     let account_store = Arc::new(store::account_store::AccountStore::new(pool.clone(), driver.clone()));
     let token_store = Arc::new(store::token_store::TokenStore::new(pool.clone(), driver.clone()));
+    let settings_store = Arc::new(store::settings_store::SettingsStore::new(pool.clone()));
 
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),
         cache.clone(),
+        settings_store.clone(),
     ));
+    // 启动时加载评分权重到内存缓存
+    account_svc.reload_score_weights().await;
     let rewriter = Arc::new(service::rewriter::Rewriter::new());
     let telemetry_svc = Arc::new(service::telemetry::TelemetryService::new(
         account_store.clone(),
@@ -96,6 +100,7 @@ async fn main() {
         account_svc,
         token_tester,
         token_store,
+        settings_store,
         oauth_flow_svc,
         telemetry_svc,
     );

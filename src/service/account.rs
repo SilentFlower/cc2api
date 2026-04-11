@@ -3,6 +3,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::warn;
 use uuid::Uuid;
@@ -50,20 +51,60 @@ pub struct AccountScoreInfo {
     pub detail_5h: WindowDetail,
     /// 并发负载百分比（当前/最大 × 100）。
     pub concurrency_pct: f64,
+    /// 当前使用的权重 (w7d, w5h, w_concurrency)。
+    pub weights: (f64, f64, f64),
     /// 当前占用的并发槽位数。
     pub current_concurrency: i64,
     /// 当前等待队列中的请求数。
     pub queued: i64,
 }
 
+/// 评分权重默认值。
+const DEFAULT_W7D: f64 = 0.5;
+const DEFAULT_W5H: f64 = 0.3;
+const DEFAULT_WCONC: f64 = 0.2;
+
 pub struct AccountService {
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
+    /// 评分权重缓存 (w7d, w5h, w_concurrency)，更新设置后刷新。
+    score_weights: RwLock<(f64, f64, f64)>,
+    settings_store: Arc<crate::store::settings_store::SettingsStore>,
 }
 
 impl AccountService {
-    pub fn new(store: Arc<AccountStore>, cache: Arc<dyn CacheStore>) -> Self {
-        Self { store, cache }
+    pub fn new(
+        store: Arc<AccountStore>,
+        cache: Arc<dyn CacheStore>,
+        settings_store: Arc<crate::store::settings_store::SettingsStore>,
+    ) -> Self {
+        Self {
+            store,
+            cache,
+            score_weights: RwLock::new((DEFAULT_W7D, DEFAULT_W5H, DEFAULT_WCONC)),
+            settings_store,
+        }
+    }
+
+    /// 从数据库加载评分权重到内存缓存，启动时和更新设置后调用。
+    pub async fn reload_score_weights(&self) {
+        if let Ok(settings) = self.settings_store.get_all().await {
+            let w7d = settings.get("score_weight_7d")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(DEFAULT_W7D);
+            let w5h = settings.get("score_weight_5h")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(DEFAULT_W5H);
+            let wconc = settings.get("score_weight_concurrency")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(DEFAULT_WCONC);
+            *self.score_weights.write().await = (w7d, w5h, wconc);
+        }
+    }
+
+    /// 获取当前评分权重。
+    async fn get_weights(&self) -> (f64, f64, f64) {
+        *self.score_weights.read().await
     }
 
     /// 创建新账号并自动生成身份信息。
@@ -441,7 +482,7 @@ impl AccountService {
 
     /// 综合评分选择账号：同优先级内按 7d/5h 有效用量和并发负载加权评分，分数越低越优先。
     ///
-    /// 评分公式：`score = eff_7d * 0.5 + eff_5h * 0.3 + concurrency_load_pct * 0.2`
+    /// 评分公式：`score = eff_7d * w7d + eff_5h * w5h + concurrency_load_pct * wconc`（权重可在设置页面配置）
     /// - `eff_Xd = utilization × (剩余时间 / 窗口总时长)`，快重置的窗口衰减更大
     /// - 无 resets_at 数据时衰减因子为 1.0（最保守）
     /// - 并发已满的账号优先排除，仅在所有账号都满时才参与评分
@@ -463,6 +504,7 @@ impl AccountService {
         }
 
         let now = Utc::now();
+        let (w7d, w5h, wconc) = self.get_weights().await;
 
         // 计算每个候选的综合得分，同时记录并发是否已满
         let mut scored: Vec<(&Account, f64, bool)> = Vec::with_capacity(best.len());
@@ -477,7 +519,7 @@ impl AccountService {
             } else {
                 0.0
             };
-            let score = eff_7d * 0.5 + eff_5h * 0.3 + conc_pct * 0.2;
+            let score = eff_7d * w7d + eff_5h * w5h + conc_pct * wconc;
             scored.push((acc, score, full));
         }
 
@@ -509,6 +551,7 @@ impl AccountService {
     /// 计算单个账号的调度评分及实时状态（供 API 展示用）。
     pub async fn get_account_score_info(&self, account: &Account) -> AccountScoreInfo {
         let now = Utc::now();
+        let (w7d, w5h, wconc) = self.get_weights().await;
         let d5h = effective_utilization_detail(account, "five_hour", 5.0 * 3600.0, now);
         let d7d = effective_utilization_detail(account, "seven_day", 7.0 * 24.0 * 3600.0, now);
 
@@ -523,7 +566,7 @@ impl AccountService {
         let wait_key = format!("wait:account:{}", account.id);
         let queued = self.cache.get_slot_count(&wait_key).await;
 
-        let score = d7d.effective * 0.5 + d5h.effective * 0.3 + concurrency_pct * 0.2;
+        let score = d7d.effective * w7d + d5h.effective * w5h + concurrency_pct * wconc;
 
         AccountScoreInfo {
             score,
@@ -532,6 +575,7 @@ impl AccountService {
             detail_7d: d7d,
             detail_5h: d5h,
             concurrency_pct,
+            weights: (w7d, w5h, wconc),
             current_concurrency,
             queued,
         }

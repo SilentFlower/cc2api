@@ -100,6 +100,30 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         }
         sqlx::query(stmt).execute(pool).await?;
     }
+
+    // settings 表（全局配置项）
+    let settings_schema = if driver == "sqlite" { SQLITE_SETTINGS_SCHEMA } else { PG_SETTINGS_SCHEMA };
+    for stmt in settings_schema.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        sqlx::query(stmt).execute(pool).await?;
+    }
+    // 插入默认评分权重（若不存在）
+    for (key, val) in &[
+        ("score_weight_7d", "0.5"),
+        ("score_weight_5h", "0.3"),
+        ("score_weight_concurrency", "0.2"),
+    ] {
+        let insert_sql = if driver == "sqlite" {
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"
+        } else {
+            "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING"
+        };
+        sqlx::query(insert_sql).bind(key).bind(val).execute(pool).await.ok();
+    }
+
     Ok(())
 }
 
@@ -184,5 +208,19 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     status              TEXT NOT NULL DEFAULT 'active',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"#;
+
+const SQLITE_SETTINGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+)
+"#;
+
+const PG_SETTINGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
 )
 "#;

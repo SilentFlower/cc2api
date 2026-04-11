@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
@@ -49,6 +49,7 @@ impl GatewayService {
     }
 
     async fn handle_request_inner(&self, req: Request, api_token: Option<&ApiToken>) -> Result<Response, AppError> {
+        let req_start = std::time::Instant::now();
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -90,12 +91,16 @@ impl GatewayService {
         loop {
             let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
             // 选择账号
+            let t0 = std::time::Instant::now();
             let account = match self
                 .account_svc
                 .select_account(&session_hash, &exclude_ids, &allowed_ids)
                 .await
             {
-                Ok(a) => a,
+                Ok(a) => {
+                    info!("[耗时] 账号选择: {:.0}ms → 账号#{}", t0.elapsed().as_millis(), a.id);
+                    a
+                }
                 Err(_) if last_resp.is_some() => {
                     // 无可用账号但有上一次的 429 响应，返回给客户端
                     return Ok(last_resp.unwrap());
@@ -138,11 +143,14 @@ impl GatewayService {
                 }
 
                 if path.starts_with("/v1/messages") {
+                    let t_tel = std::time::Instant::now();
                     self.telemetry_svc.activate_session(&account).await;
+                    info!("[耗时] 遥测激活: {:.0}ms", t_tel.elapsed().as_millis());
                 }
             }
 
             // 获取并发槽位，满时排队等待
+            let t_slot = std::time::Instant::now();
             let mut acquired = self
                 .account_svc
                 .acquire_slot(account.id, account.concurrency)
@@ -198,9 +206,16 @@ impl GatewayService {
             // 槽位释放绑定到响应体 stream 的生命周期上。
             // SlotReleaseGuard 兜底：若转发前出错或 panic，drop 时自动释放槽位。
             // 成功包装 stream 后 defuse() 解除，由 SlotGuardStream 接管释放。
+            let slot_ms = t_slot.elapsed().as_millis();
+            if slot_ms > 10 {
+                info!("[耗时] 槽位获取: {:.0}ms (排队等待)", slot_ms);
+            } else {
+                info!("[耗时] 槽位获取: {:.0}ms", slot_ms);
+            }
             let mut slot_guard = SlotReleaseGuard::new(self.account_svc.clone(), account.id);
 
             // 改写请求体
+            let t_rewrite = std::time::Instant::now();
             debug!(
                 "request body BEFORE rewrite: {}",
                 truncate_body(&body_bytes, 4096)
@@ -245,6 +260,7 @@ impl GatewayService {
                     return Err(e);
                 }
             };
+            info!("[耗时] 请求改写+Token解析: {:.0}ms", t_rewrite.elapsed().as_millis());
             let mut final_headers = rewritten_headers;
             final_headers.insert(
                 "authorization".into(),
@@ -252,6 +268,7 @@ impl GatewayService {
             );
 
             // 转发到上游
+            let t_upstream = std::time::Instant::now();
             let resp = match self
                 .forward_request(
                     &method.to_string(),
@@ -263,8 +280,16 @@ impl GatewayService {
                 )
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    info!(
+                        "[耗时] 上游响应: {:.0}ms (HTTP {})",
+                        t_upstream.elapsed().as_millis(),
+                        r.status().as_u16()
+                    );
+                    r
+                }
                 Err(e) => {
+                    info!("[耗时] 上游失败: {:.0}ms", t_upstream.elapsed().as_millis());
                     // SlotReleaseGuard drop 会自动释放槽位
                     return Err(e);
                 }
@@ -272,6 +297,13 @@ impl GatewayService {
 
             // 非 429：将响应体包装为 SlotGuardBody，流结束时释放槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                info!(
+                    "[耗时] 请求总计: {:.0}ms | {} {} → 账号#{}",
+                    req_start.elapsed().as_millis(),
+                    method,
+                    path,
+                    account.id
+                );
                 let (svc, account_id) = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(body, svc, account_id));

@@ -61,6 +61,7 @@ export interface Account {
     concurrency_pct: number
     detail_7d?: { utilization: number; decay: number }
     detail_5h?: { utilization: number; decay: number }
+    weights?: { w7d: number; w5h: number; wconc: number }
   }
   current_concurrency?: number
   queued_requests?: number
@@ -147,4 +148,8 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-code', { session_id: sessionId, code }),
   exchangeSetupTokenCode: (sessionId: string, code: string) =>
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
+
+  // 设置
+  getSettings: () => request<Record<string, string>>('GET', '/admin/settings'),
+  updateSettings: (data: Record<string, string>) => request<{ ok: boolean }>('PUT', '/admin/settings', data),
 }
