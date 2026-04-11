@@ -297,13 +297,6 @@ impl GatewayService {
 
             // 非 429：将响应体包装为 SlotGuardBody，流结束时释放槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
-                info!(
-                    "[耗时] 网关处理完成: {:.0}ms | {} {} → {}",
-                    req_start.elapsed().as_millis(),
-                    method,
-                    path,
-                    account.name
-                );
                 let (svc, account_id) = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
