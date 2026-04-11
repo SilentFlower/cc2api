@@ -626,6 +626,11 @@ impl http_body::Body for SlotGuardBody {
 
 impl Drop for SlotGuardBody {
     fn drop(&mut self) {
+        info!(
+            "[耗时] 传输结束: {:.0}ms → {}",
+            self.req_start.elapsed().as_millis(),
+            self.account_name
+        );
         if let Some((svc, account_id)) = self.release.take() {
             tokio::spawn(async move {
                 svc.release_slot(account_id).await;
