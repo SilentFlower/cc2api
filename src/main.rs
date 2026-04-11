@@ -36,7 +36,12 @@ async fn main() {
     // 缓存：优先 Redis，回退内存
     let cache: Arc<dyn store::cache::CacheStore> = match &cfg.redis {
         Some(redis_cfg) => {
-            match store::redis::RedisStore::new(&redis_cfg.addr(), &redis_cfg.password, redis_cfg.db)
+            match store::redis::RedisStore::new(
+                &redis_cfg.host,
+                redis_cfg.port,
+                &redis_cfg.password,
+                redis_cfg.db,
+            )
                 .await
             {
                 Ok(r) => {
@@ -74,6 +79,16 @@ async fn main() {
     ));
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
+
+    // 后台定时拉取 OAuth 账户用量数据
+    let usage_poller = Arc::new(service::usage_poller::UsagePollerService::new(
+        account_svc.clone(),
+        cfg.usage_poll_interval,
+    ));
+    tokio::spawn({
+        let poller = usage_poller.clone();
+        async move { poller.run().await }
+    });
 
     let app = handler::router::build_router(
         &cfg,
