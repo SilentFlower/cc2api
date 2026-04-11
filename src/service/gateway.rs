@@ -407,7 +407,8 @@ fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_j
         get_str("anthropic-ratelimit-unified-5h-reset"),
     ) {
         if let (Ok(util), Some(reset)) = (util_str.parse::<f64>(), normalize_reset_timestamp(&reset_raw)) {
-            usage["five_hour"] = serde_json::json!({ "utilization": util, "resets_at": reset });
+            // 响应头返回 0~1 的比例，乘以 100 转为百分比，与 OAuth usage API 格式一致
+            usage["five_hour"] = serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
             has_window = true;
         }
     }
@@ -418,7 +419,7 @@ fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_j
         get_str("anthropic-ratelimit-unified-7d-reset"),
     ) {
         if let (Ok(util), Some(reset)) = (util_str.parse::<f64>(), normalize_reset_timestamp(&reset_raw)) {
-            usage["seven_day"] = serde_json::json!({ "utilization": util, "resets_at": reset });
+            usage["seven_day"] = serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
             has_window = true;
         }
     }
