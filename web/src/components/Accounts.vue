@@ -342,6 +342,15 @@ function formatTimeLeft(resetsAt: string): string {
 }
 
 /**
+ * 获取窗口的有效利用率：resets_at 已过期则视为 0（窗口已重置）。
+ */
+function effectiveUtil(window?: { utilization: number; resets_at: string }): number {
+  if (!window) return 0;
+  if (new Date(window.resets_at).getTime() <= Date.now()) return 0;
+  return window.utilization;
+}
+
+/**
  * 获取用量进度条颜色
  * @param pct 使用百分比 (0-100)
  */
@@ -706,42 +715,42 @@ async function copyText(text: string) {
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">5 小时</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.five_hour ? Math.round(a.usage_data.five_hour.utilization) : '0' }}%
+                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(a.usage_data?.five_hour)) }}%
                   <span v-if="a.usage_data?.five_hour" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.five_hour.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.five_hour ? a.usage_data.five_hour.utilization : 0)"
+                <div :class="usageBarColor(effectiveUtil(a.usage_data?.five_hour))"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.five_hour ? Math.min(a.usage_data.five_hour.utilization, 100) : 0) + '%' }" />
+                  :style="{ width: Math.min(effectiveUtil(a.usage_data?.five_hour), 100) + '%' }" />
               </div>
             </div>
             <!-- 7 天 -->
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day ? Math.round(a.usage_data.seven_day.utilization) : '0' }}%
+                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(a.usage_data?.seven_day)) }}%
                   <span v-if="a.usage_data?.seven_day" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.seven_day.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.seven_day ? a.usage_data.seven_day.utilization : 0)"
+                <div :class="usageBarColor(effectiveUtil(a.usage_data?.seven_day))"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.seven_day ? Math.min(a.usage_data.seven_day.utilization, 100) : 0) + '%' }" />
+                  :style="{ width: Math.min(effectiveUtil(a.usage_data?.seven_day), 100) + '%' }" />
               </div>
             </div>
             <!-- 7 天 Sonnet -->
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天 Sonnet</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day_sonnet ? Math.round(a.usage_data.seven_day_sonnet.utilization) : '0' }}%
+                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(a.usage_data?.seven_day_sonnet)) }}%
                   <span v-if="a.usage_data?.seven_day_sonnet" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.seven_day_sonnet.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.seven_day_sonnet ? a.usage_data.seven_day_sonnet.utilization : 0)"
+                <div :class="usageBarColor(effectiveUtil(a.usage_data?.seven_day_sonnet))"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.seven_day_sonnet ? Math.min(a.usage_data.seven_day_sonnet.utilization, 100) : 0) + '%' }" />
+                  :style="{ width: Math.min(effectiveUtil(a.usage_data?.seven_day_sonnet), 100) + '%' }" />
               </div>
             </div>
           </div>

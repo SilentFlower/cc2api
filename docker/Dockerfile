@@ -20,12 +20,28 @@ RUN case "$TARGETPLATFORM" in \
         ;; \
     esac
 
+# ---- 依赖缓存层：先只复制 Cargo 清单和 craftls，构建空壳项目缓存依赖 ----
 COPY Cargo.toml Cargo.lock ./
-COPY src/ ./src/
 COPY craftls/ ./craftls/
-COPY --from=frontend /app/web/dist ./web/dist/
+# 创建空壳 src，让 cargo build 能解析并下载+编译所有依赖
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && \
+    case "$TARGETPLATFORM" in \
+      "linux/arm64") \
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
+        cargo build --release --target aarch64-unknown-linux-gnu \
+        ;; \
+      *) \
+        cargo build --release \
+        ;; \
+    esac && \
+    rm -rf src
 
-RUN case "$TARGETPLATFORM" in \
+# ---- 源码层：只有业务代码变动时才重新编译 ----
+COPY src/ ./src/
+COPY --from=frontend /app/web/dist ./web/dist/
+# 触发重新编译业务代码（touch 确保时间戳比缓存的依赖新）
+RUN touch src/main.rs && \
+    case "$TARGETPLATFORM" in \
       "linux/arm64") \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
         cargo build --release --target aarch64-unknown-linux-gnu && \
