@@ -26,6 +26,22 @@ const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 /// 无法确定限流原因时的保守限流时长（与历史行为一致）。
 const FALLBACK_QUARANTINE: Duration = Duration::from_secs(5 * 60 * 60);
 
+/// 账号调度评分详情，用于前端展示。
+pub struct AccountScoreInfo {
+    /// 综合得分（越低越优先）。
+    pub score: f64,
+    /// 7 天窗口有效用量（utilization × 时间衰减）。
+    pub eff_7d: f64,
+    /// 5 小时窗口有效用量（utilization × 时间衰减）。
+    pub eff_5h: f64,
+    /// 并发负载百分比（当前/最大 × 100）。
+    pub concurrency_pct: f64,
+    /// 当前占用的并发槽位数。
+    pub current_concurrency: i64,
+    /// 当前等待队列中的请求数。
+    pub queued: i64,
+}
+
 pub struct AccountService {
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
@@ -164,6 +180,19 @@ impl AccountService {
     pub async fn release_slot(&self, account_id: i64) {
         let key = format!("concurrency:account:{}", account_id);
         self.cache.release_slot(&key).await;
+    }
+
+    /// 尝试进入等待队列，未超过上限返回 true。
+    pub async fn cache_acquire_wait(&self, key: &str, max: i32) -> bool {
+        self.cache
+            .acquire_slot(key, max, Duration::from_secs(60))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// 离开等待队列。
+    pub async fn cache_release_wait(&self, key: &str) {
+        self.cache.release_slot(key).await;
     }
 
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
@@ -396,12 +425,12 @@ impl AccountService {
         }
     }
 
-    /// 综合评分选择账号：同优先级内按 5h 用量和并发负载加权评分，分数越低越优先。
+    /// 综合评分选择账号：同优先级内按 7d/5h 有效用量和并发负载加权评分，分数越低越优先。
     ///
-    /// 评分公式：`score = 5h_utilization * 0.7 + concurrency_load_pct * 0.3`
-    /// - `5h_utilization`：0~100，无数据按 0（假设全新）
-    /// - `concurrency_load_pct`：当前并发数 / 最大并发数 * 100
-    /// - 并发已满（current >= max）的账号优先排除，仅在所有账号都满时才参与评分
+    /// 评分公式：`score = eff_7d * 0.5 + eff_5h * 0.3 + concurrency_load_pct * 0.2`
+    /// - `eff_Xd = utilization × (剩余时间 / 窗口总时长)`，快重置的窗口衰减更大
+    /// - 无 resets_at 数据时衰减因子为 1.0（最保守）
+    /// - 并发已满的账号优先排除，仅在所有账号都满时才参与评分
     /// - 得分相同时随机选择
     async fn select_by_score(&self, accounts: &[Account]) -> Account {
         if accounts.len() == 1 {
@@ -419,10 +448,13 @@ impl AccountService {
             return best[0].clone();
         }
 
+        let now = Utc::now();
+
         // 计算每个候选的综合得分，同时记录并发是否已满
         let mut scored: Vec<(&Account, f64, bool)> = Vec::with_capacity(best.len());
         for acc in &best {
-            let util = get_5h_utilization(acc);
+            let eff_5h = effective_utilization(acc, "five_hour", 5.0 * 3600.0, now);
+            let eff_7d = effective_utilization(acc, "seven_day", 7.0 * 24.0 * 3600.0, now);
             let key = format!("concurrency:account:{}", acc.id);
             let current = self.cache.get_slot_count(&key).await;
             let full = acc.concurrency > 0 && current >= acc.concurrency as i64;
@@ -431,7 +463,7 @@ impl AccountService {
             } else {
                 0.0
             };
-            let score = util * 0.7 + conc_pct * 0.3;
+            let score = eff_7d * 0.5 + eff_5h * 0.3 + conc_pct * 0.2;
             scored.push((acc, score, full));
         }
 
@@ -459,16 +491,71 @@ impl AccountService {
         let idx = rand::thread_rng().gen_range(0..winners.len());
         winners[idx].clone()
     }
+
+    /// 计算单个账号的调度评分及实时状态（供 API 展示用）。
+    pub async fn get_account_score_info(&self, account: &Account) -> AccountScoreInfo {
+        let now = Utc::now();
+        let eff_5h = effective_utilization(account, "five_hour", 5.0 * 3600.0, now);
+        let eff_7d = effective_utilization(account, "seven_day", 7.0 * 24.0 * 3600.0, now);
+
+        let conc_key = format!("concurrency:account:{}", account.id);
+        let current_concurrency = self.cache.get_slot_count(&conc_key).await;
+        let concurrency_pct = if account.concurrency > 0 {
+            (current_concurrency as f64) / (account.concurrency as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let wait_key = format!("wait:account:{}", account.id);
+        let queued = self.cache.get_slot_count(&wait_key).await;
+
+        let score = eff_7d * 0.5 + eff_5h * 0.3 + concurrency_pct * 0.2;
+
+        AccountScoreInfo {
+            score,
+            eff_7d,
+            eff_5h,
+            concurrency_pct,
+            current_concurrency,
+            queued,
+        }
+    }
 }
 
-/// 从账号 usage_data 中提取 5h 窗口的 utilization（0~100），无数据返回 0.0。
-fn get_5h_utilization(account: &Account) -> f64 {
-    account
+/// 计算指定窗口的有效用量：utilization × 时间衰减因子。
+/// 快重置的窗口衰减更大，相同用量下得分更低（更优先选中）。
+/// 无 resets_at 或无用量数据时衰减因子为 1.0（最保守）。
+fn effective_utilization(
+    account: &Account,
+    window: &str,
+    max_window_secs: f64,
+    now: chrono::DateTime<Utc>,
+) -> f64 {
+    let util = account
         .usage_data
-        .get("five_hour")
+        .get(window)
         .and_then(|w| w.get("utilization"))
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
+        .unwrap_or(0.0);
+
+    if util == 0.0 {
+        return 0.0;
+    }
+
+    // 解析 resets_at，计算剩余时间占窗口总时长的比例
+    let decay = account
+        .usage_data
+        .get(window)
+        .and_then(|w| w.get("resets_at"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|reset| {
+            let remaining = (reset.with_timezone(&Utc) - now).num_seconds().max(0) as f64;
+            (remaining / max_window_secs).clamp(0.0, 1.0)
+        })
+        .unwrap_or(1.0); // 无数据按最保守处理
+
+    util * decay
 }
 enum RateLimitWindow {
     /// 7 天窗口命中，携带其 resets_at。

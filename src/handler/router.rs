@@ -139,13 +139,23 @@ async fn list_accounts(
     let (accounts, total) = state.account_svc.list_accounts_paged(page, page_size).await?;
     let total_pages = (total + page_size - 1) / page_size;
 
-    // 为每个账号附加遥测会话过期时间
+    // 为每个账号附加遥测会话过期时间 + 调度评分信息
     let mut data: Vec<serde_json::Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
         let mut obj = serde_json::to_value(a).unwrap_or_default();
         if let Some(expires) = state.telemetry_svc.get_session_expires_at(a.id).await {
             obj["telemetry_expires_at"] = serde_json::json!(expires.to_rfc3339());
         }
+        // 附加实时调度评分和并发/排队状态
+        let si = state.account_svc.get_account_score_info(a).await;
+        obj["scheduling_score"] = serde_json::json!((si.score * 10.0).round() / 10.0);
+        obj["scheduling_detail"] = serde_json::json!({
+            "eff_7d": (si.eff_7d * 10.0).round() / 10.0,
+            "eff_5h": (si.eff_5h * 10.0).round() / 10.0,
+            "concurrency_pct": (si.concurrency_pct * 10.0).round() / 10.0,
+        });
+        obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
+        obj["queued_requests"] = serde_json::json!(si.queued);
         data.push(obj);
     }
 

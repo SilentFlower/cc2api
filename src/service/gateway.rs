@@ -83,7 +83,7 @@ impl GatewayService {
             (vec![], vec![])
         };
 
-        // 429 自动换号重试循环
+        // 429 自动换号 / 并发降级重试循环
         let mut exclude_ids = blocked_ids.clone();
         let mut last_resp: Option<Response> = None;
 
@@ -101,6 +101,14 @@ impl GatewayService {
                     return Ok(last_resp.unwrap());
                 }
                 Err(e) => {
+                    // 仅当是"无可用账号"且有运行时排除的账号时，返回 429
+                    if exclude_ids.len() > blocked_ids.len() {
+                        if matches!(&e, AppError::ServiceUnavailable(_)) {
+                            return Err(AppError::TooManyRequests(
+                                "all accounts are busy".into(),
+                            ));
+                        }
+                    }
                     return Err(AppError::ServiceUnavailable(format!(
                         "no available account: {}",
                         e
@@ -141,7 +149,33 @@ impl GatewayService {
                 .await
                 .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
             if !acquired {
-                debug!("account {} slots full, waiting for availability", account.id);
+                // 检查等待队列是否已满
+                let wait_key = format!("wait:account:{}", account.id);
+                let entered_queue = self
+                    .account_svc
+                    .cache_acquire_wait(&wait_key, account.concurrency)
+                    .await;
+                if !entered_queue {
+                    // 等待队列满：降级到其他账号，重新绑定粘性
+                    warn!(
+                        "account {} wait queue full, falling back to another account",
+                        account.id
+                    );
+                    exclude_ids.push(account.id);
+                    continue;
+                }
+                // scopeguard 保证即使请求被取消/丢弃也能释放等待计数
+                let wait_svc = self.account_svc.clone();
+                let wait_key_clone = wait_key.clone();
+                let _wait_guard = scopeguard::guard((), move |_| {
+                    let svc = wait_svc;
+                    let key = wait_key_clone;
+                    tokio::spawn(async move {
+                        svc.cache_release_wait(&key).await;
+                    });
+                });
+                // 排队等待槽位释放
+                debug!("account {} slots full, queued for availability", account.id);
                 for _ in 0..SLOT_WAIT_MAX_RETRIES {
                     tokio::time::sleep(SLOT_WAIT_INTERVAL).await;
                     match self.account_svc.acquire_slot(account.id, account.concurrency).await {
@@ -149,10 +183,15 @@ impl GatewayService {
                         _ => {}
                     }
                 }
+                // scopeguard 会在此处自动释放等待队列计数（drop _wait_guard）
                 if !acquired {
-                    return Err(AppError::TooManyRequests(
-                        "concurrency slot unavailable after waiting".into(),
-                    ));
+                    // 等待超时：降级到其他账号，重新绑定粘性
+                    warn!(
+                        "account {} slot wait timed out, falling back to another account",
+                        account.id
+                    );
+                    exclude_ids.push(account.id);
+                    continue;
                 }
             }
 

@@ -47,11 +47,13 @@
 
 **账号管理**
 - 多账号池，Setup Token + OAuth 双认证
-- 粘性会话 24h 绑定同一账号
-- 优先级调度 + 同优先级随机
-- 每账号独立并发上限
+- 粘性会话 1h 绑定同一账号（活跃时自动续期）
+- 负载感知调度：`eff_7d×0.5 + eff_5h×0.3 + 并发%×0.2`（含时间衰减）
+- 每账号独立并发上限，满时排队等待（30s 超时，队列上限 = 并发数）
+- 并发/排队满时自动降级到其他账号
 - OAuth 按用量窗口智能限流 / 403 永久停用
-- 后台自动刷新用量，前端 60s 静默更新
+- 被动采集用量（响应头）+ 可选主动轮询（`auto_poll_usage`）
+- 前端实时展示调度评分、并发数、排队数
 - 手动一键启停
 
 </td>
@@ -512,13 +514,18 @@ cc-bridge/
 
 ### 账号选择
 
-1. 粘性绑定命中且可调度 → 复用
+1. 粘性绑定命中且可调度 → 复用（刷新 1h TTL）
 2. 否则从可调度账号（active + 未限流 + 未排除）中按 `priority` 升序选最优组
-3. 同优先级随机选择 → 写入 24h 粘性绑定
+3. 同优先级内按综合评分选择（越低越优先）：
+   - `eff_7d = 7d_utilization × (剩余时间 / 7天)` — 权重 0.5
+   - `eff_5h = 5h_utilization × (剩余时间 / 5小时)` — 权重 0.3
+   - `concurrency_load% = 当前并发 / 最大并发 × 100` — 权重 0.2
+   - 并发已满的账号优先排除；快重置的窗口衰减更大
+4. 绑定粘性会话（1h TTL，活跃时续期）
 
 ### 并发控制
 
-每账号 `concurrency` 上限，请求命中后抢占槽位，失败返回 429。槽位请求结束后自动释放。
+每账号 `concurrency` 上限，请求命中后抢占槽位。槽位满时进入等待队列（500ms 轮询，最多 30s），队列上限等于账号并发数。等待队列满或超时后自动降级到其他账号。所有账号都忙时返回 429。
 
 ### 限速与停用
 
@@ -549,11 +556,12 @@ cc-bridge/
 
 收到 429 后网关会把当前账号加入本次请求的排除列表，从可调度账号中重新选号继续尝试，直到成功或无可用账号。客户端只看到最终结果，中间切换对其透明。
 
-### 用量数据自动刷新
+### 用量数据
 
-- **后台轮询**：启动时 spawn 一个任务，每 `USAGE_POLL_INTERVAL_SECS`（默认 300 秒）遍历所有 active 的 OAuth 账号，调用 Anthropic `/api/oauth/usage` 更新 `usage_data` 字段。账号之间 500ms 间隔，避免瞬时并发过高。
-- **前端静默重载**：Accounts 页面打开时每 60 秒重新拉取账号列表，从本地数据库读取最新用量。页面切走后 `onUnmounted` 清理定时器。
-- **手动刷新按钮**：点击"用量"按钮仍可立即刷新单个账号的用量数据。
+- **被动采集**（所有账号）：每次请求从上游响应头 `anthropic-ratelimit-unified-*` 提取 utilization 和 resets_at，merge 到 `usage_data`。零 API 开销，SetupToken 也能获取用量。
+- **主动轮询**（可选）：账号开启 `auto_poll_usage` 后，后台每 `USAGE_POLL_INTERVAL_SECS`（默认 300 秒）调用 Anthropic `/api/oauth/usage` 获取完整用量。仅 OAuth 账号支持。默认关闭。
+- **前端静默重载**：Accounts 页面每 60 秒重拉账号列表，展示实时调度评分、并发数、排队数。
+- **手动刷新按钮**：点击"用量"按钮可立即刷新单个账号的用量数据。
 
 ### 请求头改写
 
@@ -605,6 +613,7 @@ cc-bridge/
 | `rate_limited_at` / `rate_limit_reset_at` / `disable_reason` | 限流/停用状态 |
 | `usage_data` / `usage_fetched_at` | 用量缓存 |
 | `auto_telemetry` / `telemetry_count` | 自动遥测 |
+| `auto_poll_usage` | 是否开启后台自动轮询用量 |
 
 ### `api_tokens` 表
 
@@ -639,6 +648,7 @@ cc-bridge/
 | `concurrency` | 否 | 最大并发，默认 3 |
 | `priority` | 否 | 数值越小优先级越高，默认 50 |
 | `auto_telemetry` | 否 | 是否开启自动遥测，默认 false |
+| `auto_poll_usage` | 否 | 是否开启后台自动轮询用量（仅 OAuth），默认 false |
 
 > 创建时系统自动生成 `device_id`、`canonical_env`、`canonical_prompt_env`、`canonical_process`。
 

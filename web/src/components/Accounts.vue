@@ -581,10 +581,29 @@ async function copyText(text: string) {
           <!-- 信息 -->
           <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
             <div class="grid grid-cols-3 gap-3">
+              <div class="text-center relative group">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">评分</p>
+                <p class="text-sm font-medium cursor-help" :class="(a.scheduling_score ?? 0) >= 70 ? 'text-red-500' : (a.scheduling_score ?? 0) >= 40 ? 'text-amber-600' : 'text-emerald-600'">
+                  {{ a.scheduling_score?.toFixed(1) ?? '0.0' }}
+                </p>
+                <div v-if="a.scheduling_detail" class="absolute z-10 hidden group-hover:block bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 -top-16 left-1/2 -translate-x-1/2 whitespace-nowrap shadow-lg">
+                  7d: {{ a.scheduling_detail.eff_7d.toFixed(1) }}×0.5 · 5h: {{ a.scheduling_detail.eff_5h.toFixed(1) }}×0.3 · 并发: {{ a.scheduling_detail.concurrency_pct.toFixed(0) }}%×0.2
+                </div>
+              </div>
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">并发</p>
-                <p class="text-sm font-medium text-[#29261e]">{{ a.concurrency }}</p>
+                <p class="text-sm font-medium" :class="(a.current_concurrency ?? 0) >= a.concurrency ? 'text-red-500' : 'text-[#29261e]'">
+                  {{ a.current_concurrency ?? 0 }}/{{ a.concurrency }}
+                </p>
               </div>
+              <div class="text-center">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">排队</p>
+                <p class="text-sm font-medium" :class="(a.queued_requests ?? 0) > 0 ? 'text-amber-600' : 'text-[#29261e]'">
+                  {{ a.queued_requests ?? 0 }}
+                </p>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 gap-3">
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">优先级</p>
                 <p class="text-sm font-medium text-[#29261e]">{{ a.priority }}</p>

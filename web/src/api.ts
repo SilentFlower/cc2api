@@ -54,6 +54,14 @@ export interface Account {
   auto_poll_usage: boolean
   telemetry_count: number
   telemetry_expires_at?: string
+  scheduling_score?: number
+  scheduling_detail?: {
+    eff_7d: number
+    eff_5h: number
+    concurrency_pct: number
+  }
+  current_concurrency?: number
+  queued_requests?: number
   rate_limited_at?: string
   rate_limit_reset_at?: string
   disable_reason?: string
