@@ -614,7 +614,7 @@ async function copyText(text: string) {
                    @mouseleave="hideScoreTooltip">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">评分</p>
                 <p class="text-sm font-medium cursor-help" :class="(a.scheduling_score ?? 0) >= 70 ? 'text-red-500' : (a.scheduling_score ?? 0) >= 40 ? 'text-amber-600' : 'text-emerald-600'">
-                  {{ a.scheduling_score?.toFixed(1) ?? '0.0' }}
+                  {{ a.scheduling_score?.toFixed(2) ?? '0.00' }}
                 </p>
               </div>
               <div class="text-center">
@@ -1380,10 +1380,10 @@ async function copyText(text: string) {
     <div v-if="scoreTooltip.visible && scoreTooltip.account?.scheduling_detail"
          class="fixed z-50 bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 whitespace-nowrap shadow-lg leading-relaxed pointer-events-none"
          :style="{ top: scoreTooltip.y + 'px', left: scoreTooltip.x + 'px', transform: 'translateY(-100%)' }">
-      <div>7d: {{ scoreTooltip.account.scheduling_detail.detail_7d?.utilization?.toFixed(1) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_7d?.decay?.toFixed(3) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_7d.toFixed(1) }} × 0.5</div>
-      <div>5h: {{ scoreTooltip.account.scheduling_detail.detail_5h?.utilization?.toFixed(1) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_5h?.decay?.toFixed(3) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_5h.toFixed(1) }} × 0.3</div>
-      <div>并发: {{ scoreTooltip.account.scheduling_detail.concurrency_pct.toFixed(0) }}% × 0.2</div>
-      <div class="border-t border-white/20 mt-1 pt-1 font-medium">= {{ scoreTooltip.account.scheduling_score?.toFixed(1) }}　<span class="text-white/50">越小越优先</span></div>
+      <div>7d: {{ scoreTooltip.account.scheduling_detail.detail_7d?.utilization?.toFixed(2) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_7d?.decay?.toFixed(4) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_7d.toFixed(2) }} × 0.5</div>
+      <div>5h: {{ scoreTooltip.account.scheduling_detail.detail_5h?.utilization?.toFixed(2) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_5h?.decay?.toFixed(4) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_5h.toFixed(2) }} × 0.3</div>
+      <div>并发: {{ scoreTooltip.account.scheduling_detail.concurrency_pct.toFixed(2) }}% × 0.2</div>
+      <div class="border-t border-white/20 mt-1 pt-1 font-medium">= {{ scoreTooltip.account.scheduling_score?.toFixed(2) }}　<span class="text-white/50">越小越优先</span></div>
     </div>
   </Teleport>
 </template>

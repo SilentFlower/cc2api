@@ -148,18 +148,18 @@ async fn list_accounts(
         }
         // 附加实时调度评分和并发/排队状态
         let si = state.account_svc.get_account_score_info(a).await;
-        obj["scheduling_score"] = serde_json::json!((si.score * 10.0).round() / 10.0);
+        obj["scheduling_score"] = serde_json::json!((si.score * 100.0).round() / 100.0);
         obj["scheduling_detail"] = serde_json::json!({
-            "eff_7d": (si.eff_7d * 10.0).round() / 10.0,
-            "eff_5h": (si.eff_5h * 10.0).round() / 10.0,
-            "concurrency_pct": (si.concurrency_pct * 10.0).round() / 10.0,
+            "eff_7d": (si.eff_7d * 100.0).round() / 100.0,
+            "eff_5h": (si.eff_5h * 100.0).round() / 100.0,
+            "concurrency_pct": (si.concurrency_pct * 100.0).round() / 100.0,
             "detail_7d": {
-                "utilization": (si.detail_7d.utilization * 10.0).round() / 10.0,
-                "decay": (si.detail_7d.decay * 1000.0).round() / 1000.0
+                "utilization": (si.detail_7d.utilization * 100.0).round() / 100.0,
+                "decay": (si.detail_7d.decay * 10000.0).round() / 10000.0
             },
             "detail_5h": {
-                "utilization": (si.detail_5h.utilization * 10.0).round() / 10.0,
-                "decay": (si.detail_5h.decay * 1000.0).round() / 1000.0
+                "utilization": (si.detail_5h.utilization * 100.0).round() / 100.0,
+                "decay": (si.detail_5h.decay * 10000.0).round() / 10000.0
             },
         });
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
