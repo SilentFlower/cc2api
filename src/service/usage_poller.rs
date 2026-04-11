@@ -46,7 +46,9 @@ impl UsagePollerService {
         let targets: Vec<i64> = accounts
             .iter()
             .filter(|a| {
-                a.auth_type == AccountAuthType::Oauth && a.status == AccountStatus::Active
+                a.auth_type == AccountAuthType::Oauth
+                    && a.status == AccountStatus::Active
+                    && a.auto_poll_usage
             })
             .map(|a| a.id)
             .collect();

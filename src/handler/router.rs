@@ -176,6 +176,7 @@ struct CreateAccountRequest {
     concurrency: Option<i32>,
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
+    auto_poll_usage: Option<bool>,
 }
 
 async fn create_account(
@@ -220,6 +221,7 @@ async fn create_account(
         rate_limit_reset_at: None,
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
+        auto_poll_usage: req.auto_poll_usage.unwrap_or(false),
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
@@ -341,6 +343,9 @@ async fn update_account(
     }
     if let Some(auto_telemetry) = updates.get("auto_telemetry").and_then(|v| v.as_bool()) {
         existing.auto_telemetry = auto_telemetry;
+    }
+    if let Some(auto_poll_usage) = updates.get("auto_poll_usage").and_then(|v| v.as_bool()) {
+        existing.auto_poll_usage = auto_poll_usage;
     }
 
     state.account_svc.update_account(&existing).await?;

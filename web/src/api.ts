@@ -51,6 +51,7 @@ export interface Account {
   concurrency: number
   priority: number
   auto_telemetry: boolean
+  auto_poll_usage: boolean
   telemetry_count: number
   telemetry_expires_at?: string
   rate_limited_at?: string

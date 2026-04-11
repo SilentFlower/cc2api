@@ -47,6 +47,7 @@ const form = ref({
   concurrency: 3,
   priority: 50,
   auto_telemetry: false,
+  auto_poll_usage: false,
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -123,6 +124,7 @@ function openCreate() {
     concurrency: 3,
     priority: 50,
     auto_telemetry: false,
+    auto_poll_usage: false,
   };
   showForm.value = true;
 }
@@ -149,6 +151,7 @@ function openEdit(a: Account) {
     concurrency: a.concurrency,
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
+    auto_poll_usage: a.auto_poll_usage ?? false,
   };
   showForm.value = true;
 }
@@ -184,6 +187,7 @@ async function save() {
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       updates.auto_telemetry = form.value.auto_telemetry;
+      updates.auto_poll_usage = form.value.auto_poll_usage;
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -207,6 +211,7 @@ async function save() {
         concurrency: form.value.concurrency,
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
+        auto_poll_usage: form.value.auto_poll_usage,
       };
       if (expiresAt) payload.expires_at = Number(expiresAt);
       await api.createAccount(payload);
@@ -483,6 +488,7 @@ function applyOAuthResult() {
     concurrency: 3,
     priority: 50,
     auto_telemetry: false,
+    auto_poll_usage: false,
   };
   showForm.value = true;
 }
@@ -607,6 +613,12 @@ async function copyText(text: string) {
                 </p>
                 <p v-if="a.telemetry_expires_at" class="text-xs text-amber-500 mt-0.5">
                   遥测中 · 停止于 {{ new Date(a.telemetry_expires_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}
+                </p>
+              </div>
+              <div v-if="a.auth_type === 'oauth'">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">自动轮询用量</p>
+                <p class="text-sm" :class="a.auto_poll_usage ? 'text-emerald-600' : 'text-[#8c8475]'">
+                  {{ a.auto_poll_usage ? '已开启' : '关闭' }}
                 </p>
               </div>
               <div>
@@ -1024,6 +1036,32 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后由网关代替客户端发送遥测请求</p>
+          </div>
+          <div v-if="form.auth_type === 'oauth'" class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">自动轮询用量</Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="form.auto_poll_usage = false"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="!form.auto_poll_usage
+                  ? 'bg-[#f9f6f1] border-[#8c8475] text-[#5c5647]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#8c8475]/40'"
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                @click="form.auto_poll_usage = true"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.auto_poll_usage
+                  ? 'bg-emerald-50 border-emerald-400 text-emerald-600'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-emerald-300'"
+              >
+                开启
+              </button>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">开启后后台定时拉取该账号的用量数据</p>
           </div>
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">

@@ -183,6 +183,9 @@ pub struct Account {
     /// 是否启用自动遥测。
     #[serde(default)]
     pub auto_telemetry: bool,
+    /// 是否启用后台自动轮询用量数据（仅 OAuth 账号有效）。
+    #[serde(default)]
+    pub auto_poll_usage: bool,
     /// 累计发送的遥测请求次数。
     #[serde(default)]
     pub telemetry_count: i64,
