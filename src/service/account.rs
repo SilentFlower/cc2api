@@ -178,6 +178,25 @@ impl AccountService {
         Ok(usage)
     }
 
+    /// 从上游响应头被动采集的用量数据合并到数据库。
+    /// 不发起任何 API 请求。与已有 usage_data 做 merge，不会丢失响应头中未包含的窗口（如 seven_day_sonnet）。
+    pub async fn update_passive_usage(&self, id: i64, partial: serde_json::Value) -> Result<(), AppError> {
+        let account = self.store.get_by_id(id).await?;
+        let mut existing = if account.usage_data.is_object() {
+            account.usage_data
+        } else {
+            serde_json::json!({})
+        };
+        // 将被动采集的窗口逐一合并到已有数据
+        if let (Some(target), Some(src)) = (existing.as_object_mut(), partial.as_object()) {
+            for (k, v) in src {
+                target.insert(k.clone(), v.clone());
+            }
+        }
+        let merged_str = serde_json::to_string(&existing).unwrap_or_else(|_| "{}".into());
+        self.store.update_usage(id, &merged_str).await
+    }
+
     pub async fn resolve_upstream_token(&self, id: i64) -> Result<String, AppError> {
         let account = self.store.get_by_id(id).await?;
         match account.auth_type {

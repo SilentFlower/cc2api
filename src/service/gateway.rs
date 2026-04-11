@@ -317,6 +317,20 @@ impl GatewayService {
             }
         }
 
+        // 被动采集：从上游响应头提取用量数据，异步合并到数据库。
+        // 429 时跳过，因为 handle_rate_limit 已通过 API 获取了完整数据，异步写入会覆盖。
+        if status_code != 429 {
+            if let Some(usage_json) = extract_passive_usage(resp.headers()) {
+                let svc = self.account_svc.clone();
+                let aid = account.id;
+                tokio::spawn(async move {
+                    if let Err(e) = svc.update_passive_usage(aid, usage_json).await {
+                        debug!("passive usage update failed for account {}: {}", aid, e);
+                    }
+                });
+            }
+        }
+
         // 构建响应
         let mut response_builder = Response::builder().status(
             StatusCode::from_u16(status_code)
@@ -374,4 +388,40 @@ fn truncate_body(b: &[u8], max: usize) -> String {
     } else {
         String::from_utf8_lossy(b).to_string()
     }
+}
+
+/// 从上游响应头中提取 ratelimit 用量信息，构建与 OAuth usage API 格式一致的 JSON。
+/// 仅保留 utilization 和 resets_at 都存在且可解析的完整窗口，避免不完整数据导致前端异常。
+/// 没有任何完整窗口时返回 None。
+fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_json::Value> {
+    let get_str = |name: &str| -> Option<String> {
+        headers.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    };
+
+    let mut usage = serde_json::json!({});
+    let mut has_window = false;
+
+    // 5 小时窗口：utilization 和 resets_at 必须同时存在且可解析
+    if let (Some(util_str), Some(reset)) = (
+        get_str("anthropic-ratelimit-unified-5h-utilization"),
+        get_str("anthropic-ratelimit-unified-5h-reset"),
+    ) {
+        if let Ok(util) = util_str.parse::<f64>() {
+            usage["five_hour"] = serde_json::json!({ "utilization": util, "resets_at": reset });
+            has_window = true;
+        }
+    }
+
+    // 7 天窗口：同上
+    if let (Some(util_str), Some(reset)) = (
+        get_str("anthropic-ratelimit-unified-7d-utilization"),
+        get_str("anthropic-ratelimit-unified-7d-reset"),
+    ) {
+        if let Ok(util) = util_str.parse::<f64>() {
+            usage["seven_day"] = serde_json::json!({ "utilization": util, "resets_at": reset });
+            has_window = true;
+        }
+    }
+
+    if has_window { Some(usage) } else { None }
 }
