@@ -2,8 +2,12 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use chrono::Utc;
+use futures_core::Stream;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
 use crate::error::AppError;
@@ -195,15 +199,10 @@ impl GatewayService {
                 }
             }
 
-            // 确保在函数结束后释放槽位
-            let account_svc = self.account_svc.clone();
-            let account_id_for_release = account.id;
-            let _guard = scopeguard::guard((), move |_| {
-                let svc = account_svc.clone();
-                tokio::spawn(async move {
-                    svc.release_slot(account_id_for_release).await;
-                });
-            });
+            // 槽位释放绑定到响应体 stream 的生命周期上。
+            // SlotReleaseGuard 兜底：若转发前出错或 panic，drop 时自动释放槽位。
+            // 成功包装 stream 后 defuse() 解除，由 SlotGuardStream 接管释放。
+            let mut slot_guard = SlotReleaseGuard::new(self.account_svc.clone(), account.id);
 
             // 改写请求体
             debug!(
@@ -243,7 +242,13 @@ impl GatewayService {
                 rewritten_body.clone()
             };
 
-            let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
+            let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // SlotReleaseGuard drop 会自动释放槽位
+                    return Err(e);
+                }
+            };
             let mut final_headers = rewritten_headers;
             final_headers.insert(
                 "authorization".into(),
@@ -251,7 +256,7 @@ impl GatewayService {
             );
 
             // 转发到上游
-            let resp = self
+            let resp = match self
                 .forward_request(
                     &method.to_string(),
                     &path,
@@ -260,23 +265,35 @@ impl GatewayService {
                     &final_body,
                     &account,
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // SlotReleaseGuard drop 会自动释放槽位
+                    return Err(e);
+                }
+            };
 
-            // 非 429 直接返回
+            // 非 429：将响应体包装为 SlotGuardStream，流结束时释放槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
-                return Ok(resp);
+                let (svc, account_id) = slot_guard.defuse();
+                let (parts, body) = resp.into_parts();
+                let guarded = SlotGuardStream::new(
+                    http_body_util::BodyStream::new(body),
+                    svc,
+                    account_id,
+                );
+                return Ok(Response::from_parts(parts, Body::from_stream(guarded)));
             }
 
-            // 429：排除该账号，尝试下一个
+            // 429：guard drop 会释放槽位，排除该账号，尝试下一个
             warn!(
                 "account {} returned 429, excluding and retrying (attempt {})",
                 account.id,
                 attempt + 1,
             );
             exclude_ids.push(account.id);
-            // 取消 scopeguard 并手动释放槽位，避免重复释放
-            std::mem::forget(_guard);
-            self.account_svc.release_slot(account.id).await;
+            drop(slot_guard); // 显式 drop，释放槽位
             last_resp = Some(resp);
         }
     }
@@ -494,4 +511,71 @@ fn normalize_reset_timestamp(raw: &str) -> Option<String> {
         return Some(raw.to_string());
     }
     None
+}
+
+/// 并发槽位释放守卫：drop 时自动释放槽位，防止错误路径或 panic 导致泄漏。
+/// 成功包装 stream 后调用 `defuse()` 解除，由 `SlotGuardStream` 接管释放。
+struct SlotReleaseGuard {
+    inner: Option<(Arc<AccountService>, i64)>,
+}
+
+impl SlotReleaseGuard {
+    fn new(svc: Arc<AccountService>, account_id: i64) -> Self {
+        Self { inner: Some((svc, account_id)) }
+    }
+
+    /// 解除守卫并取出释放信息，调用后 drop 不再释放。
+    fn defuse(&mut self) -> (Arc<AccountService>, i64) {
+        self.inner.take().expect("SlotReleaseGuard already defused")
+    }
+}
+
+impl Drop for SlotReleaseGuard {
+    fn drop(&mut self) {
+        if let Some((svc, account_id)) = self.inner.take() {
+            tokio::spawn(async move {
+                svc.release_slot(account_id).await;
+            });
+        }
+    }
+}
+
+/// 包装响应体 Stream，在流结束或被丢弃时自动释放并发槽位。
+///
+/// 解决 Axum 流式响应中 handler 提前返回导致槽位过早释放的问题：
+/// 将 release 逻辑绑定到 stream 的生命周期上，确保槽位覆盖整个传输过程。
+struct SlotGuardStream<S> {
+    inner: S,
+    /// `Some(...)` 表示槽位尚未释放，`Drop` 时 take 并执行释放。
+    release: Option<(Arc<AccountService>, i64)>,
+}
+
+impl<S> SlotGuardStream<S> {
+    fn new(inner: S, account_svc: Arc<AccountService>, account_id: i64) -> Self {
+        Self {
+            inner,
+            release: Some((account_svc, account_id)),
+        }
+    }
+}
+
+impl<S, E> Stream for SlotGuardStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for SlotGuardStream<S> {
+    fn drop(&mut self) {
+        if let Some((svc, account_id)) = self.release.take() {
+            tokio::spawn(async move {
+                svc.release_slot(account_id).await;
+            });
+        }
+    }
 }
