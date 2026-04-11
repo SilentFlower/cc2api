@@ -402,26 +402,40 @@ fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_j
     let mut has_window = false;
 
     // 5 小时窗口：utilization 和 resets_at 必须同时存在且可解析
-    if let (Some(util_str), Some(reset)) = (
+    if let (Some(util_str), Some(reset_raw)) = (
         get_str("anthropic-ratelimit-unified-5h-utilization"),
         get_str("anthropic-ratelimit-unified-5h-reset"),
     ) {
-        if let Ok(util) = util_str.parse::<f64>() {
+        if let (Ok(util), Some(reset)) = (util_str.parse::<f64>(), normalize_reset_timestamp(&reset_raw)) {
             usage["five_hour"] = serde_json::json!({ "utilization": util, "resets_at": reset });
             has_window = true;
         }
     }
 
     // 7 天窗口：同上
-    if let (Some(util_str), Some(reset)) = (
+    if let (Some(util_str), Some(reset_raw)) = (
         get_str("anthropic-ratelimit-unified-7d-utilization"),
         get_str("anthropic-ratelimit-unified-7d-reset"),
     ) {
-        if let Ok(util) = util_str.parse::<f64>() {
+        if let (Ok(util), Some(reset)) = (util_str.parse::<f64>(), normalize_reset_timestamp(&reset_raw)) {
             usage["seven_day"] = serde_json::json!({ "utilization": util, "resets_at": reset });
             has_window = true;
         }
     }
 
     if has_window { Some(usage) } else { None }
+}
+
+/// 将响应头中的重置时间统一转为 RFC3339 格式。
+/// 响应头可能是 Unix 时间戳（秒）或已经是 ISO8601/RFC3339 字符串。
+fn normalize_reset_timestamp(raw: &str) -> Option<String> {
+    // 尝试解析为 Unix 时间戳（秒）
+    if let Ok(ts) = raw.parse::<i64>() {
+        return chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339());
+    }
+    // 尝试解析为 RFC3339，验证合法性
+    if chrono::DateTime::parse_from_rfc3339(raw).is_ok() {
+        return Some(raw.to_string());
+    }
+    None
 }
