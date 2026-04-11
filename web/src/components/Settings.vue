@@ -59,9 +59,9 @@ async function saveSettings() {
   saving.value = true;
   try {
     await api.updateSettings({
-      score_weight_7d: w7d.value,
-      score_weight_5h: w5h.value,
-      score_weight_concurrency: wconc.value,
+      score_weight_7d: String(w7d.value),
+      score_weight_5h: String(w5h.value),
+      score_weight_concurrency: String(wconc.value),
     });
     toast('保存成功');
   } catch (e) {
