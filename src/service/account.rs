@@ -541,6 +541,7 @@ impl AccountService {
 /// 计算指定窗口的有效用量详情：utilization × 时间衰减因子。
 /// 快重置的窗口衰减更大，相同用量下得分更低（更优先选中）。
 /// 无 resets_at 或无用量数据时衰减因子为 1.0（最保守）。
+/// 当 resets_at 已过期时，说明窗口已重置，直接视为用量清零。
 fn effective_utilization_detail(
     account: &Account,
     window: &str,
@@ -570,6 +571,11 @@ fn effective_utilization_detail(
             (remaining / max_window_secs).clamp(0.0, 1.0)
         })
         .unwrap_or(1.0); // 无数据按最保守处理
+
+    // resets_at 已过期 → 窗口已重置，用量归零
+    if decay == 0.0 {
+        return WindowDetail { utilization: 0.0, decay: 1.0, effective: 0.0 };
+    }
 
     WindowDetail { utilization: util, decay, effective: util * decay }
 }
