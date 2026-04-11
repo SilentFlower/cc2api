@@ -2,12 +2,8 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
 use chrono::Utc;
-use futures_core::Stream;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
 use crate::error::AppError;
@@ -274,16 +270,12 @@ impl GatewayService {
                 }
             };
 
-            // 非 429：将响应体包装为 SlotGuardStream，流结束时释放槽位
+            // 非 429：将响应体包装为 SlotGuardBody，流结束时释放槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 let (svc, account_id) = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
-                let guarded = SlotGuardStream::new(
-                    http_body_util::BodyStream::new(body),
-                    svc,
-                    account_id,
-                );
-                return Ok(Response::from_parts(parts, Body::from_stream(guarded)));
+                let guarded_body = Body::new(SlotGuardBody::new(body, svc, account_id));
+                return Ok(Response::from_parts(parts, guarded_body));
             }
 
             // 429：guard drop 会释放槽位，排除该账号，尝试下一个
@@ -540,18 +532,18 @@ impl Drop for SlotReleaseGuard {
     }
 }
 
-/// 包装响应体 Stream，在流结束或被丢弃时自动释放并发槽位。
+/// 包装响应体 Body，在 body 传输完成或被丢弃时自动释放并发槽位。
 ///
 /// 解决 Axum 流式响应中 handler 提前返回导致槽位过早释放的问题：
-/// 将 release 逻辑绑定到 stream 的生命周期上，确保槽位覆盖整个传输过程。
-struct SlotGuardStream<S> {
-    inner: S,
+/// 将 release 逻辑绑定到 body 的生命周期上，确保槽位覆盖整个传输过程。
+struct SlotGuardBody {
+    inner: Body,
     /// `Some(...)` 表示槽位尚未释放，`Drop` 时 take 并执行释放。
     release: Option<(Arc<AccountService>, i64)>,
 }
 
-impl<S> SlotGuardStream<S> {
-    fn new(inner: S, account_svc: Arc<AccountService>, account_id: i64) -> Self {
+impl SlotGuardBody {
+    fn new(inner: Body, account_svc: Arc<AccountService>, account_id: i64) -> Self {
         Self {
             inner,
             release: Some((account_svc, account_id)),
@@ -559,18 +551,27 @@ impl<S> SlotGuardStream<S> {
     }
 }
 
-impl<S, E> Stream for SlotGuardStream<S>
-where
-    S: Stream<Item = Result<Bytes, E>> + Unpin,
-{
-    type Item = Result<Bytes, E>;
+impl http_body::Body for SlotGuardBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
-impl<S> Drop for SlotGuardStream<S> {
+impl Drop for SlotGuardBody {
     fn drop(&mut self) {
         if let Some((svc, account_id)) = self.release.take() {
             tokio::spawn(async move {
