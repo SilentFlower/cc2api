@@ -98,7 +98,7 @@ impl GatewayService {
                 .await
             {
                 Ok(a) => {
-                    info!("[耗时] 账号选择: {:.0}ms → 账号#{}", t0.elapsed().as_millis(), a.id);
+                    info!("[耗时] 账号选择: {:.0}ms → {}", t0.elapsed().as_millis(), a.name);
                     a
                 }
                 Err(_) if last_resp.is_some() => {
@@ -298,15 +298,17 @@ impl GatewayService {
             // 非 429：将响应体包装为 SlotGuardBody，流结束时释放槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 info!(
-                    "[耗时] 请求总计: {:.0}ms | {} {} → 账号#{}",
+                    "[耗时] 网关处理完成: {:.0}ms | {} {} → {}",
                     req_start.elapsed().as_millis(),
                     method,
                     path,
-                    account.id
+                    account.name
                 );
                 let (svc, account_id) = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
-                let guarded_body = Body::new(SlotGuardBody::new(body, svc, account_id));
+                let guarded_body = Body::new(SlotGuardBody::new(
+                    body, svc, account_id, req_start, account.name.clone(),
+                ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
 
@@ -572,13 +574,28 @@ struct SlotGuardBody {
     inner: Body,
     /// `Some(...)` 表示槽位尚未释放，`Drop` 时 take 并执行释放。
     release: Option<(Arc<AccountService>, i64)>,
+    /// 请求开始时间，用于计算首字耗时。
+    req_start: std::time::Instant,
+    /// 账号名称，用于日志输出。
+    account_name: String,
+    /// 是否已收到第一个 frame。
+    first_frame_logged: bool,
 }
 
 impl SlotGuardBody {
-    fn new(inner: Body, account_svc: Arc<AccountService>, account_id: i64) -> Self {
+    fn new(
+        inner: Body,
+        account_svc: Arc<AccountService>,
+        account_id: i64,
+        req_start: std::time::Instant,
+        account_name: String,
+    ) -> Self {
         Self {
             inner,
             release: Some((account_svc, account_id)),
+            req_start,
+            account_name,
+            first_frame_logged: false,
         }
     }
 }
@@ -591,7 +608,18 @@ impl http_body::Body for SlotGuardBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+        let result = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if !self.first_frame_logged {
+            if let std::task::Poll::Ready(Some(Ok(_))) = &result {
+                self.first_frame_logged = true;
+                info!(
+                    "[耗时] 首字到达: {:.0}ms → {}",
+                    self.req_start.elapsed().as_millis(),
+                    self.account_name
+                );
+            }
+        }
+        result
     }
 
     fn is_end_stream(&self) -> bool {
