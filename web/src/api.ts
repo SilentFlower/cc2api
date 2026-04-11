@@ -59,6 +59,8 @@ export interface Account {
     eff_7d: number
     eff_5h: number
     concurrency_pct: number
+    detail_7d?: { utilization: number; decay: number }
+    detail_5h?: { utilization: number; decay: number }
   }
   current_concurrency?: number
   queued_requests?: number
