@@ -28,6 +28,25 @@ const showForm = ref(false);
 const showDeleteConfirm = ref(false);
 /** 待删除账号 ID */
 const deleteTargetId = ref<number | null>(null);
+
+/** 评分 Tooltip 状态 */
+const scoreTooltip = ref<{ visible: boolean; x: number; y: number; account: Account | null }>({
+  visible: false, x: 0, y: 0, account: null,
+});
+/** 显示评分详情 Tooltip */
+function showScoreTooltip(e: MouseEvent, account: Account) {
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  scoreTooltip.value = {
+    visible: true,
+    x: rect.left,
+    y: rect.top - 8,  // 元素上方，后续通过 transform 往上偏移
+    account,
+  };
+}
+/** 隐藏评分详情 Tooltip */
+function hideScoreTooltip() {
+  scoreTooltip.value.visible = false;
+}
 /** 当前编辑的账号（null 表示新建） */
 const editing = ref<Account | null>(null);
 /** 表单数据 */
@@ -558,7 +577,7 @@ async function copyText(text: string) {
       <Card
         v-for="a in accounts"
         :key="a.id"
-        class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-visible"
+        class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-hidden"
         :class="(a.status === 'disabled' || isRateLimited(a)) ? 'opacity-60' : ''"
       >
         <div class="p-5 space-y-3">
@@ -581,17 +600,13 @@ async function copyText(text: string) {
           <!-- 信息 -->
           <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
             <div class="grid grid-cols-3 gap-3">
-              <div class="text-center relative group">
+              <div class="text-center relative"
+                   @mouseenter="showScoreTooltip($event, a)"
+                   @mouseleave="hideScoreTooltip">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">评分</p>
                 <p class="text-sm font-medium cursor-help" :class="(a.scheduling_score ?? 0) >= 70 ? 'text-red-500' : (a.scheduling_score ?? 0) >= 40 ? 'text-amber-600' : 'text-emerald-600'">
                   {{ a.scheduling_score?.toFixed(1) ?? '0.0' }}
                 </p>
-                <div v-if="a.scheduling_detail" class="absolute z-10 hidden group-hover:block bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 -top-24 left-0 whitespace-nowrap shadow-lg leading-relaxed">
-                  <div>7d: {{ a.scheduling_detail.detail_7d?.utilization?.toFixed(1) ?? '0' }}% × {{ a.scheduling_detail.detail_7d?.decay?.toFixed(3) ?? '1' }} = {{ a.scheduling_detail.eff_7d.toFixed(1) }} × 0.5</div>
-                  <div>5h: {{ a.scheduling_detail.detail_5h?.utilization?.toFixed(1) ?? '0' }}% × {{ a.scheduling_detail.detail_5h?.decay?.toFixed(3) ?? '1' }} = {{ a.scheduling_detail.eff_5h.toFixed(1) }} × 0.3</div>
-                  <div>并发: {{ a.scheduling_detail.concurrency_pct.toFixed(0) }}% × 0.2</div>
-                  <div class="border-t border-white/20 mt-1 pt-1 font-medium">= {{ a.scheduling_score?.toFixed(1) }}　<span class="text-white/50">越小越优先</span></div>
-                </div>
               </div>
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">并发</p>
@@ -1350,4 +1365,16 @@ async function copyText(text: string) {
       </DialogContent>
     </Dialog>
   </div>
+
+  <!-- 评分详情 Tooltip（Teleport 到 body，不受卡片 overflow-hidden 影响） -->
+  <Teleport to="body">
+    <div v-if="scoreTooltip.visible && scoreTooltip.account?.scheduling_detail"
+         class="fixed z-50 bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 whitespace-nowrap shadow-lg leading-relaxed pointer-events-none"
+         :style="{ top: scoreTooltip.y + 'px', left: scoreTooltip.x + 'px', transform: 'translateY(-100%)' }">
+      <div>7d: {{ scoreTooltip.account.scheduling_detail.detail_7d?.utilization?.toFixed(1) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_7d?.decay?.toFixed(3) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_7d.toFixed(1) }} × 0.5</div>
+      <div>5h: {{ scoreTooltip.account.scheduling_detail.detail_5h?.utilization?.toFixed(1) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_5h?.decay?.toFixed(3) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_5h.toFixed(1) }} × 0.3</div>
+      <div>并发: {{ scoreTooltip.account.scheduling_detail.concurrency_pct.toFixed(0) }}% × 0.2</div>
+      <div class="border-t border-white/20 mt-1 pt-1 font-medium">= {{ scoreTooltip.account.scheduling_score?.toFixed(1) }}　<span class="text-white/50">越小越优先</span></div>
+    </div>
+  </Teleport>
 </template>
