@@ -16,6 +16,10 @@ use crate::service::rewriter::{
 use crate::service::telemetry::TelemetryService;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
+/// 并发槽位等待重试间隔。
+const SLOT_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// 并发槽位最大重试次数（500ms × 60 = 30s）。
+const SLOT_WAIT_MAX_RETRIES: usize = 60;
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -130,14 +134,26 @@ impl GatewayService {
                 }
             }
 
-            // 获取并发槽位
-            let acquired = self
+            // 获取并发槽位，满时排队等待
+            let mut acquired = self
                 .account_svc
                 .acquire_slot(account.id, account.concurrency)
                 .await
                 .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
             if !acquired {
-                return Err(AppError::TooManyRequests("concurrency slot unavailable".into()));
+                debug!("account {} slots full, waiting for availability", account.id);
+                for _ in 0..SLOT_WAIT_MAX_RETRIES {
+                    tokio::time::sleep(SLOT_WAIT_INTERVAL).await;
+                    match self.account_svc.acquire_slot(account.id, account.concurrency).await {
+                        Ok(true) => { acquired = true; break; }
+                        _ => {}
+                    }
+                }
+                if !acquired {
+                    return Err(AppError::TooManyRequests(
+                        "concurrency slot unavailable after waiting".into(),
+                    ));
+                }
             }
 
             // 确保在函数结束后释放槽位

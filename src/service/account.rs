@@ -13,7 +13,7 @@ use crate::service::rewriter::ClientType;
 use crate::store::account_store::AccountStore;
 use crate::store::cache::CacheStore;
 
-const STICKY_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const STICKY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
 const OAUTH_LOCK_TTL: Duration = Duration::from_secs(30);
 const OAUTH_WAIT_RETRY: Duration = Duration::from_millis(500);
@@ -107,6 +107,10 @@ impl AccountService {
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
                         {
+                            // 粘性命中：刷新 TTL，保持活跃会话不过期
+                            let _ = self.cache.set_session_account_id(
+                                session_hash, account_id, STICKY_SESSION_TTL,
+                            ).await;
                             return Ok(account);
                         }
                     }
@@ -134,8 +138,8 @@ impl AccountService {
             ));
         }
 
-        // 按优先级分组，同优先级内随机选择
-        let selected = select_by_priority(&candidates);
+        // 按优先级分组，同优先级内按综合评分选择（5h 用量 + 并发负载）
+        let selected = self.select_by_score(&candidates).await;
 
         // 绑定粘性会话
         if !session_hash.is_empty() {
@@ -391,9 +395,81 @@ impl AccountService {
             ),
         }
     }
+
+    /// 综合评分选择账号：同优先级内按 5h 用量和并发负载加权评分，分数越低越优先。
+    ///
+    /// 评分公式：`score = 5h_utilization * 0.7 + concurrency_load_pct * 0.3`
+    /// - `5h_utilization`：0~100，无数据按 0（假设全新）
+    /// - `concurrency_load_pct`：当前并发数 / 最大并发数 * 100
+    /// - 并发已满（current >= max）的账号优先排除，仅在所有账号都满时才参与评分
+    /// - 得分相同时随机选择
+    async fn select_by_score(&self, accounts: &[Account]) -> Account {
+        if accounts.len() == 1 {
+            return accounts[0].clone();
+        }
+
+        // 找到最高优先级（最小数值）
+        let best_priority = accounts.iter().map(|a| a.priority).min().unwrap_or(50);
+        let best: Vec<&Account> = accounts
+            .iter()
+            .filter(|a| a.priority == best_priority)
+            .collect();
+
+        if best.len() == 1 {
+            return best[0].clone();
+        }
+
+        // 计算每个候选的综合得分，同时记录并发是否已满
+        let mut scored: Vec<(&Account, f64, bool)> = Vec::with_capacity(best.len());
+        for acc in &best {
+            let util = get_5h_utilization(acc);
+            let key = format!("concurrency:account:{}", acc.id);
+            let current = self.cache.get_slot_count(&key).await;
+            let full = acc.concurrency > 0 && current >= acc.concurrency as i64;
+            let conc_pct = if acc.concurrency > 0 {
+                (current as f64) / (acc.concurrency as f64) * 100.0
+            } else {
+                0.0
+            };
+            let score = util * 0.7 + conc_pct * 0.3;
+            scored.push((acc, score, full));
+        }
+
+        // 优先从未满的账号中选择；全都满了才回退到全部候选
+        let pool: Vec<(&Account, f64)> = {
+            let not_full: Vec<_> = scored.iter().filter(|(_, _, full)| !full).map(|(a, s, _)| (*a, *s)).collect();
+            if not_full.is_empty() {
+                scored.iter().map(|(a, s, _)| (*a, *s)).collect()
+            } else {
+                not_full
+            }
+        };
+
+        // 找到最低分
+        let min_score = pool.iter().map(|(_, s)| *s).fold(f64::MAX, f64::min);
+
+        // 收集得分最低的候选（容差 0.01 处理浮点误差）
+        let winners: Vec<&Account> = pool
+            .iter()
+            .filter(|(_, s)| (*s - min_score).abs() < 0.01)
+            .map(|(a, _)| *a)
+            .collect();
+
+        // 同分随机选择
+        let idx = rand::thread_rng().gen_range(0..winners.len());
+        winners[idx].clone()
+    }
 }
 
-/// 命中的用量窗口类型。
+/// 从账号 usage_data 中提取 5h 窗口的 utilization（0~100），无数据返回 0.0。
+fn get_5h_utilization(account: &Account) -> f64 {
+    account
+        .usage_data
+        .get("five_hour")
+        .and_then(|w| w.get("utilization"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+}
 enum RateLimitWindow {
     /// 7 天窗口命中，携带其 resets_at。
     SevenDay(chrono::DateTime<Utc>),
@@ -539,24 +615,6 @@ pub fn generate_session_hash(
     hex::encode(&hash[..16])
 }
 
-fn select_by_priority(accounts: &[Account]) -> Account {
-    if accounts.len() == 1 {
-        return accounts[0].clone();
-    }
-
-    // 找到最高优先级（最小数值）
-    let best_priority = accounts.iter().map(|a| a.priority).min().unwrap_or(50);
-
-    // 收集相同优先级的所有账号
-    let best: Vec<&Account> = accounts
-        .iter()
-        .filter(|a| a.priority == best_priority)
-        .collect();
-
-    // 同优先级内随机选择
-    let idx = rand::thread_rng().gen_range(0..best.len());
-    best[idx].clone()
-}
 
 #[cfg(test)]
 mod tests {

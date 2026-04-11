@@ -103,6 +103,16 @@ impl CacheStore for RedisStore {
         let _: Result<(), _> = self.client.clone().decr(key, 1i64).await;
     }
 
+    async fn get_slot_count(&self, key: &str) -> i64 {
+        self.client
+            .clone()
+            .get::<_, Option<i64>>(key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
     async fn acquire_lock(
         &self,
         key: &str,

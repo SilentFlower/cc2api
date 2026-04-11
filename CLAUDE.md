@@ -31,14 +31,15 @@ No test suite exists. Account validity is tested via the UI's "test" button.
 
 ### Request Flow
 
-Auth middleware → API token lookup → account selection (sticky session + priority + concurrency) → request rewriting (headers, body, telemetry, identity) → TLS fingerprint spoofing via custom rustls (`craftls/`) → forward to api.anthropic.com → response header filtering → return to client.
+Auth middleware → API token lookup → account selection (sticky session + load-aware scoring + concurrency) → request rewriting (headers, body, telemetry, identity) → TLS fingerprint spoofing via custom rustls (`craftls/`) → forward to api.anthropic.com → passive usage collection from response headers → response header filtering → return to client.
 
 ### Key Modules
 
 - **`src/handler/router.rs`** — All HTTP endpoints: SPA routes, `/admin/*` management API (password-protected), and the catch-all gateway proxy.
-- **`src/service/gateway.rs`** — Core forwarding orchestration: account selection, slot acquisition with scopeguard, upstream request, rate limit detection (429 → quarantine account).
+- **`src/service/gateway.rs`** — Core forwarding orchestration: account selection, slot acquisition with wait-retry (500ms × 60 = 30s max), upstream request, rate limit detection (429 → quarantine account), passive usage collection from `anthropic-ratelimit-unified-*` response headers.
 - **`src/service/rewriter.rs`** — Request/response transformation: header normalization, body patching (session hash, version, telemetry paths like event_logging/GrowthBook), system prompt env var injection, AI Gateway fingerprint header stripping.
-- **`src/service/account.rs`** — Account selection logic: sticky sessions (SHA256 of UA+body, 24h TTL), OAuth token refresh with locking, concurrency slot management, usage/billing queries.
+- **`src/service/account.rs`** — Account selection logic: sticky sessions (1h TTL, refreshed on hit), load-aware scoring (`5h_utilization * 0.7 + concurrency_load% * 0.3`), OAuth token refresh with locking, concurrency slot management, usage/billing queries, passive usage merge.
+- **`src/service/usage_poller.rs`** — Optional background polling for OAuth account usage (controlled per-account via `auto_poll_usage`, default off).
 - **`src/tlsfp/tlsfp.rs`** — Custom TLS ClientHello builder that mimics Node.js fingerprint, using the forked rustls in `craftls/`.
 - **`src/middleware/auth.rs`** — Extracts API key from `x-api-key` or `Authorization: Bearer` header, validates against token store.
 - **`src/store/`** — SQLx-based persistence (SQLite default, PostgreSQL optional) with `CacheStore` trait implemented by `MemoryStore` and `RedisStore`.
@@ -63,5 +64,24 @@ All via environment variables (see `.env.example`). Key ones: `SERVER_HOST`/`SER
 ## Dual Auth Modes
 
 Accounts support two auth types: **SetupToken** (classic API key) and **OAuth** (with automatic access token refresh via stored refresh tokens). Both flows converge in `AccountService::select_account`.
+
+## Usage Tracking
+
+Two complementary mechanisms:
+
+- **Passive collection** (all accounts): Every upstream response's `anthropic-ratelimit-unified-*` headers are parsed and merged into `usage_data`. Zero API cost, works for SetupToken too.
+- **Active polling** (opt-in per account): `auto_poll_usage` flag enables background polling via OAuth usage API. Only for OAuth accounts. Default off.
+
+Usage data feeds into both the dashboard display and the load-aware account selection scoring.
+
+## Account Selection
+
+Within the same priority group, accounts are ranked by a composite score:
+
+```
+score = 5h_utilization * 0.7 + concurrency_load_pct * 0.3
+```
+
+Accounts at full concurrency are excluded from selection unless all candidates are full. Concurrency slots that are unavailable trigger a wait-retry loop (500ms interval, 30s max) before returning an error.
 
 ## KEY: EVERY TIME YOU WANT TO CHANGE STH, PLEASE REFER cc-gateway

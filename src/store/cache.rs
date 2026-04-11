@@ -13,6 +13,8 @@ pub trait CacheStore: Send + Sync {
     async fn delete_session(&self, session_hash: &str) -> Result<(), AppError>;
     async fn acquire_slot(&self, key: &str, max: i32, ttl: Duration) -> Result<bool, AppError>;
     async fn release_slot(&self, key: &str);
+    /// 获取指定 key 的当前槽位占用数（用于负载感知选择）。
+    async fn get_slot_count(&self, key: &str) -> i64;
     async fn acquire_lock(
         &self,
         key: &str,
