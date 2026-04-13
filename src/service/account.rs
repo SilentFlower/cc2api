@@ -31,9 +31,9 @@ const FALLBACK_QUARANTINE: Duration = Duration::from_secs(5 * 60 * 60);
 pub struct WindowDetail {
     /// 原始利用率（0~100）。
     pub utilization: f64,
-    /// 时间衰减因子（0~1，距重置越近越小）。
+    /// 时间衰减因子（阶梯档位 0.4~1.0，距重置越近越小）。
     pub decay: f64,
-    /// 有效用量 = utilization × decay。
+    /// 有效用量 = utilization × 阶梯衰减。
     pub effective: f64,
 }
 
@@ -41,9 +41,9 @@ pub struct WindowDetail {
 pub struct AccountScoreInfo {
     /// 综合得分（越低越优先）。
     pub score: f64,
-    /// 7 天窗口有效用量（utilization × 时间衰减）。
+    /// 7 天窗口有效用量（utilization × 阶梯衰减）。
     pub eff_7d: f64,
-    /// 5 小时窗口有效用量（utilization × 时间衰减）。
+    /// 5 小时窗口有效用量（utilization × 阶梯衰减）。
     pub eff_5h: f64,
     /// 7 天窗口计算详情。
     pub detail_7d: WindowDetail,
@@ -483,7 +483,7 @@ impl AccountService {
     /// 综合评分选择账号：同优先级内按 7d/5h 有效用量和并发负载加权评分，分数越低越优先。
     ///
     /// 评分公式：`score = eff_7d * w7d + eff_5h * w5h + concurrency_load_pct * wconc`（权重可在设置页面配置）
-    /// - `eff_Xd = utilization × (剩余时间 / 窗口总时长)`，快重置的窗口衰减更大
+    /// - `eff_Xd = utilization × 阶梯衰减`，快重置的窗口衰减更大（分 3 档：1.0/0.8/0.6）
     /// - 无 resets_at 数据时衰减因子为 1.0（最保守）
     /// - 并发已满的账号优先排除，仅在所有账号都满时才参与评分
     /// - 得分相同时随机选择
@@ -582,8 +582,9 @@ impl AccountService {
     }
 }
 
-/// 计算指定窗口的有效用量详情：utilization × 时间衰减因子。
-/// 快重置的窗口衰减更大，相同用量下得分更低（更优先选中）。
+/// 计算指定窗口的有效用量详情：utilization × 阶梯衰减因子。
+/// 使用固定阶梯而非线性比例，避免时间衰减过度影响评分：
+///   剩余比例 > 50% → 1.0 | 20%~50% → 0.8 | ≤ 20% → 0.6
 /// 无 resets_at 或无用量数据时衰减因子为 1.0（最保守）。
 /// 当 resets_at 已过期时，说明窗口已重置，直接视为用量清零。
 fn effective_utilization_detail(
@@ -603,7 +604,7 @@ fn effective_utilization_detail(
         return WindowDetail { utilization: 0.0, decay: 1.0, effective: 0.0 };
     }
 
-    // 解析 resets_at，计算剩余时间占窗口总时长的比例
+    // 解析 resets_at，计算剩余时间占窗口总时长的比例，再映射到阶梯档位
     let decay = account
         .usage_data
         .get(window)
@@ -612,7 +613,13 @@ fn effective_utilization_detail(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|reset| {
             let remaining = (reset.with_timezone(&Utc) - now).num_seconds().max(0) as f64;
-            (remaining / max_window_secs).clamp(0.0, 1.0)
+            if remaining == 0.0 {
+                // resets_at 已过期 → 窗口已重置，用量归零
+                return 0.0;
+            }
+            let ratio = (remaining / max_window_secs).clamp(0.0, 1.0);
+            // 固定阶梯：将连续比例映射为离散档位，防止线性衰减过度压低高用量账号
+            tiered_decay(ratio)
         })
         .unwrap_or(1.0); // 无数据按最保守处理
 
@@ -622,6 +629,17 @@ fn effective_utilization_detail(
     }
 
     WindowDetail { utilization: util, decay, effective: util * decay }
+}
+
+/// 将剩余时间比例映射为阶梯衰减系数。
+/// 比例越低（越接近重置），衰减系数越小，有效用量越低（越优先选中）。
+/// 仅分 3 档，最低 0.6，避免时间因素过度影响评分。
+fn tiered_decay(ratio: f64) -> f64 {
+    match () {
+        _ if ratio > 0.5 => 1.0,
+        _ if ratio > 0.2 => 0.8,
+        _ => 0.6,
+    }
 }
 enum RateLimitWindow {
     /// 7 天窗口命中，携带其 resets_at。
@@ -994,5 +1012,31 @@ mod tests {
         });
         assert!(classify_rate_limit(&usage, 97.0).is_none());
         assert!(classify_rate_limit(&usage, 90.0).is_some());
+    }
+
+    // ---- tiered_decay ----
+
+    #[test]
+    fn tiered_decay_high_ratio() {
+        assert_eq!(tiered_decay(0.9), 1.0);
+        assert_eq!(tiered_decay(0.51), 1.0);
+    }
+
+    #[test]
+    fn tiered_decay_boundary_values() {
+        assert_eq!(tiered_decay(0.5), 0.8);  // 不满足 >0.5，落入中档
+        assert_eq!(tiered_decay(0.2), 0.6);  // 不满足 >0.2，落入最低档
+    }
+
+    #[test]
+    fn tiered_decay_low_ratio() {
+        assert_eq!(tiered_decay(0.1), 0.6);
+        assert_eq!(tiered_decay(0.0), 0.6);
+    }
+
+    #[test]
+    fn tiered_decay_mid_range() {
+        assert_eq!(tiered_decay(0.4), 0.8);
+        assert_eq!(tiered_decay(0.21), 0.8);
     }
 }

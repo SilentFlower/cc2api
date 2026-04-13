@@ -161,11 +161,11 @@ async fn list_accounts(
             "concurrency_pct": (si.concurrency_pct * 100.0).round() / 100.0,
             "detail_7d": {
                 "utilization": (si.detail_7d.utilization * 100.0).round() / 100.0,
-                "decay": (si.detail_7d.decay * 10000.0).round() / 10000.0
+                "decay": (si.detail_7d.decay * 100.0).round() / 100.0
             },
             "detail_5h": {
                 "utilization": (si.detail_5h.utilization * 100.0).round() / 100.0,
-                "decay": (si.detail_5h.decay * 10000.0).round() / 10000.0
+                "decay": (si.detail_5h.decay * 100.0).round() / 100.0
             },
             "weights": {
                 "w7d": si.weights.0,

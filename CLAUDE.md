@@ -79,12 +79,12 @@ Usage data feeds into both the dashboard display and the load-aware account sele
 Within the same priority group, accounts are ranked by a composite score:
 
 ```
-eff_7d = 7d_utilization × (remaining / 7days)
-eff_5h = 5h_utilization × (remaining / 5hours)
+eff_7d = 7d_utilization × tiered_decay(remaining / 7days)
+eff_5h = 5h_utilization × tiered_decay(remaining / 5hours)
 score  = eff_7d × 0.5 + eff_5h × 0.3 + concurrency_load% × 0.2
 ```
 
-Utilization is time-decay weighted: accounts closer to reset score lower (about to clear). Missing resets_at uses decay=1.0 (worst case).
+Utilization is weighted by a tiered decay factor (3 tiers: 1.0/0.8/0.6) based on remaining time ratio. This replaces linear decay to prevent time proximity from disproportionately affecting scores. Missing resets_at uses decay=1.0 (worst case).
 
 Accounts at full concurrency are excluded from selection unless all candidates are full. Concurrency slots that are unavailable trigger a wait-retry loop (500ms interval, 30s max) before returning an error.
 
