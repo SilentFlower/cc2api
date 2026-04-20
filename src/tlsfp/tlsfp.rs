@@ -322,14 +322,12 @@ fn build_tls_config() -> rustls::ClientConfig {
 pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     let tls_config = build_tls_config();
 
-    // 仅设置读超时与连接超时，不设整体超时：
-    // 长流式响应（Opus 扩展思考 + 长输出）可持续数十分钟，
-    // 整体超时会误杀健康长流；read_timeout 只在两次读之间无数据超过阈值时触发，
-    // 足以检测卡死连接而不影响正常长流。
+    // 不设整体 timeout，也不用 read_timeout（reqwest 0.12.4 不支持该 API）：
+    // 整体超时会误杀健康长流（Opus 扩展思考可持续数十分钟）；
+    // 卡死连接的检测统一放到 gateway 层（tokio::time::timeout 包 send() 与 bytes_stream()）。
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
         .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(120))
         .no_proxy();
 
     if !proxy_url.is_empty() {

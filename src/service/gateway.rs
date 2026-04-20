@@ -20,6 +20,13 @@ const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const SLOT_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 /// 并发槽位最大重试次数（500ms × 60 = 30s）。
 const SLOT_WAIT_MAX_RETRIES: usize = 60;
+/// TTFB（Time To First Byte）超时：从 send() 到收到响应头的最长等待时间。
+/// 握手 + 发请求 + 等上游开始响应，60s 足够覆盖正常场景；超过则认为上游卡住。
+const UPSTREAM_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 流式读间隔超时：两次 bytes_stream chunk 之间允许的最长静默时间。
+/// Anthropic SSE 每几秒至少有一个 ping event，120s 无数据视为连接卡死。
+/// 该超时不限制流总时长，健康长流（Opus 扩展思考等）可持续任意时间。
+const UPSTREAM_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -358,9 +365,12 @@ impl GatewayService {
         req_builder = req_builder.header("Host", "api.anthropic.com");
         req_builder = req_builder.body(body.to_vec());
 
-        let resp = req_builder
-            .send()
+        let resp = tokio::time::timeout(UPSTREAM_TTFB_TIMEOUT, req_builder.send())
             .await
+            .map_err(|_| {
+                warn!("upstream TTFB timeout for account {}", account.id);
+                AppError::BadGateway("upstream TTFB timeout".into())
+            })?
             .map_err(|e| {
                 warn!("upstream error for account {}: {}", account.id, e);
                 AppError::BadGateway("upstream request failed".into())
@@ -437,8 +447,20 @@ impl GatewayService {
             response_builder = response_builder.header(k.clone(), v.clone());
         }
 
-        // 流式传输响应体
-        let body_stream = resp.bytes_stream();
+        // 流式传输响应体，给 bytes_stream 加两次 chunk 间隔超时以检测卡死连接。
+        // 该超时只限制"静默时长"，对健康长流无影响。
+        use tokio_stream::StreamExt;
+        let body_stream = resp
+            .bytes_stream()
+            .timeout(UPSTREAM_STREAM_IDLE_TIMEOUT)
+            .map(|r| match r {
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(e)) => Err(std::io::Error::other(e)),
+                Err(_elapsed) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upstream stream idle timeout",
+                )),
+            });
         let body = Body::from_stream(body_stream);
 
         response_builder
