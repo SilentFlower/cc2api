@@ -449,17 +449,29 @@ impl GatewayService {
 
         // 流式传输响应体，给 bytes_stream 加两次 chunk 间隔超时以检测卡死连接。
         // 该超时只限制"静默时长"，对健康长流无影响。
+        // 诊断日志区分三种终止场景：上游错误 / idle 超时 / 正常结束（无日志）。
         use tokio_stream::StreamExt;
+        let account_name = account.name.clone();
+        let idle_secs = UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs();
         let body_stream = resp
             .bytes_stream()
             .timeout(UPSTREAM_STREAM_IDLE_TIMEOUT)
-            .map(|r| match r {
+            .map(move |r| match r {
                 Ok(Ok(bytes)) => Ok(bytes),
-                Ok(Err(e)) => Err(std::io::Error::other(e)),
-                Err(_elapsed) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "upstream stream idle timeout",
-                )),
+                Ok(Err(e)) => {
+                    warn!("上游流错误 (account: {}): {}", account_name, e);
+                    Err(std::io::Error::other(e))
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "上游流 idle {}s 超时 (account: {})",
+                        idle_secs, account_name
+                    );
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upstream stream idle timeout",
+                    ))
+                }
             });
         let body = Body::from_stream(body_stream);
 
