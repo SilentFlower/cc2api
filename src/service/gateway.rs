@@ -450,22 +450,51 @@ impl GatewayService {
         // 流式传输响应体，给 bytes_stream 加两次 chunk 间隔超时以检测卡死连接。
         // 该超时只限制"静默时长"，对健康长流无影响。
         // 诊断日志区分三种终止场景：上游错误 / idle 超时 / 正常结束（无日志）。
+        // [临时诊断] 追踪 chunk 间隔：任何 >10s 的静默都打 info 日志；错误/超时时汇总最大间隔。
         use tokio_stream::StreamExt;
         let account_name = account.name.clone();
         let idle_secs = UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs();
+        let stream_start = std::time::Instant::now();
+        let mut last_chunk_at: Option<std::time::Instant> = None;
+        let mut max_gap_ms: u128 = 0;
+        let mut chunk_count: u64 = 0;
         let body_stream = resp
             .bytes_stream()
             .timeout(UPSTREAM_STREAM_IDLE_TIMEOUT)
             .map(move |r| match r {
-                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Ok(bytes)) => {
+                    let now = std::time::Instant::now();
+                    chunk_count += 1;
+                    if let Some(prev) = last_chunk_at {
+                        let gap_ms = now.duration_since(prev).as_millis();
+                        if gap_ms > max_gap_ms {
+                            max_gap_ms = gap_ms;
+                        }
+                        if gap_ms > 10_000 {
+                            info!(
+                                "[chunk-gap] {}ms (account: {}, #{} chunk, {} bytes, 已过 {}ms)",
+                                gap_ms,
+                                account_name,
+                                chunk_count,
+                                bytes.len(),
+                                now.duration_since(stream_start).as_millis()
+                            );
+                        }
+                    }
+                    last_chunk_at = Some(now);
+                    Ok(bytes)
+                }
                 Ok(Err(e)) => {
-                    warn!("上游流错误 (account: {}): {}", account_name, e);
+                    warn!(
+                        "上游流错误 (account: {}, 已收 {} chunks, 最大间隔 {}ms): {}",
+                        account_name, chunk_count, max_gap_ms, e
+                    );
                     Err(std::io::Error::other(e))
                 }
                 Err(_elapsed) => {
                     warn!(
-                        "上游流 idle {}s 超时 (account: {})",
-                        idle_secs, account_name
+                        "上游流 idle {}s 超时 (account: {}, 已收 {} chunks, 最大间隔 {}ms)",
+                        idle_secs, account_name, chunk_count, max_gap_ms
                     );
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
