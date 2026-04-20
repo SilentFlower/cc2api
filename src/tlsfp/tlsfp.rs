@@ -324,7 +324,7 @@ pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
 
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(900))
         .no_proxy();
 
     if !proxy_url.is_empty() {
