@@ -645,6 +645,13 @@ impl Drop for SlotReleaseGuard {
 ///
 /// 任务被 `SlotGuardBody::drop` 中的 `abort()` 停止,主流结束立即终止心跳。
 async fn heartbeat_loop(proxy_url: String, account_name: String) {
+    // 启动即打 warn,便于在日志里直接确认心跳是否启用
+    warn!(
+        "[heartbeat] started for account: {} (interval: {}s, target: {})",
+        account_name,
+        HEARTBEAT_INTERVAL.as_secs(),
+        HEARTBEAT_URL
+    );
     let client = crate::tlsfp::make_request_client(&proxy_url);
     let mut count: u64 = 0;
     loop {
@@ -652,16 +659,16 @@ async fn heartbeat_loop(proxy_url: String, account_name: String) {
         count += 1;
         match client.head(HEARTBEAT_URL).send().await {
             Ok(resp) => {
-                debug!(
-                    "heartbeat #{} ok status={} (account: {})",
+                warn!(
+                    "[heartbeat] #{} ok status={} (account: {})",
                     count,
                     resp.status().as_u16(),
                     account_name
                 );
             }
             Err(e) => {
-                debug!(
-                    "heartbeat #{} failed (account: {}): {}",
+                warn!(
+                    "[heartbeat] #{} FAILED (account: {}): {}",
                     count, account_name, e
                 );
             }
