@@ -60,7 +60,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio-socks = "0.5"
 
 # HTTP Client
-reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls-manual-roots", "stream", "json", "socks", "http2"] }
+reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls-manual-roots", "stream", "json", "socks"] }
 scopeguard = "1"
 dotenvy = "0.15"
 

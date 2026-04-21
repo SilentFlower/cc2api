@@ -326,18 +326,12 @@ pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     // 整体超时会误杀健康长流（Opus 扩展思考可持续数十分钟）；
     // 卡死连接的检测统一放到 gateway 层（tokio::time::timeout 包 send() 与 bytes_stream()）。
     //
-    // 保活双保险:
-    //   tcp_keepalive: OS 层 SO_KEEPALIVE + KEEPIDLE=30s,idle 30s 后发 TCP 探测包
-    //     (注意: 多数 SOCKS5 代理会在各自 hop 独立处理,未必转发到上游)
-    //   http2_keep_alive_*: 应用层发 HTTP/2 PING 帧,加密后变成 TCP payload 字节,
-    //     必然经过代理的应用层转发 → 最有效的"让代理看到有流量"信号
+    // 保活: tcp_keepalive OS 层 SO_KEEPALIVE + KEEPIDLE=30s,idle 30s 后发 TCP 探测包。
+    // HTTP/2 PING 因 craftls 指纹 ALPN 只声明 http/1.1,永远协商不出 h2,故不配置。
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
         .connect_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
-        .http2_keep_alive_while_idle(true)
         .no_proxy();
 
     if !proxy_url.is_empty() {
