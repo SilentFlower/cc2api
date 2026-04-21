@@ -27,11 +27,6 @@ const UPSTREAM_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Anthropic SSE 每几秒至少有一个 ping event，120s 无数据视为连接卡死。
 /// 该超时不限制流总时长，健康长流（Opus 扩展思考等）可持续任意时间。
 const UPSTREAM_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// 代理保活心跳间隔：每 N 秒向外部站点发一次 HEAD 请求(走同一代理),
-/// 制造客户端→代理方向的字节流动,避免代理按"静默/低速"策略砍断长连接。
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-/// 心跳目标 URL:选小响应、高可用的公共端点。
-const HEARTBEAT_URL: &str = "https://api.ipify.org";
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -311,18 +306,8 @@ impl GatewayService {
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 let (svc, account_id) = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
-                // 仅当账号配了代理时启动心跳(直连无意义)
-                let heartbeat_task = if !account.proxy_url.is_empty() {
-                    Some(tokio::spawn(heartbeat_loop(
-                        account.proxy_url.clone(),
-                        account.name.clone(),
-                    )))
-                } else {
-                    None
-                };
                 let guarded_body = Body::new(SlotGuardBody::new(
                     body, svc, account_id, req_start, account.name.clone(),
-                    heartbeat_task,
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -637,38 +622,6 @@ impl Drop for SlotReleaseGuard {
     }
 }
 
-/// 代理保活心跳任务:周期性向 HEARTBEAT_URL 发 HEAD 请求,走同一代理。
-///
-/// 目的: 制造"客户端→代理方向"的字节流动,防止 havefun 等代理按空闲/低速
-/// 策略在 ~300s 切断长连接。实测下会有效果;但如果代理按"per-connection"
-/// 计时,这个独立连接上的活动未必能救回主流,需实际观察。
-///
-/// 任务被 `SlotGuardBody::drop` 中的 `abort()` 停止,主流结束立即终止心跳。
-async fn heartbeat_loop(proxy_url: String, account_name: String) {
-    let client = crate::tlsfp::make_request_client(&proxy_url);
-    let mut count: u64 = 0;
-    loop {
-        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-        count += 1;
-        match client.head(HEARTBEAT_URL).send().await {
-            Ok(resp) => {
-                debug!(
-                    "heartbeat #{} ok status={} (account: {})",
-                    count,
-                    resp.status().as_u16(),
-                    account_name
-                );
-            }
-            Err(e) => {
-                debug!(
-                    "heartbeat #{} failed (account: {}): {}",
-                    count, account_name, e
-                );
-            }
-        }
-    }
-}
-
 /// 包装响应体 Body，在 body 传输完成或被丢弃时自动释放并发槽位。
 ///
 /// 解决 Axum 流式响应中 handler 提前返回导致槽位过早释放的问题：
@@ -683,8 +636,6 @@ struct SlotGuardBody {
     account_name: String,
     /// 是否已收到第一个 frame。
     first_frame_logged: bool,
-    /// 心跳 task 句柄:Drop 时 abort,确保长请求结束后心跳立即停止。
-    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SlotGuardBody {
@@ -694,7 +645,6 @@ impl SlotGuardBody {
         account_id: i64,
         req_start: std::time::Instant,
         account_name: String,
-        heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
             inner,
@@ -702,7 +652,6 @@ impl SlotGuardBody {
             req_start,
             account_name,
             first_frame_logged: false,
-            heartbeat_task,
         }
     }
 }
@@ -745,10 +694,6 @@ impl Drop for SlotGuardBody {
             self.req_start.elapsed().as_millis(),
             self.account_name
         );
-        // 主流结束立即停掉心跳,避免残留后台任务
-        if let Some(task) = self.heartbeat_task.take() {
-            task.abort();
-        }
         if let Some((svc, account_id)) = self.release.take() {
             tokio::spawn(async move {
                 svc.release_slot(account_id).await;
