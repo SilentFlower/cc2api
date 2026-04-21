@@ -218,10 +218,6 @@ impl Rewriter {
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
 
-            // 强制 X-Stainless-Timeout 为 600，与 API 模式保持一致，
-            // 避免中间层(如 new-api)传入的短 timeout 让上游提前返错。
-            out.insert("X-Stainless-Timeout".into(), "600".into());
-
             // 合并客户端 beta 与必需 beta
             let existing_beta = out
                 .get("anthropic-beta")
