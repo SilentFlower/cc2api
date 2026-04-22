@@ -86,7 +86,7 @@ onMounted(loadSettings);
         <div>
           <h3 class="text-sm font-semibold text-[#29261e]">评分权重</h3>
           <p class="text-xs text-[#8c8475] mt-1">
-            调度评分公式：score = eff_7d × W1 + eff_5h × W2 + 并发% × W3，分数越低越优先分配。时间衰减使用阶梯档位（1.0/0.8/0.6）替代线性比例。
+            调度评分公式：score = eff_7d × W1 + eff_5h × W2 + 负载% × W3，分数越低越优先分配。负载% =（活跃+排队）/并发 × 100。时间衰减使用阶梯档位（1.0/0.8/0.6）替代线性比例。
           </p>
         </div>
 
