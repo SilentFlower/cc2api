@@ -110,6 +110,7 @@ pub struct AccountQueue {
 }
 
 /// [`AccountQueue::acquire`] 的错误原因。
+#[derive(Debug)]
 pub enum QueueWaitError {
     /// 等待队列已满，调用方应降级到其他账号。
     QueueFull,
