@@ -21,6 +21,11 @@ const PER_ACCOUNT_GAP: Duration = Duration::from_millis(500);
 /// 预热请求 TTFB 超时,短于主链路的 gateway 超时(预热非关键路径,快速失败为宜)。
 const PRIME_TTFB_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 成功响应的流耗尽超时。rewriter 强制 stream=true,必须读完整个 SSE 上游才确定把
+/// 这次调用计入 5h 窗口,duration_ms 也才等于完整调用时间。Haiku 512 tokens 一般 <5s,
+/// 60s 给足余量;若真的超时,视为上游异常,但 ratelimit 响应头已经拿到,仍算触发成功。
+const PRIME_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 主循环扫描间隔。触发点为 HH:10 分,30s 扫一次足以确保分钟内命中至少一次。
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -200,11 +205,16 @@ impl PrimePollerService {
                 }
             };
 
-            // 落日志:info/warn 级别打点,便于 grep;同时写入 DB 供前端展示。
+            // 落日志:success/skipped 用 info,真失败用 warn;跳过是预期行为,不该算告警。
             if outcome.success {
                 info!(
                     "prime: account={} hour={} model={} success=true duration={}ms",
                     account.id, hour, model, outcome.duration_ms
+                );
+            } else if outcome.error_message.starts_with("skipped:") {
+                info!(
+                    "prime: account={} hour={} model={} {}",
+                    account.id, hour, model, outcome.error_message
                 );
             } else {
                 warn!(
@@ -346,28 +356,26 @@ impl PrimePollerService {
             account,
             ClientType::API,
         );
-        // 去掉 rewriter 注入的内部 `_session_id` 标记,避免上游收到未知字段。
-        let final_bytes = match serde_json::from_slice::<serde_json::Value>(&rewritten_bytes) {
-            Ok(mut v) => {
-                clean_session_id_from_body(&mut v);
-                serde_json::to_vec(&v).unwrap_or(rewritten_bytes)
-            }
-            Err(_) => rewritten_bytes,
-        };
+        // 先解析 rewritten_bytes,此时 metadata._session_id 标记仍在。
+        // 必须在剥除 _session_id 之前先跑 rewrite_headers:后者从 body 里的
+        // _session_id 抽取 X-Claude-Code-Session-Id,与 metadata.user_id.session_id 对齐。
+        // 若先剥再生成 header,header 会 fallback 到新 UUID,body/header 的 session 不一致。
+        let mut body_value: serde_json::Value =
+            serde_json::from_slice(&rewritten_bytes).unwrap_or(serde_json::Value::Null);
 
-        // Rewriter 的 header 改写需要一个 body 视图来抽 session_id / model,
-        // 用最终 body 的 Value 参与 header 生成。
-        let body_view: serde_json::Value =
-            serde_json::from_slice(&final_bytes).unwrap_or(serde_json::Value::Null);
         let empty_in: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut headers = self.rewriter.rewrite_headers(
             &empty_in,
             account,
             ClientType::API,
             model,
-            &body_view,
+            &body_value,
         );
         headers.insert("authorization".into(), format!("Bearer {}", token));
+
+        // header 生成完毕,可以剥掉内部 _session_id 标记,再序列化成最终 wire bytes。
+        clean_session_id_from_body(&mut body_value);
+        let final_bytes = serde_json::to_vec(&body_value).unwrap_or(rewritten_bytes);
 
         // 走定制 tlsfp 客户端,复用账号的 proxy_url。
         let client = crate::tlsfp::make_request_client(&account.proxy_url);
@@ -403,7 +411,22 @@ impl PrimePollerService {
         let passive_usage = extract_passive_usage(resp.headers());
 
         if resp.status().is_success() {
-            // 预热只需头部的 ratelimit 信息,不关心流式响应体;连接随 resp 离开作用域被释放。
+            // rewriter 强制 stream=true,若此刻立即 drop 会在首包就中断 SSE,
+            // 上游是否计入 5h 窗口、计入几个 token 不可靠,duration 也退化成 TTFB。
+            // 这里必须耗尽整个响应流,上游才会把本次调用完整计入 5h 窗口。
+            // 带 60s 超时保护,避免极端情况下卡住整轮预热。
+            match tokio::time::timeout(PRIME_DRAIN_TIMEOUT, resp.bytes()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(
+                    "prime: account={} body drain error: {} (5h window likely still triggered)",
+                    account.id, e
+                ),
+                Err(_) => warn!(
+                    "prime: account={} body drain timeout after {}s (headers already received)",
+                    account.id,
+                    PRIME_DRAIN_TIMEOUT.as_secs()
+                ),
+            }
             PrimeOutcome {
                 success: true,
                 error_message: String::new(),

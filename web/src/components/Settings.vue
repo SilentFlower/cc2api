@@ -146,6 +146,13 @@ function formatTime(raw: string): string {
   });
 }
 
+/** 判断一条日志是否"跳过"而非真正失败。
+ *  后端把冷却期跳过统一用 'skipped: ...' 前缀写入 error_message,
+ *  前端依前缀识别,渲染成琥珀色"跳过"徽章,避免与红色"失败"混淆。 */
+function isSkipped(log: PrimeLogEntry): boolean {
+  return !log.success && log.error_message.startsWith('skipped:');
+}
+
 onMounted(async () => {
   await loadSettings();
   await loadPrimeLogs();
@@ -316,6 +323,13 @@ onMounted(async () => {
                   class="bg-emerald-50 text-emerald-700 border-emerald-200"
                 >
                   成功
+                </Badge>
+                <Badge
+                  v-else-if="isSkipped(log)"
+                  class="bg-amber-50 text-amber-700 border-amber-200"
+                  :title="log.error_message"
+                >
+                  跳过
                 </Badge>
                 <Badge
                   v-else
