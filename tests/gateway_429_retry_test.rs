@@ -235,13 +235,22 @@ async fn test_slot_can_be_reacquired_after_release() {
     let a1 = create_test_account(&svc, "slot_test@example.com", 10).await;
 
     // 模拟重试循环中获取槽位 → 收到 429 → 释放槽位
-    let acquired = svc.acquire_slot(a1.id, a1.concurrency).await.unwrap();
-    assert!(acquired);
+    let queue = svc.get_or_create_queue(a1.id, a1.concurrency).await;
+    let permit = queue
+        .acquire(std::time::Duration::from_secs(1))
+        .await
+        .expect("first acquire should succeed");
+    assert_eq!(queue.active_count(), 1);
 
     // 释放（模拟 429 重试时手动释放）
-    svc.release_slot(a1.id).await;
+    drop(permit);
+    assert_eq!(queue.active_count(), 0);
 
     // 槽位应可再次获取（下一个账号或后续请求）
-    let acquired_again = svc.acquire_slot(a1.id, a1.concurrency).await.unwrap();
-    assert!(acquired_again);
+    let permit_again = queue
+        .acquire(std::time::Duration::from_secs(1))
+        .await
+        .expect("second acquire after release should succeed");
+    assert_eq!(queue.active_count(), 1);
+    drop(permit_again);
 }

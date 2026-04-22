@@ -4,25 +4,24 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
-use crate::service::account::AccountService;
+use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
     clean_session_id_from_body, detect_client_type, ClientType, Rewriter,
 };
 use crate::service::telemetry::TelemetryService;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
-/// 并发槽位等待重试间隔。
-const SLOT_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-/// 并发槽位最大重试次数（500ms × 60 = 30s）。
-const SLOT_WAIT_MAX_RETRIES: usize = 60;
+/// 账号级 FIFO 排队的最长等待时长。超时后会降级到其他账号；队列上限仍由 concurrency 控制。
+const SLOT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// TTFB（Time To First Byte）超时：从 send() 到收到响应头的最长等待时间。
-/// 握手 + 发请求 + 等上游开始响应，60s 足够覆盖正常场景；超过则认为上游卡住。
-const UPSTREAM_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 握手 + 发请求 + 等上游开始响应，120s 足以覆盖非流式 Opus + 扩展思考场景；超过则认为上游卡住。
+const UPSTREAM_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// 流式读间隔超时：两次 bytes_stream chunk 之间允许的最长静默时间。
 /// Anthropic SSE 每几秒至少有一个 ping event，120s 无数据视为连接卡死。
 /// 该超时不限制流总时长，健康长流（Opus 扩展思考等）可持续任意时间。
@@ -156,22 +155,15 @@ impl GatewayService {
                 }
             }
 
-            // 获取并发槽位，满时排队等待
+            // 获取并发槽位：走账号级 FIFO 排队器（tokio Semaphore 按调用顺序授予 permit）
             let t_slot = std::time::Instant::now();
-            let mut acquired = self
+            let queue = self
                 .account_svc
-                .acquire_slot(account.id, account.concurrency)
-                .await
-                .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
-            if !acquired {
-                // 检查等待队列是否已满
-                let wait_key = format!("wait:account:{}", account.id);
-                let entered_queue = self
-                    .account_svc
-                    .cache_acquire_wait(&wait_key, account.concurrency)
-                    .await;
-                if !entered_queue {
-                    // 等待队列满：降级到其他账号，重新绑定粘性
+                .get_or_create_queue(account.id, account.concurrency)
+                .await;
+            let slot_permit = match queue.acquire(SLOT_WAIT_TIMEOUT).await {
+                Ok(p) => p,
+                Err(QueueWaitError::QueueFull) => {
                     warn!(
                         "account {} wait queue full, falling back to another account",
                         account.id
@@ -179,28 +171,7 @@ impl GatewayService {
                     exclude_ids.push(account.id);
                     continue;
                 }
-                // scopeguard 保证即使请求被取消/丢弃也能释放等待计数
-                let wait_svc = self.account_svc.clone();
-                let wait_key_clone = wait_key.clone();
-                let _wait_guard = scopeguard::guard((), move |_| {
-                    let svc = wait_svc;
-                    let key = wait_key_clone;
-                    tokio::spawn(async move {
-                        svc.cache_release_wait(&key).await;
-                    });
-                });
-                // 排队等待槽位释放
-                debug!("account {} slots full, queued for availability", account.id);
-                for _ in 0..SLOT_WAIT_MAX_RETRIES {
-                    tokio::time::sleep(SLOT_WAIT_INTERVAL).await;
-                    match self.account_svc.acquire_slot(account.id, account.concurrency).await {
-                        Ok(true) => { acquired = true; break; }
-                        _ => {}
-                    }
-                }
-                // scopeguard 会在此处自动释放等待队列计数（drop _wait_guard）
-                if !acquired {
-                    // 等待超时：降级到其他账号，重新绑定粘性
+                Err(QueueWaitError::Timeout) => {
                     warn!(
                         "account {} slot wait timed out, falling back to another account",
                         account.id
@@ -208,18 +179,21 @@ impl GatewayService {
                     exclude_ids.push(account.id);
                     continue;
                 }
-            }
+                Err(QueueWaitError::Closed) => {
+                    return Err(AppError::Internal("slot semaphore closed".into()));
+                }
+            };
 
             // 槽位释放绑定到响应体 stream 的生命周期上。
-            // SlotReleaseGuard 兜底：若转发前出错或 panic，drop 时自动释放槽位。
-            // 成功包装 stream 后 defuse() 解除，由 SlotGuardStream 接管释放。
+            // SlotReleaseGuard 兜底：若转发前出错或 panic，drop permit 自动归还槽位。
+            // 成功包装 stream 后 defuse() 解除，由 SlotGuardBody 持有 permit 直到流结束。
             let slot_ms = t_slot.elapsed().as_millis();
             if slot_ms > 10 {
                 info!("[耗时] 槽位获取: {:.0}ms (排队等待)", slot_ms);
             } else {
                 info!("[耗时] 槽位获取: {:.0}ms", slot_ms);
             }
-            let mut slot_guard = SlotReleaseGuard::new(self.account_svc.clone(), account.id);
+            let mut slot_guard = SlotReleaseGuard::new(slot_permit);
 
             // 改写请求体
             let t_rewrite = std::time::Instant::now();
@@ -302,24 +276,24 @@ impl GatewayService {
                 }
             };
 
-            // 非 429：将响应体包装为 SlotGuardBody，流结束时释放槽位
+            // 非 429：将响应体包装为 SlotGuardBody，流结束时归还槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
-                let (svc, account_id) = slot_guard.defuse();
+                let permit = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
-                    body, svc, account_id, req_start, account.name.clone(),
+                    body, permit, req_start, account.name.clone(),
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
 
-            // 429：guard drop 会释放槽位，排除该账号，尝试下一个
+            // 429：guard drop 会归还槽位 permit，排除该账号，尝试下一个
             warn!(
                 "account {} returned 429, excluding and retrying (attempt {})",
                 account.id,
                 attempt + 1,
             );
             exclude_ids.push(account.id);
-            drop(slot_guard); // 显式 drop，释放槽位
+            drop(slot_guard); // 显式 drop → permit drop → 归还槽位
             last_resp = Some(resp);
         }
     }
@@ -595,41 +569,38 @@ fn normalize_reset_timestamp(raw: &str) -> Option<String> {
     None
 }
 
-/// 并发槽位释放守卫：drop 时自动释放槽位，防止错误路径或 panic 导致泄漏。
-/// 成功包装 stream 后调用 `defuse()` 解除，由 `SlotGuardStream` 接管释放。
+/// 并发槽位释放守卫：drop permit 时自动归还 semaphore，防止错误路径或 panic 导致泄漏。
+/// 成功包装 stream 后调用 `defuse()` 把 permit 交给 `SlotGuardBody` 管理。
 struct SlotReleaseGuard {
-    inner: Option<(Arc<AccountService>, i64)>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl SlotReleaseGuard {
-    fn new(svc: Arc<AccountService>, account_id: i64) -> Self {
-        Self { inner: Some((svc, account_id)) }
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self { permit: Some(permit) }
     }
 
-    /// 解除守卫并取出释放信息，调用后 drop 不再释放。
-    fn defuse(&mut self) -> (Arc<AccountService>, i64) {
-        self.inner.take().expect("SlotReleaseGuard already defused")
+    /// 解除守卫并取出 permit，调用后本 guard drop 不再释放。
+    fn defuse(&mut self) -> OwnedSemaphorePermit {
+        self.permit.take().expect("SlotReleaseGuard already defused")
     }
 }
 
 impl Drop for SlotReleaseGuard {
     fn drop(&mut self) {
-        if let Some((svc, account_id)) = self.inner.take() {
-            tokio::spawn(async move {
-                svc.release_slot(account_id).await;
-            });
-        }
+        // permit 的 Drop 本身就会归还 semaphore,无需额外动作
+        let _ = self.permit.take();
     }
 }
 
-/// 包装响应体 Body，在 body 传输完成或被丢弃时自动释放并发槽位。
+/// 包装响应体 Body，在 body 传输完成或被丢弃时自动归还并发槽位。
 ///
 /// 解决 Axum 流式响应中 handler 提前返回导致槽位过早释放的问题：
-/// 将 release 逻辑绑定到 body 的生命周期上，确保槽位覆盖整个传输过程。
+/// 将 permit 的生命周期绑定到 body 上，确保槽位覆盖整个传输过程。
 struct SlotGuardBody {
     inner: Body,
-    /// `Some(...)` 表示槽位尚未释放，`Drop` 时 take 并执行释放。
-    release: Option<(Arc<AccountService>, i64)>,
+    /// `Some(permit)` 表示槽位尚未归还；`Drop` 时 take 让 permit 自动归还 semaphore。
+    permit: Option<OwnedSemaphorePermit>,
     /// 请求开始时间，用于计算首字耗时。
     req_start: std::time::Instant,
     /// 账号名称，用于日志输出。
@@ -641,14 +612,13 @@ struct SlotGuardBody {
 impl SlotGuardBody {
     fn new(
         inner: Body,
-        account_svc: Arc<AccountService>,
-        account_id: i64,
+        permit: OwnedSemaphorePermit,
         req_start: std::time::Instant,
         account_name: String,
     ) -> Self {
         Self {
             inner,
-            release: Some((account_svc, account_id)),
+            permit: Some(permit),
             req_start,
             account_name,
             first_frame_logged: false,
@@ -694,10 +664,7 @@ impl Drop for SlotGuardBody {
             self.req_start.elapsed().as_millis(),
             self.account_name
         );
-        if let Some((svc, account_id)) = self.release.take() {
-            tokio::spawn(async move {
-                svc.release_slot(account_id).await;
-            });
-        }
+        // permit 的 Drop 负责归还 semaphore
+        let _ = self.permit.take();
     }
 }
