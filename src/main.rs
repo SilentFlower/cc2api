@@ -63,6 +63,7 @@ async fn main() {
     let account_store = Arc::new(store::account_store::AccountStore::new(pool.clone(), driver.clone()));
     let token_store = Arc::new(store::token_store::TokenStore::new(pool.clone(), driver.clone()));
     let settings_store = Arc::new(store::settings_store::SettingsStore::new(pool.clone()));
+    let prime_log_store = Arc::new(store::prime_log_store::PrimeLogStore::new(pool.clone()));
 
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),
@@ -94,6 +95,19 @@ async fn main() {
         async move { poller.run().await }
     });
 
+    // 峰值 5h 窗口预热调度器:每天 HH:10 对活跃账号发小型 Haiku 请求,
+    // 主动启动 Anthropic 侧的 5h 窗口,使其重置点落在下午用户高峰附近。
+    let prime_poller = Arc::new(service::prime_poller::PrimePollerService::new(
+        account_svc.clone(),
+        settings_store.clone(),
+        prime_log_store.clone(),
+        rewriter.clone(),
+    ));
+    tokio::spawn({
+        let poller = prime_poller.clone();
+        async move { poller.run().await }
+    });
+
     let app = handler::router::build_router(
         &cfg,
         gateway_svc,
@@ -101,6 +115,7 @@ async fn main() {
         token_tester,
         token_store,
         settings_store,
+        prime_log_store,
         oauth_flow_svc,
         telemetry_svc,
     );

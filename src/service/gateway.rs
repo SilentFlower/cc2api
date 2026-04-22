@@ -521,7 +521,7 @@ fn truncate_body(b: &[u8], max: usize) -> String {
 /// 从上游响应头中提取 ratelimit 用量信息，构建与 OAuth usage API 格式一致的 JSON。
 /// 仅保留 utilization 和 resets_at 都存在且可解析的完整窗口，避免不完整数据导致前端异常。
 /// 没有任何完整窗口时返回 None。
-fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_json::Value> {
+pub(crate) fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_json::Value> {
     let get_str = |name: &str| -> Option<String> {
         headers.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
     };

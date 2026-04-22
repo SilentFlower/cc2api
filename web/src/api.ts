@@ -126,6 +126,21 @@ export interface OAuthExchangeResult {
   email_address: string;
 }
 
+/** 峰值预热调用日志,对应后端 `prime_logs` 表单行。 */
+export interface PrimeLogEntry {
+  id: number;
+  account_id: number;
+  account_name: string;
+  /** ISO8601 本地时间字符串 */
+  triggered_at: string;
+  /** 触发的小时(0-23) */
+  hour: number;
+  model: string;
+  success: boolean;
+  error_message: string;
+  duration_ms: number;
+}
+
 export const api = {
   listAccounts: (page = 1, pageSize = 12) =>
     request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
@@ -153,4 +168,7 @@ export const api = {
   // 设置
   getSettings: () => request<Record<string, string>>('GET', '/admin/settings'),
   updateSettings: (data: Record<string, string>) => request<{ ok: boolean }>('PUT', '/admin/settings', data),
+
+  // 峰值预热日志
+  getPrimeLogs: () => request<PrimeLogEntry[]>('GET', '/admin/prime-logs'),
 }

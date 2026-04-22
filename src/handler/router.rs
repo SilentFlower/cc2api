@@ -19,6 +19,7 @@ use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::telemetry::TelemetryService;
+use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::SettingsStore;
 use crate::store::token_store::TokenStore;
 
@@ -29,6 +30,7 @@ pub struct AppState {
     pub token_tester: Arc<TokenTester>,
     pub token_store: Arc<TokenStore>,
     pub settings_store: Arc<SettingsStore>,
+    pub prime_log_store: Arc<PrimeLogStore>,
     pub oauth_flow_svc: Arc<OAuthFlowService>,
     pub telemetry_svc: Arc<TelemetryService>,
     pub admin_password: String,
@@ -41,6 +43,7 @@ pub fn build_router(
     token_tester: Arc<TokenTester>,
     token_store: Arc<TokenStore>,
     settings_store: Arc<SettingsStore>,
+    prime_log_store: Arc<PrimeLogStore>,
     oauth_flow_svc: Arc<OAuthFlowService>,
     telemetry_svc: Arc<TelemetryService>,
 ) -> Router {
@@ -50,6 +53,7 @@ pub fn build_router(
         token_tester,
         token_store,
         settings_store,
+        prime_log_store,
         oauth_flow_svc,
         telemetry_svc,
         admin_password: cfg.admin.password.clone(),
@@ -89,6 +93,7 @@ pub fn build_router(
         .route("/admin/oauth/exchange-code", post(oauth_exchange_code))
         .route("/admin/oauth/exchange-setup-token-code", post(oauth_exchange_setup_token_code))
         .route("/admin/settings", get(get_settings).put(update_settings))
+        .route("/admin/prime-logs", get(get_prime_logs))
         .layer(middleware::from_fn(move |req, next: Next| {
             let pwd = admin_password.clone();
             admin_auth(pwd, req, next)
@@ -663,8 +668,45 @@ async fn update_settings(
             }
         }
     }
+    // 峰值预热开关:仅允许 "true" / "false"
+    if let Some(val) = body.get("peak_prime_enabled") {
+        if val != "true" && val != "false" {
+            return Err(AppError::BadRequest(
+                "'peak_prime_enabled' 必须是 true 或 false".into(),
+            ));
+        }
+    }
+    // 峰值预热小时列表:逗号分隔,每段必须是 0-23 整数;允许空串(等价于禁用)
+    if let Some(val) = body.get("peak_prime_hours") {
+        for seg in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            match seg.parse::<u32>() {
+                Ok(h) if h < 24 => {}
+                _ => {
+                    return Err(AppError::BadRequest(
+                        format!("'peak_prime_hours' 包含非法小时: {}", seg),
+                    ));
+                }
+            }
+        }
+    }
+    // 峰值预热模型:非空字符串,具体模型名由 Anthropic 侧校验
+    if let Some(val) = body.get("peak_prime_model") {
+        if val.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "'peak_prime_model' 不能为空".into(),
+            ));
+        }
+    }
     state.settings_store.upsert_many(&body).await?;
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// 获取最近 50 条峰值预热调用记录,按时间倒序。
+async fn get_prime_logs(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let logs = state.prime_log_store.list_recent(50).await?;
+    Ok(Json(serde_json::json!(logs)))
 }

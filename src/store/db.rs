@@ -114,11 +114,15 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         }
         sqlx::query(stmt).execute(pool).await?;
     }
-    // 插入默认评分权重（若不存在）
+    // 插入默认评分权重与峰值预热配置（仅当 key 不存在时）
     for (key, val) in &[
         ("score_weight_7d", "0.5"),
         ("score_weight_5h", "0.3"),
         ("score_weight_concurrency", "0.2"),
+        // 峰值预热相关默认值
+        ("peak_prime_enabled", "true"),
+        ("peak_prime_hours", "4,5,6"),
+        ("peak_prime_model", "claude-haiku-4-5-20251001"),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"
@@ -126,6 +130,16 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING"
         };
         sqlx::query(insert_sql).bind(key).bind(val).execute(pool).await.ok();
+    }
+
+    // prime_logs 表（峰值预热调用日志）
+    let prime_logs_schema = if driver == "sqlite" { SQLITE_PRIME_LOGS_SCHEMA } else { PG_PRIME_LOGS_SCHEMA };
+    for stmt in prime_logs_schema.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        sqlx::query(stmt).execute(pool).await?;
     }
 
     Ok(())
@@ -227,4 +241,37 @@ CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL
 )
+"#;
+
+/// 峰值预热日志表（SQLite）。
+/// triggered_at 存 ISO8601 本地时间字符串（与既有表一致的字符串风格），避免跨平台时区差异。
+const SQLITE_PRIME_LOGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS prime_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL,
+    account_name    TEXT NOT NULL,
+    triggered_at    TEXT NOT NULL,
+    hour            INTEGER NOT NULL,
+    model           TEXT NOT NULL,
+    success         INTEGER NOT NULL,
+    error_message   TEXT NOT NULL DEFAULT '',
+    duration_ms     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_prime_logs_triggered_at ON prime_logs(triggered_at DESC);
+"#;
+
+/// 峰值预热日志表（PostgreSQL）。
+const PG_PRIME_LOGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS prime_logs (
+    id              BIGSERIAL PRIMARY KEY,
+    account_id      BIGINT NOT NULL,
+    account_name    TEXT NOT NULL,
+    triggered_at    TEXT NOT NULL,
+    hour            INT NOT NULL,
+    model           TEXT NOT NULL,
+    success         INT NOT NULL,
+    error_message   TEXT NOT NULL DEFAULT '',
+    duration_ms     BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_prime_logs_triggered_at ON prime_logs(triggered_at DESC);
 "#;
