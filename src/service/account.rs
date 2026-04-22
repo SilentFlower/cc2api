@@ -73,8 +73,9 @@ const DEFAULT_WCONC: f64 = 0.2;
 ///
 /// # 两把信号量的职责
 /// - `slots`：目标 permit 数 = `slot_max`（即账号当前的 `concurrency`），控制同时活跃的请求数。
-/// - `queue_cap`：目标 permit 数 = `slot_max`，作为"等待位"上限。只有进入等待队列才会持有该 permit，
-///   活跃阶段不占用。用它是为了在等待人数达上限时快速降级到其他账号（保持历史行为）。
+/// - `queue_cap`：目标 permit 数 = `queue_max` = `2 × concurrency`，作为"等待位"上限。
+///   只有进入等待队列才会持有该 permit，活跃阶段不占用。用它是为了在等待人数达上限时
+///   快速降级到其他账号。2 倍系数给突发流量留出缓冲，而不是刚好满就拒绝。
 ///
 /// # 运行时修改 concurrency
 /// 不重建 queue 实例，而是通过 [`AccountQueue::adjust_capacity`] 原地调整两把信号量：
@@ -85,8 +86,8 @@ const DEFAULT_WCONC: f64 = 0.2;
 ///   期间如果又被扩容，旧吞任务会在下次循环发现 cap 已达标直接退出——**不会遗留过期吞任务**。
 ///
 /// # 单账号系统内最多请求数
-/// `active ≤ slot_max` + `waiting ≤ slot_max` = `2 × slot_max`。缩容时短暂可能超过 `new`
-/// 直到已有 waiter 耗尽（被 honor）——这是可接受的过渡态。
+/// `active ≤ concurrency` + `waiting ≤ 2 × concurrency` = `3 × concurrency`。缩容时
+/// 短暂可能超过 new 直到已有 waiter 耗尽（被 honor）——这是可接受的过渡态。
 ///
 /// # 客户端中断 / 超时安全
 /// `acquire` 返回的 `Future` 在被 drop 时：`queue_permit` 自动归还到 `queue_cap`；
@@ -100,6 +101,8 @@ pub struct AccountQueue {
     /// 槽位容量目标（== 账号当前 `concurrency`）。shrinker 循环读这个值作为裁决依据,
     /// 扩容时自动撤销旧的 shrink 意图。
     slot_max: Arc<AtomicI32>,
+    /// 等待位容量目标（== `2 × concurrency`）。单独存一个 atomic 供 queue_cap 的 shrinker 读取。
+    queue_max: Arc<AtomicI32>,
     /// `slots` 信号量当前实际总 permit 数（累计 add_permits - 累计 forget）。用于
     /// `adjust_capacity` 计算 delta 和 shrinker 判断是否继续吞 permit。
     slots_cap: Arc<AtomicI32>,
@@ -121,15 +124,17 @@ pub enum QueueWaitError {
 }
 
 impl AccountQueue {
-    /// 构造一个新的排队器，`slots` 与 `queue_cap` 容量均设置为 `concurrency`。
+    /// 构造一个新的排队器，`slots` 容量 = `concurrency`，`queue_cap` 容量 = `2 × concurrency`。
     fn new(concurrency: i32) -> Self {
         let cap = concurrency.max(1);
+        let qc = cap.saturating_mul(2);
         Self {
             slots: Arc::new(Semaphore::new(cap as usize)),
-            queue_cap: Arc::new(Semaphore::new(cap as usize)),
+            queue_cap: Arc::new(Semaphore::new(qc as usize)),
             slot_max: Arc::new(AtomicI32::new(cap)),
+            queue_max: Arc::new(AtomicI32::new(qc)),
             slots_cap: Arc::new(AtomicI32::new(cap)),
-            qc_cap: Arc::new(AtomicI32::new(cap)),
+            qc_cap: Arc::new(AtomicI32::new(qc)),
             waiting: Arc::new(AtomicI64::new(0)),
         }
     }
@@ -137,26 +142,29 @@ impl AccountQueue {
     /// 原地调整槽位容量（admin 修改 concurrency 时调用），不替换 queue 实例,已占用 permit 不受影响。
     ///
     /// # 关键设计
-    /// `slot_max` 是共享的 target，所有后台 shrinker 任务每次循环都读取最新值。因此：
+    /// `slot_max` / `queue_max` 是共享的 target，所有后台 shrinker 任务每次循环都读取最新值。因此：
     /// - 扩容 10→1→10：第二次调用 store(10)，旧的 shrinker（从 10→1 留下）下次循环看到
     ///   `cap(10) <= target(10)` 后把 permit 归还并退出，不会继续悄悄吞；
     /// - 缩容 10→5→1：两次调整合并到同一个 target=1，新旧 shrinker 共同工作至 `cap=1`。
     fn adjust_capacity(&self, new: i32) {
         let new = new.max(1);
         self.slot_max.store(new, Ordering::Release);
+        self.queue_max
+            .store(new.saturating_mul(2), Ordering::Release);
         Self::adjust_semaphore(&self.slots, &self.slots_cap, &self.slot_max);
-        Self::adjust_semaphore(&self.queue_cap, &self.qc_cap, &self.slot_max);
+        Self::adjust_semaphore(&self.queue_cap, &self.qc_cap, &self.queue_max);
     }
 
-    /// 把指定 semaphore 的实际容量向 `slot_max` 看齐。
+    /// 把指定 semaphore 的实际容量向 `target_atomic` 看齐。
     /// `cap` 跟踪该 semaphore 的累计 add_permits - 累计 forget 数。
+    /// `target_atomic` 对 slots 是 `slot_max`,对 queue_cap 是 `queue_max`。
     fn adjust_semaphore(
         sem: &Arc<Semaphore>,
         cap: &Arc<AtomicI32>,
-        slot_max: &Arc<AtomicI32>,
+        target_atomic: &Arc<AtomicI32>,
     ) {
         let current = cap.load(Ordering::Acquire);
-        let target = slot_max.load(Ordering::Acquire);
+        let target = target_atomic.load(Ordering::Acquire);
         if target == current {
             return;
         }
@@ -175,10 +183,10 @@ impl AccountQueue {
         if took >= needed {
             return;
         }
-        // 剩余部分 spawn 后台任务延迟吞；任务每次循环读 slot_max 判断是否继续。
+        // 剩余部分 spawn 后台任务延迟吞；任务每次循环读共享 target 判断是否继续。
         let sem_c = sem.clone();
         let cap_c = cap.clone();
-        let target_c = slot_max.clone();
+        let target_c = target_atomic.clone();
         tokio::spawn(async move {
             loop {
                 // 每轮先读共享 target：如果此间有扩容把 target 抬到 ≥ cap，直接退出
@@ -192,7 +200,7 @@ impl AccountQueue {
                     Ok(p) => p,
                     Err(_) => return, // semaphore 被 close
                 };
-                // 原子决定：若 cap 仍 > slot_max 则吞掉，否则归还 permit 并退出
+                // 原子决定：若 cap 仍 > target 则吞掉，否则归还 permit 并退出
                 let decision = cap_c.fetch_update(
                     Ordering::AcqRel,
                     Ordering::Acquire,
@@ -710,6 +718,7 @@ impl AccountService {
     /// 评分公式：`score = eff_7d * w7d + eff_5h * w5h + concurrency_load_pct * wconc`（权重可在设置页面配置）
     /// - `eff_Xd = utilization × 阶梯衰减`，快重置的窗口衰减更大（分 3 档：1.0/0.8/0.6）
     /// - 无 resets_at 数据时衰减因子为 1.0（最保守）
+    /// - `concurrency_load_pct = (活跃 + 排队) / concurrency × 100`,排队中的请求也计入负载
     /// - 并发已满的账号优先排除，仅在所有账号都满时才参与评分
     /// - 得分相同时随机选择
     async fn select_by_score(&self, accounts: &[Account]) -> Account {
@@ -736,12 +745,15 @@ impl AccountService {
         for acc in &best {
             let eff_5h = effective_utilization_detail(acc, "five_hour", 5.0 * 3600.0, now).effective;
             let eff_7d = effective_utilization_detail(acc, "seven_day", 7.0 * 24.0 * 3600.0, now).effective;
-            // 从 FIFO 排队器读取实时活跃数,替代原 cache.get_slot_count("concurrency:account:{}") 查询
+            // 从 FIFO 排队器读取实时活跃/等待数
             let queue = self.get_or_create_queue(acc.id, acc.concurrency).await;
             let current = queue.active_count();
+            let waiting = queue.waiting_count();
             let full = acc.concurrency > 0 && current >= acc.concurrency as i64;
+            // 把"排队中"的请求也作为负载计入评分:单位仍是 % concurrency,
+            // 两个账号都活跃满时,排队少的负载百分比更低,优先被选中。
             let conc_pct = if acc.concurrency > 0 {
-                (current as f64) / (acc.concurrency as f64) * 100.0
+                ((current + waiting) as f64) / (acc.concurrency as f64) * 100.0
             } else {
                 0.0
             };
@@ -784,13 +796,13 @@ impl AccountService {
         // 从 FIFO 排队器读取实时活跃/等待数(替代原 cache.get_slot_count 查询)
         let queue = self.get_or_create_queue(account.id, account.concurrency).await;
         let current_concurrency = queue.active_count();
+        let queued = queue.waiting_count();
+        // 负载 % = (活跃 + 排队) / concurrency × 100,与 select_by_score 保持一致
         let concurrency_pct = if account.concurrency > 0 {
-            (current_concurrency as f64) / (account.concurrency as f64) * 100.0
+            ((current_concurrency + queued) as f64) / (account.concurrency as f64) * 100.0
         } else {
             0.0
         };
-
-        let queued = queue.waiting_count();
 
         let score = d7d.effective * w7d + d5h.effective * w5h + concurrency_pct * wconc;
 
