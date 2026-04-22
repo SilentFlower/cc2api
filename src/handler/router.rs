@@ -206,6 +206,7 @@ struct CreateAccountRequest {
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
     auto_poll_usage: Option<bool>,
+    allow_1m_models: Option<String>,
 }
 
 async fn create_account(
@@ -251,6 +252,7 @@ async fn create_account(
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         auto_poll_usage: req.auto_poll_usage.unwrap_or(false),
+        allow_1m_models: req.allow_1m_models.unwrap_or_else(|| "opus".to_string()),
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
@@ -375,6 +377,9 @@ async fn update_account(
     }
     if let Some(auto_poll_usage) = updates.get("auto_poll_usage").and_then(|v| v.as_bool()) {
         existing.auto_poll_usage = auto_poll_usage;
+    }
+    if let Some(allow_1m_models) = updates.get("allow_1m_models").and_then(|v| v.as_str()) {
+        existing.allow_1m_models = allow_1m_models.to_string();
     }
 
     state.account_svc.update_account(&existing).await?;

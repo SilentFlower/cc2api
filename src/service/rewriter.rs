@@ -61,6 +61,31 @@ pub enum ClientType {
 
 const DEFAULT_VERSION: &str = "2.1.81";
 
+/// 从逗号分隔的 anthropic-beta header 中剥离指定 token，保留其它 token 和相对顺序。
+///
+/// 对应 sub2api 的 `stripBetaTokensWithSet`：对非白名单模型默认过滤掉
+/// `context-1m-2025-08-07` 这类受控 beta，防止 Sonnet/Haiku 误开 1M 档计费。
+fn strip_beta_token(beta: &str, token: &str) -> String {
+    beta.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty() && *t != token)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 判断 model_id 是否命中账号配置的 1M 上下文白名单。
+///
+/// `allow_1m_models` 是逗号分隔的子串列表（大小写不敏感，空段被忽略）。
+/// 任一子串在 model_id 中出现即视为命中。全空白名单 → 全部 filter。
+fn matches_1m_whitelist(model_id: &str, allow_1m_models: &str) -> bool {
+    let m = model_id.to_lowercase();
+    allow_1m_models
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .any(|pat| m.contains(pat.to_lowercase().as_str()))
+}
+
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
 fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
     let mut seen = std::collections::HashSet::new();
@@ -218,14 +243,22 @@ impl Rewriter {
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
 
-            // 合并客户端 beta 与必需 beta
+            // 合并客户端 beta 与必需 beta；对于不在账号 1M 白名单内的模型，
+            // 强制剥掉 context-1m-2025-08-07（即便客户端传了）。
+            // 对应 sub2api BetaPolicy(action=filter, model_whitelist=..., fallback=filter)：
+            // 默认放行 "opus" 家族，运维可在账号设置里改 allow_1m_models 字段。
             let existing_beta = out
                 .get("anthropic-beta")
                 .cloned()
                 .unwrap_or_default();
+            let filtered_existing = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
+                existing_beta
+            } else {
+                strip_beta_token(&existing_beta, "context-1m-2025-08-07")
+            };
             out.insert(
                 "anthropic-beta".into(),
-                merge_anthropic_beta(beta_header_for_model(model_id), &existing_beta),
+                merge_anthropic_beta(beta_header_for_model(model_id), &filtered_existing),
             );
         }
 
@@ -1180,4 +1213,130 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{matches_1m_whitelist, strip_beta_token};
+
+    const CTX_1M: &str = "context-1m-2025-08-07";
+
+    #[test]
+    fn strip_token_in_middle() {
+        let got = strip_beta_token(
+            "oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14",
+            CTX_1M,
+        );
+        assert_eq!(got, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+    }
+
+    #[test]
+    fn strip_token_at_start() {
+        let got = strip_beta_token(
+            "context-1m-2025-08-07,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+            CTX_1M,
+        );
+        assert_eq!(got, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+    }
+
+    #[test]
+    fn strip_token_at_end() {
+        let got = strip_beta_token(
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-1m-2025-08-07",
+            CTX_1M,
+        );
+        assert_eq!(got, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+    }
+
+    #[test]
+    fn strip_token_not_present() {
+        let got = strip_beta_token(
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14",
+            CTX_1M,
+        );
+        assert_eq!(got, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+    }
+
+    #[test]
+    fn strip_token_with_whitespace() {
+        // 客户端常发带空格格式；trim 后仍能匹配。
+        let got = strip_beta_token(
+            "oauth-2025-04-20, context-1m-2025-08-07 , interleaved-thinking-2025-05-14",
+            CTX_1M,
+        );
+        assert_eq!(got, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+    }
+
+    #[test]
+    fn strip_token_empty_header() {
+        assert_eq!(strip_beta_token("", CTX_1M), "");
+    }
+
+    #[test]
+    fn strip_token_header_is_only_the_token() {
+        assert_eq!(strip_beta_token(CTX_1M, CTX_1M), "");
+    }
+
+    #[test]
+    fn strip_token_multiple_occurrences() {
+        // 理论上不应该出现，但工具必须全部剥干净。
+        let got = strip_beta_token(
+            "context-1m-2025-08-07,oauth-2025-04-20,context-1m-2025-08-07",
+            CTX_1M,
+        );
+        assert_eq!(got, "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn strip_token_ignores_empty_segments() {
+        // ",,context-1m-2025-08-07,,oauth-2025-04-20,," 这种脏数据也能处理。
+        let got = strip_beta_token(",,context-1m-2025-08-07,,oauth-2025-04-20,,", CTX_1M);
+        assert_eq!(got, "oauth-2025-04-20");
+    }
+
+    // ---- matches_1m_whitelist ----
+
+    #[test]
+    fn whitelist_default_opus_matches_opus_models() {
+        assert!(matches_1m_whitelist("claude-opus-4-7", "opus"));
+        assert!(matches_1m_whitelist("claude-opus-4-6", "opus"));
+        // 大小写不敏感
+        assert!(matches_1m_whitelist("Claude-Opus-4-7", "opus"));
+        assert!(matches_1m_whitelist("claude-opus-4-7", "OPUS"));
+    }
+
+    #[test]
+    fn whitelist_default_opus_rejects_non_opus() {
+        assert!(!matches_1m_whitelist("claude-sonnet-4-5", "opus"));
+        assert!(!matches_1m_whitelist("claude-haiku-4-5", "opus"));
+    }
+
+    #[test]
+    fn whitelist_empty_means_block_everyone() {
+        // 运维显式置空 = 所有模型都不放行
+        assert!(!matches_1m_whitelist("claude-opus-4-7", ""));
+        assert!(!matches_1m_whitelist("claude-sonnet-4-5", ""));
+    }
+
+    #[test]
+    fn whitelist_multiple_patterns() {
+        // 运维配置 "opus,sonnet" → opus 和 sonnet 都放行
+        assert!(matches_1m_whitelist("claude-opus-4-7", "opus,sonnet"));
+        assert!(matches_1m_whitelist("claude-sonnet-4-5", "opus,sonnet"));
+        assert!(!matches_1m_whitelist("claude-haiku-4-5", "opus,sonnet"));
+    }
+
+    #[test]
+    fn whitelist_ignores_whitespace_and_empty_segments() {
+        // 脏输入："opus, , ,sonnet,," 也能解析
+        assert!(matches_1m_whitelist("claude-opus-4-7", "opus, , ,sonnet,,"));
+        assert!(matches_1m_whitelist("claude-sonnet-4-5", "opus, , ,sonnet,,"));
+    }
+
+    #[test]
+    fn whitelist_precise_model_id_match() {
+        // 配置可以用完整 model id 做精确控制
+        assert!(matches_1m_whitelist("claude-opus-4-7", "claude-opus-4-7"));
+        assert!(!matches_1m_whitelist("claude-opus-4-6", "claude-opus-4-7"));
+    }
 }

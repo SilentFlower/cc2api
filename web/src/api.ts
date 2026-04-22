@@ -52,6 +52,7 @@ export interface Account {
   priority: number
   auto_telemetry: boolean
   auto_poll_usage: boolean
+  allow_1m_models: string
   telemetry_count: number
   telemetry_expires_at?: string
   scheduling_score?: number

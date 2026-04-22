@@ -111,6 +111,7 @@ impl AccountStore {
             disable_reason: row.try_get::<String, _>("disable_reason").unwrap_or_default(),
             auto_telemetry: row.try_get::<i32, _>("auto_telemetry").unwrap_or(0) != 0,
             auto_poll_usage: row.try_get::<i32, _>("auto_poll_usage").unwrap_or(0) != 0,
+            allow_1m_models: row.try_get::<String, _>("allow_1m_models").unwrap_or_else(|_| "opus".into()),
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),
@@ -150,8 +151,8 @@ impl AccountStore {
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
-                concurrency, priority, auto_telemetry, auto_poll_usage)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+                concurrency, priority, auto_telemetry, auto_poll_usage, allow_1m_models)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
             RETURNING id, created_at, updated_at"#,
             self.ts(9), self.ts(10), "$11"
         );
@@ -179,6 +180,7 @@ impl AccountStore {
         .bind(a.priority)
         .bind(auto_telemetry_int)
         .bind(auto_poll_usage_int)
+        .bind(&a.allow_1m_models)
         .fetch_one(&self.pool)
         .await?;
 
@@ -198,8 +200,8 @@ impl AccountStore {
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid=$13, organization_uuid=$14, subscription_type=$15,
-                concurrency=$16, priority=$17, auto_telemetry=$18, auto_poll_usage=$19, updated_at={}
-            WHERE id=$20"#,
+                concurrency=$16, priority=$17, auto_telemetry=$18, auto_poll_usage=$19, allow_1m_models=$20, updated_at={}
+            WHERE id=$21"#,
             self.ts(8), self.ts(9), self.now_expr()
         );
         sqlx::query(&q)
@@ -222,6 +224,7 @@ impl AccountStore {
             .bind(a.priority)
             .bind(auto_telemetry_int)
             .bind(auto_poll_usage_int)
+            .bind(&a.allow_1m_models)
             .bind(a.id)
             .execute(&self.pool)
             .await?;
@@ -447,7 +450,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
-    disable_reason, auto_telemetry, auto_poll_usage, telemetry_count,
+    disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
 
 #[cfg(test)]

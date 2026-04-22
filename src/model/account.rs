@@ -186,6 +186,12 @@ pub struct Account {
     /// 是否启用后台自动轮询用量数据（仅 OAuth 账号有效）。
     #[serde(default)]
     pub auto_poll_usage: bool,
+    /// 允许透传 `context-1m-2025-08-07` beta 的模型模式列表，逗号分隔，大小写不敏感，
+    /// 匹配方式为"子串包含"。留空 = 不放行（所有模型都 filter 掉 context-1m）。
+    /// 默认 `"opus"`，意味着 model id 含 "opus" 的请求可以开 1M 上下文，
+    /// Sonnet/Haiku 默认被过滤，避免误开 1M 档的更贵计费。
+    #[serde(default = "default_allow_1m_models")]
+    pub allow_1m_models: String,
     /// 累计发送的遥测请求次数。
     #[serde(default)]
     pub telemetry_count: i64,
@@ -199,6 +205,8 @@ pub struct Account {
 
 fn default_concurrency() -> i32 { 3 }
 fn default_priority() -> i32 { 50 }
+/// 新账号的默认 1M 上下文模型白名单。保持与 sub2api 默认预设一致：仅放行 Opus 家族。
+fn default_allow_1m_models() -> String { "opus".to_string() }
 
 impl Account {
     pub fn is_schedulable(&self) -> bool {

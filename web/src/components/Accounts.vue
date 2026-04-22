@@ -67,6 +67,7 @@ const form = ref({
   priority: 50,
   auto_telemetry: false,
   auto_poll_usage: false,
+  allow_1m_models: 'opus',
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -144,6 +145,7 @@ function openCreate() {
     priority: 50,
     auto_telemetry: false,
     auto_poll_usage: false,
+    allow_1m_models: 'opus',
   };
   showForm.value = true;
 }
@@ -171,6 +173,7 @@ function openEdit(a: Account) {
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
     auto_poll_usage: a.auto_poll_usage ?? false,
+    allow_1m_models: a.allow_1m_models ?? 'opus',
   };
   showForm.value = true;
 }
@@ -207,6 +210,7 @@ async function save() {
       updates.priority = form.value.priority;
       updates.auto_telemetry = form.value.auto_telemetry;
       updates.auto_poll_usage = form.value.auto_poll_usage;
+      updates.allow_1m_models = form.value.allow_1m_models;
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -231,6 +235,7 @@ async function save() {
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
         auto_poll_usage: form.value.auto_poll_usage,
+        allow_1m_models: form.value.allow_1m_models,
       };
       if (expiresAt) payload.expires_at = Number(expiresAt);
       await api.createAccount(payload);
@@ -517,6 +522,7 @@ function applyOAuthResult() {
     priority: 50,
     auto_telemetry: false,
     auto_poll_usage: false,
+    allow_1m_models: 'opus',
   };
   showForm.value = true;
 }
@@ -1108,6 +1114,36 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后后台定时拉取该账号的用量数据</p>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">允许 1M 上下文的模型</Label>
+            <input
+              v-model="form.allow_1m_models"
+              type="text"
+              placeholder="opus"
+              class="w-full px-3 py-2 text-sm rounded-lg border border-[#e8e2d9] bg-[#f9f6f1] text-[#5c5647] focus:border-[#8c8475] focus:outline-none transition-colors"
+            />
+            <div class="flex flex-wrap gap-1.5">
+              <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
+              <button
+                type="button"
+                @click="form.allow_1m_models = 'opus'"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
+              >仅 Opus</button>
+              <button
+                type="button"
+                @click="form.allow_1m_models = 'opus,sonnet'"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
+              >Opus + Sonnet</button>
+              <button
+                type="button"
+                @click="form.allow_1m_models = ''"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-red-300 hover:bg-red-50 hover:text-red-600 transition-colors"
+              >全部关闭</button>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">
+              逗号分隔的子串列表(大小写不敏感)。留空 = 所有模型都过滤掉 context-1m-2025-08-07。默认 "opus" 只放行 Opus 家族。
+            </p>
           </div>
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">
