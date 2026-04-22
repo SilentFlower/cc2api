@@ -1,15 +1,14 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{NaiveDate, Timelike};
+use chrono::{NaiveDate, Timelike, Utc};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use crate::model::account::AccountStatus;
+use crate::model::account::{Account, AccountStatus};
 use crate::service::account::AccountService;
 use crate::service::gateway::extract_passive_usage;
-use crate::service::rewriter::{ClientType, Rewriter};
+use crate::service::rewriter::{clean_session_id_from_body, ClientType, Rewriter};
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::SettingsStore;
 
@@ -28,9 +27,8 @@ const TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// 约定的触发分钟:每天在 HH:10 分发起预热,避免 :00/:30 的全球流量峰值。
 const TRIGGER_MINUTE: u32 = 10;
 
-/// Claude Code 真实客户端的系统提示词,与 sub2api `createTestPayload` 保持一致,
-/// 以便预热请求在上游看来与正常 CC 流量无差异。
-const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+/// 错误信息截断字符数。按字符而非字节截,避免多字节字符跨边界导致 panic。
+const ERROR_SNIPPET_CHARS: usize = 200;
 
 /// 预热解析出的有效配置。
 struct PrimeConfig {
@@ -45,15 +43,20 @@ struct PrimeOutcome {
     error_message: String,
     duration_ms: i64,
     passive_usage: Option<serde_json::Value>,
+    /// 上游 HTTP 状态码,None 表示请求没到达上游(如 token 解析失败、序列化失败)。
+    /// 用于后续按状态码做 429/403 处理。
+    status: Option<u16>,
 }
 
 /// 峰值 5h 窗口预热服务。
 ///
-/// 每天在配置的清晨时间点(默认 4:10 / 5:10 / 6:10 本地时间)对所有活跃账号逐一发送一次
-/// 极小的 Haiku `/v1/messages` 请求,借此主动启动 Anthropic 侧的 5h 速率限制窗口,
-/// 让窗口重置点落在下午用户高峰之前或之中。
+/// 每天在配置的清晨时间点(默认 4:10 / 5:10 / 6:10 本地时间)对所有活跃且未处于速率冷却
+/// 期的账号逐一发送一次 Haiku `/v1/messages` 请求,借此主动启动 Anthropic 侧的 5h 速率
+/// 限制窗口,让窗口重置点落在下午用户高峰之前或之中。
 ///
-/// 失败不重试,每次调用(含成功/失败)都会写入 `prime_logs` 表,供设置页展示。
+/// 失败不重试,每次调用(含成功/失败/跳过)都会写入 `prime_logs` 表,供设置页展示。
+/// 429 / 403 会联动 `AccountService` 的状态处理,和主链路行为保持一致,防止预热探测到
+/// 坏账号却让真实流量继续选中它。
 pub struct PrimePollerService {
     account_svc: Arc<AccountService>,
     settings_store: Arc<SettingsStore>,
@@ -159,6 +162,7 @@ impl PrimePollerService {
     }
 
     /// 对所有活跃账号依次发起预热请求,账号间间隔 PER_ACCOUNT_GAP。
+    /// 仍处于 429 冷却期的账号会被跳过(避免续命式延长冷却),但仍写入 skip 日志。
     async fn run_round(&self, hour: u32, model: &str) {
         let accounts = match self.account_svc.list_accounts().await {
             Ok(list) => list,
@@ -168,18 +172,35 @@ impl PrimePollerService {
             }
         };
 
-        let targets: Vec<_> = accounts
+        // 只看启用状态的账号;disabled/error 与预热无关。
+        // 冷却期判断在循环内做,因为要记 skip 日志。
+        let targets: Vec<Account> = accounts
             .into_iter()
             .filter(|a| a.status == AccountStatus::Active)
             .collect();
 
-        debug!("prime poller: priming {} active accounts", targets.len());
+        debug!("prime poller: evaluating {} active accounts", targets.len());
 
         for account in targets {
             let triggered_at = chrono::Local::now().to_rfc3339();
-            let outcome = self.prime_one(&account, model).await;
+            let outcome = if account.is_schedulable() {
+                self.prime_one(&account, model).await
+            } else {
+                // 处于速率冷却期,不发请求,但在日志里留痕,便于排查"今天没预热"的原因。
+                let reset = account
+                    .rate_limit_reset_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".into());
+                PrimeOutcome {
+                    success: false,
+                    error_message: format!("skipped: rate-limited until {}", reset),
+                    duration_ms: 0,
+                    passive_usage: None,
+                    status: None,
+                }
+            };
 
-            // 落日志:info 级别打点,便于 grep;同时写入 DB 供前端展示。
+            // 落日志:info/warn 级别打点,便于 grep;同时写入 DB 供前端展示。
             if outcome.success {
                 info!(
                     "prime: account={} hour={} model={} success=true duration={}ms",
@@ -200,20 +221,30 @@ impl PrimePollerService {
                 hour: hour as i32,
                 model: model.to_string(),
                 success: outcome.success,
-                error_message: outcome.error_message,
+                error_message: outcome.error_message.clone(),
                 duration_ms: outcome.duration_ms,
             };
             if let Err(e) = self.log_store.insert(&entry).await {
                 warn!("prime poller: write log failed for account {}: {}", account.id, e);
             }
 
-            // 成功则合并响应头中的 ratelimit 数据,刷新账号窗口信息,供调度/展示使用。
-            if let Some(usage) = outcome.passive_usage {
-                if let Err(e) = self.account_svc.update_passive_usage(account.id, usage).await {
-                    warn!(
-                        "prime poller: update passive usage failed for account {}: {}",
-                        account.id, e
-                    );
+            // 根据上游状态码联动账号状态,保持与主链路 gateway 一致:
+            // - 429: 调用 handle_rate_limit,按账号类型/用量设置冷却窗口。
+            // - 403: 若未处于 429 冷却期则永久停用,避免坏账号继续被真实流量选中。
+            if let Some(code) = outcome.status {
+                self.apply_status_side_effects(&account, code).await;
+            }
+
+            // 合并响应头中的 ratelimit 数据,刷新账号窗口信息,供调度/展示使用。
+            // 429 场景不覆盖,因为 handle_rate_limit 已写入更完整的数据(可能从 OAuth usage API)。
+            if outcome.status != Some(429) {
+                if let Some(usage) = outcome.passive_usage {
+                    if let Err(e) = self.account_svc.update_passive_usage(account.id, usage).await {
+                        warn!(
+                            "prime poller: update passive usage failed for account {}: {}",
+                            account.id, e
+                        );
+                    }
                 }
             }
 
@@ -221,48 +252,126 @@ impl PrimePollerService {
         }
     }
 
+    /// 根据上游 HTTP 状态码联动账号状态。
+    ///
+    /// 与 `src/service/gateway.rs:359/369` 的处理保持一致:
+    /// - 429 → `handle_rate_limit` 按类型/用量设置冷却;
+    /// - 403 且未处于 429 冷却期 → `disable_account` 永久停用,防止真实流量继续选中。
+    async fn apply_status_side_effects(&self, account: &Account, status: u16) {
+        if status == 429 {
+            if let Err(e) = self.account_svc.handle_rate_limit(account).await {
+                warn!(
+                    "prime poller: handle_rate_limit failed for account {}: {}",
+                    account.id, e
+                );
+            }
+            return;
+        }
+        if status == 403 {
+            // 账号可能已在 429 冷却期,此时 403 是冷却期的副作用响应,不做停用。
+            // 该判断与 gateway.rs 完全一致,避免误判断账号。
+            let is_rate_limited = account
+                .rate_limit_reset_at
+                .map(|reset| Utc::now() < reset)
+                .unwrap_or(false);
+            if is_rate_limited {
+                warn!(
+                    "prime poller: account {} got 403 while rate-limited, skipping disable",
+                    account.id
+                );
+                return;
+            }
+            if let Err(e) = self
+                .account_svc
+                .disable_account(account.id, AccountStatus::Disabled, "403 认证失败", None)
+                .await
+            {
+                warn!(
+                    "prime poller: disable_account failed for account {}: {}",
+                    account.id, e
+                );
+            } else {
+                warn!(
+                    "prime poller: account {} permanently disabled for 403",
+                    account.id
+                );
+            }
+        }
+    }
+
     /// 对单个账号执行一次预热请求,不抛错,所有结果都归并到 PrimeOutcome。
-    async fn prime_one(&self, account: &crate::model::account::Account, model: &str) -> PrimeOutcome {
+    async fn prime_one(&self, account: &Account, model: &str) -> PrimeOutcome {
         let started = Instant::now();
 
-        // 取账号凭证(OAuth 会自动刷新,SetupToken 直接返回)
+        // 取账号凭证(OAuth 会自动刷新,SetupToken 直接返回)。
         let token = match self.account_svc.resolve_upstream_token(account.id).await {
             Ok(t) => t,
             Err(e) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: format!("resolve token: {}", e),
+                    error_message: truncate_chars(&format!("resolve token: {}", e), ERROR_SNIPPET_CHARS),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    status: None,
                 };
             }
         };
 
-        // 构造与真实 Claude Code 流量一致的请求体。
-        let body_value = build_prime_body(model);
-        let body_bytes = match serde_json::to_vec(&body_value) {
+        // 构造最小请求体,其余字段交给 rewriter 补全,保证与真实 Claude Code 流量对齐:
+        // - metadata.user_id 由 rewriter 注入 {device_id, account_uuid, session_id} JSON 字符串
+        // - system prompt、tools、stream=true、去除 temperature 等由 rewriter 统一规范化
+        let minimal_body = serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": "hi" }]
+            }],
+            "max_tokens": 512
+        });
+        let minimal_bytes = match serde_json::to_vec(&minimal_body) {
             Ok(b) => b,
             Err(e) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: format!("serialize body: {}", e),
+                    error_message: truncate_chars(&format!("serialize body: {}", e), ERROR_SNIPPET_CHARS),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    status: None,
                 };
             }
         };
+        let rewritten_bytes = self.rewriter.rewrite_body(
+            &minimal_bytes,
+            "/v1/messages",
+            account,
+            ClientType::API,
+        );
+        // 去掉 rewriter 注入的内部 `_session_id` 标记,避免上游收到未知字段。
+        let final_bytes = match serde_json::from_slice::<serde_json::Value>(&rewritten_bytes) {
+            Ok(mut v) => {
+                clean_session_id_from_body(&mut v);
+                serde_json::to_vec(&v).unwrap_or(rewritten_bytes)
+            }
+            Err(_) => rewritten_bytes,
+        };
 
-        // 由 Rewriter 生成与 API 模式一致的 header 集合,
-        // 保证 anthropic-beta/version、User-Agent、X-Stainless-* 等与真实流量完全一致。
-        let empty_in: HashMap<String, String> = HashMap::new();
-        let mut headers =
-            self.rewriter
-                .rewrite_headers(&empty_in, account, ClientType::API, model, &body_value);
+        // Rewriter 的 header 改写需要一个 body 视图来抽 session_id / model,
+        // 用最终 body 的 Value 参与 header 生成。
+        let body_view: serde_json::Value =
+            serde_json::from_slice(&final_bytes).unwrap_or(serde_json::Value::Null);
+        let empty_in: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut headers = self.rewriter.rewrite_headers(
+            &empty_in,
+            account,
+            ClientType::API,
+            model,
+            &body_view,
+        );
         headers.insert("authorization".into(), format!("Bearer {}", token));
 
         // 走定制 tlsfp 客户端,复用账号的 proxy_url。
         let client = crate::tlsfp::make_request_client(&account.proxy_url);
-        let mut req = client.post(UPSTREAM_URL).body(body_bytes);
+        let mut req = client.post(UPSTREAM_URL).body(final_bytes);
         for (k, v) in &headers {
             req = req.header(k, v);
         }
@@ -273,9 +382,10 @@ impl PrimePollerService {
             Ok(Err(e)) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: format!("request failed: {}", e),
+                    error_message: truncate_chars(&format!("request failed: {}", e), ERROR_SNIPPET_CHARS),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    status: None,
                 };
             }
             Err(_) => {
@@ -284,67 +394,44 @@ impl PrimePollerService {
                     error_message: "upstream TTFB timeout".into(),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    status: None,
                 };
             }
         };
 
-        let status = resp.status();
+        let status_code = resp.status().as_u16();
         let passive_usage = extract_passive_usage(resp.headers());
 
-        if status.is_success() {
+        if resp.status().is_success() {
+            // 预热只需头部的 ratelimit 信息,不关心流式响应体;连接随 resp 离开作用域被释放。
             PrimeOutcome {
                 success: true,
                 error_message: String::new(),
                 duration_ms: started.elapsed().as_millis() as i64,
                 passive_usage,
+                status: Some(status_code),
             }
         } else {
-            // 非 2xx 视为失败,但仍把响应头的 usage 信息带回(429 时上游也会返回窗口状态)。
+            // 按字符(不是字节)截断,避免多字节 UTF-8 切片 panic 把整个后台任务打掉。
             let snippet = match resp.text().await {
-                Ok(t) if !t.is_empty() => {
-                    let max = 200.min(t.len());
-                    t[..max].to_string()
-                }
+                Ok(t) if !t.is_empty() => truncate_chars(&t, ERROR_SNIPPET_CHARS),
                 _ => String::new(),
             };
             PrimeOutcome {
                 success: false,
-                error_message: format!("http {}: {}", status.as_u16(), snippet),
+                error_message: format!("http {}: {}", status_code, snippet),
                 duration_ms: started.elapsed().as_millis() as i64,
                 passive_usage,
+                status: Some(status_code),
             }
         }
     }
 }
 
-/// 构造 Claude Code 测试请求体,形状对齐 sub2api 的 `createTestPayload`:
-/// `/root/project/sub2api/backend/internal/service/account_test_service.go:126`。
-///
-/// 关键差异:
-/// - `stream: false`:预热是内部轮询,非流式读取更简单;如后续被风控再切回 true。
-/// - `max_tokens: 512`:足以触发计费并拿到响应头,远小于 sub2api 测试的 1024。
-fn build_prime_body(model: &str) -> serde_json::Value {
-    let user_id = uuid::Uuid::new_v4().to_string();
-    serde_json::json!({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": "hi",
-                "cache_control": {"type": "ephemeral"}
-            }]
-        }],
-        "system": [{
-            "type": "text",
-            "text": CLAUDE_CODE_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"}
-        }],
-        "metadata": {
-            "user_id": user_id
-        },
-        "max_tokens": 512,
-        "temperature": 1,
-        "stream": false
-    })
+/// 按字符截断字符串,避免直接字节切片在多字节字符上 panic。
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().take(max_chars).collect()
 }
