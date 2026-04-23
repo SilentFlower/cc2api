@@ -5,6 +5,10 @@ services:
       - "${SERVER_PORT:-5674}:5674"
     env_file:
       - ../.env
+    environment:
+      # 让容器走东 8 区,使峰值预热调度器(chrono::Local)的 HH:10 触发点对齐北京时间。
+      # 镜像里已自带 /usr/share/zoneinfo/Asia/Shanghai,无需额外挂载。
+      TZ: Asia/Shanghai
     volumes:
       - claude-code-gateway-data:/app/data
     restart: unless-stopped
