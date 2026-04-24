@@ -410,6 +410,29 @@ impl PrimePollerService {
         let status_code = resp.status().as_u16();
         let passive_usage = extract_passive_usage(resp.headers());
 
+        // 调试日志：打印预热响应中的 rate limit header 和解析结果，
+        // 用于排查"预热成功但账号未进入 5h 窗口"问题。
+        {
+            let get_hdr = |n: &str| -> Option<String> {
+                resp.headers().get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+            };
+            let h5u = get_hdr("anthropic-ratelimit-unified-5h-utilization");
+            let h5r = get_hdr("anthropic-ratelimit-unified-5h-reset");
+            let h7u = get_hdr("anthropic-ratelimit-unified-7d-utilization");
+            let h7r = get_hdr("anthropic-ratelimit-unified-7d-reset");
+            info!(
+                "prime: account={} http={} passive_captured={} \
+                 5h_util={:?} 5h_reset={:?} 7d_util={:?} 7d_reset={:?}",
+                account.id,
+                status_code,
+                passive_usage.is_some(),
+                h5u,
+                h5r,
+                h7u,
+                h7r,
+            );
+        }
+
         if resp.status().is_success() {
             // rewriter 强制 stream=true,若此刻立即 drop 会在首包就中断 SSE,
             // 上游是否计入 5h 窗口、计入几个 token 不可靠,duration 也退化成 TTFB。
