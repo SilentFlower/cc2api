@@ -24,8 +24,9 @@ const OAUTH_WAIT_ATTEMPTS: usize = 20;
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
-/// 撞墙之外的纯速率限制的短冷却时间。
-const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+/// 撞墙之外的纯速率限制的短冷却时间。瞬时 429(每分钟级突发限流)很快即过,
+/// 没必要把账号晾整分钟;若上游给了 retry-after 则走更精确的分支,不受此值影响。
+const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(15);
 /// retry-after 冷却时长上限（秒）,防御上游给出异常大的值把账号长期下线。
 const MAX_RETRY_AFTER_SECS: i64 = 5 * 60 * 60;
 
@@ -663,11 +664,9 @@ impl AccountService {
         account: &Account,
         retry_after_secs: Option<i64>,
         body: &str,
+        usage: Option<serde_json::Value>,
     ) -> Result<(), AppError> {
-        match self
-            .determine_rate_limit_window(account, retry_after_secs, body)
-            .await
-        {
+        match self.determine_rate_limit_window(account, retry_after_secs, body, usage) {
             Some((reason, reset_at)) => {
                 warn!(
                     "account {} rate limited ({}) until {}",
@@ -700,11 +699,15 @@ impl AccountService {
     ///
     /// 返回 `Some((原因, 解除时间))` 表示隔离账号;返回 `None` 表示这是单请求级拒绝
     /// (计费/权限类),不隔离账号。
-    async fn determine_rate_limit_window(
+    ///
+    /// 撞墙判断**完全不主动查 usage 接口**,改用被动用量:`usage` 入参为这条 429
+    /// 响应自带的 ratelimit 头(最新),取不到再退回账号已存的 `usage_data`。
+    fn determine_rate_limit_window(
         &self,
         account: &Account,
         retry_after_secs: Option<i64>,
         body: &str,
+        usage: Option<serde_json::Value>,
     ) -> Option<(&'static str, chrono::DateTime<Utc>)> {
         let now = Utc::now();
 
@@ -734,24 +737,11 @@ impl AccountService {
             )
         };
 
-        // 3) 非 OAuth 无法查 usage 接口 → 仅短冷却(不再保守 5h)。
-        if account.auth_type != AccountAuthType::Oauth {
-            return Some(short());
-        }
-
-        // 4) OAuth:查 usage 判断是否撞墙。
-        let usage = match self.refresh_usage(account.id).await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!(
-                    "failed to fetch usage for rate-limited oauth account {}: {}",
-                    account.id, e
-                );
-                // 查不到也只短冷却,避免风暴时 usage 接口被打 429 反而把账号锁 5h。
-                return Some(short());
-            }
-        };
-
+        // 3) 撞墙判断:完全不主动查 usage 接口,改用被动用量数据。
+        //    优先用这条 429 响应自带的 ratelimit 头(usage 入参,最新),
+        //    取不到再退回账号已存的 usage_data;两者都无有效窗口 → 短冷却。
+        //    用 429 自带头还能在风暴中正确识别真撞墙(此时 usage_data 因无 200 响应而不更新)。
+        let usage = usage.unwrap_or_else(|| account.usage_data.clone());
         match classify_rate_limit(&usage, USAGE_HIT_THRESHOLD) {
             Some(RateLimitWindow::SevenDay(reset_at)) => Some(("周限额已满", reset_at)),
             Some(RateLimitWindow::FiveHour(reset_at)) => Some(("5 小时限额已满", reset_at)),

@@ -341,9 +341,12 @@ function formatTimeLeft(resetsAt: string): string {
   const days = Math.floor(diff / 86400000);
   const hours = Math.floor((diff % 86400000) / 3600000);
   const minutes = Math.floor((diff % 3600000) / 60000);
+  const seconds = Math.floor((diff % 60000) / 1000);
   if (days > 0) return `${days}d${hours}h${minutes}m`;
   if (hours > 0) return `${hours}h${minutes}m`;
-  return `${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  // 不足 1 分钟时显示秒,避免短冷却显示成 “0m” 让人误以为卡住
+  return `${seconds}s`;
 }
 
 /**
@@ -377,6 +380,10 @@ function isRateLimited(a: Account): boolean {
  */
 function statusStyle(a: Account): { class: string; label: string } {
   if (a.status === 'active' && isRateLimited(a)) {
+    // 短冷却(瞬时速率限制,秒级)与真正撞墙(5h/7d 限额)区分显示,避免误以为账号被长时间限流
+    if ((a.disable_reason || '').includes('短冷却')) {
+      return { class: 'bg-sky-50 text-sky-600 border-sky-200', label: '短冷却' };
+    }
     return { class: 'bg-amber-50 text-amber-700 border-amber-200', label: '限流中' };
   }
   if (a.status === 'active') return { class: 'bg-emerald-50 text-emerald-700 border-emerald-200', label: '活跃' };

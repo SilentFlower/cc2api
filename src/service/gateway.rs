@@ -362,6 +362,8 @@ impl GatewayService {
             // bytes() 会消费 resp,故先克隆需要的响应头
             let headers_429 = resp.headers().clone();
             let retry_after = parse_retry_after(&headers_429);
+            // 用这条 429 响应自带的 ratelimit 头做撞墙判断(被动,不再主动查 usage 接口)
+            let usage_from_headers = extract_passive_usage(&headers_429);
             let body_bytes = resp.bytes().await.unwrap_or_default();
             // 取 owned 字符串,避免后续把 body_bytes move 进 Body 时发生借用冲突。
             // 注:本客户端不自动解压(透传 content-encoding),此处按明文匹配关键字。
@@ -371,7 +373,7 @@ impl GatewayService {
 
             if let Err(e) = self
                 .account_svc
-                .handle_rate_limit(account, retry_after, &body_snippet)
+                .handle_rate_limit(account, retry_after, &body_snippet, usage_from_headers)
                 .await
             {
                 warn!(
