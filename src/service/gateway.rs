@@ -353,16 +353,44 @@ impl GatewayService {
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
 
-        // 处理限速：429 根据账号类型分别处理
-        // - SetupToken: 保守 5h 限流
-        // - OAuth: 查用量判断是撞墙（5h / 7d）还是纯 rate limit，分别设置限流时长
+        // 429：上游拒绝了这条请求。先缓冲（很小的）响应体,据此区分两类 429：
+        // - 「单请求级拒绝」（如长上下文需 usage credits、额度不足）：与账号容量无关,
+        //   绝不隔离账号,直接把 429 透传回客户端(否则一条坏请求会把整个号打成「限流中」)。
+        // - 「账号级限流」（撞 5h/7d 墙、真·速率限制）：交给 handle_rate_limit 决定隔离时长。
+        // 判定依据(响应体关键字 / retry-after 头)由 handle_rate_limit 内部处理。
         if status_code == 429 {
-            if let Err(e) = self.account_svc.handle_rate_limit(account).await {
+            // bytes() 会消费 resp,故先克隆需要的响应头
+            let headers_429 = resp.headers().clone();
+            let retry_after = parse_retry_after(&headers_429);
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            // 取 owned 字符串,避免后续把 body_bytes move 进 Body 时发生借用冲突。
+            // 注:本客户端不自动解压(透传 content-encoding),此处按明文匹配关键字。
+            // Anthropic 错误体很小、基本不压缩,匹配可靠;万一被压缩导致匹配落空,
+            // 只会退回「短冷却」而非「不隔离」——属安全降级,不会比旧行为更糟。
+            let body_snippet = String::from_utf8_lossy(&body_bytes).into_owned();
+
+            if let Err(e) = self
+                .account_svc
+                .handle_rate_limit(account, retry_after, &body_snippet)
+                .await
+            {
                 warn!(
                     "failed to handle rate limit for account {}: {}",
                     account.id, e
                 );
             }
+
+            // 用缓冲的 body 重建 429 响应（无需流式）,过滤掉网关指纹响应头后返回。
+            let mut rb = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
+            for (k, v) in headers_429.iter() {
+                if is_gateway_fingerprint_header(k.as_str()) {
+                    continue;
+                }
+                rb = rb.header(k.clone(), v.clone());
+            }
+            return rb
+                .body(Body::from(body_bytes))
+                .map_err(|e| AppError::Internal(format!("build 429 response: {}", e)));
         }
 
         // 处理认证失败：403 永久停用（但如果账号已处于 429 限流中则跳过，避免误判）
@@ -505,6 +533,16 @@ const GATEWAY_HEADER_PREFIXES: &[&str] = &[
 fn is_gateway_fingerprint_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     GATEWAY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// 解析 429 响应的 `retry-after` 头（秒）。仅接受正整数秒;HTTP-date 形式忽略。
+/// 上游给了明确退避时间时,据此精确冷却,优于自行猜测。
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
 }
 
 fn truncate_body(b: &[u8], max: usize) -> String {

@@ -269,7 +269,9 @@ impl PrimePollerService {
     /// - 403 且未处于 429 冷却期 → `disable_account` 永久停用,防止真实流量继续选中。
     async fn apply_status_side_effects(&self, account: &Account, status: u16) {
         if status == 429 {
-            if let Err(e) = self.account_svc.handle_rate_limit(account).await {
+            // 预热请求体极小,不会触发长上下文计费类 429;此处无 retry-after/响应体,
+            // 走 usage 判断撞墙 + 短冷却的常规逻辑即可。
+            if let Err(e) = self.account_svc.handle_rate_limit(account, None, "").await {
                 warn!(
                     "prime poller: handle_rate_limit failed for account {}: {}",
                     account.id, e
