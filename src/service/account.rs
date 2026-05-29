@@ -26,8 +26,8 @@ const OAUTH_WAIT_ATTEMPTS: usize = 20;
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
 /// 撞墙之外的纯速率限制的短冷却时间。
 const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
-/// 无法确定限流原因时的保守限流时长（与历史行为一致）。
-const FALLBACK_QUARANTINE: Duration = Duration::from_secs(5 * 60 * 60);
+/// retry-after 冷却时长上限（秒）,防御上游给出异常大的值把账号长期下线。
+const MAX_RETRY_AFTER_SECS: i64 = 5 * 60 * 60;
 
 /// 单个窗口的用量详情，用于前端展示计算过程。
 pub struct WindowDetail {
@@ -648,50 +648,98 @@ impl AccountService {
         self.store.enable_account(id).await
     }
 
-    /// 处理上游返回 429 的情况：根据账号类型和用量数据决定限流时长和原因。
+    /// 处理上游返回 429 的情况。
     ///
-    /// - **SetupToken**：无法查询用量接口，保守限流 5h（与历史行为一致）。
-    /// - **OAuth**：立即拉取 `/api/oauth/usage` 判断是否撞墙：
-    ///   - 命中 7 天墙 → 限流到周重置时间
-    ///   - 命中 5 小时墙 → 限流到 5h 重置时间
-    ///   - 都没撞墙 → 纯速率限制，短冷却 1 分钟
-    ///   - usage 接口调用失败 → 回退到 5h 保守限流
+    /// 先区分这条 429 是「单请求级拒绝」还是「账号级限流」:
+    /// - **计费/权限类**（响应体含 long context / credit,如 Sonnet 1M 上下文但账号未开
+    ///   按量付费）：属这条请求自身的问题,**不隔离账号**,直接放行(由上层把 429 透传回客户端)。
+    /// - **有 `retry-after`**：按上游指定时长冷却(封顶 [`MAX_RETRY_AFTER_SECS`]),最稳。
+    /// - **OAuth 撞墙（5h/7d）**：隔离到对应窗口重置时间。
+    /// - **其余**（未撞墙 / 无法查 usage / SetupToken）：仅短冷却,避免一次抖动长时间下线账号。
     ///
-    /// Sonnet 7 天墙暂不纳入判断（上游可能只对 Sonnet 请求返回 429，不影响其他模型）。
-    pub async fn handle_rate_limit(&self, account: &Account) -> Result<(), AppError> {
-        let (reason, reset_at) = self.determine_rate_limit_window(account).await;
-        warn!(
-            "account {} rate limited ({}) until {}",
-            account.id,
-            reason,
-            reset_at.to_rfc3339()
-        );
-        self.store
-            .disable_account(
-                account.id,
-                crate::model::account::AccountStatus::Active,
-                reason,
-                Some(reset_at),
-            )
+    /// Sonnet 7 天墙暂不纳入判断（上游可能只对 Sonnet 请求返回 429,不影响其他模型）。
+    pub async fn handle_rate_limit(
+        &self,
+        account: &Account,
+        retry_after_secs: Option<i64>,
+        body: &str,
+    ) -> Result<(), AppError> {
+        match self
+            .determine_rate_limit_window(account, retry_after_secs, body)
             .await
+        {
+            Some((reason, reset_at)) => {
+                warn!(
+                    "account {} rate limited ({}) until {}",
+                    account.id,
+                    reason,
+                    reset_at.to_rfc3339()
+                );
+                self.store
+                    .disable_account(
+                        account.id,
+                        crate::model::account::AccountStatus::Active,
+                        reason,
+                        Some(reset_at),
+                    )
+                    .await
+            }
+            None => {
+                // 单请求级拒绝(如长上下文需 credits):不是账号限流,不隔离账号。
+                warn!(
+                    "account {} got non-capacity 429, passing through without quarantine: {}",
+                    account.id,
+                    body.chars().take(160).collect::<String>()
+                );
+                Ok(())
+            }
+        }
     }
 
+    /// 判断这条 429 该如何限流。
+    ///
+    /// 返回 `Some((原因, 解除时间))` 表示隔离账号;返回 `None` 表示这是单请求级拒绝
+    /// (计费/权限类),不隔离账号。
     async fn determine_rate_limit_window(
         &self,
         account: &Account,
-    ) -> (&'static str, chrono::DateTime<Utc>) {
+        retry_after_secs: Option<i64>,
+        body: &str,
+    ) -> Option<(&'static str, chrono::DateTime<Utc>)> {
         let now = Utc::now();
-        let fallback = || {
+
+        // 1) 上游明确给了 retry-after → 这是最权威的退避信号,优先按它精确冷却
+        //    (封顶防御异常值)。真·速率限制通常带此头;计费/长上下文类拒绝通常不带,
+        //    会落到下面第 2 步。先判它,避免真限流文案里偶含 "credit" 被误当成不隔离。
+        if let Some(secs) = retry_after_secs {
+            let capped = secs.min(MAX_RETRY_AFTER_SECS);
+            return Some((
+                "429 速率限制（retry-after）",
+                now + chrono::Duration::seconds(capped),
+            ));
+        }
+
+        // 2) 计费/权限类拒绝（无 retry-after）:长上下文需 usage credits、额度不足等。
+        //    这是「这条请求」的问题(如 Sonnet 1M 上下文 + 账号没开按量付费),
+        //    与账号容量无关,绝不隔离账号。
+        let body_lc = body.to_lowercase();
+        if body_lc.contains("long context") || body_lc.contains("credit") {
+            return None;
+        }
+
+        let short = || {
             (
-                "429 速率限制",
-                now + chrono::Duration::from_std(FALLBACK_QUARANTINE).unwrap(),
+                "速率限制（短冷却）",
+                now + chrono::Duration::from_std(PURE_RATE_LIMIT_COOLDOWN).unwrap(),
             )
         };
 
+        // 3) 非 OAuth 无法查 usage 接口 → 仅短冷却(不再保守 5h)。
         if account.auth_type != AccountAuthType::Oauth {
-            return fallback();
+            return Some(short());
         }
 
+        // 4) OAuth:查 usage 判断是否撞墙。
         let usage = match self.refresh_usage(account.id).await {
             Ok(u) => u,
             Err(e) => {
@@ -699,17 +747,15 @@ impl AccountService {
                     "failed to fetch usage for rate-limited oauth account {}: {}",
                     account.id, e
                 );
-                return fallback();
+                // 查不到也只短冷却,避免风暴时 usage 接口被打 429 反而把账号锁 5h。
+                return Some(short());
             }
         };
 
         match classify_rate_limit(&usage, USAGE_HIT_THRESHOLD) {
-            Some(RateLimitWindow::SevenDay(reset_at)) => ("周限额已满", reset_at),
-            Some(RateLimitWindow::FiveHour(reset_at)) => ("5 小时限额已满", reset_at),
-            None => (
-                "速率限制（未达用量墙）",
-                now + chrono::Duration::from_std(PURE_RATE_LIMIT_COOLDOWN).unwrap(),
-            ),
+            Some(RateLimitWindow::SevenDay(reset_at)) => Some(("周限额已满", reset_at)),
+            Some(RateLimitWindow::FiveHour(reset_at)) => Some(("5 小时限额已满", reset_at)),
+            None => Some(short()),
         }
     }
 
