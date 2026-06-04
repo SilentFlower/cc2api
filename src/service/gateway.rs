@@ -13,7 +13,7 @@ use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
-    clean_session_id_from_body, detect_client_type, ClientType, Rewriter,
+    clean_session_id_from_body, detect_client_type, ordered_anthropic_headers, ClientType, Rewriter,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
@@ -388,11 +388,10 @@ impl GatewayService {
             _ => client.post(&target_url),
         };
 
-        for (k, v) in headers {
+        for (k, v) in ordered_anthropic_headers(path, headers) {
             debug!("upstream header: {}: {}", k, v);
             req_builder = req_builder.header(k, v);
         }
-        req_builder = req_builder.header("Host", "api.anthropic.com");
         req_builder = req_builder.body(body.to_vec());
 
         let resp = tokio::time::timeout(UPSTREAM_TTFB_TIMEOUT, req_builder.send())

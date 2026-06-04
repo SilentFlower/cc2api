@@ -143,6 +143,187 @@ fn requires_anthropic_beta(path: &str) -> bool {
     !path.starts_with("/mcp-registry/") && path != "/"
 }
 
+/// 判断该 endpoint 是否应该主动发送 JSON content-type。
+///
+/// 2.1.156 抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
+/// “值正确但 header 集合不像真实客户端”的 wire 指纹偏差。
+fn requires_json_content_type(path: &str) -> bool {
+    !(path == "/"
+        || path.starts_with("/mcp-registry/")
+        || path.starts_with("/api/oauth/")
+        || path.starts_with("/api/claude_code_grove")
+        || path.starts_with("/api/claude_code_penguin_mode"))
+}
+
+/// 按 Claude Code 2.1.156 抓包中的 endpoint wire 顺序组织上游 header。
+///
+/// reqwest/hyper 是否保留大小写仍取决于底层 HTTP 实现；这里至少保证应用层
+/// profile 的集合和插入顺序稳定，避免继续依赖 HashMap 的随机遍历顺序。
+pub fn ordered_anthropic_headers(
+    path: &str,
+    headers: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut ordered = Vec::new();
+    let mut used = std::collections::HashSet::<String>::new();
+
+    for name in wire_header_order(path) {
+        let lower = name.to_ascii_lowercase();
+        if lower == "host" {
+            ordered.push(((*name).to_string(), "api.anthropic.com".to_string()));
+            used.insert(lower);
+            continue;
+        }
+        if lower == "connection" {
+            let value = find_header_value(headers, name)
+                .cloned()
+                .unwrap_or_else(|| "keep-alive".to_string());
+            ordered.push(((*name).to_string(), value));
+            used.insert(lower);
+            continue;
+        }
+        if let Some(value) = find_header_value(headers, name) {
+            ordered.push(((*name).to_string(), value.clone()));
+            used.insert(lower);
+        }
+    }
+
+    let mut rest = headers
+        .iter()
+        .filter(|(k, _)| !used.contains(k.to_ascii_lowercase().as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    rest.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    ordered.extend(rest);
+    ordered
+}
+
+fn find_header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+fn wire_header_order(path: &str) -> &'static [&'static str] {
+    if path.starts_with("/v1/messages") {
+        &[
+            "Accept",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "X-Claude-Code-Session-Id",
+            "X-Stainless-Arch",
+            "X-Stainless-Lang",
+            "X-Stainless-OS",
+            "X-Stainless-Package-Version",
+            "X-Stainless-Retry-Count",
+            "X-Stainless-Runtime",
+            "X-Stainless-Runtime-Version",
+            "X-Stainless-Timeout",
+            "anthropic-beta",
+            "anthropic-dangerous-direct-browser-access",
+            "anthropic-version",
+            "x-app",
+            "x-client-request-id",
+            "Connection",
+            "Host",
+            "Accept-Encoding",
+        ]
+    } else if path.starts_with("/api/eval/") {
+        &[
+            "Authorization",
+            "Content-Type",
+            "anthropic-beta",
+            "Connection",
+            "User-Agent",
+            "Accept",
+            "Host",
+            "Accept-Encoding",
+        ]
+    } else if path.starts_with("/api/event_logging/") {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "anthropic-beta",
+            "x-service-name",
+            "Connection",
+            "Host",
+        ]
+    } else if path.starts_with("/api/claude_cli/bootstrap") {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "anthropic-beta",
+            "Connection",
+            "Host",
+        ]
+    } else if path.starts_with("/mcp-registry/") {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "User-Agent",
+            "Connection",
+            "Host",
+        ]
+    } else if path.starts_with("/api/oauth/")
+        || path.starts_with("/api/claude_code_grove")
+        || path.starts_with("/api/claude_code_penguin_mode")
+    {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "User-Agent",
+            "anthropic-beta",
+            "Connection",
+            "Host",
+        ]
+    } else if path.starts_with("/v1/code/triggers") {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "anthropic-beta",
+            "anthropic-client-platform",
+            "anthropic-version",
+            "x-organization-uuid",
+            "Connection",
+            "Host",
+        ]
+    } else if path.starts_with("/v1/mcp_servers") {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "anthropic-beta",
+            "anthropic-version",
+            "Connection",
+            "Host",
+        ]
+    } else {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "anthropic-beta",
+            "Connection",
+            "Host",
+        ]
+    }
+}
+
 /// 处理所有请求的反检测改写。
 pub struct Rewriter;
 
@@ -178,7 +359,9 @@ impl Rewriter {
                     beta_header_for_path(path, model_id).into(),
                 );
             }
-            out.insert("content-type".into(), "application/json".into());
+            if requires_json_content_type(path) {
+                out.insert("content-type".into(), "application/json".into());
+            }
             if path.starts_with("/api/eval/") {
                 out.insert("Accept".into(), "*/*".into());
                 out.insert("User-Agent".into(), growthbook_user_agent().into());
@@ -1289,7 +1472,7 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 mod tests {
     use super::{
         cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
-        matches_1m_whitelist, strip_beta_token, ClientType, Rewriter,
+        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token, ClientType, Rewriter,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1529,6 +1712,180 @@ mod tests {
             "oauth-2025-04-20"
         );
         assert_eq!(penguin_headers.get("User-Agent").unwrap(), "axios/1.15.2");
+    }
+
+    #[test]
+    fn endpoint_wire_order_matches_2156_capture() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let empty = std::collections::HashMap::new();
+        let body = json!({"metadata": {"_session_id": "session-1"}});
+
+        let mut message_headers = rewriter.rewrite_headers(
+            &empty,
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-opus-4-8",
+            &body,
+        );
+        message_headers.insert("Authorization".into(), "Bearer redacted".into());
+        assert_eq!(
+            ordered_header_names("/v1/messages", &message_headers),
+            vec![
+                "Accept",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "X-Claude-Code-Session-Id",
+                "X-Stainless-Arch",
+                "X-Stainless-Lang",
+                "X-Stainless-OS",
+                "X-Stainless-Package-Version",
+                "X-Stainless-Retry-Count",
+                "X-Stainless-Runtime",
+                "X-Stainless-Runtime-Version",
+                "X-Stainless-Timeout",
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+                "anthropic-version",
+                "x-app",
+                "x-client-request-id",
+                "Connection",
+                "Host",
+                "Accept-Encoding",
+            ]
+        );
+
+        let mut event_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::API,
+            "",
+            &json!({}),
+        );
+        event_headers.insert("Authorization".into(), "Bearer redacted".into());
+        assert_eq!(
+            ordered_header_names("/api/event_logging/v2/batch", &event_headers),
+            vec![
+                "Accept",
+                "Accept-Encoding",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "anthropic-beta",
+                "x-service-name",
+                "Connection",
+                "Host",
+            ]
+        );
+
+        let mut eval_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/eval/sdk-zAZezfDKGoZuXXKe",
+            &account,
+            ClientType::API,
+            "",
+            &json!({}),
+        );
+        eval_headers.insert("Authorization".into(), "Bearer redacted".into());
+        assert_eq!(
+            ordered_header_names("/api/eval/sdk-zAZezfDKGoZuXXKe", &eval_headers),
+            vec![
+                "Authorization",
+                "Content-Type",
+                "anthropic-beta",
+                "Connection",
+                "User-Agent",
+                "Accept",
+                "Host",
+                "Accept-Encoding",
+            ]
+        );
+
+        let mut trigger_headers = rewriter.rewrite_headers(
+            &empty,
+            "/v1/code/triggers",
+            &account,
+            ClientType::API,
+            "",
+            &json!({}),
+        );
+        trigger_headers.insert("Authorization".into(), "Bearer redacted".into());
+        assert_eq!(
+            ordered_header_names("/v1/code/triggers", &trigger_headers),
+            vec![
+                "Accept",
+                "Accept-Encoding",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "anthropic-beta",
+                "anthropic-client-platform",
+                "anthropic-version",
+                "x-organization-uuid",
+                "Connection",
+                "Host",
+            ]
+        );
+
+        let mut mcp_headers = rewriter.rewrite_headers(
+            &empty,
+            "/v1/mcp_servers",
+            &account,
+            ClientType::API,
+            "",
+            &json!({}),
+        );
+        mcp_headers.insert("Authorization".into(), "Bearer redacted".into());
+        assert_eq!(
+            ordered_header_names("/v1/mcp_servers", &mcp_headers),
+            vec![
+                "Accept",
+                "Accept-Encoding",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "anthropic-beta",
+                "anthropic-version",
+                "Connection",
+                "Host",
+            ]
+        );
+    }
+
+    #[test]
+    fn get_profile_omits_content_type_when_capture_has_none() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let empty = std::collections::HashMap::new();
+        let body = json!({});
+
+        for path in [
+            "/api/oauth/account/settings",
+            "/api/claude_code_grove",
+            "/api/claude_code_penguin_mode",
+            "/mcp-registry/v0/servers",
+        ] {
+            let headers =
+                rewriter.rewrite_headers(&empty, path, &account, ClientType::API, "", &body);
+            assert!(
+                !headers.contains_key("content-type"),
+                "{} should not include content-type",
+                path
+            );
+        }
+    }
+
+    fn ordered_header_names(
+        path: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Vec<String> {
+        ordered_anthropic_headers(path, headers)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 
     #[test]

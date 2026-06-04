@@ -14,6 +14,7 @@ use crate::model::identity::{
     RunProfile,
 };
 use crate::service::account::AccountService;
+use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
     claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
     EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN,
@@ -396,17 +397,14 @@ async fn send_telemetry(
     user_agent: &str,
     service_header: bool,
 ) {
-    let mut req = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("User-Agent", user_agent)
-        .header("anthropic-beta", OAUTH_BETA_TOKEN)
-        .header("Authorization", format!("Bearer {}", token))
-        .json(body);
+    let path = telemetry_path_from_url(url);
+    let headers = telemetry_request_headers(path, token, user_agent, service_header);
 
-    if service_header {
-        req = req.header("x-service-name", "claude-code");
+    let mut req = client.post(url);
+    for (name, value) in ordered_anthropic_headers(path, &headers) {
+        req = req.header(name, value);
     }
+    let req = req.json(body);
 
     let result = req.send().await;
 
@@ -424,6 +422,46 @@ async fn send_telemetry(
             warn!("telemetry: {} failed: {}", url, e);
         }
     }
+}
+
+fn telemetry_path_from_url(url: &str) -> &str {
+    url.strip_prefix(UPSTREAM_BASE).unwrap_or(url)
+}
+
+fn telemetry_request_headers(
+    path: &str,
+    token: &str,
+    user_agent: &str,
+    service_header: bool,
+) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    headers.insert("User-Agent".to_string(), user_agent.to_string());
+    headers.insert("anthropic-beta".to_string(), OAUTH_BETA_TOKEN.to_string());
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    if path.starts_with("/api/eval/") {
+        headers.insert("Accept".to_string(), "*/*".to_string());
+        headers.insert(
+            "accept-encoding".to_string(),
+            "gzip, deflate, br, zstd".to_string(),
+        );
+    } else if is_event_logging_path(path) {
+        headers.insert(
+            "Accept".to_string(),
+            "application/json, text/plain, */*".to_string(),
+        );
+        headers.insert(
+            "accept-encoding".to_string(),
+            "gzip, compress, deflate, br".to_string(),
+        );
+    }
+
+    if service_header {
+        headers.insert("x-service-name".to_string(), "claude-code".to_string());
+    }
+
+    headers
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +983,7 @@ mod tests {
         CanonicalProcessData, CanonicalPromptEnvData,
     };
     use crate::model::identity::run_profile;
+    use crate::service::rewriter::ordered_anthropic_headers;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE,
@@ -1012,6 +1051,63 @@ mod tests {
         assert!(is_telemetry_path("/api/event_logging/v2/batch"));
         assert!(is_telemetry_path("/api/event_logging/batch"));
         assert!(is_telemetry_path("/api/eval/sdk-zAZezfDKGoZuXXKe"));
+    }
+
+    #[test]
+    fn telemetry_headers_match_2156_wire_profile() {
+        let event_headers = super::telemetry_request_headers(
+            "/api/event_logging/v2/batch",
+            "redacted",
+            "claude-code/2.1.156",
+            true,
+        );
+        assert_eq!(
+            event_headers.get("Accept").unwrap(),
+            "application/json, text/plain, */*"
+        );
+        assert_eq!(
+            event_headers.get("accept-encoding").unwrap(),
+            "gzip, compress, deflate, br"
+        );
+        assert_eq!(
+            ordered_header_names("/api/event_logging/v2/batch", &event_headers),
+            vec![
+                "Accept",
+                "Accept-Encoding",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "anthropic-beta",
+                "x-service-name",
+                "Connection",
+                "Host",
+            ]
+        );
+
+        let eval_headers = super::telemetry_request_headers(
+            "/api/eval/sdk-zAZezfDKGoZuXXKe",
+            "redacted",
+            "Bun/1.3.14",
+            false,
+        );
+        assert_eq!(eval_headers.get("Accept").unwrap(), "*/*");
+        assert_eq!(
+            eval_headers.get("accept-encoding").unwrap(),
+            "gzip, deflate, br, zstd"
+        );
+        assert_eq!(
+            ordered_header_names("/api/eval/sdk-zAZezfDKGoZuXXKe", &eval_headers),
+            vec![
+                "Authorization",
+                "Content-Type",
+                "anthropic-beta",
+                "Connection",
+                "User-Agent",
+                "Accept",
+                "Host",
+                "Accept-Encoding",
+            ]
+        );
     }
 
     #[test]
@@ -1175,5 +1271,15 @@ mod tests {
         assert_eq!(resource["os.type"], "Linux");
         assert_eq!(resource["host.arch"], "x64");
         assert_eq!(resource["user.subscription_type"], "max");
+    }
+
+    fn ordered_header_names(
+        path: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Vec<String> {
+        ordered_anthropic_headers(path, headers)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 }
