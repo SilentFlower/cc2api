@@ -1,7 +1,8 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{response::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -30,6 +31,8 @@ const UPSTREAM_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Anthropic SSE 每几秒至少有一个 ping event，120s 无数据视为连接卡死。
 /// 该超时不限制流总时长，健康长流（Opus 扩展思考等）可持续任意时间。
 const UPSTREAM_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// signature 错误体只用于识别上游错误类型，限制读取大小避免异常响应占用内存。
+const SIGNATURE_ERROR_BODY_LIMIT: usize = 1024 * 1024;
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -323,27 +326,7 @@ impl GatewayService {
                 )
                 .await
             {
-                Ok(r) => {
-                    if let Some(context) = telemetry_context.clone() {
-                        self.telemetry_svc
-                            .record_message_result(
-                                &account,
-                                context,
-                                MessageTelemetryResult {
-                                    status_code: Some(r.status().as_u16()),
-                                    duration_ms: t_upstream.elapsed().as_millis() as u64,
-                                    error_kind: None,
-                                },
-                            )
-                            .await;
-                    }
-                    info!(
-                        "[耗时] 上游响应: {:.0}ms (HTTP {})",
-                        t_upstream.elapsed().as_millis(),
-                        r.status().as_u16()
-                    );
-                    r
-                }
+                Ok(r) => r,
                 Err(e) => {
                     if let Some(context) = telemetry_context.clone() {
                         self.telemetry_svc
@@ -363,6 +346,38 @@ impl GatewayService {
                     return Err(e);
                 }
             };
+            let (resp, signature_retry_stage) = self
+                .maybe_retry_signature_error(
+                    &method.to_string(),
+                    &path,
+                    &query,
+                    &final_headers,
+                    &final_body,
+                    &account,
+                    resp,
+                )
+                .await?;
+
+            if let Some(context) = telemetry_context.clone() {
+                self.telemetry_svc
+                    .record_message_result(
+                        &account,
+                        context,
+                        MessageTelemetryResult {
+                            status_code: Some(resp.status().as_u16()),
+                            duration_ms: t_upstream.elapsed().as_millis() as u64,
+                            error_kind: signature_retry_stage.map(|stage| {
+                                format!("signature_retry_{}", stage.telemetry_suffix())
+                            }),
+                        },
+                    )
+                    .await;
+            }
+            info!(
+                "[耗时] 上游响应: {:.0}ms (HTTP {})",
+                t_upstream.elapsed().as_millis(),
+                resp.status().as_u16()
+            );
 
             // 非 429：将响应体包装为 SlotGuardBody，流结束时归还槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
@@ -387,6 +402,97 @@ impl GatewayService {
             drop(slot_guard); // 显式 drop → permit drop → 归还槽位
             last_resp = Some(resp);
         }
+    }
+
+    /// 对 `/v1/messages` 的 signature 相关 400 执行两阶段降级重试。
+    ///
+    /// @param method 原始 HTTP 方法。
+    /// @param path 原始请求路径。
+    /// @param query 原始查询字符串。
+    /// @param headers 已改写并携带 upstream token 的请求头。
+    /// @param body 已改写后的原始上游请求体。
+    /// @param account 当前已选账号，重试必须复用该账号。
+    /// @param resp 首次上游响应。
+    /// @return 返回最终响应和最后执行的 signature retry 阶段。
+    async fn maybe_retry_signature_error(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+        account: &Account,
+        resp: Response,
+    ) -> Result<(Response, Option<SignatureRetryStage>), AppError> {
+        if path != "/v1/messages" || resp.status() != StatusCode::BAD_REQUEST {
+            return Ok((resp, None));
+        }
+
+        let (mut last_parts, mut last_body) = buffer_response_body(resp).await?;
+        if !is_signature_related_error_body(&last_body) {
+            return Ok((response_from_buffered(last_parts, last_body), None));
+        }
+
+        warn!(
+            "account {} returned signature-related 400, retrying with sanitized thinking history",
+            account.id
+        );
+
+        let mut last_stage = None;
+        let retry_headers = headers_without_content_length(headers);
+        for stage in SignatureRetryStage::ordered() {
+            let retry_body = signature_retry_body_for_stage(body, stage);
+            let Some(retry_body) = retry_body else {
+                continue;
+            };
+            let retry_body = self.rewriter.refresh_cch_attestation(retry_body, account);
+
+            last_stage = Some(stage);
+            warn!(
+                "account {} signature retry stage={} request_body={}",
+                account.id,
+                stage.as_str(),
+                safe_body_summary(&retry_body)
+            );
+
+            let retry_resp = match self
+                .forward_request(method, path, query, &retry_headers, &retry_body, account)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    warn!(
+                        "account {} signature retry stage={} failed: {}",
+                        account.id,
+                        stage.as_str(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if retry_resp.status() != StatusCode::BAD_REQUEST {
+                return Ok((retry_resp, last_stage));
+            }
+
+            let (retry_parts, retry_body_bytes) = buffer_response_body(retry_resp).await?;
+            if !is_signature_related_error_body(&retry_body_bytes) {
+                return Ok((
+                    response_from_buffered(retry_parts, retry_body_bytes),
+                    last_stage,
+                ));
+            }
+
+            warn!(
+                "account {} signature retry stage={} still returned signature-related 400",
+                account.id,
+                stage.as_str()
+            );
+            last_parts = retry_parts;
+            last_body = retry_body_bytes;
+        }
+
+        Ok((response_from_buffered(last_parts, last_body), last_stage))
     }
 
     async fn forward_request(
@@ -424,7 +530,7 @@ impl GatewayService {
         };
 
         for (k, v) in ordered_anthropic_headers(path, headers) {
-            debug!("upstream header: {}: {}", k, v);
+            debug!("upstream header: {}: {}", k, safe_header_log_value(&k, &v));
             req_builder = req_builder.header(k, v);
         }
         req_builder = req_builder.body(body.to_vec());
@@ -637,6 +743,276 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
 fn safe_body_summary(b: &[u8]) -> String {
     let digest = Sha256::digest(b);
     format!("{} bytes sha256:{}", b.len(), hex::encode(&digest[..8]))
+}
+
+fn safe_header_log_value(name: &str, value: &str) -> String {
+    if name.eq_ignore_ascii_case("authorization") {
+        return "***".into();
+    }
+    value.to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureRetryStage {
+    ThinkingOnly,
+    ThinkingAndTools,
+}
+
+impl SignatureRetryStage {
+    fn ordered() -> [Self; 2] {
+        [Self::ThinkingOnly, Self::ThinkingAndTools]
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ThinkingOnly => "thinking-only",
+            Self::ThinkingAndTools => "thinking+tools",
+        }
+    }
+
+    fn telemetry_suffix(self) -> &'static str {
+        match self {
+            Self::ThinkingOnly => "thinking_only",
+            Self::ThinkingAndTools => "thinking_tools",
+        }
+    }
+}
+
+async fn buffer_response_body(resp: Response) -> Result<(Parts, Bytes), AppError> {
+    let (parts, body) = resp.into_parts();
+    let body_bytes = axum::body::to_bytes(body, SIGNATURE_ERROR_BODY_LIMIT)
+        .await
+        .map_err(|e| AppError::Internal(format!("buffer upstream response: {}", e)))?;
+    Ok((parts, body_bytes))
+}
+
+fn response_from_buffered(parts: Parts, body: Bytes) -> Response {
+    Response::from_parts(parts, Body::from(body))
+}
+
+fn headers_without_content_length(
+    headers: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn is_signature_related_error_body(body: &[u8]) -> bool {
+    let mut text = String::new();
+    if let Some(message) = extract_upstream_error_message(body) {
+        text.push_str(&message);
+        text.push('\n');
+    }
+    text.push_str(&String::from_utf8_lossy(body));
+
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("thought_signature") || lower.contains("signature") {
+        return true;
+    }
+    lower.contains("expected")
+        && (lower.contains("thinking") || lower.contains("redacted_thinking"))
+}
+
+fn extract_upstream_error_message(body: &[u8]) -> Option<String> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    parsed
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            parsed
+                .get("message")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.trim().is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn strip_thinking_from_messages_request(body: &[u8]) -> Option<Vec<u8>> {
+    strip_messages_request(body, false)
+}
+
+fn strip_signature_sensitive_blocks_from_messages_request(body: &[u8]) -> Option<Vec<u8>> {
+    strip_messages_request(body, true)
+}
+
+fn signature_retry_body_for_stage(body: &[u8], stage: SignatureRetryStage) -> Option<Vec<u8>> {
+    match stage {
+        SignatureRetryStage::ThinkingOnly => strip_thinking_from_messages_request(body),
+        SignatureRetryStage::ThinkingAndTools => {
+            strip_signature_sensitive_blocks_from_messages_request(body)
+        }
+    }
+}
+
+fn strip_messages_request(body: &[u8], strip_tools: bool) -> Option<Vec<u8>> {
+    let mut parsed = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let mut changed = false;
+
+    if let Some(obj) = parsed.as_object_mut() {
+        if obj.remove("thinking").is_some() {
+            changed = true;
+        }
+    }
+
+    if let Some(messages) = parsed.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages.iter_mut() {
+            if sanitize_message_content(message, strip_tools) {
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+
+    serde_json::to_vec(&parsed).ok()
+}
+
+fn sanitize_message_content(message: &mut serde_json::Value, strip_tools: bool) -> bool {
+    let content = match message.get_mut("content") {
+        Some(content) => content,
+        None => return false,
+    };
+    let blocks = match content.as_array_mut() {
+        Some(blocks) => blocks,
+        None => return false,
+    };
+
+    let original = std::mem::take(blocks);
+    let mut sanitized = Vec::with_capacity(original.len());
+    let mut changed = false;
+
+    for block in original {
+        match sanitize_content_block(block, strip_tools) {
+            BlockSanitizeResult::Keep(block) => sanitized.push(block),
+            BlockSanitizeResult::Replace(block) => {
+                sanitized.push(block);
+                changed = true;
+            }
+            BlockSanitizeResult::Remove => {
+                changed = true;
+            }
+        }
+    }
+
+    if changed && sanitized.is_empty() {
+        sanitized.push(serde_json::json!({
+            "type": "text",
+            "text": "(content removed)"
+        }));
+    }
+
+    *blocks = sanitized;
+    changed
+}
+
+enum BlockSanitizeResult {
+    Keep(serde_json::Value),
+    Replace(serde_json::Value),
+    Remove,
+}
+
+fn sanitize_content_block(block: serde_json::Value, strip_tools: bool) -> BlockSanitizeResult {
+    let obj = match block {
+        serde_json::Value::Object(obj) => obj,
+        other => return BlockSanitizeResult::Keep(other),
+    };
+    let block_type = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    match block_type.as_str() {
+        "thinking" => {
+            let thinking = obj
+                .get("thinking")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+            if thinking.is_empty() {
+                BlockSanitizeResult::Remove
+            } else {
+                BlockSanitizeResult::Replace(text_block(thinking.to_string()))
+            }
+        }
+        "redacted_thinking" => BlockSanitizeResult::Remove,
+        "tool_use" if strip_tools => BlockSanitizeResult::Replace(tool_use_text_block(&obj)),
+        "tool_result" if strip_tools => {
+            BlockSanitizeResult::Replace(tool_result_text_block(&obj))
+        }
+        "" => {
+            if let Some(thinking) = obj.get("thinking").and_then(|t| t.as_str()) {
+                if thinking.is_empty() {
+                    BlockSanitizeResult::Remove
+                } else {
+                    BlockSanitizeResult::Replace(text_block(thinking.to_string()))
+                }
+            } else {
+                BlockSanitizeResult::Keep(serde_json::Value::Object(obj))
+            }
+        }
+        _ => BlockSanitizeResult::Keep(serde_json::Value::Object(obj)),
+    }
+}
+
+fn text_block(text: String) -> serde_json::Value {
+    serde_json::json!({
+        "type": "text",
+        "text": text
+    })
+}
+
+fn tool_use_text_block(obj: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let mut text = "(tool_use)".to_string();
+    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+        if !name.is_empty() {
+            text.push_str(" name=");
+            text.push_str(name);
+        }
+    }
+    if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            text.push_str(" id=");
+            text.push_str(id);
+        }
+    }
+    if let Some(input) = obj.get("input") {
+        if !input.is_null() {
+            text.push_str(" input=");
+            text.push_str(&serde_json::to_string(input).unwrap_or_else(|_| "null".into()));
+        }
+    }
+    text_block(text)
+}
+
+fn tool_result_text_block(obj: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let mut text = "(tool_result)".to_string();
+    if let Some(tool_use_id) = obj.get("tool_use_id").and_then(|v| v.as_str()) {
+        if !tool_use_id.is_empty() {
+            text.push_str(" tool_use_id=");
+            text.push_str(tool_use_id);
+        }
+    }
+    if obj
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        text.push_str(" is_error=true");
+    }
+    if let Some(content) = obj.get("content") {
+        if !content.is_null() {
+            text.push('\n');
+            text.push_str(&serde_json::to_string(content).unwrap_or_else(|_| "null".into()));
+        }
+    }
+    text_block(text)
 }
 
 fn has_system_role_message(body: &serde_json::Value) -> bool {
@@ -951,8 +1327,11 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         build_message_telemetry_context, extract_message_session_id, has_system_role_message,
-        is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
-        system_role_model_error_body,
+        is_signature_related_error_body, is_system_role_model_allowed,
+        parse_system_role_model_list, safe_body_summary,
+        signature_retry_body_for_stage, SignatureRetryStage,
+        strip_signature_sensitive_blocks_from_messages_request,
+        strip_thinking_from_messages_request, system_role_model_error_body,
     };
     use crate::service::rewriter::ClientType;
     use serde_json::json;
@@ -965,6 +1344,161 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn signature_error_detector_matches_anthropic_and_structural_errors() {
+        assert!(is_signature_related_error_body(
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#
+        ));
+        assert!(is_signature_related_error_body(
+            br#"{"error":{"message":"Corrupted thought_signature."}}"#
+        ));
+        assert!(is_signature_related_error_body(
+            br#"{"error":{"message":"Expected `thinking` or `redacted_thinking`, but found `text`"}}"#
+        ));
+        assert!(is_signature_related_error_body(
+            br#"{"error":{"message":"invalid request","status":"INVALID_ARGUMENT","details":[{"reason":"Corrupted thought_signature."}]}}"#
+        ));
+        assert!(!is_signature_related_error_body(
+            br#"{"error":{"message":"model is overloaded"}}"#
+        ));
+    }
+
+    #[test]
+    fn strip_thinking_retry_converts_thinking_and_keeps_tools() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "messages":[
+                {
+                    "role":"assistant",
+                    "content":[
+                        {"type":"thinking","thinking":"secret plan","signature":"bad"},
+                        {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}
+                    ]
+                },
+                {
+                    "role":"user",
+                    "content":[
+                        {"type":"redacted_thinking","data":"opaque"},
+                        {"type":"text","text":"ok"}
+                    ]
+                }
+            ]
+        }"#;
+
+        let stripped = strip_thinking_from_messages_request(body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+        assert!(value.get("thinking").is_none());
+        let assistant_blocks = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(assistant_blocks[0], json!({"type":"text","text":"secret plan"}));
+        assert_eq!(assistant_blocks[1]["type"], "tool_use");
+        let user_blocks = value["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(user_blocks, &vec![json!({"type":"text","text":"ok"})]);
+    }
+
+    #[test]
+    fn strip_signature_sensitive_retry_converts_tools_and_fills_empty_content() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "messages":[
+                {
+                    "role":"assistant",
+                    "content":[
+                        {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}},
+                        {"type":"redacted_thinking","data":"opaque"}
+                    ]
+                },
+                {
+                    "role":"user",
+                    "content":[
+                        {"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}
+                    ]
+                },
+                {
+                    "role":"assistant",
+                    "content":[
+                        {"type":"redacted_thinking","data":"only"}
+                    ]
+                }
+            ]
+        }"#;
+
+        let stripped = strip_signature_sensitive_blocks_from_messages_request(body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+        let assistant_blocks = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(assistant_blocks.len(), 1);
+        assert_eq!(assistant_blocks[0]["type"], "text");
+        assert!(assistant_blocks[0]["text"].as_str().unwrap().contains("(tool_use)"));
+        assert!(assistant_blocks[0]["text"].as_str().unwrap().contains("name=Bash"));
+
+        let user_blocks = value["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(user_blocks.len(), 1);
+        assert_eq!(user_blocks[0]["type"], "text");
+        assert!(user_blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(tool_result)"));
+
+        let empty_blocks = value["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(
+            empty_blocks,
+            &vec![json!({"type":"text","text":"(content removed)"})]
+        );
+    }
+
+    #[test]
+    fn signature_retry_stages_run_from_thinking_to_tools() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "messages":[{
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"secret plan","signature":"bad"},
+                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}
+                ]
+            }]
+        }"#;
+
+        let stages = SignatureRetryStage::ordered();
+        assert_eq!(
+            stages,
+            [
+                SignatureRetryStage::ThinkingOnly,
+                SignatureRetryStage::ThinkingAndTools
+            ]
+        );
+
+        let thinking_only: serde_json::Value =
+            serde_json::from_slice(&signature_retry_body_for_stage(body, stages[0]).unwrap())
+                .unwrap();
+        assert_eq!(
+            thinking_only["messages"][0]["content"][0],
+            json!({"type":"text","text":"secret plan"})
+        );
+        assert_eq!(
+            thinking_only["messages"][0]["content"][1]["type"],
+            "tool_use"
+        );
+
+        let thinking_and_tools: serde_json::Value =
+            serde_json::from_slice(&signature_retry_body_for_stage(body, stages[1]).unwrap())
+                .unwrap();
+        assert_eq!(
+            thinking_and_tools["messages"][0]["content"][0],
+            json!({"type":"text","text":"secret plan"})
+        );
+        assert_eq!(
+            thinking_and_tools["messages"][0]["content"][1]["type"],
+            "text"
+        );
+        assert!(thinking_and_tools["messages"][0]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(tool_use)"));
     }
 
     #[test]
