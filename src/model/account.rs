@@ -6,10 +6,7 @@ mod optional_timestamp_millis {
     use chrono::{DateTime, TimeZone, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(
-        value: &Option<DateTime<Utc>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(value: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -19,9 +16,7 @@ mod optional_timestamp_millis {
         }
     }
 
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<DateTime<Utc>>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -203,10 +198,16 @@ pub struct Account {
     pub updated_at: DateTime<Utc>,
 }
 
-fn default_concurrency() -> i32 { 3 }
-fn default_priority() -> i32 { 50 }
+fn default_concurrency() -> i32 {
+    3
+}
+fn default_priority() -> i32 {
+    50
+}
 /// 新账号的默认 1M 上下文模型白名单。保持与 sub2api 默认预设一致：仅放行 Opus 家族。
-fn default_allow_1m_models() -> String { "opus".to_string() }
+fn default_allow_1m_models() -> String {
+    "opus".to_string()
+}
 
 impl Account {
     pub fn is_schedulable(&self) -> bool {
@@ -264,6 +265,12 @@ pub struct CanonicalEnvData {
     pub build_time: String,
     pub deployment_environment: String,
     pub vcs: String,
+    #[serde(default)]
+    pub linux_distro_id: String,
+    #[serde(default)]
+    pub linux_distro_version: String,
+    #[serde(default)]
+    pub linux_kernel: String,
 }
 
 /// 系统提示词中的环境改写数据。

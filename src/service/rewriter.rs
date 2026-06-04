@@ -5,14 +5,15 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-use crate::model::account::{
-    Account, BillingMode, CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData,
+use crate::model::account::{Account, BillingMode, CanonicalEnvData, CanonicalPromptEnvData};
+use crate::model::identity::{
+    device_profile, process_snapshot, process_snapshot_json, request_profile, DeviceProfile,
 };
 use crate::service::version_profile::{
-    CODE_TRIGGERS_BETA_TOKEN, DEFAULT_CLAUDE_CODE_VERSION, MCP_SERVERS_BETA_TOKEN,
-    MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
     claude_cli_user_agent, claude_code_user_agent, growthbook_user_agent, is_event_logging_path,
-    normalize_version,
+    normalize_version, CODE_TRIGGERS_BETA_TOKEN, DEFAULT_CLAUDE_CODE_VERSION,
+    MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION,
+    STAINLESS_RUNTIME_VERSION,
 };
 
 /// header wire 大小写映射。
@@ -162,7 +163,8 @@ impl Rewriter {
         model_id: &str,
         body_map: &serde_json::Value,
     ) -> HashMap<String, String> {
-        let env = self.parse_env(account);
+        let profile = device_profile(account);
+        let env = &profile.env;
         let version = normalize_version(&env.version);
 
         let mut out = HashMap::new();
@@ -261,10 +263,9 @@ impl Rewriter {
                 out.insert("X-Stainless-Retry-Count".into(), "0".into());
                 out.insert("X-Stainless-Timeout".into(), "600".into());
 
-                let session_id =
-                    extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
-                out.insert("X-Claude-Code-Session-Id".into(), session_id);
-                out.insert("x-client-request-id".into(), generate_session_uuid());
+                let request = request_profile(account, extract_session_id_from_body(body_map));
+                out.insert("X-Claude-Code-Session-Id".into(), request.session_id);
+                out.insert("x-client-request-id".into(), request.client_request_id);
             }
         } else {
             // CC 客户端模式：白名单 + 改写
@@ -414,8 +415,8 @@ impl Rewriter {
 
         let mut output = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
 
-        let env = self.parse_env(account);
-        let version = normalize_version(&env.version);
+        let profile = device_profile(account);
+        let version = normalize_version(&profile.env.version);
         if path.starts_with("/v1/messages") && account.billing_mode == BillingMode::Rewrite {
             output = compute_cch_attestation(output, version);
         }
@@ -430,17 +431,21 @@ impl Rewriter {
         account: &Account,
         client_type: ClientType,
     ) {
-        let env = self.parse_env(account);
-        let prompt_env = self.parse_prompt_env(account);
+        let profile = device_profile(account);
 
         if client_type == ClientType::ClaudeCode {
             // 替换模式
-            self.rewrite_metadata_user_id(body, account);
-            self.rewrite_system_prompt(body, &prompt_env, &env.version, &account.billing_mode);
+            self.rewrite_metadata_user_id(body, &profile);
+            self.rewrite_system_prompt(
+                body,
+                &profile.prompt,
+                &profile.env.version,
+                &account.billing_mode,
+            );
             scrub_git_user_in_reminders(body, &account.name);
         } else {
             // 注入模式
-            let session_id = self.inject_metadata_user_id(body, account);
+            let session_id = self.inject_metadata_user_id(body, &profile, account);
             if let Some(sid) = &session_id {
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                     metadata.insert("_session_id".into(), serde_json::Value::String(sid.clone()));
@@ -481,7 +486,7 @@ impl Rewriter {
     }
 
     /// 替换已有 metadata.user_id 中的 device_id（CC 客户端模式）。
-    fn rewrite_metadata_user_id(&self, body: &mut serde_json::Value, account: &Account) {
+    fn rewrite_metadata_user_id(&self, body: &mut serde_json::Value, profile: &DeviceProfile) {
         let user_id_str = {
             let metadata = match body.get("metadata").and_then(|m| m.as_object()) {
                 Some(m) => m,
@@ -498,7 +503,7 @@ impl Rewriter {
             if let Some(obj) = uid.as_object_mut() {
                 obj.insert(
                     "device_id".into(),
-                    serde_json::Value::String(account.device_id.clone()),
+                    serde_json::Value::String(profile.device_id.clone()),
                 );
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
@@ -512,7 +517,7 @@ impl Rewriter {
         if let Some(idx) = user_id_str.find("_account_") {
             let new_val = format!(
                 "user_{}_account_{}",
-                account.device_id,
+                profile.device_id,
                 &user_id_str[idx + 9..]
             );
             if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
@@ -525,6 +530,7 @@ impl Rewriter {
     fn inject_metadata_user_id(
         &self,
         body: &mut serde_json::Value,
+        profile: &DeviceProfile,
         account: &Account,
     ) -> Option<String> {
         // 确保 metadata 存在
@@ -540,22 +546,21 @@ impl Rewriter {
             .and_then(|m| m.get("user_id"))
             .is_some()
         {
-            self.rewrite_metadata_user_id(body, account);
+            self.rewrite_metadata_user_id(body, profile);
             return None;
         }
 
-        let session_id = generate_session_uuid();
-        let account_uuid = account.account_uuid.clone().unwrap_or_default();
+        let request = request_profile(account, None);
         let uid = serde_json::json!({
-            "device_id": account.device_id,
-            "account_uuid": account_uuid,
-            "session_id": session_id,
+            "device_id": profile.device_id,
+            "account_uuid": profile.account_uuid,
+            "session_id": request.session_id,
         });
         let uid_str = serde_json::to_string(&uid).unwrap_or_default();
         if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
             metadata.insert("user_id".into(), serde_json::Value::String(uid_str));
         }
-        Some(session_id)
+        Some(request.session_id)
     }
 
     /// 将 Claude Code 系统提示词添加到请求体前面（仅 API 注入模式）。
@@ -728,15 +733,14 @@ impl Rewriter {
     // --- 事件日志批量改写 ---
 
     fn rewrite_event_batch(&self, body: &mut serde_json::Value, account: &Account) {
-        let env = self.parse_env(account);
-        let proc = self.parse_process(account);
+        let profile = device_profile(account);
 
         let events = match body.get_mut("events").and_then(|e| e.as_array_mut()) {
             Some(e) => e,
             None => return,
         };
 
-        let canonical_env = build_canonical_env_map(&env);
+        let canonical_env = build_canonical_env_map(&profile.env);
 
         for event in events.iter_mut() {
             let e = match event.as_object_mut() {
@@ -744,9 +748,9 @@ impl Rewriter {
                 None => continue,
             };
 
-            rewrite_event_fields(e, account, &env, &proc, &canonical_env);
+            rewrite_event_fields(e, &profile, &canonical_env);
             if let Some(event_data) = e.get_mut("event_data").and_then(|v| v.as_object_mut()) {
-                rewrite_event_fields(event_data, account, &env, &proc, &canonical_env);
+                rewrite_event_fields(event_data, &profile, &canonical_env);
             }
         }
     }
@@ -754,46 +758,30 @@ impl Rewriter {
     // --- GrowthBook remoteEval 改写 (POST /api/eval/{clientKey}) ---
 
     fn rewrite_growthbook_eval(&self, body: &mut serde_json::Value, account: &Account) {
-        let env = self.parse_env(account);
+        let profile = device_profile(account);
         let attrs = match body.get_mut("attributes").and_then(|a| a.as_object_mut()) {
             Some(a) => a,
             None => return,
         };
 
-        apply_growthbook_attributes(attrs, account, &env);
+        apply_growthbook_attributes(attrs, &profile);
     }
 
     // --- 通用身份改写 ---
 
     fn rewrite_generic_identity(&self, body: &mut serde_json::Value, account: &Account) {
         if let Some(obj) = body.as_object_mut() {
+            let profile = device_profile(account);
             if obj.contains_key("device_id") {
                 obj.insert(
                     "device_id".into(),
-                    serde_json::Value::String(account.device_id.clone()),
+                    serde_json::Value::String(profile.device_id),
                 );
             }
             if obj.contains_key("email") {
-                obj.insert(
-                    "email".into(),
-                    serde_json::Value::String(account.email.clone()),
-                );
+                obj.insert("email".into(), serde_json::Value::String(profile.email));
             }
         }
-    }
-
-    // --- 辅助解析 ---
-
-    fn parse_env(&self, account: &Account) -> CanonicalEnvData {
-        serde_json::from_value(account.canonical_env.clone()).unwrap_or_default()
-    }
-
-    fn parse_prompt_env(&self, account: &Account) -> CanonicalPromptEnvData {
-        serde_json::from_value(account.canonical_prompt.clone()).unwrap_or_default()
-    }
-
-    fn parse_process(&self, account: &Account) -> CanonicalProcessData {
-        serde_json::from_value(account.canonical_process.clone()).unwrap_or_default()
     }
 }
 
@@ -939,21 +927,19 @@ fn build_canonical_env_map(env: &CanonicalEnvData) -> serde_json::Value {
 /// 改写 event_logging 事件字段，兼容旧顶层结构和 2.1.156 的 event_data 结构。
 fn rewrite_event_fields(
     map: &mut serde_json::Map<String, serde_json::Value>,
-    account: &Account,
-    env: &CanonicalEnvData,
-    proc: &CanonicalProcessData,
+    profile: &DeviceProfile,
     canonical_env: &serde_json::Value,
 ) {
     if map.contains_key("device_id") {
         map.insert(
             "device_id".into(),
-            serde_json::Value::String(account.device_id.clone()),
+            serde_json::Value::String(profile.device_id.clone()),
         );
     }
     if map.contains_key("email") {
         map.insert(
             "email".into(),
-            serde_json::Value::String(account.email.clone()),
+            serde_json::Value::String(profile.email.clone()),
         );
     }
 
@@ -962,14 +948,13 @@ fn rewrite_event_fields(
     map.remove("gateway");
 
     if map.contains_key("account_uuid") {
-        let uuid = account
-            .account_uuid
-            .clone()
-            .unwrap_or_else(|| derive_account_uuid(account));
-        map.insert("account_uuid".into(), serde_json::Value::String(uuid));
+        map.insert(
+            "account_uuid".into(),
+            serde_json::Value::String(profile.account_uuid.clone()),
+        );
     }
     if map.contains_key("organization_uuid") {
-        if let Some(ref org) = account.organization_uuid {
+        if let Some(ref org) = profile.organization_uuid {
             map.insert(
                 "organization_uuid".into(),
                 serde_json::Value::String(org.clone()),
@@ -984,7 +969,7 @@ fn rewrite_event_fields(
     }
 
     if let Some(p) = map.remove("process") {
-        map.insert("process".into(), rewrite_process(&p, proc));
+        map.insert("process".into(), rewrite_process(&p, profile));
     }
 
     if let Some(am) = map.get("additional_metadata").and_then(|v| v.as_str()) {
@@ -996,7 +981,7 @@ fn rewrite_event_fields(
     }
 
     if let Some(ua_str) = map.get("user_attributes").and_then(|v| v.as_str()) {
-        let rewritten = rewrite_user_attributes_json_with_env(ua_str, account, env);
+        let rewritten = rewrite_user_attributes_json_with_profile(ua_str, profile);
         map.insert(
             "user_attributes".into(),
             serde_json::Value::String(rewritten),
@@ -1006,7 +991,7 @@ fn rewrite_event_fields(
 
 // --- 进程指纹改写 ---
 
-fn rewrite_process(original: &serde_json::Value, proc: &CanonicalProcessData) -> serde_json::Value {
+fn rewrite_process(original: &serde_json::Value, profile: &DeviceProfile) -> serde_json::Value {
     let engine = base64::engine::general_purpose::STANDARD;
     match original {
         serde_json::Value::String(s) => {
@@ -1018,57 +1003,29 @@ fn rewrite_process(original: &serde_json::Value, proc: &CanonicalProcessData) ->
                 Ok(v) => v,
                 Err(_) => return original.clone(),
             };
-            rewrite_process_fields(&mut obj, proc);
+            rewrite_process_fields(&mut obj, profile);
             let out = serde_json::to_vec(&obj).unwrap_or_default();
             serde_json::Value::String(engine.encode(&out))
         }
         serde_json::Value::Object(_) => {
             let mut obj = original.clone();
-            rewrite_process_fields(&mut obj, proc);
+            rewrite_process_fields(&mut obj, profile);
             obj
         }
         _ => original.clone(),
     }
 }
 
-fn rewrite_process_fields(obj: &mut serde_json::Value, proc: &CanonicalProcessData) {
+fn rewrite_process_fields(obj: &mut serde_json::Value, profile: &DeviceProfile) {
     if let Some(map) = obj.as_object_mut() {
-        map.insert(
-            "constrainedMemory".into(),
-            serde_json::json!(proc.constrained_memory),
-        );
-        map.insert(
-            "rss".into(),
-            serde_json::json!(random_in_range(proc.rss_range[0], proc.rss_range[1])),
-        );
-        map.insert(
-            "heapTotal".into(),
-            serde_json::json!(random_in_range(
-                proc.heap_total_range[0],
-                proc.heap_total_range[1]
-            )),
-        );
-        map.insert(
-            "heapUsed".into(),
-            serde_json::json!(random_in_range(
-                proc.heap_used_range[0],
-                proc.heap_used_range[1]
-            )),
-        );
-        map.insert(
-            "external".into(),
-            serde_json::json!(random_in_range(
-                proc.external_range[0],
-                proc.external_range[1]
-            )),
-        );
-        map.insert(
-            "arrayBuffers".into(),
-            serde_json::json!(random_in_range(
-                proc.array_buffers_range[0],
-                proc.array_buffers_range[1]
-            )),
-        );
+        let uptime = map.get("uptime").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let snapshot = process_snapshot(&profile.process, &profile.device_id, uptime);
+        let snapshot_json = process_snapshot_json(&snapshot);
+        if let Some(snapshot_map) = snapshot_json.as_object() {
+            for (key, value) in snapshot_map {
+                map.insert(key.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -1095,22 +1052,18 @@ fn rewrite_additional_metadata(encoded: &str) -> String {
 
 /// 改写 GrowthBook 实验事件中 user_attributes JSON 字符串内的身份字段。
 fn rewrite_user_attributes_json(json_str: &str, account: &Account) -> String {
-    let env: CanonicalEnvData = CanonicalEnvData::default();
-    rewrite_user_attributes_json_with_env(json_str, account, &env)
+    let profile = device_profile(account);
+    rewrite_user_attributes_json_with_profile(json_str, &profile)
 }
 
 /// 改写 GrowthBook 实验事件中 user_attributes JSON 字符串内的身份字段。
-fn rewrite_user_attributes_json_with_env(
-    json_str: &str,
-    account: &Account,
-    env: &CanonicalEnvData,
-) -> String {
+fn rewrite_user_attributes_json_with_profile(json_str: &str, profile: &DeviceProfile) -> String {
     let mut obj: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
     };
     if let Some(map) = obj.as_object_mut() {
-        apply_growthbook_attributes(map, account, env);
+        apply_growthbook_attributes(map, profile);
     }
     serde_json::to_string(&obj).unwrap_or_else(|_| json_str.to_string())
 }
@@ -1118,31 +1071,25 @@ fn rewrite_user_attributes_json_with_env(
 /// 对 GrowthBook attributes 补齐 Claude Code 2.1.156 抓包中的关键身份字段。
 fn apply_growthbook_attributes(
     map: &mut serde_json::Map<String, serde_json::Value>,
-    account: &Account,
-    env: &CanonicalEnvData,
+    profile: &DeviceProfile,
 ) {
     map.insert(
         "id".into(),
-        serde_json::Value::String(account.device_id.clone()),
+        serde_json::Value::String(profile.device_id.clone()),
     );
     map.insert(
         "deviceID".into(),
-        serde_json::Value::String(account.device_id.clone()),
+        serde_json::Value::String(profile.device_id.clone()),
     );
     map.insert(
         "email".into(),
-        serde_json::Value::String(account.email.clone()),
+        serde_json::Value::String(profile.email.clone()),
     );
     map.insert(
         "accountUUID".into(),
-        serde_json::Value::String(
-            account
-                .account_uuid
-                .clone()
-                .unwrap_or_else(|| derive_account_uuid(account)),
-        ),
+        serde_json::Value::String(profile.account_uuid.clone()),
     );
-    if let Some(ref org) = account.organization_uuid {
+    if let Some(ref org) = profile.organization_uuid {
         map.insert(
             "organizationUUID".into(),
             serde_json::Value::String(org.clone()),
@@ -1150,7 +1097,7 @@ fn apply_growthbook_attributes(
     } else {
         map.remove("organizationUUID");
     }
-    if let Some(ref sub) = account.subscription_type {
+    if let Some(ref sub) = profile.subscription_type {
         map.insert(
             "subscriptionType".into(),
             serde_json::Value::String(sub.clone()),
@@ -1162,28 +1109,28 @@ fn apply_growthbook_attributes(
     );
     map.insert(
         "rateLimitTier".into(),
-        serde_json::Value::String(rate_limit_tier(account)),
+        serde_json::Value::String(rate_limit_tier(&profile.subscription_type)),
     );
     map.insert("entrypoint".into(), serde_json::Value::String("cli".into()));
     map.remove("apiBaseUrlHost");
 
-    if !env.platform.is_empty() {
+    if !profile.env.platform.is_empty() {
         map.insert(
             "platform".into(),
-            serde_json::Value::String(env.platform.clone()),
+            serde_json::Value::String(profile.env.platform.clone()),
         );
     }
-    if !env.version.is_empty() {
+    if !profile.env.version.is_empty() {
         map.insert(
             "appVersion".into(),
-            serde_json::Value::String(env.version.clone()),
+            serde_json::Value::String(profile.env.version.clone()),
         );
     }
 }
 
 /// 根据订阅类型生成 GrowthBook rateLimitTier。
-fn rate_limit_tier(account: &Account) -> String {
-    match account.subscription_type.as_deref() {
+fn rate_limit_tier(subscription_type: &Option<String>) -> String {
+    match subscription_type.as_deref() {
         Some("max") => "default_claude_max_20x".to_string(),
         Some("pro") => "default_claude_pro".to_string(),
         Some(other) if !other.is_empty() => format!("default_claude_{}", other),
@@ -1282,46 +1229,6 @@ pub fn detect_client_type(user_agent: &str, body: &serde_json::Value) -> ClientT
 
 const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// 通过账号信息生成稳定的 UUID 标识符。
-fn derive_account_uuid(account: &Account) -> String {
-    let seed = if account.email.is_empty() {
-        format!("account-{}", account.id)
-    } else {
-        account.email.clone()
-    };
-    let hash = Sha256::digest(seed.as_bytes());
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex::encode(&hash[0..4]),
-        hex::encode(&hash[4..6]),
-        hex::encode(&hash[6..8]),
-        hex::encode(&hash[8..10]),
-        hex::encode(&hash[10..16])
-    )
-}
-
-pub fn generate_session_uuid() -> String {
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill(&mut b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex::encode(&b[0..4]),
-        hex::encode(&b[4..6]),
-        hex::encode(&b[6..8]),
-        hex::encode(&b[8..10]),
-        hex::encode(&b[10..16])
-    )
-}
-
-fn random_in_range(min: i64, max: i64) -> i64 {
-    if max <= min {
-        return min;
-    }
-    rand::thread_rng().gen_range(min..max)
-}
-
 /// 仅在 `<system-reminder>` 标签内替换 `Git user:` 行。
 /// 不影响 messages、tools 和 `<system-reminder>` 外部的文本，避免破坏 git 操作。
 fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &str) {
@@ -1381,8 +1288,8 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientType, Rewriter, cch_attestation_seed, compute_cch_attestation,
-        compute_cc_version_suffix, matches_1m_whitelist, strip_beta_token,
+        cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
+        matches_1m_whitelist, strip_beta_token, ClientType, Rewriter,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1393,6 +1300,7 @@ mod tests {
         DEFAULT_CLAUDE_CODE_VERSION_BASE, MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION,
         STAINLESS_RUNTIME_VERSION,
     };
+    use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
 
@@ -1660,6 +1568,18 @@ mod tests {
     fn event_logging_v2_path_is_rewritten() {
         let account = test_account();
         let rewriter = Rewriter::new();
+        let process = {
+            let process = json!({
+                "uptime": 12.0,
+                "rss": 999,
+                "heapTotal": 999,
+                "heapUsed": 999,
+                "external": 999,
+                "arrayBuffers": 999,
+                "constrainedMemory": 999,
+            });
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&process).unwrap())
+        };
         let body = json!({
             "events": [{
                 "event_type": "ClaudeCodeInternalEvent",
@@ -1669,6 +1589,7 @@ mod tests {
                     "account_uuid": "old-account",
                     "organization_uuid": "old-org",
                     "env": {},
+                    "process": process,
                     "additional_metadata": "",
                     "user_attributes": "{\"id\":\"old\",\"apiBaseUrlHost\":\"proxy.local\"}"
                 }
@@ -1690,6 +1611,19 @@ mod tests {
             serde_json::from_str(event["user_attributes"].as_str().unwrap()).unwrap();
         assert_eq!(attrs["userType"], "external");
         assert!(attrs.get("apiBaseUrlHost").is_none());
+
+        let rewritten_process_b64 = event["process"].as_str().unwrap();
+        let rewritten_process_bytes = base64::engine::general_purpose::STANDARD
+            .decode(rewritten_process_b64)
+            .unwrap();
+        let rewritten_process: serde_json::Value =
+            serde_json::from_slice(&rewritten_process_bytes).unwrap();
+        assert_eq!(rewritten_process["uptime"], 12.0);
+        assert!(
+            rewritten_process["heapUsed"].as_i64().unwrap()
+                <= rewritten_process["heapTotal"].as_i64().unwrap()
+        );
+        assert_eq!(rewritten_process["constrainedMemory"], 0);
     }
 
     #[test]
