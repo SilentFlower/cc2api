@@ -8,7 +8,9 @@ use tracing::{debug, info, warn};
 use crate::model::account::{Account, AccountStatus};
 use crate::service::account::AccountService;
 use crate::service::gateway::extract_passive_usage;
-use crate::service::rewriter::{clean_session_id_from_body, ClientType, Rewriter};
+use crate::service::rewriter::{
+    clean_session_id_from_body, ordered_anthropic_headers, ClientType, Rewriter,
+};
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::SettingsStore;
 
@@ -126,7 +128,10 @@ impl PrimePollerService {
         }
 
         *last_fired = Some(key);
-        info!("prime poller: tick at {}:{:02}, model = {}", h, TRIGGER_MINUTE, cfg.model);
+        info!(
+            "prime poller: tick at {}:{:02}, model = {}",
+            h, TRIGGER_MINUTE, cfg.model
+        );
         self.run_round(h, &cfg.model).await;
     }
 
@@ -235,7 +240,10 @@ impl PrimePollerService {
                 duration_ms: outcome.duration_ms,
             };
             if let Err(e) = self.log_store.insert(&entry).await {
-                warn!("prime poller: write log failed for account {}: {}", account.id, e);
+                warn!(
+                    "prime poller: write log failed for account {}: {}",
+                    account.id, e
+                );
             }
 
             // 根据上游状态码联动账号状态,保持与主链路 gateway 一致:
@@ -249,7 +257,11 @@ impl PrimePollerService {
             // 429 场景不覆盖,因为 handle_rate_limit 已写入更完整的数据(可能从 OAuth usage API)。
             if outcome.status != Some(429) {
                 if let Some(usage) = outcome.passive_usage {
-                    if let Err(e) = self.account_svc.update_passive_usage(account.id, usage).await {
+                    if let Err(e) = self
+                        .account_svc
+                        .update_passive_usage(account.id, usage)
+                        .await
+                    {
                         warn!(
                             "prime poller: update passive usage failed for account {}: {}",
                             account.id, e
@@ -271,7 +283,11 @@ impl PrimePollerService {
         if status == 429 {
             // 预热请求体极小,不会触发长上下文计费类 429;此处无 retry-after/响应体/被动用量,
             // 走「用已存 usage_data 判断撞墙 + 短冷却」的常规逻辑即可。
-            if let Err(e) = self.account_svc.handle_rate_limit(account, None, "", None).await {
+            if let Err(e) = self
+                .account_svc
+                .handle_rate_limit(account, None, "", None)
+                .await
+            {
                 warn!(
                     "prime poller: handle_rate_limit failed for account {}: {}",
                     account.id, e
@@ -321,7 +337,10 @@ impl PrimePollerService {
             Err(e) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: truncate_chars(&format!("resolve token: {}", e), ERROR_SNIPPET_CHARS),
+                    error_message: truncate_chars(
+                        &format!("resolve token: {}", e),
+                        ERROR_SNIPPET_CHARS,
+                    ),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
                     status: None,
@@ -345,19 +364,19 @@ impl PrimePollerService {
             Err(e) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: truncate_chars(&format!("serialize body: {}", e), ERROR_SNIPPET_CHARS),
+                    error_message: truncate_chars(
+                        &format!("serialize body: {}", e),
+                        ERROR_SNIPPET_CHARS,
+                    ),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
                     status: None,
                 };
             }
         };
-        let rewritten_bytes = self.rewriter.rewrite_body(
-            &minimal_bytes,
-            "/v1/messages",
-            account,
-            ClientType::API,
-        );
+        let rewritten_bytes =
+            self.rewriter
+                .rewrite_body(&minimal_bytes, "/v1/messages", account, ClientType::API);
         // 先解析 rewritten_bytes,此时 metadata._session_id 标记仍在。
         // 必须在剥除 _session_id 之前先跑 rewrite_headers:后者从 body 里的
         // _session_id 抽取 X-Claude-Code-Session-Id,与 metadata.user_id.session_id 对齐。
@@ -383,17 +402,19 @@ impl PrimePollerService {
         // 走定制 tlsfp 客户端,复用账号的 proxy_url。
         let client = crate::tlsfp::make_request_client(&account.proxy_url);
         let mut req = client.post(UPSTREAM_URL).body(final_bytes);
-        for (k, v) in &headers {
+        for (k, v) in ordered_anthropic_headers("/v1/messages", &headers) {
             req = req.header(k, v);
         }
-        req = req.header("Host", "api.anthropic.com");
 
         let resp = match tokio::time::timeout(PRIME_TTFB_TIMEOUT, req.send()).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: truncate_chars(&format!("request failed: {}", e), ERROR_SNIPPET_CHARS),
+                    error_message: truncate_chars(
+                        &format!("request failed: {}", e),
+                        ERROR_SNIPPET_CHARS,
+                    ),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
                     status: None,
@@ -417,7 +438,10 @@ impl PrimePollerService {
         // 用于排查"预热成功但账号未进入 5h 窗口"问题。
         {
             let get_hdr = |n: &str| -> Option<String> {
-                resp.headers().get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+                resp.headers()
+                    .get(n)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
             };
             let h5u = get_hdr("anthropic-ratelimit-unified-5h-utilization");
             let h5r = get_hdr("anthropic-ratelimit-unified-5h-reset");
