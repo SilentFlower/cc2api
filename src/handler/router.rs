@@ -646,7 +646,12 @@ fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 async fn get_settings(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let settings = state.settings_store.get_all().await?;
+    let mut settings = state.settings_store.get_all().await?;
+    settings
+        .entry("allow_system_role_models".into())
+        .or_insert_with(|| {
+            crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS.to_string()
+        });
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -697,10 +702,37 @@ async fn update_settings(
             ));
         }
     }
+    // 允许 messages[].role=system 的模型列表:逗号分隔,允许为空;非空项必须是模型 ID 安全集。
+    if let Some(val) = body.get("allow_system_role_models") {
+        validate_model_id_list("allow_system_role_models", val)?;
+    }
     state.settings_store.upsert_many(&body).await?;
+    if body.contains_key("allow_system_role_models") {
+        state.gateway_svc.reload_system_role_models().await?;
+    }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// 校验逗号分隔的模型 ID 列表。
+///
+/// @param key 设置项 key,用于错误提示。
+/// @param raw 原始逗号分隔字符串。
+/// @return 校验通过返回 `Ok(())`,否则返回业务错误。
+fn validate_model_id_list(key: &str, raw: &str) -> Result<(), AppError> {
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !item
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        {
+            return Err(AppError::BadRequest(format!(
+                "'{}' 包含非法模型 ID: {}",
+                key, item
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 获取最近 50 条峰值预热调用记录,按时间倒序。
@@ -709,4 +741,30 @@ async fn get_prime_logs(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let logs = state.prime_log_store.list_recent(50).await?;
     Ok(Json(serde_json::json!(logs)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_model_id_list;
+
+    #[test]
+    fn model_id_list_allows_empty_and_valid_ids() {
+        assert!(validate_model_id_list("allow_system_role_models", "").is_ok());
+        assert!(validate_model_id_list(
+            "allow_system_role_models",
+            "claude-opus-4-8, claude.test:model_1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn model_id_list_rejects_unsafe_chars() {
+        let err = validate_model_id_list(
+            "allow_system_role_models",
+            "claude-opus-4-8, bad/model",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("bad/model"));
+    }
 }

@@ -123,6 +123,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         ("peak_prime_enabled", "true"),
         ("peak_prime_hours", "4,5,6"),
         ("peak_prime_model", "claude-haiku-4-5-20251001"),
+        // Claude Code Opus 4.8 会在 messages 中携带 role=system。
+        (
+            "allow_system_role_models",
+            crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

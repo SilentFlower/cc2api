@@ -359,6 +359,17 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 
 统一格式 `{"error": "..."}`，常见状态码：`400` / `401` / `404` / `429` / `502` / `503` / `500`。
 
+`/v1/messages` 如果携带 `messages[].role=system`，但请求体 `model` 未命中全局设置
+`allow_system_role_models`，网关会本地返回 400，不请求上游。该错误会额外返回当前模型和允许列表：
+
+```json
+{
+  "error": "messages[].role=system is not allowed for this model",
+  "model": "claude-opus-4-7",
+  "allowed_system_role_models": ["claude-opus-4-8"]
+}
+```
+
 ---
 
 ## OAuth 授权登录
@@ -583,6 +594,17 @@ cc-bridge/
 | `/api/event_logging/v2/batch` / `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、`userType`、`rateLimitTier`、`entrypoint`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
+
+### 系统角色模型白名单
+
+Claude Code 2.1.156 在 `claude-opus-4-8` 请求中可能把运行时提醒放入
+`messages[].role=system`。网关通过全局 settings key
+`allow_system_role_models` 控制哪些模型允许透传这种格式：
+
+- 默认值：`claude-opus-4-8`
+- 格式：逗号分隔的精确模型 ID 列表，例如 `claude-opus-4-8,claude-sonnet-4-6`
+- 空字符串：不允许任何模型透传 `messages[].role=system`
+- 未命中：本地返回 400，并在响应中返回 `allowed_system_role_models`
 
 ### Billing / CCH 策略
 
