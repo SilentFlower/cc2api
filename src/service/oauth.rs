@@ -1,5 +1,9 @@
 use crate::error::AppError;
 use crate::model::account::CanonicalEnvData;
+use crate::service::version_profile::{
+    MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
+    claude_cli_user_agent, claude_code_user_agent, normalize_version,
+};
 use crate::tlsfp::make_request_client;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -48,11 +52,7 @@ impl TokenTester {
     ) -> Result<(), AppError> {
         let env: CanonicalEnvData =
             serde_json::from_value(canonical_env.clone()).unwrap_or_default();
-        let version = if env.version.is_empty() {
-            "2.1.81"
-        } else {
-            &env.version
-        };
+        let version = normalize_version(&env.version);
         let stainless_os = match env.platform.as_str() {
             "darwin" => "Mac OS X",
             "win32" => "Windows",
@@ -73,17 +73,17 @@ impl TokenTester {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05")
+            .header("anthropic-beta", MESSAGE_BETA_TOKENS)
             .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("User-Agent", format!("claude-cli/{} (external, cli)", version))
+            .header("User-Agent", claude_cli_user_agent(version))
             .header("x-app", "cli")
             .header("accept-encoding", "gzip, deflate, br, zstd")
             .header("X-Stainless-Lang", "js")
-            .header("X-Stainless-Package-Version", "0.70.0")
+            .header("X-Stainless-Package-Version", STAINLESS_PACKAGE_VERSION)
             .header("X-Stainless-OS", stainless_os)
             .header("X-Stainless-Arch", &env.arch)
             .header("X-Stainless-Runtime", "node")
-            .header("X-Stainless-Runtime-Version", &env.node_version)
+            .header("X-Stainless-Runtime-Version", STAINLESS_RUNTIME_VERSION)
             .header("X-Stainless-Retry-Count", "0")
             .header("X-Stainless-Timeout", "600")
             .json(&body)
@@ -129,8 +129,7 @@ pub async fn refresh_oauth_token(
         let text = resp.text().await.unwrap_or_default();
         return Err(AppError::Internal(format!(
             "oauth refresh failed: status {} {}",
-            status,
-            text
+            status, text
         )));
     }
 
@@ -166,8 +165,8 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "claude-code/2.1.81")
+        .header("anthropic-beta", OAUTH_BETA_TOKEN)
+        .header("User-Agent", claude_code_user_agent(""))
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("usage request failed: {}", e)))?;
@@ -184,10 +183,7 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
                 "usage endpoint rate limited (429), try again later: {}",
                 text
             )),
-            _ => AppError::Internal(format!(
-                "usage fetch failed: status {} {}",
-                status, text
-            )),
+            _ => AppError::Internal(format!("usage fetch failed: status {} {}", status, text)),
         });
     }
 

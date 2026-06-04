@@ -368,6 +368,7 @@ impl PrimePollerService {
         let empty_in: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut headers = self.rewriter.rewrite_headers(
             &empty_in,
+            "/v1/messages",
             account,
             ClientType::API,
             model,

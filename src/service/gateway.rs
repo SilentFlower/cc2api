@@ -220,6 +220,7 @@ impl GatewayService {
                 .unwrap_or("");
             let rewritten_headers = self.rewriter.rewrite_headers(
                 &headers,
+                &path,
                 &account,
                 client_type,
                 model_id,

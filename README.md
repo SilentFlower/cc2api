@@ -385,9 +385,9 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 | 功能 | 说明 |
 |------|------|
 | **拦截** | 客户端遥测请求返回 200，不转发上游 |
-| **代发** | `/api/event_logging/batch`（每 10s）、`/api/eval/sdk-*`（每 6h） |
+| **代发** | `/api/event_logging/v2/batch`（每 10s）、`/api/eval/sdk-*`（每 6h） |
 | **触发** | 账号收到 `/v1/messages` 请求时激活遥测会话（10min TTL，自动续期） |
-| **拦截路径** | `/api/event_logging/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
+| **拦截路径** | `/api/event_logging/v2/batch`、`/api/event_logging/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
 
 > Datadog 遥测由客户端直连 `browser-intake-datadoghq.com`，无法通过网关拦截。建议在网络层屏蔽。
 
@@ -565,8 +565,12 @@ cc-bridge/
 
 ### 请求头改写
 
-- User-Agent → `claude-code/<version> (external, cli)`
-- 注入/合并 `anthropic-beta`、固定 `anthropic-version`
+- 默认 Claude Code 指纹为 `2.1.156`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成
+- `/v1/messages` 使用 `claude-cli/<version> (external, cli)`、`X-Stainless-Package-Version=0.94.0`、`X-Stainless-Runtime-Version=v24.3.0`
+- `/api/event_logging/v2/batch` 使用 `claude-code/<version>`、`anthropic-beta=oauth-2025-04-20`、`x-service-name=claude-code`
+- `/api/eval/*` 使用抓包中的 `Bun/1.3.14` UA
+- `/v1/code/triggers` / `/v1/mcp_servers` 使用各自 endpoint beta token
+- 注入/合并 `anthropic-beta`、固定必要 `anthropic-version`
 - 强制使用账号真实 `Authorization`
 - 追加 `beta=true` 查询参数
 - 还原 header wire casing
@@ -576,9 +580,13 @@ cc-bridge/
 | 路径 | 改写内容 |
 |------|---------|
 | `/v1/messages` | 系统提示词注入、`metadata.user_id`、环境/进程指纹、`cache_control`、billing 处理 |
-| `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
-| `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、移除 `apiBaseUrlHost` |
+| `/api/event_logging/v2/batch` / `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
+| `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、`userType`、`rateLimitTier`、`entrypoint`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
+
+### Billing / CCH 策略
+
+`billing_mode=rewrite` 会按版本改写 `cc_version` / `cch`。Claude Code `2.1.156` 的 `cc_version` 后缀公式已按 JS 字符串索引语义修正；`cch` 使用序列化后的 body（其中 `cch=00000` 保持占位）计算 `xxhash64` 低 20 bits，seed 为 `0x4D659218E32A3268`。旧版本继续使用旧 seed `0x6E52736AC806831E`。
 
 ### TLS 指纹
 
