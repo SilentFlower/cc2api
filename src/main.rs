@@ -81,7 +81,12 @@ async fn main() {
         account_svc.clone(),
         rewriter.clone(),
         telemetry_svc.clone(),
+        settings_store.clone(),
     ));
+    gateway_svc
+        .reload_system_role_models()
+        .await
+        .expect("load system role models failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 

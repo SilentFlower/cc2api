@@ -1,8 +1,11 @@
-use std::collections::HashMap;
 use sqlx::AnyPool;
 use sqlx::Row;
+use std::collections::HashMap;
 
 use crate::error::AppError;
+
+/// 允许 `messages[].role=system` 的默认模型列表。
+pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {
@@ -30,6 +33,23 @@ impl SettingsStore {
         Ok(map)
     }
 
+    /// 读取单个设置项。
+    ///
+    /// @param key 设置项 key。
+    /// @param default_value key 不存在时返回的默认值。
+    /// @return 设置项字符串值。
+    pub async fn get_value(&self, key: &str, default_value: &str) -> Result<String, AppError> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key=$1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("query setting '{}': {}", key, e)))?;
+
+        Ok(row
+            .and_then(|r| r.try_get::<String, _>("value").ok())
+            .unwrap_or_else(|| default_value.to_string()))
+    }
+
     /// 批量更新设置项（upsert）。
     pub async fn upsert_many(&self, items: &HashMap<String, String>) -> Result<(), AppError> {
         for (key, value) in items {
@@ -44,5 +64,46 @@ impl SettingsStore {
             .map_err(|e| AppError::Internal(format!("upsert setting '{}': {}", key, e)))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, SettingsStore};
+    use sqlx::AnyPool;
+
+    async fn make_store() -> SettingsStore {
+        sqlx::any::install_default_drivers();
+        let tmp = std::env::temp_dir().join(format!("ccgw_settings_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        crate::store::db::migrate(&pool, "sqlite").await.expect("migrate");
+        SettingsStore::new(pool)
+    }
+
+    #[tokio::test]
+    async fn get_value_keeps_empty_string_as_configured_value() {
+        let store = make_store().await;
+        let mut items = std::collections::HashMap::new();
+        items.insert("allow_system_role_models".to_string(), String::new());
+
+        store.upsert_many(&items).await.expect("upsert");
+
+        let value = store
+            .get_value("allow_system_role_models", DEFAULT_ALLOW_SYSTEM_ROLE_MODELS)
+            .await
+            .expect("get value");
+        assert_eq!(value, "");
+    }
+
+    #[tokio::test]
+    async fn get_value_returns_default_for_missing_key() {
+        let store = make_store().await;
+
+        let value = store
+            .get_value("missing_key", DEFAULT_ALLOW_SYSTEM_ROLE_MODELS)
+            .await
+            .expect("get value");
+        assert_eq!(value, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS);
     }
 }

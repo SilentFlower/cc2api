@@ -29,6 +29,9 @@ const primeEnabled = ref(true);
 const primeHours = ref('4,5,6');
 const primeModel = ref('claude-haiku-4-5-20251001');
 
+/** 允许 messages[].role=system 的模型列表 */
+const allowSystemRoleModels = ref('claude-opus-4-8');
+
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
 const logsLoading = ref(false);
@@ -72,6 +75,16 @@ const isValidHours = computed(() => {
 /** 预热模型不能为空 */
 const isValidModel = computed(() => primeModel.value.trim().length > 0);
 
+/** 系统角色模型列表是否合法 */
+const isValidSystemRoleModels = computed(() => {
+  const raw = allowSystemRoleModels.value.trim();
+  if (!raw) return true;
+  return raw.split(',').every((s) => {
+    const model = s.trim();
+    return !model || /^[A-Za-z0-9._:-]+$/.test(model);
+  });
+});
+
 /** 加载设置 */
 async function loadSettings() {
   try {
@@ -82,6 +95,7 @@ async function loadSettings() {
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
+    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -114,6 +128,10 @@ async function saveSettings() {
     toast('预热模型不能为空');
     return;
   }
+  if (!isValidSystemRoleModels.value) {
+    toast('系统角色模型列表包含非法字符');
+    return;
+  }
   saving.value = true;
   try {
     await api.updateSettings({
@@ -123,6 +141,7 @@ async function saveSettings() {
       peak_prime_enabled: primeEnabled.value ? 'true' : 'false',
       peak_prime_hours: primeHours.value.trim(),
       peak_prime_model: primeModel.value.trim(),
+      allow_system_role_models: allowSystemRoleModels.value.trim(),
     });
     toast('保存成功');
   } catch (e) {
@@ -267,11 +286,43 @@ onMounted(async () => {
       </div>
     </Card>
 
+    <!-- 系统角色模型白名单 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">系统角色模型</h3>
+        </div>
+
+        <div class="space-y-2">
+          <Label class="text-[#5c5647] text-sm">允许模型 (逗号分隔)</Label>
+          <Input
+            v-model="allowSystemRoleModels"
+            placeholder="claude-opus-4-8"
+            class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+            :class="isValidSystemRoleModels ? '' : 'border-red-400'"
+          />
+          <div class="flex flex-wrap gap-1.5">
+            <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
+            <button
+              type="button"
+              @click="allowSystemRoleModels = 'claude-opus-4-8'"
+              class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
+            >Opus 4.8</button>
+            <button
+              type="button"
+              @click="allowSystemRoleModels = ''"
+              class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-red-300 hover:bg-red-50 hover:text-red-600 transition-colors"
+            >全部关闭</button>
+          </div>
+        </div>
+      </div>
+    </Card>
+
     <!-- 保存按钮 -->
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}

@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
@@ -18,6 +18,7 @@ use crate::service::rewriter::{
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
 };
+use crate::store::settings_store::{SettingsStore, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS};
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 /// 账号级 FIFO 排队的最长等待时长。超时后会降级到其他账号；队列上限仍由 concurrency 控制。
@@ -34,6 +35,8 @@ pub struct GatewayService {
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
+    settings_store: Arc<SettingsStore>,
+    system_role_models: RwLock<Vec<String>>,
 }
 
 impl GatewayService {
@@ -41,12 +44,33 @@ impl GatewayService {
         account_svc: Arc<AccountService>,
         rewriter: Arc<Rewriter>,
         telemetry_svc: Arc<TelemetryService>,
+        settings_store: Arc<SettingsStore>,
     ) -> Self {
         Self {
             account_svc,
             rewriter,
             telemetry_svc,
+            settings_store,
+            system_role_models: RwLock::new(parse_system_role_model_list(
+                DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+            )),
         }
+    }
+
+    /// 从全局设置刷新允许 `messages[].role=system` 的模型白名单。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_system_role_models(&self) -> Result<(), AppError> {
+        let raw_allowed = self
+            .settings_store
+            .get_value(
+                "allow_system_role_models",
+                DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+            )
+            .await?;
+        let allowed_models = parse_system_role_model_list(&raw_allowed);
+        *self.system_role_models.write().await = allowed_models;
+        Ok(())
     }
 
     /// 核心网关逻辑 -- axum handler。
@@ -86,6 +110,17 @@ impl GatewayService {
         } else {
             serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}))
         };
+
+        if path.starts_with("/v1/messages") && has_system_role_message(&body_map) {
+            let allowed_models = self.system_role_models.read().await;
+            let model = body_map
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default();
+            if !is_system_role_model_allowed(model, &allowed_models) {
+                return Ok(system_role_model_error_response(model, &allowed_models));
+            }
+        }
 
         // 检测客户端类型
         let client_type = detect_client_type(&ua, &body_map);
@@ -604,6 +639,51 @@ fn safe_body_summary(b: &[u8]) -> String {
     format!("{} bytes sha256:{}", b.len(), hex::encode(&digest[..8]))
 }
 
+fn has_system_role_message(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("role")
+                    .and_then(|role| role.as_str())
+                    == Some("system")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn parse_system_role_model_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn is_system_role_model_allowed(model: &str, allowed_models: &[String]) -> bool {
+    allowed_models.iter().any(|allowed| allowed == model)
+}
+
+fn system_role_model_error_body(
+    model: &str,
+    allowed_models: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": "messages[].role=system is not allowed for this model",
+        "model": model,
+        "allowed_system_role_models": allowed_models,
+    })
+}
+
+fn system_role_model_error_response(model: &str, allowed_models: &[String]) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(system_role_model_error_body(model, allowed_models)),
+    )
+        .into_response()
+}
+
 fn build_message_telemetry_context(
     original_body: &serde_json::Value,
     rewritten_body: &serde_json::Value,
@@ -869,7 +949,11 @@ impl Drop for SlotGuardBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_message_telemetry_context, extract_message_session_id, safe_body_summary};
+    use super::{
+        build_message_telemetry_context, extract_message_session_id, has_system_role_message,
+        is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
+        system_role_model_error_body,
+    };
     use crate::service::rewriter::ClientType;
     use serde_json::json;
 
@@ -951,5 +1035,56 @@ mod tests {
         assert_eq!(context.session_id.as_deref(), Some("fallback-session"));
         assert_eq!(context.system_prompt_block_count, 1);
         assert_eq!(context.client_type, "api");
+    }
+
+    #[test]
+    fn system_role_guard_detects_messages_role_system() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "runtime reminder"}
+            ]
+        });
+
+        assert!(has_system_role_message(&body));
+        assert!(!has_system_role_message(&json!({
+            "messages": [{"role": "assistant", "content": "ok"}]
+        })));
+        assert!(!has_system_role_message(&json!({"system": "top level only"})));
+    }
+
+    #[test]
+    fn system_role_model_list_uses_exact_trimmed_matches() {
+        let allowed = parse_system_role_model_list(
+            " claude-opus-4-8,claude-sonnet-4-6,,claude.test:model ",
+        );
+
+        assert_eq!(
+            allowed,
+            vec![
+                "claude-opus-4-8".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                "claude.test:model".to_string()
+            ]
+        );
+        assert!(is_system_role_model_allowed("claude-opus-4-8", &allowed));
+        assert!(!is_system_role_model_allowed("opus", &allowed));
+        assert!(!is_system_role_model_allowed("claude-opus-4-7", &allowed));
+    }
+
+    #[test]
+    fn system_role_error_body_includes_model_and_allowed_list() {
+        let allowed = vec!["claude-opus-4-8".to_string()];
+        let body = system_role_model_error_body("claude-opus-4-7", &allowed);
+
+        assert_eq!(
+            body,
+            json!({
+                "error": "messages[].role=system is not allowed for this model",
+                "model": "claude-opus-4-7",
+                "allowed_system_role_models": ["claude-opus-4-8"]
+            })
+        );
     }
 }
