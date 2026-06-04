@@ -3,6 +3,7 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, info, warn};
@@ -14,7 +15,9 @@ use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
     clean_session_id_from_body, detect_client_type, ClientType, Rewriter,
 };
-use crate::service::telemetry::TelemetryService;
+use crate::service::telemetry::{
+    MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
+};
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 /// 账号级 FIFO 排队的最长等待时长。超时后会降级到其他账号；队列上限仍由 concurrency 控制。
@@ -54,7 +57,11 @@ impl GatewayService {
         }
     }
 
-    async fn handle_request_inner(&self, req: Request, api_token: Option<&ApiToken>) -> Result<Response, AppError> {
+    async fn handle_request_inner(
+        &self,
+        req: Request,
+        api_token: Option<&ApiToken>,
+    ) -> Result<Response, AppError> {
         let req_start = std::time::Instant::now();
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -62,7 +69,11 @@ impl GatewayService {
 
         // 提取 header
         let headers = extract_headers(req.headers());
-        let ua = headers.get("User-Agent").or_else(|| headers.get("user-agent")).cloned().unwrap_or_default();
+        let ua = headers
+            .get("User-Agent")
+            .or_else(|| headers.get("user-agent"))
+            .cloned()
+            .unwrap_or_default();
 
         // 读取请求体
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
@@ -104,7 +115,11 @@ impl GatewayService {
                 .await
             {
                 Ok(a) => {
-                    info!("[耗时] 账号选择: {:.0}ms → {}", t0.elapsed().as_millis(), a.name);
+                    info!(
+                        "[耗时] 账号选择: {:.0}ms → {}",
+                        t0.elapsed().as_millis(),
+                        a.name
+                    );
                     a
                 }
                 Err(_) if last_resp.is_some() => {
@@ -115,9 +130,7 @@ impl GatewayService {
                     // 仅当是"无可用账号"且有运行时排除的账号时，返回 429
                     if exclude_ids.len() > blocked_ids.len() {
                         if matches!(&e, AppError::ServiceUnavailable(_)) {
-                            return Err(AppError::TooManyRequests(
-                                "all accounts are busy".into(),
-                            ));
+                            return Err(AppError::TooManyRequests("all accounts are busy".into()));
                         }
                     }
                     return Err(AppError::ServiceUnavailable(format!(
@@ -128,15 +141,14 @@ impl GatewayService {
             };
 
             if attempt > 0 {
-                warn!(
-                    "429 retry attempt {} with account {}",
-                    attempt, account.id
-                );
+                warn!("429 retry attempt {} with account {}", attempt, account.id);
             }
 
             // 自动遥测：拦截遥测请求 + 激活会话
             if account.auto_telemetry {
-                use crate::service::telemetry::{is_telemetry_path, fake_metrics_enabled_response, fake_telemetry_response};
+                use crate::service::telemetry::{
+                    fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
+                };
 
                 if is_telemetry_path(&path) {
                     let body = if path.contains("/metrics_enabled") {
@@ -198,15 +210,15 @@ impl GatewayService {
             // 改写请求体
             let t_rewrite = std::time::Instant::now();
             debug!(
-                "request body BEFORE rewrite: {}",
-                truncate_body(&body_bytes, 4096)
+                "request body summary BEFORE rewrite: {}",
+                safe_body_summary(&body_bytes)
             );
             let rewritten_body =
                 self.rewriter
                     .rewrite_body(&body_bytes, &path, &account, client_type);
             debug!(
-                "request body AFTER rewrite: {}",
-                truncate_body(&rewritten_body, 4096)
+                "request body summary AFTER rewrite: {}",
+                safe_body_summary(&rewritten_body)
             );
 
             // 重新解析改写后的 body
@@ -214,10 +226,7 @@ impl GatewayService {
                 serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
 
             // 改写 header
-            let model_id = body_map
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
             let rewritten_headers = self.rewriter.rewrite_headers(
                 &headers,
                 &path,
@@ -228,6 +237,23 @@ impl GatewayService {
             );
 
             // 清理 body 中的 _session_id 标记并重新序列化
+            let telemetry_context = if account.auto_telemetry && path.starts_with("/v1/messages") {
+                let context = build_message_telemetry_context(
+                    &body_map,
+                    &rewritten_body_map,
+                    body_bytes.len(),
+                    rewritten_body.len(),
+                    client_type,
+                    attempt,
+                );
+                self.telemetry_svc
+                    .record_message_request(&account, context.clone())
+                    .await;
+                Some(context)
+            } else {
+                None
+            };
+
             let final_body = if client_type == ClientType::API {
                 clean_session_id_from_body(&mut rewritten_body_map);
                 serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
@@ -242,12 +268,12 @@ impl GatewayService {
                     return Err(e);
                 }
             };
-            info!("[耗时] 请求改写+Token解析: {:.0}ms", t_rewrite.elapsed().as_millis());
-            let mut final_headers = rewritten_headers;
-            final_headers.insert(
-                "authorization".into(),
-                format!("Bearer {}", upstream_token),
+            info!(
+                "[耗时] 请求改写+Token解析: {:.0}ms",
+                t_rewrite.elapsed().as_millis()
             );
+            let mut final_headers = rewritten_headers;
+            final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
 
             // 转发到上游
             let t_upstream = std::time::Instant::now();
@@ -263,6 +289,19 @@ impl GatewayService {
                 .await
             {
                 Ok(r) => {
+                    if let Some(context) = telemetry_context.clone() {
+                        self.telemetry_svc
+                            .record_message_result(
+                                &account,
+                                context,
+                                MessageTelemetryResult {
+                                    status_code: Some(r.status().as_u16()),
+                                    duration_ms: t_upstream.elapsed().as_millis() as u64,
+                                    error_kind: None,
+                                },
+                            )
+                            .await;
+                    }
                     info!(
                         "[耗时] 上游响应: {:.0}ms (HTTP {})",
                         t_upstream.elapsed().as_millis(),
@@ -271,6 +310,19 @@ impl GatewayService {
                     r
                 }
                 Err(e) => {
+                    if let Some(context) = telemetry_context.clone() {
+                        self.telemetry_svc
+                            .record_message_result(
+                                &account,
+                                context,
+                                MessageTelemetryResult {
+                                    status_code: None,
+                                    duration_ms: t_upstream.elapsed().as_millis() as u64,
+                                    error_kind: Some("upstream_error".into()),
+                                },
+                            )
+                            .await;
+                    }
                     info!("[耗时] 上游失败: {:.0}ms", t_upstream.elapsed().as_millis());
                     // SlotReleaseGuard drop 会自动释放槽位
                     return Err(e);
@@ -282,7 +334,10 @@ impl GatewayService {
                 let permit = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
-                    body, permit, req_start, account.name.clone(),
+                    body,
+                    permit,
+                    req_start,
+                    account.name.clone(),
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -409,12 +464,7 @@ impl GatewayService {
                 );
             } else if let Err(e) = self
                 .account_svc
-                .disable_account(
-                    account.id,
-                    AccountStatus::Disabled,
-                    "403 认证失败",
-                    None,
-                )
+                .disable_account(account.id, AccountStatus::Disabled, "403 认证失败", None)
                 .await
             {
                 warn!("failed to disable account {} for 403: {}", account.id, e);
@@ -438,10 +488,8 @@ impl GatewayService {
         }
 
         // 构建响应
-        let mut response_builder = Response::builder().status(
-            StatusCode::from_u16(status_code)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        );
+        let mut response_builder = Response::builder()
+            .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
 
         for (k, v) in resp.headers() {
             let name = k.as_str();
@@ -513,7 +561,6 @@ impl GatewayService {
             .body(body)
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))
     }
-
 }
 
 fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
@@ -530,7 +577,12 @@ fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, Str
 /// 过滤这些指纹前缀以防止客户端上报 gateway 类型。
 /// Claude Code 扫描的 AI Gateway 响应头前缀（来源: src/services/api/logging.ts）。
 const GATEWAY_HEADER_PREFIXES: &[&str] = &[
-    "x-litellm-", "helicone-", "x-portkey-", "cf-aig-", "x-kong-", "x-bt-",
+    "x-litellm-",
+    "helicone-",
+    "x-portkey-",
+    "cf-aig-",
+    "x-kong-",
+    "x-bt-",
 ];
 
 fn is_gateway_fingerprint_header(name: &str) -> bool {
@@ -548,23 +600,113 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
         .filter(|n| *n > 0)
 }
 
-fn truncate_body(b: &[u8], max: usize) -> String {
-    if b.len() > max {
-        format!(
-            "{}...(truncated)",
-            String::from_utf8_lossy(&b[..max])
-        )
-    } else {
-        String::from_utf8_lossy(b).to_string()
+fn safe_body_summary(b: &[u8]) -> String {
+    let digest = Sha256::digest(b);
+    format!("{} bytes sha256:{}", b.len(), hex::encode(&digest[..8]))
+}
+
+fn build_message_telemetry_context(
+    original_body: &serde_json::Value,
+    rewritten_body: &serde_json::Value,
+    request_body_bytes: usize,
+    rewritten_body_bytes: usize,
+    client_type: ClientType,
+    attempt: usize,
+) -> MessageTelemetryContext {
+    MessageTelemetryContext {
+        model: original_body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        session_id: extract_message_session_id(rewritten_body)
+            .or_else(|| crate::service::rewriter::extract_session_id_from_body(rewritten_body)),
+        request_body_bytes,
+        rewritten_body_bytes,
+        stream: original_body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        tool_count: original_body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|tools| tools.len())
+            .unwrap_or(0),
+        attachment_count: count_attachment_blocks(original_body),
+        system_prompt_block_count: count_system_prompt_blocks(rewritten_body),
+        client_type: match client_type {
+            ClientType::ClaudeCode => "claude_code",
+            ClientType::API => "api",
+        }
+        .into(),
+        attempt,
+    }
+}
+
+fn extract_message_session_id(body: &serde_json::Value) -> Option<String> {
+    let user_id = body
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())?;
+    let parsed = serde_json::from_str::<serde_json::Value>(user_id).ok()?;
+    parsed
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+}
+
+fn count_system_prompt_blocks(body: &serde_json::Value) -> usize {
+    match body.get("system") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .count(),
+        Some(serde_json::Value::String(s)) if !s.is_empty() => 1,
+        _ => 0,
+    }
+}
+
+fn count_attachment_blocks(body: &serde_json::Value) -> usize {
+    let mut count = 0;
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for message in messages {
+            count +=
+                count_attachment_value(message.get("content").unwrap_or(&serde_json::Value::Null));
+        }
+    }
+    count
+}
+
+fn count_attachment_value(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items.iter().map(count_attachment_value).sum(),
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let self_count = matches!(
+                kind,
+                "image" | "image_url" | "document" | "file" | "input_image" | "input_file"
+            ) as usize;
+            self_count
+                + map
+                    .get("content")
+                    .map(count_attachment_value)
+                    .unwrap_or_default()
+        }
+        _ => 0,
     }
 }
 
 /// 从上游响应头中提取 ratelimit 用量信息，构建与 OAuth usage API 格式一致的 JSON。
 /// 仅保留 utilization 和 resets_at 都存在且可解析的完整窗口，避免不完整数据导致前端异常。
 /// 没有任何完整窗口时返回 None。
-pub(crate) fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Option<serde_json::Value> {
+pub(crate) fn extract_passive_usage(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<serde_json::Value> {
     let get_str = |name: &str| -> Option<String> {
-        headers.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
     };
 
     let mut usage = serde_json::json!({});
@@ -575,9 +717,13 @@ pub(crate) fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Opt
         get_str("anthropic-ratelimit-unified-5h-utilization"),
         get_str("anthropic-ratelimit-unified-5h-reset"),
     ) {
-        if let (Ok(util), Some(reset)) = (util_str.parse::<f64>(), normalize_reset_timestamp(&reset_raw)) {
+        if let (Ok(util), Some(reset)) = (
+            util_str.parse::<f64>(),
+            normalize_reset_timestamp(&reset_raw),
+        ) {
             // 响应头返回 0~1 的比例，乘以 100 转为百分比，与 OAuth usage API 格式一致
-            usage["five_hour"] = serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
+            usage["five_hour"] =
+                serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
             has_window = true;
         }
     }
@@ -587,13 +733,21 @@ pub(crate) fn extract_passive_usage(headers: &reqwest::header::HeaderMap) -> Opt
         get_str("anthropic-ratelimit-unified-7d-utilization"),
         get_str("anthropic-ratelimit-unified-7d-reset"),
     ) {
-        if let (Ok(util), Some(reset)) = (util_str.parse::<f64>(), normalize_reset_timestamp(&reset_raw)) {
-            usage["seven_day"] = serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
+        if let (Ok(util), Some(reset)) = (
+            util_str.parse::<f64>(),
+            normalize_reset_timestamp(&reset_raw),
+        ) {
+            usage["seven_day"] =
+                serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
             has_window = true;
         }
     }
 
-    if has_window { Some(usage) } else { None }
+    if has_window {
+        Some(usage)
+    } else {
+        None
+    }
 }
 
 /// 将响应头中的重置时间统一转为 RFC3339 格式。
@@ -618,12 +772,16 @@ struct SlotReleaseGuard {
 
 impl SlotReleaseGuard {
     fn new(permit: OwnedSemaphorePermit) -> Self {
-        Self { permit: Some(permit) }
+        Self {
+            permit: Some(permit),
+        }
     }
 
     /// 解除守卫并取出 permit，调用后本 guard drop 不再释放。
     fn defuse(&mut self) -> OwnedSemaphorePermit {
-        self.permit.take().expect("SlotReleaseGuard already defused")
+        self.permit
+            .take()
+            .expect("SlotReleaseGuard already defused")
     }
 }
 
@@ -707,5 +865,92 @@ impl Drop for SlotGuardBody {
         );
         // permit 的 Drop 负责归还 semaphore
         let _ = self.permit.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_message_telemetry_context, extract_message_session_id, safe_body_summary};
+    use crate::service::rewriter::ClientType;
+    use serde_json::json;
+
+    #[test]
+    fn safe_body_summary_hides_raw_body() {
+        let body = br#"{"private_text":"raw-prompt-marker","private_token":"raw-token-marker"}"#;
+        let summary = safe_body_summary(body);
+
+        assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
+        assert!(!summary.contains("raw-prompt-marker"));
+        assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn message_context_extracts_safe_counts_and_session_id() {
+        let original_body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "stream": true,
+            "tools": [{"name": "Read"}, {"name": "Edit"}],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "raw-prompt-marker"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "redacted"}},
+                    {"type": "input_file", "file_id": "file_123"}
+                ]
+            }]
+        });
+        let rewritten_body = json!({
+            "metadata": {
+                "user_id": "{\"session_id\":\"session-from-user-id\"}"
+            },
+            "system": [
+                {"type": "text", "text": "system prompt body"}
+            ]
+        });
+
+        let context = build_message_telemetry_context(
+            &original_body,
+            &rewritten_body,
+            111,
+            222,
+            ClientType::ClaudeCode,
+            1,
+        );
+
+        assert_eq!(context.model, "claude-sonnet-4-20250514");
+        assert_eq!(context.session_id.as_deref(), Some("session-from-user-id"));
+        assert_eq!(context.request_body_bytes, 111);
+        assert_eq!(context.rewritten_body_bytes, 222);
+        assert!(context.stream);
+        assert_eq!(context.tool_count, 2);
+        assert_eq!(context.attachment_count, 2);
+        assert_eq!(context.system_prompt_block_count, 1);
+        assert_eq!(context.client_type, "claude_code");
+        assert_eq!(context.attempt, 1);
+    }
+
+    #[test]
+    fn message_context_falls_back_to_internal_session_id() {
+        let rewritten_body = json!({
+            "metadata": {
+                "_session_id": "fallback-session"
+            },
+            "system": "system prompt body"
+        });
+
+        assert_eq!(extract_message_session_id(&rewritten_body), None);
+
+        let context = build_message_telemetry_context(
+            &json!({}),
+            &rewritten_body,
+            10,
+            20,
+            ClientType::API,
+            0,
+        );
+
+        assert_eq!(context.session_id.as_deref(), Some("fallback-session"));
+        assert_eq!(context.system_prompt_block_count, 1);
+        assert_eq!(context.client_type, "api");
     }
 }

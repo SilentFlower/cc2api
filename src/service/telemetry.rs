@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,9 @@ const EVENT_BATCH_INTERVAL: Duration = Duration::from_secs(10);
 const GROWTHBOOK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
+const EVENT_BATCH_MAX: usize = 25;
+const EVENT_QUEUE_MAX: usize = 200;
+const SLOW_FIRST_BYTE_MS: u64 = 10_000;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
@@ -64,6 +67,7 @@ struct TelemetrySession {
     token: String,
     started_at: Instant,
     run_profile: RunProfile,
+    pending_events: VecDeque<TelemetryEvent>,
     expires_at: Instant,
     expires_at_utc: chrono::DateTime<Utc>,
     last_event_batch_at: Instant,
@@ -71,6 +75,59 @@ struct TelemetrySession {
     last_metrics_at: Instant,
     send_count: i64,
     running: bool,
+}
+
+/// 表示 `/v1/messages` 请求阶段的安全遥测摘要。
+///
+/// 该结构只保存字段计数、长度、状态等安全信息，不包含 prompt、tool input、响应正文或 token。
+#[derive(Debug, Clone)]
+pub struct MessageTelemetryContext {
+    /// 请求声明的模型名称。为空时事件构造会回退到默认 Claude Code 模型。
+    pub model: String,
+    /// 请求级 session id，只来自 metadata 派生字段，不来自正文原文。
+    pub session_id: Option<String>,
+    /// 原始请求体字节数。
+    pub request_body_bytes: usize,
+    /// 改写后请求体字节数。
+    pub rewritten_body_bytes: usize,
+    /// 是否为流式请求。
+    pub stream: bool,
+    /// 请求声明的工具数量。
+    pub tool_count: usize,
+    /// 请求中附件或文件块数量。
+    pub attachment_count: usize,
+    /// 改写后 system prompt 文本块数量。
+    pub system_prompt_block_count: usize,
+    /// 请求来源类型，用于区分 Claude Code 客户端和纯 API 客户端。
+    pub client_type: String,
+    /// 当前网关重试序号。
+    pub attempt: usize,
+}
+
+/// 表示 `/v1/messages` 上游响应阶段的安全遥测摘要。
+#[derive(Debug, Clone)]
+pub struct MessageTelemetryResult {
+    /// 上游 HTTP 状态码。网络错误时为空。
+    pub status_code: Option<u16>,
+    /// 从发送上游请求到收到响应头或错误的耗时。
+    pub duration_ms: u64,
+    /// 上游请求失败类型。成功响应为空。
+    pub error_kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TelemetryEvent {
+    event_type: TelemetryEventType,
+    name: Option<String>,
+    model: String,
+    session_id: Option<String>,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelemetryEventType {
+    Internal,
+    GrowthbookExperiment,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +194,7 @@ impl TelemetryService {
             token,
             started_at: now,
             run_profile: run_profile(account, started_at_utc),
+            pending_events: startup_events(account),
             expires_at: now + SESSION_TTL,
             expires_at_utc: started_at_utc + chrono::Duration::from_std(SESSION_TTL).unwrap(),
             last_event_batch_at: now - EVENT_BATCH_INTERVAL, // 立即触发首次
@@ -156,6 +214,51 @@ impl TelemetryService {
         tokio::spawn(async move {
             telemetry_loop(sessions_ref, store_ref, account_id, proxy_url).await;
         });
+    }
+
+    /// 将 `/v1/messages` 请求改写前后的安全摘要写入遥测事件队列。
+    ///
+    /// `context` 只能包含字段数量、字节长度、session id 等派生信息，不能传入请求体原文或 token。
+    pub async fn record_message_request(
+        &self,
+        account: &Account,
+        context: MessageTelemetryContext,
+    ) {
+        if !account.auto_telemetry {
+            return;
+        }
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&account.id) {
+            session.expires_at = Instant::now() + SESSION_TTL;
+            session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+            enqueue_events(
+                &mut session.pending_events,
+                message_request_events(&context),
+            );
+        }
+    }
+
+    /// 将 `/v1/messages` 上游响应或错误摘要写入遥测事件队列。
+    ///
+    /// `result` 只描述状态码、耗时和错误类别，用于生成 success、slow first byte 或 error 事件。
+    pub async fn record_message_result(
+        &self,
+        account: &Account,
+        context: MessageTelemetryContext,
+        result: MessageTelemetryResult,
+    ) {
+        if !account.auto_telemetry {
+            return;
+        }
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&account.id) {
+            session.expires_at = Instant::now() + SESSION_TTL;
+            session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+            enqueue_events(
+                &mut session.pending_events,
+                message_result_events(&context, &result),
+            );
+        }
     }
 }
 
@@ -199,13 +302,24 @@ async fn telemetry_loop(
         let now = Instant::now();
 
         // --- event_logging/v2/batch ---
-        if now.duration_since(session.last_event_batch_at) >= EVENT_BATCH_INTERVAL {
+        if !session.pending_events.is_empty()
+            && now.duration_since(session.last_event_batch_at) >= EVENT_BATCH_INTERVAL
+        {
             let uptime_secs = now.duration_since(session.started_at).as_secs_f64();
-            let payload = build_event_batch(&session.account, &session.run_profile, uptime_secs);
+            let mut events = Vec::new();
+            while events.len() < EVENT_BATCH_MAX {
+                match session.pending_events.pop_front() {
+                    Some(event) => events.push(event),
+                    None => break,
+                }
+            }
+            let payload =
+                build_event_batch(&session.account, &session.run_profile, uptime_secs, &events);
             let token = session.token.clone();
             let c = client.clone();
             session.last_event_batch_at = now;
             session.send_count += 1;
+            let event_count = events.len();
             drop(map);
 
             send_telemetry(
@@ -219,6 +333,10 @@ async fn telemetry_loop(
             .await;
 
             let _ = store.increment_telemetry_count(account_id, 1).await;
+            debug!(
+                "telemetry: sent {} queued events for account {}",
+                event_count, account_id
+            );
             continue;
         }
 
@@ -322,6 +440,7 @@ fn build_event_batch(
     account: &Account,
     run_profile: &RunProfile,
     uptime_secs: f64,
+    events: &[TelemetryEvent],
 ) -> serde_json::Value {
     let profile = device_profile(account);
     let process_b64 = {
@@ -339,40 +458,412 @@ fn build_event_batch(
         auth["organization_uuid"] = json!(org);
     }
 
-    let event = json!({
-        "event_type": "ClaudeCodeInternalEvent",
-        "event_data": {
-            "event_id": uuid::Uuid::new_v4().to_string(),
-            "event_name": "tengu_api_success",
-            "client_timestamp": js_iso_timestamp(),
-            "device_id": profile.device_id,
-            "email": profile.email,
-            "session_id": run_profile.session_id,
-            "model": "claude-sonnet-4-20250514",
-            "user_type": "external",
-            "is_interactive": true,
-            "client_type": "cli",
-            "entrypoint": "cli",
-            "betas": "",
-            "agent_sdk_version": "",
-            "swe_bench_run_id": "",
-            "swe_bench_instance_id": "",
-            "swe_bench_task_id": "",
-            "agent_id": "",
-            "parent_session_id": "",
-            "agent_type": "",
-            "team_name": "",
-            "skill_name": "",
-            "plugin_name": "",
-            "marketplace_name": "",
-            "additional_metadata": "",
-            "auth": auth,
-            "env": env_obj,
-            "process": process_b64,
-        }
-    });
+    let events: Vec<serde_json::Value> = events
+        .iter()
+        .map(|event| build_event_json(event, run_profile, &profile, &env_obj, &auth, &process_b64))
+        .collect();
 
-    json!({ "events": [event] })
+    json!({ "events": events })
+}
+
+fn build_event_json(
+    event: &TelemetryEvent,
+    run_profile: &RunProfile,
+    profile: &crate::model::identity::DeviceProfile,
+    env_obj: &serde_json::Value,
+    auth: &serde_json::Value,
+    process_b64: &str,
+) -> serde_json::Value {
+    match event.event_type {
+        TelemetryEventType::Internal => {
+            let mut event_data = base_internal_event_data(
+                event.name.as_deref().unwrap_or("tengu_feature_ok"),
+                event,
+                run_profile,
+                profile,
+                env_obj,
+                auth,
+                process_b64,
+            );
+            for (key, value) in &event.fields {
+                event_data.insert(key.clone(), value.clone());
+            }
+            json!({
+                "event_type": "ClaudeCodeInternalEvent",
+                "event_data": event_data,
+            })
+        }
+        TelemetryEventType::GrowthbookExperiment => {
+            let mut event_data = serde_json::Map::new();
+            event_data.insert("event_id".into(), json!(uuid::Uuid::new_v4().to_string()));
+            event_data.insert("timestamp".into(), json!(js_iso_timestamp()));
+            event_data.insert("experiment_id".into(), json!("claude_code_remote_eval"));
+            event_data.insert("variation_id".into(), json!(0));
+            event_data.insert("environment".into(), json!("production"));
+            event_data.insert("user_attributes".into(), json!("{}"));
+            event_data.insert("experiment_metadata".into(), json!("{}"));
+            event_data.insert("device_id".into(), json!(profile.device_id));
+            event_data.insert("auth".into(), auth.clone());
+            event_data.insert(
+                "session_id".into(),
+                json!(event
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| run_profile.growthbook_session_id.clone())),
+            );
+            for (key, value) in &event.fields {
+                event_data.insert(key.clone(), value.clone());
+            }
+            json!({
+                "event_type": "GrowthbookExperimentEvent",
+                "event_data": event_data,
+            })
+        }
+    }
+}
+
+fn base_internal_event_data(
+    event_name: &str,
+    event: &TelemetryEvent,
+    run_profile: &RunProfile,
+    profile: &crate::model::identity::DeviceProfile,
+    env_obj: &serde_json::Value,
+    auth: &serde_json::Value,
+    process_b64: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut event_data = serde_json::Map::new();
+    event_data.insert("event_id".into(), json!(uuid::Uuid::new_v4().to_string()));
+    event_data.insert("event_name".into(), json!(event_name));
+    event_data.insert("client_timestamp".into(), json!(js_iso_timestamp()));
+    event_data.insert("device_id".into(), json!(profile.device_id));
+    event_data.insert("email".into(), json!(profile.email));
+    event_data.insert(
+        "session_id".into(),
+        json!(event
+            .session_id
+            .clone()
+            .unwrap_or_else(|| run_profile.session_id.clone())),
+    );
+    event_data.insert("model".into(), json!(event.model));
+    event_data.insert("user_type".into(), json!("external"));
+    event_data.insert("is_interactive".into(), json!(true));
+    event_data.insert("client_type".into(), json!("cli"));
+    event_data.insert("entrypoint".into(), json!("cli"));
+    event_data.insert("betas".into(), json!(""));
+    event_data.insert("agent_sdk_version".into(), json!(""));
+    event_data.insert("swe_bench_run_id".into(), json!(""));
+    event_data.insert("swe_bench_instance_id".into(), json!(""));
+    event_data.insert("swe_bench_task_id".into(), json!(""));
+    event_data.insert("agent_id".into(), json!(""));
+    event_data.insert("parent_session_id".into(), json!(""));
+    event_data.insert("agent_type".into(), json!(""));
+    event_data.insert("team_name".into(), json!(""));
+    event_data.insert("skill_name".into(), json!(""));
+    event_data.insert("plugin_name".into(), json!(""));
+    event_data.insert("marketplace_name".into(), json!(""));
+    event_data.insert("additional_metadata".into(), json!(""));
+    event_data.insert("auth".into(), auth.clone());
+    event_data.insert("env".into(), env_obj.clone());
+    event_data.insert("process".into(), json!(process_b64));
+    event_data
+}
+
+fn enqueue_events(queue: &mut VecDeque<TelemetryEvent>, events: Vec<TelemetryEvent>) {
+    for event in events {
+        if queue.len() >= EVENT_QUEUE_MAX {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+    }
+}
+
+fn startup_events(account: &Account) -> VecDeque<TelemetryEvent> {
+    let mut events = VecDeque::new();
+    let model = "claude-sonnet-4-20250514".to_string();
+    let session_id = None;
+    for name in [
+        "tengu_started",
+        "tengu_init",
+        "tengu_startup_telemetry",
+        "tengu_feature_ok",
+    ] {
+        events.push_back(internal_event(name, &model, session_id.clone()));
+    }
+    let mut skill_fields = serde_json::Map::new();
+    skill_fields.insert("skill_source".into(), json!("startup_summary"));
+    skill_fields.insert("skill_count".into(), json!(0));
+    events.push_back(internal_event_with_fields(
+        "tengu_skill_loaded",
+        &model,
+        session_id.clone(),
+        skill_fields,
+    ));
+    events.push_back(growthbook_experiment_event(&model, session_id));
+    if !account
+        .subscription_type
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "subscription_type".into(),
+            json!(account.subscription_type.clone().unwrap_or_default()),
+        );
+        events.push_back(internal_event_with_fields(
+            "tengu_feature_ok",
+            &model,
+            None,
+            fields,
+        ));
+    }
+    events
+}
+
+fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEvent> {
+    let mut events = Vec::new();
+    let model = normalized_model(&context.model);
+    let session_id = context.session_id.clone();
+
+    let mut before = common_message_fields(context);
+    before.insert("phase".into(), json!("before_normalize"));
+    events.push(internal_event_with_fields(
+        "tengu_api_before_normalize",
+        &model,
+        session_id.clone(),
+        before,
+    ));
+
+    let mut after = common_message_fields(context);
+    after.insert("phase".into(), json!("after_normalize"));
+    events.push(internal_event_with_fields(
+        "tengu_api_after_normalize",
+        &model,
+        session_id.clone(),
+        after,
+    ));
+
+    let mut query = common_message_fields(context);
+    query.insert("api_endpoint".into(), json!("/v1/messages"));
+    events.push(internal_event_with_fields(
+        "tengu_api_query",
+        &model,
+        session_id.clone(),
+        query,
+    ));
+
+    events.push(internal_event_with_fields(
+        "tengu_sysprompt_boundary_found",
+        &model,
+        session_id.clone(),
+        system_prompt_fields(context),
+    ));
+    events.push(internal_event_with_fields(
+        "tengu_sysprompt_block",
+        &model,
+        session_id.clone(),
+        system_prompt_fields(context),
+    ));
+
+    let mut cache_fields = common_message_fields(context);
+    cache_fields.insert(
+        "breakpoint_count".into(),
+        json!(context.system_prompt_block_count),
+    );
+    events.push(internal_event_with_fields(
+        "tengu_api_cache_breakpoints",
+        &model,
+        session_id.clone(),
+        cache_fields,
+    ));
+
+    if context.tool_count > 0 {
+        let mut tool_fields = common_message_fields(context);
+        tool_fields.insert("tool_count".into(), json!(context.tool_count));
+        events.push(internal_event_with_fields(
+            "tengu_tool_search_mode_decision",
+            &model,
+            session_id.clone(),
+            tool_fields.clone(),
+        ));
+        events.push(internal_event_with_fields(
+            "tengu_tool_use_can_use_tool_allowed",
+            &model,
+            session_id.clone(),
+            tool_fields.clone(),
+        ));
+        events.push(internal_event_with_fields(
+            "tengu_tool_use_granted_in_config",
+            &model,
+            session_id.clone(),
+            tool_fields,
+        ));
+    }
+
+    if context.attachment_count > 0 {
+        let mut attachment_fields = common_message_fields(context);
+        attachment_fields.insert("attachment_count".into(), json!(context.attachment_count));
+        events.push(internal_event_with_fields(
+            "tengu_query_before_attachments",
+            &model,
+            session_id.clone(),
+            attachment_fields.clone(),
+        ));
+        events.push(internal_event_with_fields(
+            "tengu_attachment_compute_duration",
+            &model,
+            session_id.clone(),
+            attachment_fields.clone(),
+        ));
+        events.push(internal_event_with_fields(
+            "tengu_query_after_attachments",
+            &model,
+            session_id.clone(),
+            attachment_fields,
+        ));
+
+        let mut file_fields = common_message_fields(context);
+        file_fields.insert("operation".into(), json!("attachment_summary"));
+        file_fields.insert("file_count".into(), json!(context.attachment_count));
+        events.push(internal_event_with_fields(
+            "tengu_file_operation",
+            &model,
+            session_id,
+            file_fields,
+        ));
+    }
+
+    events
+}
+
+fn message_result_events(
+    context: &MessageTelemetryContext,
+    result: &MessageTelemetryResult,
+) -> Vec<TelemetryEvent> {
+    let mut events = Vec::new();
+    let model = normalized_model(&context.model);
+    let session_id = context.session_id.clone();
+    let mut fields = common_message_fields(context);
+    fields.insert("duration_ms".into(), json!(result.duration_ms));
+    if let Some(status) = result.status_code {
+        fields.insert("status_code".into(), json!(status));
+    }
+    if let Some(ref error_kind) = result.error_kind {
+        fields.insert("error_kind".into(), json!(error_kind));
+    }
+
+    let event_name = match (result.status_code, result.error_kind.as_deref()) {
+        (Some(status), _) if (200..300).contains(&status) => "tengu_api_success",
+        (Some(429), _) => "tengu_api_rate_limit",
+        (_, Some(_)) => "tengu_api_error",
+        _ => "tengu_api_success",
+    };
+    events.push(internal_event_with_fields(
+        event_name,
+        &model,
+        session_id.clone(),
+        fields.clone(),
+    ));
+
+    if result.duration_ms >= SLOW_FIRST_BYTE_MS {
+        events.push(internal_event_with_fields(
+            "tengu_api_slow_first_byte",
+            &model,
+            session_id.clone(),
+            fields.clone(),
+        ));
+    }
+
+    if context.tool_count > 0 && result.status_code.is_some_and(|s| (200..300).contains(&s)) {
+        let mut tool_fields = fields.clone();
+        tool_fields.insert("tool_count".into(), json!(context.tool_count));
+        events.push(internal_event_with_fields(
+            "tengu_tool_use_success",
+            &model,
+            session_id,
+            tool_fields,
+        ));
+    }
+
+    events
+}
+
+fn internal_event(name: &str, model: &str, session_id: Option<String>) -> TelemetryEvent {
+    internal_event_with_fields(name, model, session_id, serde_json::Map::new())
+}
+
+fn internal_event_with_fields(
+    name: &str,
+    model: &str,
+    session_id: Option<String>,
+    fields: serde_json::Map<String, serde_json::Value>,
+) -> TelemetryEvent {
+    TelemetryEvent {
+        event_type: TelemetryEventType::Internal,
+        name: Some(name.to_string()),
+        model: normalized_model(model),
+        session_id,
+        fields,
+    }
+}
+
+fn growthbook_experiment_event(model: &str, session_id: Option<String>) -> TelemetryEvent {
+    TelemetryEvent {
+        event_type: TelemetryEventType::GrowthbookExperiment,
+        name: None,
+        model: normalized_model(model),
+        session_id,
+        fields: serde_json::Map::new(),
+    }
+}
+
+fn common_message_fields(
+    context: &MessageTelemetryContext,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("api_endpoint".into(), json!("/v1/messages"));
+    fields.insert(
+        "request_body_bytes".into(),
+        json!(context.request_body_bytes),
+    );
+    fields.insert(
+        "rewritten_body_bytes".into(),
+        json!(context.rewritten_body_bytes),
+    );
+    fields.insert("stream".into(), json!(context.stream));
+    fields.insert("tool_count".into(), json!(context.tool_count));
+    fields.insert("attachment_count".into(), json!(context.attachment_count));
+    fields.insert(
+        "system_prompt_block_count".into(),
+        json!(context.system_prompt_block_count),
+    );
+    fields.insert("client_type_source".into(), json!(context.client_type));
+    fields.insert("attempt".into(), json!(context.attempt));
+    fields
+}
+
+fn system_prompt_fields(
+    context: &MessageTelemetryContext,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "system_prompt_block_count".into(),
+        json!(context.system_prompt_block_count),
+    );
+    fields.insert(
+        "has_system_prompt".into(),
+        json!(context.system_prompt_block_count > 0),
+    );
+    fields.insert("content_strategy".into(), json!("redacted_summary"));
+    fields
+}
+
+fn normalized_model(model: &str) -> String {
+    if model.trim().is_empty() {
+        "claude-sonnet-4-20250514".to_string()
+    } else {
+        model.to_string()
+    }
 }
 
 /// 构造 /api/eval/{clientKey} 请求体（GrowthBook remote eval）。
@@ -444,7 +935,11 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_event_batch, build_growthbook_eval, build_metrics, is_telemetry_path};
+    use super::{
+        build_event_batch, build_growthbook_eval, build_metrics, enqueue_events, internal_event,
+        is_telemetry_path, message_request_events, message_result_events, MessageTelemetryContext,
+        MessageTelemetryResult, TelemetryEvent,
+    };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
         CanonicalProcessData, CanonicalPromptEnvData,
@@ -554,11 +1049,16 @@ mod tests {
             &account,
             Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0).unwrap(),
         );
-        let payload = build_event_batch(&account, &run, 12.5);
+        let events = vec![internal_event(
+            "tengu_api_success",
+            "claude-sonnet-4-20250514",
+            Some("session-1".into()),
+        )];
+        let payload = build_event_batch(&account, &run, 12.5, &events);
         let event = &payload["events"][0]["event_data"];
         assert_eq!(event["device_id"], "device-1");
         assert_eq!(event["email"], "user@example.com");
-        assert_eq!(event["session_id"], run.session_id);
+        assert_eq!(event["session_id"], "session-1");
         assert_eq!(event["auth"]["account_uuid"], "account-uuid");
         assert_eq!(event["auth"]["organization_uuid"], "org-uuid");
         assert_eq!(event["env"]["version"], DEFAULT_CLAUDE_CODE_VERSION);
@@ -571,6 +1071,100 @@ mod tests {
         let process: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert!(process["heapUsed"].as_i64().unwrap() <= process["heapTotal"].as_i64().unwrap());
         assert_eq!(process["constrainedMemory"], 0);
+    }
+
+    #[test]
+    fn message_lifecycle_events_are_request_driven() {
+        let context = MessageTelemetryContext {
+            model: "claude-sonnet-4-20250514".into(),
+            session_id: Some("session-1".into()),
+            request_body_bytes: 123,
+            rewritten_body_bytes: 456,
+            stream: true,
+            tool_count: 2,
+            attachment_count: 1,
+            system_prompt_block_count: 3,
+            client_type: "api".into(),
+            attempt: 1,
+        };
+
+        let request_events = message_request_events(&context);
+        let names: Vec<_> = request_events
+            .iter()
+            .filter_map(|event| event.name.as_deref())
+            .collect();
+        assert!(names.contains(&"tengu_api_before_normalize"));
+        assert!(names.contains(&"tengu_api_after_normalize"));
+        assert!(names.contains(&"tengu_api_query"));
+        assert!(names.contains(&"tengu_sysprompt_boundary_found"));
+        assert!(names.contains(&"tengu_sysprompt_block"));
+        assert!(names.contains(&"tengu_tool_search_mode_decision"));
+        assert!(names.contains(&"tengu_attachment_compute_duration"));
+        assert!(names.contains(&"tengu_file_operation"));
+
+        let result_events = message_result_events(
+            &context,
+            &MessageTelemetryResult {
+                status_code: Some(200),
+                duration_ms: 12_001,
+                error_kind: None,
+            },
+        );
+        let result_names: Vec<_> = result_events
+            .iter()
+            .filter_map(|event| event.name.as_deref())
+            .collect();
+        assert!(result_names.contains(&"tengu_api_success"));
+        assert!(result_names.contains(&"tengu_api_slow_first_byte"));
+        assert!(result_names.contains(&"tengu_tool_use_success"));
+    }
+
+    #[test]
+    fn event_batch_does_not_include_raw_prompt_or_token() {
+        let account = test_account();
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0).unwrap(),
+        );
+        let context = MessageTelemetryContext {
+            model: "claude-sonnet-4-20250514".into(),
+            session_id: Some("session-1".into()),
+            request_body_bytes: 777,
+            rewritten_body_bytes: 888,
+            stream: false,
+            tool_count: 0,
+            attachment_count: 0,
+            system_prompt_block_count: 1,
+            client_type: "api".into(),
+            attempt: 0,
+        };
+        let events = message_request_events(&context);
+        let payload = build_event_batch(&account, &run, 3.0, &events);
+        let serialized = serde_json::to_string(&payload).unwrap();
+
+        assert!(!serialized.contains("raw-token-marker"));
+        assert!(!serialized.contains("raw-prompt-marker"));
+        assert!(!serialized.contains("raw-tool-input-marker"));
+        assert!(serialized.contains("redacted_summary"));
+        assert!(serialized.contains("request_body_bytes"));
+    }
+
+    #[test]
+    fn event_queue_enforces_max_size() {
+        let mut queue = std::collections::VecDeque::<TelemetryEvent>::new();
+        for idx in 0..250 {
+            enqueue_events(
+                &mut queue,
+                vec![internal_event(
+                    &format!("event_{}", idx),
+                    "claude-sonnet-4-20250514",
+                    None,
+                )],
+            );
+        }
+        assert_eq!(queue.len(), super::EVENT_QUEUE_MAX);
+        assert_eq!(queue.front().unwrap().name.as_deref(), Some("event_50"));
+        assert_eq!(queue.back().unwrap().name.as_deref(), Some("event_249"));
     }
 
     #[test]
