@@ -8,6 +8,12 @@ use std::collections::HashMap;
 use crate::model::account::{
     Account, BillingMode, CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData,
 };
+use crate::service::version_profile::{
+    CODE_TRIGGERS_BETA_TOKEN, DEFAULT_CLAUDE_CODE_VERSION, MCP_SERVERS_BETA_TOKEN,
+    MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
+    claude_cli_user_agent, claude_code_user_agent, growthbook_user_agent, is_event_logging_path,
+    normalize_version,
+};
 
 /// header wire 大小写映射。
 /// Go 的 HTTP 服务器规范化 header，此映射还原 Claude CLI 抓包原始大小写。
@@ -31,6 +37,9 @@ static HEADER_WIRE_CASING: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     m.insert("anthropic-version", "anthropic-version");
     m.insert("anthropic-beta", "anthropic-beta");
     m.insert("x-app", "x-app");
+    m.insert("x-service-name", "x-service-name");
+    m.insert("anthropic-client-platform", "anthropic-client-platform");
+    m.insert("x-organization-uuid", "x-organization-uuid");
     m.insert("content-type", "content-type");
     m.insert("accept-language", "accept-language");
     m.insert("sec-fetch-mode", "sec-fetch-mode");
@@ -58,8 +67,6 @@ pub enum ClientType {
     ClaudeCode,
     API,
 }
-
-const DEFAULT_VERSION: &str = "2.1.81";
 
 /// 从逗号分隔的 anthropic-beta header 中剥离指定 token，保留其它 token 和相对顺序。
 ///
@@ -107,12 +114,32 @@ fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
 
 /// 根据模型返回正确的 anthropic-beta 值。
 fn beta_header_for_model(model_id: &str) -> &'static str {
-    let lower = model_id.to_lowercase();
-    if lower.contains("haiku") {
-        "oauth-2025-04-20,interleaved-thinking-2025-05-14"
+    let _ = model_id;
+    MESSAGE_BETA_TOKENS
+}
+
+/// 根据 endpoint 返回 Claude Code 2.1.156 的必需 beta token。
+fn beta_header_for_path(path: &str, model_id: &str) -> &'static str {
+    if is_event_logging_path(path)
+        || path.starts_with("/api/eval/")
+        || path.starts_with("/api/oauth/")
+        || path.starts_with("/api/claude_cli/bootstrap")
+        || path.starts_with("/api/claude_code_grove")
+        || path.starts_with("/api/claude_code_penguin_mode")
+    {
+        OAUTH_BETA_TOKEN
+    } else if path.starts_with("/v1/code/triggers") {
+        CODE_TRIGGERS_BETA_TOKEN
+    } else if path.starts_with("/v1/mcp_servers") {
+        MCP_SERVERS_BETA_TOKEN
     } else {
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
+        beta_header_for_model(model_id)
     }
+}
+
+/// 判断该 endpoint 是否应该发送 anthropic-beta。
+fn requires_anthropic_beta(path: &str) -> bool {
+    !path.starts_with("/mcp-registry/") && path != "/"
 }
 
 /// 处理所有请求的反检测改写。
@@ -129,59 +156,116 @@ impl Rewriter {
     pub fn rewrite_headers(
         &self,
         headers: &HashMap<String, String>,
+        path: &str,
         account: &Account,
         client_type: ClientType,
         model_id: &str,
         body_map: &serde_json::Value,
     ) -> HashMap<String, String> {
         let env = self.parse_env(account);
-        let version = if env.version.is_empty() {
-            DEFAULT_VERSION
-        } else {
-            &env.version
-        };
+        let version = normalize_version(&env.version);
 
         let mut out = HashMap::new();
 
         if client_type == ClientType::API {
-            // API 模式：使用与真实 Claude CLI 匹配的固定 header 集合。
+            // API 模式：使用按 endpoint 拆分的 Claude Code 2.1.156 header profile。
             out.insert("Accept".into(), "application/json".into());
-            out.insert(
-                "User-Agent".into(),
-                format!("claude-cli/{} (external, cli)", version),
-            );
-            out.insert(
-                "anthropic-beta".into(),
-                beta_header_for_model(model_id).into(),
-            );
-            out.insert("anthropic-version".into(), "2023-06-01".into());
-            out.insert(
-                "anthropic-dangerous-direct-browser-access".into(),
-                "true".into(),
-            );
-            out.insert("x-app".into(), "cli".into());
+            if requires_anthropic_beta(path) {
+                out.insert(
+                    "anthropic-beta".into(),
+                    beta_header_for_path(path, model_id).into(),
+                );
+            }
             out.insert("content-type".into(), "application/json".into());
-            out.insert(
-                "accept-encoding".into(),
-                "gzip, deflate, br, zstd".into(),
-            );
-            let stainless_os = stainless_os_from_platform(&env.platform);
-            out.insert("X-Stainless-Lang".into(), "js".into());
-            out.insert("X-Stainless-Package-Version".into(), "0.70.0".into());
-            out.insert("X-Stainless-OS".into(), stainless_os.into());
-            out.insert("X-Stainless-Arch".into(), env.arch.clone());
-            out.insert("X-Stainless-Runtime".into(), "node".into());
-            out.insert(
-                "X-Stainless-Runtime-Version".into(),
-                env.node_version.clone(),
-            );
-            out.insert("X-Stainless-Retry-Count".into(), "0".into());
-            out.insert("X-Stainless-Timeout".into(), "600".into());
+            if path.starts_with("/api/eval/") {
+                out.insert("Accept".into(), "*/*".into());
+                out.insert("User-Agent".into(), growthbook_user_agent().into());
+                out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
+            } else if is_event_logging_path(path) {
+                out.insert("Accept".into(), "application/json, text/plain, */*".into());
+                out.insert("User-Agent".into(), claude_code_user_agent(version));
+                out.insert(
+                    "accept-encoding".into(),
+                    "gzip, compress, deflate, br".into(),
+                );
+                out.insert("x-service-name".into(), "claude-code".into());
+            } else if path.starts_with("/api/claude_code_penguin_mode") {
+                out.insert("Accept".into(), "application/json, text/plain, */*".into());
+                out.insert("User-Agent".into(), "axios/1.15.2".into());
+                out.insert(
+                    "accept-encoding".into(),
+                    "gzip, compress, deflate, br".into(),
+                );
+            } else if path.starts_with("/api/claude_cli/bootstrap") {
+                out.insert("Accept".into(), "application/json, text/plain, */*".into());
+                out.insert("User-Agent".into(), claude_code_user_agent(version));
+                out.insert(
+                    "accept-encoding".into(),
+                    "gzip, compress, deflate, br".into(),
+                );
+            } else if path.starts_with("/v1/code/triggers") {
+                out.insert("Accept".into(), "application/json, text/plain, */*".into());
+                out.insert("User-Agent".into(), claude_cli_user_agent(version));
+                out.insert("anthropic-version".into(), "2023-06-01".into());
+                out.insert("anthropic-client-platform".into(), "claude_code_cli".into());
+                if let Some(ref org) = account.organization_uuid {
+                    out.insert("x-organization-uuid".into(), org.clone());
+                }
+                out.insert(
+                    "accept-encoding".into(),
+                    "gzip, compress, deflate, br".into(),
+                );
+            } else if path.starts_with("/v1/mcp_servers") {
+                out.insert("Accept".into(), "application/json, text/plain, */*".into());
+                out.insert("User-Agent".into(), "axios/1.15.2".into());
+                out.insert("anthropic-version".into(), "2023-06-01".into());
+                out.insert(
+                    "accept-encoding".into(),
+                    "gzip, compress, deflate, br".into(),
+                );
+            } else if path.starts_with("/api/")
+                || path.starts_with("/mcp-registry/")
+                || path.starts_with("/")
+            {
+                out.insert("Accept".into(), "application/json, text/plain, */*".into());
+                out.insert("User-Agent".into(), claude_cli_user_agent(version));
+                out.insert(
+                    "accept-encoding".into(),
+                    "gzip, compress, deflate, br".into(),
+                );
+            }
 
-            let session_id = extract_session_id_from_body(body_map)
-                .unwrap_or_else(generate_session_uuid);
-            out.insert("X-Claude-Code-Session-Id".into(), session_id);
-            out.insert("x-client-request-id".into(), generate_session_uuid());
+            if path.starts_with("/v1/messages") {
+                out.insert("Accept".into(), "application/json".into());
+                out.insert("User-Agent".into(), claude_cli_user_agent(version));
+                out.insert("anthropic-version".into(), "2023-06-01".into());
+                out.insert(
+                    "anthropic-dangerous-direct-browser-access".into(),
+                    "true".into(),
+                );
+                out.insert("x-app".into(), "cli".into());
+                out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
+                let stainless_os = stainless_os_from_platform(&env.platform);
+                out.insert("X-Stainless-Lang".into(), "js".into());
+                out.insert(
+                    "X-Stainless-Package-Version".into(),
+                    STAINLESS_PACKAGE_VERSION.into(),
+                );
+                out.insert("X-Stainless-OS".into(), stainless_os.into());
+                out.insert("X-Stainless-Arch".into(), env.arch.clone());
+                out.insert("X-Stainless-Runtime".into(), "node".into());
+                out.insert(
+                    "X-Stainless-Runtime-Version".into(),
+                    STAINLESS_RUNTIME_VERSION.into(),
+                );
+                out.insert("X-Stainless-Retry-Count".into(), "0".into());
+                out.insert("X-Stainless-Timeout".into(), "600".into());
+
+                let session_id =
+                    extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
+                out.insert("X-Claude-Code-Session-Id".into(), session_id);
+                out.insert("x-client-request-id".into(), generate_session_uuid());
+            }
         } else {
             // CC 客户端模式：白名单 + 改写
             let allowed: std::collections::HashSet<&str> = [
@@ -206,6 +290,9 @@ impl Rewriter {
                 "x-stainless-helper-method",
                 "x-claude-code-session-id",
                 "x-client-request-id",
+                "x-service-name",
+                "anthropic-client-platform",
+                "x-organization-uuid",
             ]
             .into_iter()
             .collect();
@@ -219,10 +306,23 @@ impl Rewriter {
                 let wire_key = resolve_wire_casing(k);
                 match lower.as_str() {
                     "user-agent" => {
-                        out.insert(
-                            wire_key,
-                            format!("claude-cli/{} (external, cli)", version),
-                        );
+                        let user_agent = if path.starts_with("/api/eval/") {
+                            growthbook_user_agent().to_string()
+                        } else if is_event_logging_path(path)
+                            || path.starts_with("/api/claude_cli/bootstrap")
+                        {
+                            claude_code_user_agent(version)
+                        } else if path.starts_with("/v1/mcp_servers")
+                            || path.starts_with("/api/claude_code_penguin_mode")
+                        {
+                            "axios/1.15.2".to_string()
+                        } else {
+                            claude_cli_user_agent(version)
+                        };
+                        out.insert(wire_key, user_agent);
+                    }
+                    "x-stainless-package-version" => {
+                        out.insert(wire_key, STAINLESS_PACKAGE_VERSION.to_string());
                     }
                     "x-stainless-os" => {
                         out.insert(wire_key, stainless_os.to_string());
@@ -231,7 +331,12 @@ impl Rewriter {
                         out.insert(wire_key, env.arch.clone());
                     }
                     "x-stainless-runtime-version" => {
-                        out.insert(wire_key, env.node_version.clone());
+                        out.insert(wire_key, STAINLESS_RUNTIME_VERSION.to_string());
+                    }
+                    "x-organization-uuid" => {
+                        if let Some(ref org) = account.organization_uuid {
+                            out.insert(wire_key, org.clone());
+                        }
                     }
                     _ => {
                         out.insert(wire_key, v.clone());
@@ -239,27 +344,39 @@ impl Rewriter {
                 }
             }
 
-            // 确保必需 header 存在
-            out.entry("anthropic-dangerous-direct-browser-access".into())
-                .or_insert_with(|| "true".into());
+            if path.starts_with("/v1/messages") {
+                out.entry("anthropic-dangerous-direct-browser-access".into())
+                    .or_insert_with(|| "true".into());
+            }
 
             // 合并客户端 beta 与必需 beta；对于不在账号 1M 白名单内的模型，
             // 强制剥掉 context-1m-2025-08-07（即便客户端传了）。
             // 对应 sub2api BetaPolicy(action=filter, model_whitelist=..., fallback=filter)：
             // 默认放行 "opus" 家族，运维可在账号设置里改 allow_1m_models 字段。
-            let existing_beta = out
-                .get("anthropic-beta")
-                .cloned()
-                .unwrap_or_default();
+            let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             let filtered_existing = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
                 existing_beta
             } else {
                 strip_beta_token(&existing_beta, "context-1m-2025-08-07")
             };
-            out.insert(
-                "anthropic-beta".into(),
-                merge_anthropic_beta(beta_header_for_model(model_id), &filtered_existing),
-            );
+            if requires_anthropic_beta(path) {
+                out.insert(
+                    "anthropic-beta".into(),
+                    merge_anthropic_beta(beta_header_for_path(path, model_id), &filtered_existing),
+                );
+            }
+            if is_event_logging_path(path) {
+                out.insert("x-service-name".into(), "claude-code".into());
+            }
+            if path.starts_with("/v1/code/triggers") {
+                out.insert("anthropic-client-platform".into(), "claude_code_cli".into());
+                if let Some(ref org) = account.organization_uuid {
+                    out.insert("x-organization-uuid".into(), org.clone());
+                }
+            }
+            if path.starts_with("/v1/mcp_servers") || path.starts_with("/v1/code/triggers") {
+                out.insert("anthropic-version".into(), "2023-06-01".into());
+            }
         }
 
         out
@@ -287,7 +404,7 @@ impl Rewriter {
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type);
-        } else if path.contains("/event_logging/batch") {
+        } else if is_event_logging_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
             self.rewrite_growthbook_eval(&mut parsed, account);
@@ -297,9 +414,10 @@ impl Rewriter {
 
         let mut output = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
 
-        // Rewrite 模式下对 /v1/messages 请求计算 cch attestation
+        let env = self.parse_env(account);
+        let version = normalize_version(&env.version);
         if path.starts_with("/v1/messages") && account.billing_mode == BillingMode::Rewrite {
-            output = compute_cch_attestation(output);
+            output = compute_cch_attestation(output, version);
         }
 
         output
@@ -325,10 +443,7 @@ impl Rewriter {
             let session_id = self.inject_metadata_user_id(body, account);
             if let Some(sid) = &session_id {
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                    metadata.insert(
-                        "_session_id".into(),
-                        serde_json::Value::String(sid.clone()),
-                    );
+                    metadata.insert("_session_id".into(), serde_json::Value::String(sid.clone()));
                 }
             }
 
@@ -386,13 +501,8 @@ impl Rewriter {
                     serde_json::Value::String(account.device_id.clone()),
                 );
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
-                if let Some(metadata) =
-                    body.get_mut("metadata").and_then(|m| m.as_object_mut())
-                {
-                    metadata.insert(
-                        "user_id".into(),
-                        serde_json::Value::String(new_str),
-                    );
+                if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                    metadata.insert("user_id".into(), serde_json::Value::String(new_str));
                 }
                 return;
             }
@@ -503,17 +613,14 @@ impl Rewriter {
         version: &str,
         billing_mode: &BillingMode,
     ) {
-        let version = if version.is_empty() {
-            DEFAULT_VERSION
-        } else {
-            version
-        };
+        let version = normalize_version(version);
+        let rewrite_billing = *billing_mode == BillingMode::Rewrite;
 
         // CCH hash 计算
-        let cch_hash = if *billing_mode == BillingMode::Rewrite {
+        let cch_hash = if rewrite_billing {
             let first_msg = extract_first_user_message(body);
             if !first_msg.is_empty() {
-                compute_cch(&first_msg, version)
+                compute_cc_version_suffix(&first_msg, version)
             } else {
                 let mut bytes = [0u8; 2];
                 rand::thread_rng().fill(&mut bytes);
@@ -525,15 +632,13 @@ impl Rewriter {
 
         let rewrite = |text: &str| -> String {
             let mut text = text.to_string();
-            if *billing_mode == BillingMode::Rewrite {
+            if rewrite_billing {
                 text = BILLING_VERSION_REGEX
                     .replace_all(&text, &format!("cc_version={}.{}", version, cch_hash))
                     .to_string();
                 // 将已有的 cch 值重置为占位符，后续在序列化后通过 xxhash64 重新计算
-                text = CCH_VALUE_REGEX
-                    .replace_all(&text, "cch=00000")
-                    .to_string();
-            } else {
+                text = CCH_VALUE_REGEX.replace_all(&text, "cch=00000").to_string();
+            } else if *billing_mode == BillingMode::Strip {
                 text = BILLING_LINE_REGEX.replace_all(&text, "").to_string();
                 text = BILLING_REGEX.replace_all(&text, "").to_string();
             }
@@ -554,9 +659,7 @@ impl Rewriter {
             } else {
                 &pe.working_dir
             };
-            text = HOME_PATH_REGEX
-                .replace_all(&text, home_prefix)
-                .to_string();
+            text = HOME_PATH_REGEX.replace_all(&text, home_prefix).to_string();
             text
         };
 
@@ -569,10 +672,9 @@ impl Rewriter {
         // 改写 body.system
         match body.get("system").cloned() {
             Some(serde_json::Value::String(sys)) => {
-                body.as_object_mut().unwrap().insert(
-                    "system".into(),
-                    serde_json::Value::String(rewrite(&sys)),
-                );
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("system".into(), serde_json::Value::String(rewrite(&sys)));
             }
             Some(serde_json::Value::Array(sys)) => {
                 let filtered: Vec<serde_json::Value> = if *billing_mode == BillingMode::Strip {
@@ -642,60 +744,9 @@ impl Rewriter {
                 None => continue,
             };
 
-            if e.contains_key("device_id") {
-                e.insert(
-                    "device_id".into(),
-                    serde_json::Value::String(account.device_id.clone()),
-                );
-            }
-            if e.contains_key("email") {
-                e.insert(
-                    "email".into(),
-                    serde_json::Value::String(account.email.clone()),
-                );
-            }
-
-            e.remove("baseUrl");
-            e.remove("base_url");
-            e.remove("gateway");
-
-            // 改写 account_uuid / organization_uuid
-            if e.contains_key("account_uuid") {
-                let uuid = account.account_uuid.clone()
-                    .unwrap_or_else(|| derive_account_uuid(account));
-                e.insert("account_uuid".into(), serde_json::Value::String(uuid));
-            }
-            if e.contains_key("organization_uuid") {
-                if let Some(ref org) = account.organization_uuid {
-                    e.insert("organization_uuid".into(), serde_json::Value::String(org.clone()));
-                } else {
-                    e.remove("organization_uuid");
-                }
-            }
-
-            if e.contains_key("env") {
-                e.insert("env".into(), canonical_env.clone());
-            }
-
-            if let Some(p) = e.remove("process") {
-                e.insert("process".into(), rewrite_process(&p, &proc));
-            }
-
-            if let Some(am) = e.get("additional_metadata").and_then(|v| v.as_str()) {
-                let rewritten = rewrite_additional_metadata(am);
-                e.insert(
-                    "additional_metadata".into(),
-                    serde_json::Value::String(rewritten),
-                );
-            }
-
-            // 改写 user_attributes（GrowthBook 实验事件中的 JSON 字符串）
-            if let Some(ua_str) = e.get("user_attributes").and_then(|v| v.as_str()) {
-                let rewritten = rewrite_user_attributes_json(ua_str, account);
-                e.insert(
-                    "user_attributes".into(),
-                    serde_json::Value::String(rewritten),
-                );
+            rewrite_event_fields(e, account, &env, &proc, &canonical_env);
+            if let Some(event_data) = e.get_mut("event_data").and_then(|v| v.as_object_mut()) {
+                rewrite_event_fields(event_data, account, &env, &proc, &canonical_env);
             }
         }
     }
@@ -709,35 +760,7 @@ impl Rewriter {
             None => return,
         };
 
-        // 身份字段
-        attrs.insert("id".into(), serde_json::Value::String(account.device_id.clone()));
-        attrs.insert("deviceID".into(), serde_json::Value::String(account.device_id.clone()));
-
-        if attrs.contains_key("email") {
-            attrs.insert("email".into(), serde_json::Value::String(account.email.clone()));
-        }
-        if attrs.contains_key("accountUUID") {
-            let uuid = account.account_uuid.clone()
-                .unwrap_or_else(|| derive_account_uuid(account));
-            attrs.insert("accountUUID".into(), serde_json::Value::String(uuid));
-        }
-        if let Some(ref org) = account.organization_uuid {
-            attrs.insert("organizationUUID".into(), serde_json::Value::String(org.clone()));
-        } else {
-            attrs.remove("organizationUUID");
-        }
-        if let Some(ref sub) = account.subscription_type {
-            attrs.insert("subscriptionType".into(), serde_json::Value::String(sub.clone()));
-        }
-
-        // 移除代理暴露字段
-        attrs.remove("apiBaseUrlHost");
-
-        // 环境对齐
-        attrs.insert("platform".into(), serde_json::Value::String(env.platform.clone()));
-        if attrs.contains_key("appVersion") {
-            attrs.insert("appVersion".into(), serde_json::Value::String(env.version.clone()));
-        }
+        apply_growthbook_attributes(attrs, account, &env);
     }
 
     // --- 通用身份改写 ---
@@ -776,12 +799,9 @@ impl Rewriter {
 
 // --- 正则表达式 ---
 
-static PLATFORM_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Platform:\s*\S+").unwrap());
-static SHELL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Shell:\s*[^\n<]+").unwrap());
-static OS_VERSION_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
+static PLATFORM_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Platform:\s*\S+").unwrap());
+static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Shell:\s*[^\n<]+").unwrap());
+static OS_VERSION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
 static WORKING_DIR_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"((?:Primary )?[Ww]orking directory:\s*)/\S+").unwrap());
 static HOME_PATH_REGEX: Lazy<Regex> =
@@ -793,28 +813,27 @@ static BILLING_REGEX: Lazy<Regex> =
 /// 仅匹配 cc_version 值部分，用于 Rewrite 模式保留 cc_entrypoint。
 static BILLING_VERSION_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3}").unwrap());
-static CCH_VALUE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
-static GIT_USER_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
+static CCH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
+static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
 
 // --- CCH Attestation (xxhash64) ---
 
-const CCH_ATTESTATION_SEED: u64 = 0x6E52736AC806831E;
+const CCH_ATTESTATION_SEED_LEGACY: u64 = 0x6E52736AC806831E;
+const CCH_ATTESTATION_SEED_2156: u64 = 0x4D659218E32A3268;
 const CCH_PLACEHOLDER: &[u8] = b"cch=00000";
 
 /// 对序列化后的 body 字节计算 cch attestation 并原地替换占位符。
 /// 算法：xxhash64(body_with_placeholder, seed) 取低 20 bits → 5 位十六进制。
-fn compute_cch_attestation(mut body: Vec<u8>) -> Vec<u8> {
+fn compute_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
     if let Some(pos) = body
         .windows(CCH_PLACEHOLDER.len())
         .position(|w| w == CCH_PLACEHOLDER)
     {
-        let hash = xxhash_rust::xxh64::xxh64(&body, CCH_ATTESTATION_SEED);
+        let hash = xxhash_rust::xxh64::xxh64(&body, cch_attestation_seed(version));
         let cch = format!("{:05x}", hash & 0xFFFFF);
-        // "cch=" 占 4 字节，后续 5 字节是 "00000"
+        // "cch=" 占 4 字节，后续 5 字节是 "00000"。
         body[pos + 4..pos + 9].copy_from_slice(cch.as_bytes());
     }
     body
@@ -825,19 +844,32 @@ fn compute_cch_attestation(mut body: Vec<u8>) -> Vec<u8> {
 const CCH_SALT: &str = "59cf53e54c78";
 const CCH_POSITIONS: [usize; 3] = [4, 7, 20];
 
-fn compute_cch(first_user_message_text: &str, version: &str) -> String {
-    let bytes = first_user_message_text.as_bytes();
-    let mut chars = Vec::new();
+fn compute_cc_version_suffix(first_user_message_text: &str, version: &str) -> String {
+    let code_units: Vec<u16> = first_user_message_text.encode_utf16().collect();
+    let mut picked = String::new();
     for &pos in &CCH_POSITIONS {
-        if pos < bytes.len() {
-            chars.push(bytes[pos]);
+        if let Some(code_unit) = code_units.get(pos) {
+            if let Some(ch) = char::from_u32(*code_unit as u32) {
+                picked.push(ch);
+            } else {
+                // JS 字符串索引可能取到 emoji 的单个 surrogate；Node 作为 UTF-8 输入时会按替换字符处理。
+                picked.push('\u{FFFD}');
+            }
         } else {
-            chars.push(b'0');
+            picked.push('0');
         }
     }
-    let input = format!("{}{}{}", CCH_SALT, String::from_utf8_lossy(&chars), version);
+    let input = format!("{}{}{}", CCH_SALT, picked, version);
     let hash = Sha256::digest(input.as_bytes());
     format!("{:x}", hash)[..3].to_string()
+}
+
+/// 返回指定 Claude Code 版本使用的 CCH attestation seed。
+fn cch_attestation_seed(version: &str) -> u64 {
+    match normalize_version(version) {
+        DEFAULT_CLAUDE_CODE_VERSION => CCH_ATTESTATION_SEED_2156,
+        _ => CCH_ATTESTATION_SEED_LEGACY,
+    }
 }
 
 /// 从 messages 数组中提取首条用户消息文本。
@@ -875,10 +907,9 @@ where
 {
     match msg.get("content").cloned() {
         Some(serde_json::Value::String(s)) => {
-            msg.as_object_mut().unwrap().insert(
-                "content".into(),
-                serde_json::Value::String(rewrite_fn(&s)),
-            );
+            msg.as_object_mut()
+                .unwrap()
+                .insert("content".into(), serde_json::Value::String(rewrite_fn(&s)));
         }
         Some(serde_json::Value::Array(arr)) => {
             let rewritten: Vec<serde_json::Value> = arr
@@ -903,6 +934,74 @@ where
 
 fn build_canonical_env_map(env: &CanonicalEnvData) -> serde_json::Value {
     crate::model::identity::build_full_env_json(env)
+}
+
+/// 改写 event_logging 事件字段，兼容旧顶层结构和 2.1.156 的 event_data 结构。
+fn rewrite_event_fields(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    account: &Account,
+    env: &CanonicalEnvData,
+    proc: &CanonicalProcessData,
+    canonical_env: &serde_json::Value,
+) {
+    if map.contains_key("device_id") {
+        map.insert(
+            "device_id".into(),
+            serde_json::Value::String(account.device_id.clone()),
+        );
+    }
+    if map.contains_key("email") {
+        map.insert(
+            "email".into(),
+            serde_json::Value::String(account.email.clone()),
+        );
+    }
+
+    map.remove("baseUrl");
+    map.remove("base_url");
+    map.remove("gateway");
+
+    if map.contains_key("account_uuid") {
+        let uuid = account
+            .account_uuid
+            .clone()
+            .unwrap_or_else(|| derive_account_uuid(account));
+        map.insert("account_uuid".into(), serde_json::Value::String(uuid));
+    }
+    if map.contains_key("organization_uuid") {
+        if let Some(ref org) = account.organization_uuid {
+            map.insert(
+                "organization_uuid".into(),
+                serde_json::Value::String(org.clone()),
+            );
+        } else {
+            map.remove("organization_uuid");
+        }
+    }
+
+    if map.contains_key("env") {
+        map.insert("env".into(), canonical_env.clone());
+    }
+
+    if let Some(p) = map.remove("process") {
+        map.insert("process".into(), rewrite_process(&p, proc));
+    }
+
+    if let Some(am) = map.get("additional_metadata").and_then(|v| v.as_str()) {
+        let rewritten = rewrite_additional_metadata(am);
+        map.insert(
+            "additional_metadata".into(),
+            serde_json::Value::String(rewritten),
+        );
+    }
+
+    if let Some(ua_str) = map.get("user_attributes").and_then(|v| v.as_str()) {
+        let rewritten = rewrite_user_attributes_json_with_env(ua_str, account, env);
+        map.insert(
+            "user_attributes".into(),
+            serde_json::Value::String(rewritten),
+        );
+    }
 }
 
 // --- 进程指纹改写 ---
@@ -996,36 +1095,100 @@ fn rewrite_additional_metadata(encoded: &str) -> String {
 
 /// 改写 GrowthBook 实验事件中 user_attributes JSON 字符串内的身份字段。
 fn rewrite_user_attributes_json(json_str: &str, account: &Account) -> String {
+    let env: CanonicalEnvData = CanonicalEnvData::default();
+    rewrite_user_attributes_json_with_env(json_str, account, &env)
+}
+
+/// 改写 GrowthBook 实验事件中 user_attributes JSON 字符串内的身份字段。
+fn rewrite_user_attributes_json_with_env(
+    json_str: &str,
+    account: &Account,
+    env: &CanonicalEnvData,
+) -> String {
     let mut obj: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
     };
     if let Some(map) = obj.as_object_mut() {
-        if map.contains_key("id") {
-            map.insert("id".into(), serde_json::Value::String(account.device_id.clone()));
-        }
-        if map.contains_key("deviceID") {
-            map.insert("deviceID".into(), serde_json::Value::String(account.device_id.clone()));
-        }
-        if map.contains_key("email") {
-            map.insert("email".into(), serde_json::Value::String(account.email.clone()));
-        }
-        if map.contains_key("accountUUID") {
-            let uuid = account.account_uuid.clone()
-                .unwrap_or_else(|| derive_account_uuid(account));
-            map.insert("accountUUID".into(), serde_json::Value::String(uuid));
-        }
-        if let Some(ref org) = account.organization_uuid {
-            map.insert("organizationUUID".into(), serde_json::Value::String(org.clone()));
-        } else {
-            map.remove("organizationUUID");
-        }
-        if let Some(ref sub) = account.subscription_type {
-            map.insert("subscriptionType".into(), serde_json::Value::String(sub.clone()));
-        }
-        map.remove("apiBaseUrlHost");
+        apply_growthbook_attributes(map, account, env);
     }
     serde_json::to_string(&obj).unwrap_or_else(|_| json_str.to_string())
+}
+
+/// 对 GrowthBook attributes 补齐 Claude Code 2.1.156 抓包中的关键身份字段。
+fn apply_growthbook_attributes(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    account: &Account,
+    env: &CanonicalEnvData,
+) {
+    map.insert(
+        "id".into(),
+        serde_json::Value::String(account.device_id.clone()),
+    );
+    map.insert(
+        "deviceID".into(),
+        serde_json::Value::String(account.device_id.clone()),
+    );
+    map.insert(
+        "email".into(),
+        serde_json::Value::String(account.email.clone()),
+    );
+    map.insert(
+        "accountUUID".into(),
+        serde_json::Value::String(
+            account
+                .account_uuid
+                .clone()
+                .unwrap_or_else(|| derive_account_uuid(account)),
+        ),
+    );
+    if let Some(ref org) = account.organization_uuid {
+        map.insert(
+            "organizationUUID".into(),
+            serde_json::Value::String(org.clone()),
+        );
+    } else {
+        map.remove("organizationUUID");
+    }
+    if let Some(ref sub) = account.subscription_type {
+        map.insert(
+            "subscriptionType".into(),
+            serde_json::Value::String(sub.clone()),
+        );
+    }
+    map.insert(
+        "userType".into(),
+        serde_json::Value::String("external".into()),
+    );
+    map.insert(
+        "rateLimitTier".into(),
+        serde_json::Value::String(rate_limit_tier(account)),
+    );
+    map.insert("entrypoint".into(), serde_json::Value::String("cli".into()));
+    map.remove("apiBaseUrlHost");
+
+    if !env.platform.is_empty() {
+        map.insert(
+            "platform".into(),
+            serde_json::Value::String(env.platform.clone()),
+        );
+    }
+    if !env.version.is_empty() {
+        map.insert(
+            "appVersion".into(),
+            serde_json::Value::String(env.version.clone()),
+        );
+    }
+}
+
+/// 根据订阅类型生成 GrowthBook rateLimitTier。
+fn rate_limit_tier(account: &Account) -> String {
+    match account.subscription_type.as_deref() {
+        Some("max") => "default_claude_max_20x".to_string(),
+        Some("pro") => "default_claude_pro".to_string(),
+        Some(other) if !other.is_empty() => format!("default_claude_{}", other),
+        _ => "default".to_string(),
+    }
 }
 
 /// 移除 system 和消息内容块中的 cache_control。
@@ -1068,8 +1231,7 @@ fn strip_empty_text_blocks(body: &mut serde_json::Value) {
         for item in blocks.iter_mut() {
             if let Some(block) = item.as_object_mut() {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                    if let Some(content) = block.get_mut("content").and_then(|c| c.as_array_mut())
-                    {
+                    if let Some(content) = block.get_mut("content").and_then(|c| c.as_array_mut()) {
                         filter_blocks(content);
                     }
                 }
@@ -1118,8 +1280,7 @@ pub fn detect_client_type(user_agent: &str, body: &serde_json::Value) -> ClientT
     ClientType::API
 }
 
-const CLAUDE_CODE_SYSTEM_PROMPT: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// 通过账号信息生成稳定的 UUID 标识符。
 fn derive_account_uuid(account: &Account) -> String {
@@ -1168,7 +1329,9 @@ fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &
     let scrub = |text: &str| -> String {
         SYSTEM_REMINDER_REGEX
             .replace_all(text, |caps: &regex::Captures| {
-                GIT_USER_REGEX.replace_all(&caps[0], replacement.as_str()).to_string()
+                GIT_USER_REGEX
+                    .replace_all(&caps[0], replacement.as_str())
+                    .to_string()
             })
             .to_string()
     };
@@ -1217,9 +1380,355 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_1m_whitelist, strip_beta_token};
+    use super::{
+        ClientType, Rewriter, cch_attestation_seed, compute_cch_attestation,
+        compute_cc_version_suffix, matches_1m_whitelist, strip_beta_token,
+    };
+    use crate::model::account::{
+        Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
+        CanonicalProcessData, CanonicalPromptEnvData,
+    };
+    use crate::service::version_profile::{
+        DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION,
+        STAINLESS_RUNTIME_VERSION,
+    };
+    use chrono::Utc;
+    use serde_json::json;
 
     const CTX_1M: &str = "context-1m-2025-08-07";
+
+    fn test_account() -> Account {
+        let env = CanonicalEnvData {
+            platform: "linux".into(),
+            platform_raw: "linux".into(),
+            arch: "x64".into(),
+            node_version: "v22.15.0".into(),
+            terminal: "ssh-session".into(),
+            package_managers: "npm".into(),
+            runtimes: "node".into(),
+            is_claude_ai_auth: true,
+            version: DEFAULT_CLAUDE_CODE_VERSION.into(),
+            version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
+            build_time: DEFAULT_CLAUDE_CODE_BUILD_TIME.into(),
+            deployment_environment: "unknown-linux".into(),
+            vcs: "git".into(),
+            ..Default::default()
+        };
+        let prompt = CanonicalPromptEnvData {
+            platform: "linux".into(),
+            shell: "bash".into(),
+            os_version: "Linux 6.5.0-generic".into(),
+            working_dir: "/home/user/project".into(),
+        };
+        let process = CanonicalProcessData {
+            constrained_memory: 0,
+            rss_range: [1, 2],
+            heap_total_range: [1, 2],
+            heap_used_range: [1, 2],
+            external_range: [1, 2],
+            array_buffers_range: [1, 2],
+        };
+        Account {
+            id: 1,
+            name: "测试账号".into(),
+            email: "user@example.com".into(),
+            status: AccountStatus::Active,
+            auth_type: AccountAuthType::Oauth,
+            setup_token: String::new(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+            oauth_refreshed_at: None,
+            auth_error: String::new(),
+            proxy_url: String::new(),
+            device_id: "device-1".into(),
+            canonical_env: serde_json::to_value(env).unwrap(),
+            canonical_prompt: serde_json::to_value(prompt).unwrap(),
+            canonical_process: serde_json::to_value(process).unwrap(),
+            billing_mode: BillingMode::Rewrite,
+            account_uuid: Some("account-uuid".into()),
+            organization_uuid: Some("org-uuid".into()),
+            subscription_type: Some("max".into()),
+            concurrency: 3,
+            priority: 50,
+            rate_limited_at: None,
+            rate_limit_reset_at: None,
+            disable_reason: String::new(),
+            auto_telemetry: false,
+            auto_poll_usage: false,
+            allow_1m_models: "opus".into(),
+            telemetry_count: 0,
+            usage_data: json!({}),
+            usage_fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn api_messages_headers_use_2156_profile() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({"metadata": {"_session_id": "session-1"}});
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-opus-4-8",
+            &body,
+        );
+        assert_eq!(
+            headers.get("User-Agent").unwrap(),
+            "claude-cli/2.1.156 (external, cli)"
+        );
+        assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
+        assert_eq!(
+            headers.get("X-Stainless-Package-Version").unwrap(),
+            STAINLESS_PACKAGE_VERSION
+        );
+        assert_eq!(
+            headers.get("X-Stainless-Runtime-Version").unwrap(),
+            STAINLESS_RUNTIME_VERSION
+        );
+        assert_eq!(
+            headers.get("X-Claude-Code-Session-Id").unwrap(),
+            "session-1"
+        );
+    }
+
+    #[test]
+    fn endpoint_headers_use_distinct_profiles() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let empty = std::collections::HashMap::new();
+        let body = json!({});
+
+        let event_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(
+            event_headers.get("User-Agent").unwrap(),
+            "claude-code/2.1.156"
+        );
+        assert_eq!(event_headers.get("x-service-name").unwrap(), "claude-code");
+        assert_eq!(
+            event_headers.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20"
+        );
+
+        let legacy_event_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/event_logging/batch",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(
+            legacy_event_headers.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20"
+        );
+
+        let eval_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/eval/sdk-zAZezfDKGoZuXXKe",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(eval_headers.get("User-Agent").unwrap(), "Bun/1.3.14");
+
+        let trigger_headers = rewriter.rewrite_headers(
+            &empty,
+            "/v1/code/triggers",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(
+            trigger_headers.get("anthropic-beta").unwrap(),
+            "ccr-triggers-2026-01-30"
+        );
+        assert_eq!(
+            trigger_headers.get("anthropic-client-platform").unwrap(),
+            "claude_code_cli"
+        );
+        assert_eq!(
+            trigger_headers.get("x-organization-uuid").unwrap(),
+            "org-uuid"
+        );
+
+        let mcp_headers = rewriter.rewrite_headers(
+            &empty,
+            "/v1/mcp_servers",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(
+            mcp_headers.get("anthropic-beta").unwrap(),
+            "mcp-servers-2025-12-04"
+        );
+        assert_eq!(mcp_headers.get("User-Agent").unwrap(), "axios/1.15.2");
+
+        let registry_headers = rewriter.rewrite_headers(
+            &empty,
+            "/mcp-registry/v0/servers",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert!(registry_headers.get("anthropic-beta").is_none());
+
+        let oauth_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/oauth/account/settings",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(
+            oauth_headers.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20"
+        );
+        assert_eq!(
+            oauth_headers.get("User-Agent").unwrap(),
+            "claude-cli/2.1.156 (external, cli)"
+        );
+
+        let penguin_headers = rewriter.rewrite_headers(
+            &empty,
+            "/api/claude_code_penguin_mode",
+            &account,
+            ClientType::API,
+            "",
+            &body,
+        );
+        assert_eq!(
+            penguin_headers.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20"
+        );
+        assert_eq!(penguin_headers.get("User-Agent").unwrap(), "axios/1.15.2");
+    }
+
+    #[test]
+    fn growthbook_rewrite_adds_2156_attributes() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "attributes": {
+                "apiBaseUrlHost": "proxy.local",
+                "platform": "darwin",
+                "appVersion": "old"
+            }
+        });
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/eval/sdk-zAZezfDKGoZuXXKe",
+            &account,
+            ClientType::ClaudeCode,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let attrs = parsed.get("attributes").unwrap();
+        assert_eq!(attrs.get("id").unwrap(), "device-1");
+        assert_eq!(attrs.get("userType").unwrap(), "external");
+        assert_eq!(
+            attrs.get("rateLimitTier").unwrap(),
+            "default_claude_max_20x"
+        );
+        assert_eq!(attrs.get("entrypoint").unwrap(), "cli");
+        assert_eq!(
+            attrs.get("appVersion").unwrap(),
+            DEFAULT_CLAUDE_CODE_VERSION
+        );
+        assert!(attrs.get("apiBaseUrlHost").is_none());
+    }
+
+    #[test]
+    fn event_logging_v2_path_is_rewritten() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "events": [{
+                "event_type": "ClaudeCodeInternalEvent",
+                "event_data": {
+                    "device_id": "old",
+                    "email": "old@example.com",
+                    "account_uuid": "old-account",
+                    "organization_uuid": "old-org",
+                    "env": {},
+                    "additional_metadata": "",
+                    "user_attributes": "{\"id\":\"old\",\"apiBaseUrlHost\":\"proxy.local\"}"
+                }
+            }]
+        });
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::ClaudeCode,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let event = &parsed["events"][0]["event_data"];
+        assert_eq!(event["device_id"], "device-1");
+        assert_eq!(event["email"], "user@example.com");
+        assert_eq!(event["account_uuid"], "account-uuid");
+        assert_eq!(event["organization_uuid"], "org-uuid");
+        let attrs: serde_json::Value =
+            serde_json::from_str(event["user_attributes"].as_str().unwrap()).unwrap();
+        assert_eq!(attrs["userType"], "external");
+        assert!(attrs.get("apiBaseUrlHost").is_none());
+    }
+
+    #[test]
+    fn cc_version_suffix_uses_string_indices() {
+        assert_eq!(
+            compute_cc_version_suffix("abcdefghijklmno pqrstuvwxyz", "2.1.156"),
+            "c09"
+        );
+        assert_eq!(
+            compute_cc_version_suffix("abcd你fghijklmnopqrstuv", "2.1.156"),
+            "45e"
+        );
+    }
+
+    #[test]
+    fn cch_seed_is_versioned() {
+        assert_eq!(
+            cch_attestation_seed(DEFAULT_CLAUDE_CODE_VERSION),
+            0x4D659218E32A3268
+        );
+        assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
+        assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
+    }
+
+    #[test]
+    fn cch_rewrite_uses_2156_seed() {
+        let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.156.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+        let out = compute_cch_attestation(body.to_vec(), DEFAULT_CLAUDE_CODE_VERSION);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("cch=40943"));
+    }
+
+    #[test]
+    fn cch_rewrite_keeps_legacy_seed_for_old_versions() {
+        let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.81.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+        let out = compute_cch_attestation(body.to_vec(), "2.1.81");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("cch=afd26"));
+    }
 
     #[test]
     fn strip_token_in_middle() {
@@ -1250,10 +1759,7 @@ mod tests {
 
     #[test]
     fn strip_token_not_present() {
-        let got = strip_beta_token(
-            "oauth-2025-04-20,interleaved-thinking-2025-05-14",
-            CTX_1M,
-        );
+        let got = strip_beta_token("oauth-2025-04-20,interleaved-thinking-2025-05-14", CTX_1M);
         assert_eq!(got, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
     }
 
@@ -1330,7 +1836,10 @@ mod tests {
     fn whitelist_ignores_whitespace_and_empty_segments() {
         // 脏输入："opus, , ,sonnet,," 也能解析
         assert!(matches_1m_whitelist("claude-opus-4-7", "opus, , ,sonnet,,"));
-        assert!(matches_1m_whitelist("claude-sonnet-4-5", "opus, , ,sonnet,,"));
+        assert!(matches_1m_whitelist(
+            "claude-sonnet-4-5",
+            "opus, , ,sonnet,,"
+        ));
     }
 
     #[test]

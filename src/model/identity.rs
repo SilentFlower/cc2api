@@ -3,6 +3,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::account::{CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData};
+use crate::service::version_profile::{
+    DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION, DEFAULT_CLAUDE_CODE_VERSION_BASE,
+};
 
 fn env_presets() -> Vec<CanonicalEnvData> {
     vec![
@@ -46,9 +49,9 @@ fn dp(arch: &str, node: &str, term: &str, pm: &str) -> CanonicalEnvData {
         package_managers: pm.into(),
         runtimes: "node".into(),
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: DEFAULT_CLAUDE_CODE_VERSION.into(),
+        version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
+        build_time: DEFAULT_CLAUDE_CODE_BUILD_TIME.into(),
         deployment_environment: "unknown-darwin".into(),
         vcs: "git".into(),
         ..Default::default()
@@ -71,9 +74,9 @@ fn lp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
         package_managers: pm.into(),
         runtimes: "node".into(),
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: DEFAULT_CLAUDE_CODE_VERSION.into(),
+        version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
+        build_time: DEFAULT_CLAUDE_CODE_BUILD_TIME.into(),
         deployment_environment: "unknown-linux".into(),
         vcs: "git".into(),
         ..Default::default()
@@ -91,9 +94,9 @@ fn wp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
         package_managers: pm.into(),
         runtimes: "node".into(),
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: DEFAULT_CLAUDE_CODE_VERSION.into(),
+        version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
+        build_time: DEFAULT_CLAUDE_CODE_BUILD_TIME.into(),
         deployment_environment: "unknown-win32".into(),
         vcs: "git".into(),
         ..Default::default()

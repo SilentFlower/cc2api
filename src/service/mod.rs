@@ -6,3 +6,4 @@ pub mod prime_poller;
 pub mod rewriter;
 pub mod telemetry;
 pub mod usage_poller;
+pub mod version_profile;
