@@ -595,6 +595,22 @@ cc-bridge/
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、`userType`、`rateLimitTier`、`entrypoint`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
 
+### Thinking 签名错误重试
+
+`/v1/messages` 如果上游返回 400 且错误体包含 `signature` /
+`thought_signature` / thinking 结构错误，网关会对同一账号、同一 token、
+同一套请求头做最多两阶段降级重试：
+
+1. `thinking-only`：移除顶层 `thinking`，把历史 `thinking` block 转为普通
+   `text`，删除 `redacted_thinking`。
+2. `thinking+tools`：第一阶段仍然是签名相关 400 时，再把 `tool_use` /
+   `tool_result` 转为普通 `text`。
+
+该逻辑用于缓解从 Kiro / Antigravity 等渠道切回官方 Anthropic 后，历史
+`thinking.signature` 无法通过官方校验的问题。网关不会验证、伪造或重算
+Anthropic `thinking.signature`，也不会使用 Gemini `thoughtSignature` 的 dummy
+值。
+
 ### 系统角色模型白名单
 
 Claude Code 2.1.156 在 `claude-opus-4-8` 请求中可能把运行时提醒放入

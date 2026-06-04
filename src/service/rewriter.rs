@@ -607,6 +607,20 @@ impl Rewriter {
         output
     }
 
+    /// 在请求体二次变更后刷新 `cch` attestation。
+    ///
+    /// @param body 已改写但后续又被签名整流修改的请求体。
+    /// @param account 当前账号,用于判断 billing 模式和版本 seed。
+    /// @return 非 Rewrite 模式或没有 `cch=` 时原样返回;否则返回重新计算后的 body。
+    pub fn refresh_cch_attestation(&self, body: Vec<u8>, account: &Account) -> Vec<u8> {
+        if account.billing_mode != BillingMode::Rewrite {
+            return body;
+        }
+        let profile = device_profile(account);
+        let version = normalize_version(&profile.env.version);
+        refresh_cch_attestation(body, version)
+    }
+
     /// 处理 /v1/messages 请求体。
     fn rewrite_messages(
         &self,
@@ -1008,6 +1022,22 @@ fn compute_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
         body[pos + 4..pos + 9].copy_from_slice(cch.as_bytes());
     }
     body
+}
+
+fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
+    if let Some(pos) = find_cch_value(&body) {
+        body[pos + 4..pos + 9].copy_from_slice(b"00000");
+        compute_cch_attestation(body, version)
+    } else {
+        body
+    }
+}
+
+fn find_cch_value(body: &[u8]) -> Option<usize> {
+    body.windows(CCH_PLACEHOLDER.len()).position(|window| {
+        window.starts_with(b"cch=")
+            && window[4..].iter().all(|b| b.is_ascii_hexdigit())
+    })
 }
 
 // --- CCH fingerprint (SHA256) ---
@@ -2019,6 +2049,17 @@ mod tests {
         let out = compute_cch_attestation(body.to_vec(), "2.1.81");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("cch=afd26"));
+    }
+
+    #[test]
+    fn cch_refresh_recomputes_existing_value_after_retry_body_change() {
+        let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.156.b94; cc_entrypoint=cli; cch=40943;"}],"messages":[{"role":"assistant","content":[{"type":"text","text":"sanitized"}]}]}"#;
+        let out = super::refresh_cch_attestation(body.to_vec(), DEFAULT_CLAUDE_CODE_VERSION);
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(!text.contains("cch=40943"));
+        assert!(!text.contains("cch=00000"));
+        assert!(text.contains("cch="));
     }
 
     #[test]
