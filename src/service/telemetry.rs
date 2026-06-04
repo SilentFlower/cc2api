@@ -4,16 +4,19 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::Utc;
-use rand::Rng;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::model::account::{Account, CanonicalEnvData, CanonicalProcessData};
+use crate::model::account::Account;
+use crate::model::identity::{
+    build_full_env_json, device_profile, process_snapshot, process_snapshot_json, run_profile,
+    RunProfile,
+};
 use crate::service::account::AccountService;
 use crate::service::version_profile::{
-    EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN, claude_code_user_agent, growthbook_user_agent,
-    is_event_logging_path, normalize_version,
+    claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
+    EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN,
 };
 use crate::store::account_store::AccountStore;
 
@@ -60,6 +63,7 @@ struct TelemetrySession {
     account: Account,
     token: String,
     started_at: Instant,
+    run_profile: RunProfile,
     expires_at: Instant,
     expires_at_utc: chrono::DateTime<Utc>,
     last_event_batch_at: Instant,
@@ -127,12 +131,14 @@ impl TelemetryService {
 
         // 新建会话
         info!("telemetry: starting session for account {}", account.id);
+        let started_at_utc = Utc::now();
         let session = TelemetrySession {
             account: account.clone(),
             token,
             started_at: now,
+            run_profile: run_profile(account, started_at_utc),
             expires_at: now + SESSION_TTL,
-            expires_at_utc: Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap(),
+            expires_at_utc: started_at_utc + chrono::Duration::from_std(SESSION_TTL).unwrap(),
             last_event_batch_at: now - EVENT_BATCH_INTERVAL, // 立即触发首次
             last_growthbook_at: None,
             last_metrics_at: now - METRICS_INTERVAL,
@@ -195,7 +201,7 @@ async fn telemetry_loop(
         // --- event_logging/v2/batch ---
         if now.duration_since(session.last_event_batch_at) >= EVENT_BATCH_INTERVAL {
             let uptime_secs = now.duration_since(session.started_at).as_secs_f64();
-            let payload = build_event_batch(&session.account, uptime_secs);
+            let payload = build_event_batch(&session.account, &session.run_profile, uptime_secs);
             let token = session.token.clone();
             let c = client.clone();
             session.last_event_batch_at = now;
@@ -222,7 +228,7 @@ async fn telemetry_loop(
             Some(t) => now.duration_since(t) >= GROWTHBOOK_INTERVAL,
         };
         if should_gb {
-            let payload = build_growthbook_eval(&session.account);
+            let payload = build_growthbook_eval(&session.account, &session.run_profile);
             let token = session.token.clone();
             let c = client.clone();
             session.last_growthbook_at = Some(now);
@@ -255,8 +261,7 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
         .get_by_id(account_id)
         .await
         .ok()
-        .and_then(|a| serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok())
-        .map(|e| e.version)
+        .map(|a| device_profile(&a).env.version)
         .unwrap_or_default();
     claude_code_user_agent(normalize_version(&version))
 }
@@ -307,81 +312,30 @@ async fn send_telemetry(
 // 请求体构造
 // ---------------------------------------------------------------------------
 
-fn parse_env(account: &Account) -> CanonicalEnvData {
-    serde_json::from_value(account.canonical_env.clone()).unwrap_or_default()
-}
-
-fn parse_process(account: &Account) -> CanonicalProcessData {
-    serde_json::from_value(account.canonical_process.clone()).unwrap_or_default()
-}
-
-fn random_in_range(min: i64, max: i64) -> i64 {
-    if max <= min {
-        return min;
-    }
-    rand::thread_rng().gen_range(min..max)
-}
-
-fn build_process_json(proc: &CanonicalProcessData, uptime_secs: f64) -> serde_json::Value {
-    let mut rng = rand::thread_rng();
-    let cpu_user = rng.gen_range(50_000i64..500_000);
-    let cpu_system = rng.gen_range(15_000i64..150_000);
-    let cpu_percent = rng.gen_range(0.5f64..5.0);
-    json!({
-        "uptime": uptime_secs,
-        "rss": random_in_range(proc.rss_range[0], proc.rss_range[1]),
-        "heapTotal": random_in_range(proc.heap_total_range[0], proc.heap_total_range[1]),
-        "heapUsed": random_in_range(proc.heap_used_range[0], proc.heap_used_range[1]),
-        "external": random_in_range(proc.external_range[0], proc.external_range[1]),
-        "arrayBuffers": random_in_range(proc.array_buffers_range[0], proc.array_buffers_range[1]),
-        "constrainedMemory": proc.constrained_memory,
-        "cpuUsage": { "user": cpu_user, "system": cpu_system },
-        "cpuPercent": cpu_percent,
-    })
-}
-
-fn derive_account_uuid(account: &Account) -> String {
-    account.account_uuid.clone().unwrap_or_else(|| {
-        use sha2::{Digest, Sha256};
-        let seed = if account.email.is_empty() {
-            format!("account-{}", account.id)
-        } else {
-            account.email.clone()
-        };
-        let hash = Sha256::digest(seed.as_bytes());
-        format!(
-            "{}-{}-{}-{}-{}",
-            hex::encode(&hash[0..4]),
-            hex::encode(&hash[4..6]),
-            hex::encode(&hash[6..8]),
-            hex::encode(&hash[8..10]),
-            hex::encode(&hash[10..16])
-        )
-    })
-}
-
 /// JS Date.toISOString() 兼容格式：毫秒精度 + Z 后缀。
 fn js_iso_timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// 构造 /api/event_logging/v2/batch 请求体。
-fn build_event_batch(account: &Account, uptime_secs: f64) -> serde_json::Value {
-    let env = parse_env(account);
-    let proc = parse_process(account);
-    let account_uuid = derive_account_uuid(account);
-    let session_id = uuid::Uuid::new_v4().to_string();
+fn build_event_batch(
+    account: &Account,
+    run_profile: &RunProfile,
+    uptime_secs: f64,
+) -> serde_json::Value {
+    let profile = device_profile(account);
     let process_b64 = {
-        let p = build_process_json(&proc, uptime_secs);
+        let snapshot = process_snapshot(&profile.process, &profile.device_id, uptime_secs);
+        let p = process_snapshot_json(&snapshot);
         let bytes = serde_json::to_vec(&p).unwrap_or_default();
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     };
 
-    let env_obj = crate::model::identity::build_full_env_json(&env);
+    let env_obj = build_full_env_json(&profile.env);
 
     let mut auth = json!({});
-    auth["account_uuid"] = json!(account_uuid);
-    if let Some(ref org) = account.organization_uuid {
+    auth["account_uuid"] = json!(profile.account_uuid);
+    if let Some(ref org) = profile.organization_uuid {
         auth["organization_uuid"] = json!(org);
     }
 
@@ -391,9 +345,9 @@ fn build_event_batch(account: &Account, uptime_secs: f64) -> serde_json::Value {
             "event_id": uuid::Uuid::new_v4().to_string(),
             "event_name": "tengu_api_success",
             "client_timestamp": js_iso_timestamp(),
-            "device_id": account.device_id,
-            "email": account.email,
-            "session_id": session_id,
+            "device_id": profile.device_id,
+            "email": profile.email,
+            "session_id": run_profile.session_id,
             "model": "claude-sonnet-4-20250514",
             "user_type": "external",
             "is_interactive": true,
@@ -422,28 +376,25 @@ fn build_event_batch(account: &Account, uptime_secs: f64) -> serde_json::Value {
 }
 
 /// 构造 /api/eval/{clientKey} 请求体（GrowthBook remote eval）。
-fn build_growthbook_eval(account: &Account) -> serde_json::Value {
-    let env = parse_env(account);
-    let account_uuid = derive_account_uuid(account);
-
-    let session_id = uuid::Uuid::new_v4().to_string();
+fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_json::Value {
+    let profile = device_profile(account);
     let mut attrs = json!({
-        "id": account.device_id,
-        "sessionId": session_id,
-        "deviceID": account.device_id,
-        "platform": env.platform,
-        "appVersion": env.version,
-        "email": account.email,
-        "accountUUID": account_uuid,
+        "id": profile.device_id,
+        "sessionId": run_profile.growthbook_session_id,
+        "deviceID": profile.device_id,
+        "platform": profile.env.platform,
+        "appVersion": profile.env.version,
+        "email": profile.email,
+        "accountUUID": profile.account_uuid,
         "userType": "external",
-        "rateLimitTier": rate_limit_tier(account),
+        "rateLimitTier": rate_limit_tier(&profile.subscription_type),
         "entrypoint": "cli",
     });
 
-    if let Some(ref org) = account.organization_uuid {
+    if let Some(ref org) = profile.organization_uuid {
         attrs["organizationUUID"] = json!(org);
     }
-    if let Some(ref sub) = account.subscription_type {
+    if let Some(ref sub) = profile.subscription_type {
         attrs["subscriptionType"] = json!(sub);
     }
 
@@ -454,8 +405,8 @@ fn build_growthbook_eval(account: &Account) -> serde_json::Value {
 }
 
 /// 根据订阅类型生成 GrowthBook rateLimitTier。
-fn rate_limit_tier(account: &Account) -> String {
-    match account.subscription_type.as_deref() {
+fn rate_limit_tier(subscription_type: &Option<String>) -> String {
+    match subscription_type.as_deref() {
         Some("max") => "default_claude_max_20x".to_string(),
         Some("pro") => "default_claude_pro".to_string(),
         Some(other) if !other.is_empty() => format!("default_claude_{}", other),
@@ -465,8 +416,8 @@ fn rate_limit_tier(account: &Account) -> String {
 
 /// 构造 /api/claude_code/metrics 请求体。
 fn build_metrics(account: &Account) -> serde_json::Value {
-    let env = parse_env(account);
-    let os_type = match env.platform.as_str() {
+    let profile = device_profile(account);
+    let os_type = match profile.env.platform.as_str() {
         "darwin" => "Darwin",
         "win32" => "Windows",
         _ => "Linux",
@@ -474,14 +425,14 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 
     let mut resource = json!({
         "service.name": "claude-code",
-        "service.version": env.version,
+        "service.version": profile.env.version,
         "os.type": os_type,
-        "host.arch": env.arch,
+        "host.arch": profile.env.arch,
         "aggregation.temporality": "delta",
         "user.customer_type": "claude_ai",
     });
 
-    if let Some(ref sub) = account.subscription_type {
+    if let Some(ref sub) = profile.subscription_type {
         resource["user.subscription_type"] = json!(sub);
     }
 
@@ -493,16 +444,18 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_growthbook_eval, is_telemetry_path};
+    use super::{build_event_batch, build_growthbook_eval, build_metrics, is_telemetry_path};
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
         CanonicalProcessData, CanonicalPromptEnvData,
     };
+    use crate::model::identity::run_profile;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE,
     };
-    use chrono::Utc;
+    use base64::Engine;
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
 
     fn test_account() -> Account {
@@ -568,8 +521,19 @@ mod tests {
 
     #[test]
     fn growthbook_eval_contains_2156_attributes() {
-        let payload = build_growthbook_eval(&test_account());
+        let account = test_account();
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0).unwrap(),
+        );
+        let payload = build_growthbook_eval(&account, &run);
         let attrs = payload.get("attributes").unwrap();
+        assert_eq!(attrs.get("id").unwrap(), "device-1");
+        assert_eq!(attrs.get("deviceID").unwrap(), "device-1");
+        assert_eq!(
+            attrs.get("sessionId").unwrap(),
+            &json!(run.growthbook_session_id)
+        );
         assert_eq!(
             attrs.get("appVersion").unwrap(),
             DEFAULT_CLAUDE_CODE_VERSION
@@ -581,5 +545,41 @@ mod tests {
         );
         assert_eq!(attrs.get("entrypoint").unwrap(), "cli");
         assert_eq!(attrs.get("organizationUUID").unwrap(), "org-uuid");
+    }
+
+    #[test]
+    fn event_batch_uses_unified_profile_and_bounded_process() {
+        let account = test_account();
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0).unwrap(),
+        );
+        let payload = build_event_batch(&account, &run, 12.5);
+        let event = &payload["events"][0]["event_data"];
+        assert_eq!(event["device_id"], "device-1");
+        assert_eq!(event["email"], "user@example.com");
+        assert_eq!(event["session_id"], run.session_id);
+        assert_eq!(event["auth"]["account_uuid"], "account-uuid");
+        assert_eq!(event["auth"]["organization_uuid"], "org-uuid");
+        assert_eq!(event["env"]["version"], DEFAULT_CLAUDE_CODE_VERSION);
+        assert_eq!(event["env"]["linux_distro_id"], "ubuntu");
+
+        let process_b64 = event["process"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(process_b64)
+            .unwrap();
+        let process: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert!(process["heapUsed"].as_i64().unwrap() <= process["heapTotal"].as_i64().unwrap());
+        assert_eq!(process["constrainedMemory"], 0);
+    }
+
+    #[test]
+    fn metrics_uses_device_profile_env_and_subscription() {
+        let payload = build_metrics(&test_account());
+        let resource = payload.get("resource_attributes").unwrap();
+        assert_eq!(resource["service.version"], DEFAULT_CLAUDE_CODE_VERSION);
+        assert_eq!(resource["os.type"], "Linux");
+        assert_eq!(resource["host.arch"], "x64");
+        assert_eq!(resource["user.subscription_type"], "max");
     }
 }
