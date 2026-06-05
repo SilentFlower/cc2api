@@ -126,7 +126,12 @@ pub fn access_policy_error_response(rejection: &AccessPolicyRejection) -> Respon
     (
         StatusCode::FORBIDDEN,
         axum::Json(json!({
-            "error": "request rejected by access policy",
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": rejection.reason,
+                "code": rejection.setting,
+            },
             "setting": rejection.setting,
             "reason": rejection.reason,
         })),
@@ -292,9 +297,11 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_claude_code_versions, AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
-        DEFAULT_ALLOWED_USER_AGENTS,
+        access_policy_error_response, validate_claude_code_versions, AccessPolicy,
+        AccessPolicyRejection, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     };
+    use axum::http::StatusCode;
+    use serde_json::Value;
 
     #[test]
     fn default_policy_allows_configured_claude_code_range() {
@@ -350,5 +357,30 @@ mod tests {
     #[test]
     fn version_range_validation_rejects_reversed_range() {
         assert!(validate_claude_code_versions("2.1.156-2.1.89").is_err());
+    }
+
+    #[tokio::test]
+    async fn access_policy_error_response_uses_standard_error_object() {
+        let rejection = AccessPolicyRejection {
+            setting: "allowed_claude_code_versions",
+            reason: "Claude Code 版本 '2.1.37' 不在允许范围内；允许范围：2.1.89-2.1.156"
+                .to_string(),
+        };
+
+        let response = access_policy_error_response(&rejection);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["type"], "error");
+        assert!(value["error"].is_object());
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["message"], rejection.reason);
+        assert_eq!(value["error"]["code"], rejection.setting);
+        assert_eq!(value["setting"], rejection.setting);
+        assert_eq!(value["reason"], rejection.reason);
     }
 }
