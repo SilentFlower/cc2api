@@ -5,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tracing::{debug, info, warn};
@@ -573,7 +574,7 @@ impl GatewayService {
                 account.id,
                 path,
                 status_code,
-                safe_upstream_error_log_body(&body_bytes)
+                safe_upstream_error_log_body(&body_bytes, &headers_429)
             );
 
             if let Err(e) = self
@@ -644,7 +645,7 @@ impl GatewayService {
                 account.id,
                 path,
                 status_code,
-                safe_upstream_error_log_body(&body_bytes)
+                safe_upstream_error_log_body(&body_bytes, &response_headers)
             );
 
             let mut rb = Response::builder()
@@ -778,11 +779,12 @@ fn safe_body_summary(b: &[u8]) -> String {
     format!("{} bytes sha256:{}", b.len(), hex::encode(&digest[..8]))
 }
 
-fn safe_upstream_error_log_body(body: &[u8]) -> String {
-    let raw = if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
-        serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(body).into_owned())
+fn safe_upstream_error_log_body(body: &[u8], headers: &reqwest::header::HeaderMap) -> String {
+    let decoded = decode_upstream_error_body(body, headers);
+    let raw = if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+        serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(&decoded).into_owned())
     } else {
-        String::from_utf8_lossy(body).into_owned()
+        String::from_utf8_lossy(&decoded).into_owned()
     };
 
     let mut out = String::new();
@@ -802,6 +804,76 @@ fn safe_upstream_error_log_body(body: &[u8]) -> String {
         out.push_str("...<truncated>");
     }
     out
+}
+
+fn decode_upstream_error_body(
+    body: &[u8],
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<u8> {
+    let Some(encoding) = headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return body.to_vec();
+    };
+
+    let mut decoded = body.to_vec();
+    for coding in encoding
+        .split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty() && v != "identity")
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        decoded = match decode_single_content_encoding(&coding, &decoded) {
+            Ok(next) => next,
+            Err(e) => {
+                return format!(
+                    "<decode {} failed: {}; raw {}>",
+                    coding,
+                    e,
+                    safe_body_summary(body)
+                )
+                .into_bytes();
+            }
+        };
+    }
+    decoded
+}
+
+fn decode_single_content_encoding(coding: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
+    match coding {
+        "gzip" | "x-gzip" => {
+            let mut decoder = flate2::read::GzDecoder::new(body);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out)?;
+            Ok(out)
+        }
+        "deflate" => decode_deflate_body(body),
+        "br" => {
+            let mut decoder = brotli::Decompressor::new(body, 4096);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out)?;
+            Ok(out)
+        }
+        "zstd" => zstd::stream::decode_all(body),
+        _ => Ok(body.to_vec()),
+    }
+}
+
+fn decode_deflate_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut zlib_decoder = flate2::read::ZlibDecoder::new(body);
+    let mut out = Vec::new();
+    match zlib_decoder.read_to_end(&mut out) {
+        Ok(_) => Ok(out),
+        Err(_) => {
+            let mut deflate_decoder = flate2::read::DeflateDecoder::new(body);
+            let mut out = Vec::new();
+            deflate_decoder.read_to_end(&mut out)?;
+            Ok(out)
+        }
+    }
 }
 
 fn safe_header_log_value(name: &str, value: &str) -> String {
