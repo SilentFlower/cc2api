@@ -989,6 +989,9 @@ fn strip_messages_request(body: &[u8], strip_tools: bool) -> Option<Vec<u8>> {
     if let Some(obj) = parsed.as_object_mut() {
         if obj.remove("thinking").is_some() {
             changed = true;
+            if remove_thinking_dependent_context_strategies(obj) {
+                changed = true;
+            }
         }
     }
 
@@ -1005,6 +1008,34 @@ fn strip_messages_request(body: &[u8], strip_tools: bool) -> Option<Vec<u8>> {
     }
 
     serde_json::to_vec(&parsed).ok()
+}
+
+fn remove_thinking_dependent_context_strategies(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let Some(context_management) = obj.get_mut("context_management").and_then(|v| v.as_object_mut())
+    else {
+        return false;
+    };
+    let Some(edits) = context_management
+        .get_mut("edits")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+
+    let original_len = edits.len();
+    edits.retain(|edit| {
+        edit.get("type").and_then(|v| v.as_str()) != Some("clear_thinking_20251015")
+    });
+    if edits.len() == original_len {
+        return false;
+    }
+
+    if edits.is_empty() {
+        context_management.remove("edits");
+    }
+    true
 }
 
 fn sanitize_message_content(message: &mut serde_json::Value, strip_tools: bool) -> bool {
@@ -1544,6 +1575,31 @@ mod tests {
         assert_eq!(assistant_blocks[1]["type"], "tool_use");
         let user_blocks = value["messages"][1]["content"].as_array().unwrap();
         assert_eq!(user_blocks, &vec![json!({"type":"text","text":"ok"})]);
+    }
+
+    #[test]
+    fn strip_thinking_retry_removes_thinking_dependent_context_strategy() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "context_management":{
+                "edits":[
+                    {"type":"clear_thinking_20251015","keep":"all"},
+                    {"type":"other_strategy","keep":"all"}
+                ]
+            },
+            "messages":[
+                {"role":"assistant","content":[{"type":"thinking","thinking":"secret","signature":"bad"}]}
+            ]
+        }"#;
+
+        let stripped = strip_thinking_from_messages_request(body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+        assert!(value.get("thinking").is_none());
+        let edits = value["context_management"]["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["type"], "other_strategy");
     }
 
     #[test]
