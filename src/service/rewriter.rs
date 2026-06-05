@@ -69,6 +69,9 @@ pub enum ClientType {
     API,
 }
 
+const API_MAX_TOKENS_LIMIT: u64 = 64000;
+const API_DEFAULT_MAX_TOKENS: u64 = 32000;
+
 /// 从逗号分隔的 anthropic-beta header 中剥离指定 token，保留其它 token 和相对顺序。
 ///
 /// 对应 sub2api 的 `stripBetaTokensWithSet`：对非白名单模型默认过滤掉
@@ -668,14 +671,7 @@ impl Rewriter {
             // 剥离 system 块中的 cache_control
             strip_cache_control(body);
 
-            // 规范化 max_tokens
-            if let Some(max_tokens) = body.get("max_tokens").and_then(|v| v.as_f64()) {
-                if max_tokens > 32768.0 {
-                    body.as_object_mut()
-                        .unwrap()
-                        .insert("max_tokens".into(), serde_json::json!(16384));
-                }
-            }
+            normalize_api_max_tokens(body);
 
             // 注入 Claude Code 系统提示词
             self.inject_system_prompt(body);
@@ -1373,6 +1369,40 @@ fn strip_cache_control(body: &mut serde_json::Value) {
     }
 }
 
+/// 按 Claude Code 2.1.156 抓包约束 API 模式的 `max_tokens`。
+fn normalize_api_max_tokens(body: &mut serde_json::Value) {
+    match body.get("max_tokens").and_then(|v| v.as_f64()) {
+        Some(max_tokens) if max_tokens > API_MAX_TOKENS_LIMIT as f64 => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("max_tokens".into(), serde_json::json!(API_MAX_TOKENS_LIMIT));
+            }
+        }
+        Some(_) => {}
+        None if body.get("max_tokens").is_none() => {
+            let max_tokens = api_default_max_tokens(body);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("max_tokens".into(), serde_json::json!(max_tokens));
+            }
+        }
+        None => {}
+    }
+}
+
+/// 返回 API 模式缺省 `max_tokens`。
+fn api_default_max_tokens(body: &serde_json::Value) -> u64 {
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if model == "claude-opus-4-8" {
+        API_MAX_TOKENS_LIMIT
+    } else {
+        API_DEFAULT_MAX_TOKENS
+    }
+}
+
 /// 移除消息和 system 中的空文本内容块。
 fn strip_empty_text_blocks(body: &mut serde_json::Value) {
     fn filter_blocks(blocks: &mut Vec<serde_json::Value>) {
@@ -1585,6 +1615,119 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn rewrite_messages_body(
+        body: serde_json::Value,
+        client_type: ClientType,
+    ) -> serde_json::Value {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            client_type,
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn api_messages_defaults_opus48_max_tokens_to_capture_value() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-opus-4-8",
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(64000));
+    }
+
+    #[test]
+    fn api_messages_defaults_haiku_max_tokens_to_title_generation_value() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-haiku-4-5-20251001",
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(32000));
+    }
+
+    #[test]
+    fn api_messages_defaults_other_claude_models_to_standard_max_tokens() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-sonnet-4-6",
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(32000));
+    }
+
+    #[test]
+    fn api_messages_preserves_probe_and_capture_max_tokens() {
+        let haiku_probe = rewrite_messages_body(
+            json!({
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1,
+                "messages": []
+            }),
+            ClientType::API,
+        );
+        let opus_capture = rewrite_messages_body(
+            json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64000,
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(haiku_probe["max_tokens"], json!(1));
+        assert_eq!(opus_capture["max_tokens"], json!(64000));
+    }
+
+    #[test]
+    fn api_messages_caps_oversized_max_tokens_to_capture_limit() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 128000,
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(64000));
+    }
+
+    #[test]
+    fn claude_code_messages_do_not_normalize_max_tokens() {
+        let existing = rewrite_messages_body(
+            json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 128000,
+                "messages": []
+            }),
+            ClientType::ClaudeCode,
+        );
+        let missing = rewrite_messages_body(
+            json!({
+                "model": "claude-opus-4-8",
+                "messages": []
+            }),
+            ClientType::ClaudeCode,
+        );
+
+        assert_eq!(existing["max_tokens"], json!(128000));
+        assert!(missing.get("max_tokens").is_none());
     }
 
     #[test]
