@@ -128,6 +128,14 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "allow_system_role_models",
             crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
         ),
+        (
+            "allowed_claude_code_versions",
+            crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING,
+        ),
+        (
+            "allowed_user_agents",
+            crate::store::settings_store::DEFAULT_ALLOWED_USER_AGENTS_SETTING,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

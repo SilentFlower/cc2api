@@ -13,6 +13,10 @@ use tracing::{debug, info, warn};
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
+use crate::service::access_policy::{
+    access_policy_error_response, AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+    DEFAULT_ALLOWED_USER_AGENTS,
+};
 use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
     clean_session_id_from_body, detect_client_type, ordered_anthropic_headers, ClientType, Rewriter,
@@ -43,6 +47,7 @@ pub struct GatewayService {
     telemetry_svc: Arc<TelemetryService>,
     settings_store: Arc<SettingsStore>,
     system_role_models: RwLock<Vec<String>>,
+    access_policy: RwLock<AccessPolicy>,
 }
 
 impl GatewayService {
@@ -60,6 +65,13 @@ impl GatewayService {
             system_role_models: RwLock::new(parse_system_role_model_list(
                 DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
             )),
+            access_policy: RwLock::new(
+                AccessPolicy::parse(
+                    DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+                    DEFAULT_ALLOWED_USER_AGENTS,
+                )
+                .expect("默认访问策略必须合法"),
+            ),
         }
     }
 
@@ -76,6 +88,26 @@ impl GatewayService {
             .await?;
         let allowed_models = parse_system_role_model_list(&raw_allowed);
         *self.system_role_models.write().await = allowed_models;
+        Ok(())
+    }
+
+    /// 从全局设置刷新客户端访问策略。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析配置失败时返回业务错误。
+    pub async fn reload_access_policy(&self) -> Result<(), AppError> {
+        let raw_versions = self
+            .settings_store
+            .get_value(
+                "allowed_claude_code_versions",
+                DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+            )
+            .await?;
+        let raw_user_agents = self
+            .settings_store
+            .get_value("allowed_user_agents", DEFAULT_ALLOWED_USER_AGENTS)
+            .await?;
+        let policy = AccessPolicy::parse(&raw_versions, &raw_user_agents)?;
+        *self.access_policy.write().await = policy;
         Ok(())
     }
 
@@ -104,6 +136,14 @@ impl GatewayService {
             .or_else(|| headers.get("user-agent"))
             .cloned()
             .unwrap_or_default();
+
+        if let Err(rejection) = self.access_policy.read().await.check_user_agent(&ua) {
+            warn!(
+                "access policy rejected request: setting={} reason={}",
+                rejection.setting, rejection.reason
+            );
+            return Ok(access_policy_error_response(&rejection));
+        }
 
         // 读取请求体
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)

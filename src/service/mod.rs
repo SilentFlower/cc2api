@@ -1,3 +1,4 @@
+pub mod access_policy;
 pub mod account;
 pub mod gateway;
 pub mod oauth;
