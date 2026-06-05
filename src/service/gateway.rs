@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{response::Parts, HeaderMap, StatusCode};
+use axum::http::{header::CONTENT_ENCODING, response::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
@@ -432,7 +432,7 @@ impl GatewayService {
         }
 
         let (mut last_parts, mut last_body) = buffer_response_body(resp).await?;
-        if !is_signature_related_error_body(&last_body) {
+        if !is_signature_related_error_response_body(&last_body, &last_parts.headers) {
             return Ok((response_from_buffered(last_parts, last_body), None));
         }
 
@@ -479,7 +479,7 @@ impl GatewayService {
             }
 
             let (retry_parts, retry_body_bytes) = buffer_response_body(retry_resp).await?;
-            if !is_signature_related_error_body(&retry_body_bytes) {
+            if !is_signature_related_error_response_body(&retry_body_bytes, &retry_parts.headers) {
                 return Ok((
                     response_from_buffered(retry_parts, retry_body_bytes),
                     last_stage,
@@ -564,11 +564,9 @@ impl GatewayService {
             // 用这条 429 响应自带的 ratelimit 头做撞墙判断(被动,不再主动查 usage 接口)
             let usage_from_headers = extract_passive_usage(&headers_429);
             let body_bytes = resp.bytes().await.unwrap_or_default();
-            // 取 owned 字符串,避免后续把 body_bytes move 进 Body 时发生借用冲突。
-            // 注:本客户端不自动解压(透传 content-encoding),此处按明文匹配关键字。
-            // Anthropic 错误体很小、基本不压缩,匹配可靠;万一被压缩导致匹配落空,
-            // 只会退回「短冷却」而非「不隔离」——属安全降级,不会比旧行为更糟。
-            let body_snippet = String::from_utf8_lossy(&body_bytes).into_owned();
+            // 业务判断使用解压后的文本；返回给客户端仍使用原始 body，避免改变透传语义。
+            let decoded_body = decode_upstream_error_body(&body_bytes, &headers_429);
+            let body_snippet = String::from_utf8_lossy(&decoded_body).into_owned();
             warn!(
                 "上游错误响应: account={} path={} status={} body={}",
                 account.id,
@@ -779,10 +777,11 @@ fn safe_body_summary(b: &[u8]) -> String {
     format!("{} bytes sha256:{}", b.len(), hex::encode(&digest[..8]))
 }
 
-fn safe_upstream_error_log_body(body: &[u8], headers: &reqwest::header::HeaderMap) -> String {
+fn safe_upstream_error_log_body(body: &[u8], headers: &HeaderMap) -> String {
     let decoded = decode_upstream_error_body(body, headers);
     let raw = if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded) {
-        serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(&decoded).into_owned())
+        serde_json::to_string(&value)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&decoded).into_owned())
     } else {
         String::from_utf8_lossy(&decoded).into_owned()
     };
@@ -806,12 +805,9 @@ fn safe_upstream_error_log_body(body: &[u8], headers: &reqwest::header::HeaderMa
     out
 }
 
-fn decode_upstream_error_body(
-    body: &[u8],
-    headers: &reqwest::header::HeaderMap,
-) -> Vec<u8> {
+fn decode_upstream_error_body(body: &[u8], headers: &HeaderMap) -> Vec<u8> {
     let Some(encoding) = headers
-        .get(reqwest::header::CONTENT_ENCODING)
+        .get(CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
     else {
         return body.to_vec();
@@ -874,6 +870,11 @@ fn decode_deflate_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
             Ok(out)
         }
     }
+}
+
+fn is_signature_related_error_response_body(body: &[u8], headers: &HeaderMap) -> bool {
+    let decoded = decode_upstream_error_body(body, headers);
+    is_signature_related_error_body(&decoded)
 }
 
 fn safe_header_log_value(name: &str, value: &str) -> String {
@@ -1458,13 +1459,15 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         build_message_telemetry_context, extract_message_session_id, has_system_role_message,
-        is_signature_related_error_body, is_system_role_model_allowed,
-        parse_system_role_model_list, safe_body_summary,
+        is_signature_related_error_body, is_signature_related_error_response_body,
+        is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
         signature_retry_body_for_stage, SignatureRetryStage,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body,
     };
     use crate::service::rewriter::ClientType;
+    use axum::http::header::CONTENT_ENCODING;
+    use std::io::Write;
     use serde_json::json;
 
     #[test]
@@ -1494,6 +1497,19 @@ mod tests {
         assert!(!is_signature_related_error_body(
             br#"{"error":{"message":"model is overloaded"}}"#
         ));
+    }
+
+    #[test]
+    fn signature_error_detector_matches_compressed_upstream_body() {
+        let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        assert!(is_signature_related_error_response_body(&compressed, &headers));
     }
 
     #[test]

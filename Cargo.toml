@@ -69,8 +69,8 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 rust-embed = "8"
 flate2 = "1"
-brotli = "8"
-zstd = "0.13"
+brotli = "3"
+zstd = "0.12"
 
 [patch.crates-io]
 rustls = { path = "craftls/rustls" }

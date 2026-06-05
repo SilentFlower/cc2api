@@ -305,9 +305,13 @@ version = "1.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "brotli",
+ "bytes",
  "chrono",
  "dotenvy",
+ "flate2",
  "hex",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -331,6 +335,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-socks",
+ "tokio-stream",
  "tower 0.4.13",
  "tower-http",
  "tracing",
@@ -339,6 +344,7 @@ dependencies = [
  "webpki-roots 0.26.11",
  "x25519-dalek",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
