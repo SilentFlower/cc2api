@@ -3,9 +3,17 @@ use sqlx::Row;
 use std::collections::HashMap;
 
 use crate::error::AppError;
+use crate::service::access_policy::{
+    DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+};
 
 /// 允许 `messages[].role=system` 的默认模型列表。
 pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
+/// 默认允许的 Claude Code / Claude CLI 版本范围。
+pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str =
+    DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
+/// 默认允许的非 Claude Code 客户端 User-Agent。
+pub const DEFAULT_ALLOWED_USER_AGENTS_SETTING: &str = DEFAULT_ALLOWED_USER_AGENTS;
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

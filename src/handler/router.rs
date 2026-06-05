@@ -14,6 +14,10 @@ use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::{self, ApiToken};
+use crate::service::access_policy::{
+    validate_claude_code_versions, validate_user_agent_patterns,
+    DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+};
 use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
@@ -652,6 +656,12 @@ async fn get_settings(
         .or_insert_with(|| {
             crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS.to_string()
         });
+    settings
+        .entry("allowed_claude_code_versions".into())
+        .or_insert_with(|| DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS.to_string());
+    settings
+        .entry("allowed_user_agents".into())
+        .or_insert_with(|| DEFAULT_ALLOWED_USER_AGENTS.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -706,9 +716,20 @@ async fn update_settings(
     if let Some(val) = body.get("allow_system_role_models") {
         validate_model_id_list("allow_system_role_models", val)?;
     }
+    if let Some(val) = body.get("allowed_claude_code_versions") {
+        validate_claude_code_versions(val)?;
+    }
+    if let Some(val) = body.get("allowed_user_agents") {
+        validate_user_agent_patterns(val)?;
+    }
     state.settings_store.upsert_many(&body).await?;
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
+    }
+    if body.contains_key("allowed_claude_code_versions")
+        || body.contains_key("allowed_user_agents")
+    {
+        state.gateway_svc.reload_access_policy().await?;
     }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;

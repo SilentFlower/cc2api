@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
+import { Textarea } from '@/components/ui/textarea';
 import {
   Table,
   TableBody,
@@ -31,6 +32,10 @@ const primeModel = ref('claude-haiku-4-5-20251001');
 
 /** 允许 messages[].role=system 的模型列表 */
 const allowSystemRoleModels = ref('claude-opus-4-8');
+
+/** 客户端访问策略表单 */
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.156');
+const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -85,6 +90,31 @@ const isValidSystemRoleModels = computed(() => {
   });
 });
 
+/** Claude Code 版本范围是否合法 */
+const isValidClaudeCodeVersions = computed(() => {
+  const raw = allowedClaudeCodeVersions.value.trim();
+  if (!raw) return true;
+  return raw.split(/[,\n\r]+/).every((s) => {
+    const item = s.trim();
+    if (!item) return true;
+    const version = '\\d+(?:\\.\\d+)*';
+    const exact = new RegExp(`^${version}$`);
+    const wildcard = new RegExp(`^${version}\\.\\*$`);
+    const range = new RegExp(`^${version}-${version}$`);
+    return exact.test(item) || wildcard.test(item) || range.test(item);
+  });
+});
+
+/** UA pattern 列表是否合法 */
+const isValidAllowedUserAgents = computed(() => {
+  const raw = allowedUserAgents.value.trim();
+  if (!raw) return true;
+  return raw.split(/[,\n\r]+/).every((s) => {
+    const pattern = s.trim();
+    return !pattern || /^[\x20-\x7E]+$/.test(pattern);
+  });
+});
+
 /** 加载设置 */
 async function loadSettings() {
   try {
@@ -96,6 +126,8 @@ async function loadSettings() {
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.156';
+    allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -132,6 +164,14 @@ async function saveSettings() {
     toast('系统角色模型列表包含非法字符');
     return;
   }
+  if (!isValidClaudeCodeVersions.value) {
+    toast('Claude Code 版本范围格式不正确');
+    return;
+  }
+  if (!isValidAllowedUserAgents.value) {
+    toast('UA 白名单包含非法字符');
+    return;
+  }
   saving.value = true;
   try {
     await api.updateSettings({
@@ -142,6 +182,8 @@ async function saveSettings() {
       peak_prime_hours: primeHours.value.trim(),
       peak_prime_model: primeModel.value.trim(),
       allow_system_role_models: allowSystemRoleModels.value.trim(),
+      allowed_claude_code_versions: allowedClaudeCodeVersions.value.trim(),
+      allowed_user_agents: allowedUserAgents.value.trim(),
     });
     toast('保存成功');
   } catch (e) {
@@ -318,11 +360,75 @@ onMounted(async () => {
       </div>
     </Card>
 
+    <!-- 客户端访问策略 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">客户端访问策略</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            Claude Code / CLI 按版本范围校验；其他客户端按 UA 白名单校验。空值表示对应限制关闭。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">Claude Code 版本范围</Label>
+            <Textarea
+              v-model="allowedClaudeCodeVersions"
+              rows="4"
+              placeholder="2.1.89-2.1.156"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+              :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
+            />
+            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、2.1.*、2.1.89-2.1.156；逗号或换行分隔</p>
+            <div class="flex flex-wrap gap-1.5">
+              <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
+              <button
+                type="button"
+                @click="allowedClaudeCodeVersions = '2.1.89-2.1.156'"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
+              >2.1.89-2.1.156</button>
+              <button
+                type="button"
+                @click="allowedClaudeCodeVersions = ''"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-red-300 hover:bg-red-50 hover:text-red-600 transition-colors"
+              >关闭版本限制</button>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">其他允许 UA</Label>
+            <Textarea
+              v-model="allowedUserAgents"
+              rows="4"
+              placeholder="AI-Hub-Monitor*&#10;python-httpx*"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+              :class="isValidAllowedUserAgents ? '' : 'border-red-400'"
+            />
+            <p class="text-[11px] text-[#b5b0a6]">支持 * 通配；只用于非 claude-code/claude-cli 客户端</p>
+            <div class="flex flex-wrap gap-1.5">
+              <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
+              <button
+                type="button"
+                @click="allowedUserAgents = 'AI-Hub-Monitor*\npython-httpx*'"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
+              >默认 UA</button>
+              <button
+                type="button"
+                @click="allowedUserAgents = ''"
+                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-red-300 hover:bg-red-50 hover:text-red-600 transition-colors"
+              >关闭 UA 限制</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Card>
+
     <!-- 保存按钮 -->
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}

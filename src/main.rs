@@ -87,6 +87,10 @@ async fn main() {
         .reload_system_role_models()
         .await
         .expect("load system role models failed");
+    gateway_svc
+        .reload_access_policy()
+        .await
+        .expect("load access policy failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 
