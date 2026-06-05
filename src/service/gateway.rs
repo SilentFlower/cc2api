@@ -33,6 +33,8 @@ const UPSTREAM_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const UPSTREAM_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// signature 错误体只用于识别上游错误类型，限制读取大小避免异常响应占用内存。
 const SIGNATURE_ERROR_BODY_LIMIT: usize = 1024 * 1024;
+/// 上游错误响应日志最多输出的字符数，避免异常错误体刷屏。
+const UPSTREAM_ERROR_LOG_BODY_LIMIT: usize = 4096;
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -566,6 +568,13 @@ impl GatewayService {
             // Anthropic 错误体很小、基本不压缩,匹配可靠;万一被压缩导致匹配落空,
             // 只会退回「短冷却」而非「不隔离」——属安全降级,不会比旧行为更糟。
             let body_snippet = String::from_utf8_lossy(&body_bytes).into_owned();
+            warn!(
+                "上游错误响应: account={} path={} status={} body={}",
+                account.id,
+                path,
+                status_code,
+                safe_upstream_error_log_body(&body_bytes)
+            );
 
             if let Err(e) = self
                 .account_svc
@@ -625,6 +634,30 @@ impl GatewayService {
                     }
                 });
             }
+        }
+
+        if status_code >= 400 {
+            let response_headers = resp.headers().clone();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            warn!(
+                "上游错误响应: account={} path={} status={} body={}",
+                account.id,
+                path,
+                status_code,
+                safe_upstream_error_log_body(&body_bytes)
+            );
+
+            let mut rb = Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+            for (k, v) in response_headers.iter() {
+                if is_gateway_fingerprint_header(k.as_str()) {
+                    continue;
+                }
+                rb = rb.header(k.clone(), v.clone());
+            }
+            return rb
+                .body(Body::from(body_bytes))
+                .map_err(|e| AppError::Internal(format!("build error response: {}", e)));
         }
 
         // 构建响应
@@ -743,6 +776,32 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
 fn safe_body_summary(b: &[u8]) -> String {
     let digest = Sha256::digest(b);
     format!("{} bytes sha256:{}", b.len(), hex::encode(&digest[..8]))
+}
+
+fn safe_upstream_error_log_body(body: &[u8]) -> String {
+    let raw = if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(body).into_owned())
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    };
+
+    let mut out = String::new();
+    let mut truncated = false;
+    for (i, ch) in raw.chars().enumerate() {
+        if i >= UPSTREAM_ERROR_LOG_BODY_LIMIT {
+            truncated = true;
+            break;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    if truncated {
+        out.push_str("...<truncated>");
+    }
+    out
 }
 
 fn safe_header_log_value(name: &str, value: &str) -> String {
