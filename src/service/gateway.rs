@@ -1248,8 +1248,14 @@ fn system_role_model_error_body(
     model: &str,
     allowed_models: &[String],
 ) -> serde_json::Value {
+    let message = "messages[].role=system is not allowed for this model";
     serde_json::json!({
-        "error": "messages[].role=system is not allowed for this model",
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": message,
+            "code": "system_role_model_not_allowed",
+        },
         "model": model,
         "allowed_system_role_models": allowed_models,
     })
@@ -1858,7 +1864,12 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "error": "messages[].role=system is not allowed for this model",
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "messages[].role=system is not allowed for this model",
+                    "code": "system_role_model_not_allowed"
+                },
                 "model": "claude-opus-4-7",
                 "allowed_system_role_models": ["claude-opus-4-8"]
             })
