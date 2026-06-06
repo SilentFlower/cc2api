@@ -22,9 +22,12 @@ use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
+use crate::service::rewriter::CacheControlTtlRewrite;
 use crate::service::telemetry::TelemetryService;
 use crate::store::prime_log_store::PrimeLogStore;
-use crate::store::settings_store::SettingsStore;
+use crate::store::settings_store::{
+    SettingsStore, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
+};
 use crate::store::token_store::TokenStore;
 
 #[derive(Clone)]
@@ -677,6 +680,9 @@ async fn get_settings(
         .or_insert_with(|| {
             crate::store::settings_store::DEFAULT_PASSTHROUGH_WORKING_DIR.to_string()
         });
+    settings
+        .entry("cache_control_ttl_rewrite".into())
+        .or_insert_with(|| DEFAULT_CACHE_CONTROL_TTL_REWRITE.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -751,6 +757,9 @@ async fn update_settings(
             }
         }
     }
+    if let Some(val) = body.get("cache_control_ttl_rewrite") {
+        CacheControlTtlRewrite::parse(val)?;
+    }
     state.settings_store.upsert_many(&body).await?;
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
@@ -765,6 +774,9 @@ async fn update_settings(
         || body.contains_key("passthrough_working_dir")
     {
         state.gateway_svc.reload_env_passthrough().await?;
+    }
+    if body.contains_key("cache_control_ttl_rewrite") {
+        state.gateway_svc.reload_cache_control_ttl_rewrite().await?;
     }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;

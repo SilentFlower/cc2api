@@ -22,6 +22,8 @@ pub const DEFAULT_PASSTHROUGH_OS_VERSION: &str = "false";
 /// 系统提示词 `Working directory:` 行是否默认真值透传。默认开启:
 /// 工作目录改写会直接误导模型对真实 cwd 的判断,故默认透传真实路径。
 pub const DEFAULT_PASSTHROUGH_WORKING_DIR: &str = "true";
+/// Anthropic ephemeral cache_control TTL 改写默认关闭,保持旧请求体行为。
+pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

@@ -9,7 +9,8 @@ use crate::model::account::{Account, AccountStatus};
 use crate::service::account::AccountService;
 use crate::service::gateway::extract_passive_usage;
 use crate::service::rewriter::{
-    clean_session_id_from_body, ordered_anthropic_headers, ClientType, EnvPassthrough, Rewriter,
+    clean_session_id_from_body, ordered_anthropic_headers, CacheControlTtlRewrite, ClientType,
+    EnvPassthrough, Rewriter,
 };
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::SettingsStore;
@@ -382,6 +383,7 @@ impl PrimePollerService {
             account,
             ClientType::API,
             EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
         );
         // 先解析 rewritten_bytes,此时 metadata._session_id 标记仍在。
         // 必须在剥除 _session_id 之前先跑 rewrite_headers:后者从 body 里的
