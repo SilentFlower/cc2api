@@ -45,6 +45,9 @@ const passthroughWorkingDir = ref(true);
 /** Anthropic cache_control TTL 改写模式 */
 const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 
+/** Claude Code messages 缓存断点改写模式 */
+const messageCacheControlRewrite = ref<'off' | 'stable'>('off');
+
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
 const logsLoading = ref(false);
@@ -141,6 +144,8 @@ async function loadSettings() {
     passthroughWorkingDir.value = (data.passthrough_working_dir ?? 'true') === 'true';
     const ttlRewrite = data.cache_control_ttl_rewrite ?? 'off';
     cacheControlTtlRewrite.value = ttlRewrite === '5m' || ttlRewrite === '1h' ? ttlRewrite : 'off';
+    const messageCacheRewrite = data.message_cache_control_rewrite ?? 'off';
+    messageCacheControlRewrite.value = messageCacheRewrite === 'stable' ? 'stable' : 'off';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -201,6 +206,7 @@ async function saveSettings() {
       passthrough_os_version: passthroughOsVersion.value ? 'true' : 'false',
       passthrough_working_dir: passthroughWorkingDir.value ? 'true' : 'false',
       cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
+      message_cache_control_rewrite: messageCacheControlRewrite.value,
     });
     toast('保存成功');
   } catch (e) {
@@ -428,47 +434,84 @@ onMounted(async () => {
       </div>
     </Card>
 
-    <!-- Anthropic 缓存 TTL 改写 -->
+    <!-- Anthropic 缓存改写 -->
     <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
-      <div class="p-6 space-y-4">
+      <div class="p-6 space-y-6">
         <div>
-          <h3 class="text-sm font-semibold text-[#29261e]">缓存 TTL 改写</h3>
+          <h3 class="text-sm font-semibold text-[#29261e]">Anthropic 缓存改写</h3>
           <p class="text-xs text-[#8c8475] mt-1">
-            仅改写请求体里已经存在的 ephemeral cache_control.ttl,不会新增缓存断点。默认不改写,保持客户端原始缓存策略。
+            分别控制 Claude Code messages 缓存断点位置和 ephemeral cache_control.ttl。默认不改写,保持客户端原始缓存策略。
           </p>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-            <input
-              v-model="cacheControlTtlRewrite"
-              type="radio"
-              value="off"
-              class="accent-[#c4704f] w-4 h-4"
-            />
-            <span class="text-sm text-[#29261e]">不改写</span>
-          </label>
-          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-            <input
-              v-model="cacheControlTtlRewrite"
-              type="radio"
-              value="5m"
-              class="accent-[#c4704f] w-4 h-4"
-            />
-            <span class="text-sm text-[#29261e]">强制 5m</span>
-          </label>
-          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-            <input
-              v-model="cacheControlTtlRewrite"
-              type="radio"
-              value="1h"
-              class="accent-[#c4704f] w-4 h-4"
-            />
-            <span class="text-sm text-[#29261e]">强制 1h</span>
-          </label>
+        <div class="space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">messages 缓存断点</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              stable 会清理 messages[].content[] 原有 cache_control,再按最后一条 message 和倒数第二个 user turn 重打稳定断点。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="messageCacheControlRewrite"
+                type="radio"
+                value="off"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">保持原样</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="messageCacheControlRewrite"
+                type="radio"
+                value="stable"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">稳定重打</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">cache_control.ttl</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              仅改写请求体里已经存在或由稳定重打创建的 ephemeral cache_control.ttl。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="cacheControlTtlRewrite"
+                type="radio"
+                value="off"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">不改写</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="cacheControlTtlRewrite"
+                type="radio"
+                value="5m"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">强制 5m</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="cacheControlTtlRewrite"
+                type="radio"
+                value="1h"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">强制 1h</span>
+            </label>
+          </div>
         </div>
         <p class="text-[11px] text-[#b5b0a6]">
-          该设置只影响 Anthropic /v1/messages 请求中的顶层、system、messages.content、tools 已有缓存块。
+          这些设置只影响 Anthropic /v1/messages 转发,发生在 CCH attestation 重新计算之前。off 可作为回滚开关。
         </p>
       </div>
     </Card>

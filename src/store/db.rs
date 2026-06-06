@@ -154,6 +154,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "cache_control_ttl_rewrite",
             crate::store::settings_store::DEFAULT_CACHE_CONTROL_TTL_REWRITE,
         ),
+        // Claude Code messages 缓存断点稳定化默认关闭,避免升级后改变缓存断点布局。
+        (
+            "message_cache_control_rewrite",
+            crate::store::settings_store::DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"
