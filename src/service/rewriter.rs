@@ -906,6 +906,9 @@ impl Rewriter {
                 let filtered: Vec<serde_json::Value> = if *billing_mode == BillingMode::Strip {
                     sys.iter()
                         .filter(|item| {
+                            if item.get("cache_control").is_some() {
+                                return true;
+                            }
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                 if BILLING_LINE_REGEX.is_match(text) {
                                     let cleaned =
@@ -926,6 +929,9 @@ impl Rewriter {
                 let rewritten: Vec<serde_json::Value> = filtered
                     .into_iter()
                     .map(|mut item| {
+                        if item.get("cache_control").is_some() {
+                            return item;
+                        }
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                             let new_text = rewrite(text);
                             item.as_object_mut()
@@ -1012,7 +1018,7 @@ static PLATFORM_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Platform:\s*\S+")
 static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Shell:\s*[^\n<]+").unwrap());
 static OS_VERSION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
 static WORKING_DIR_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"((?:Primary )?[Ww]orking directory:\s*)/\S+").unwrap());
+    Lazy::new(|| Regex::new(r"((?:Primary )?[Ww]orking directory:\s*)/[^\s<]+").unwrap());
 static HOME_PATH_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/(?:Users|home)/[^/\s]+/").unwrap());
 static BILLING_LINE_REGEX: Lazy<Regex> =
@@ -1140,6 +1146,9 @@ where
             let rewritten: Vec<serde_json::Value> = arr
                 .into_iter()
                 .map(|mut item| {
+                    if item.get("cache_control").is_some() {
+                        return item;
+                    }
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                         let new_text = rewrite_fn(text);
                         item.as_object_mut()
@@ -1521,6 +1530,9 @@ fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &
             }
             serde_json::Value::Array(arr) => {
                 for item in arr.iter_mut() {
+                    if item.get("cache_control").is_some() {
+                        continue;
+                    }
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                         let new_text = scrub(text);
                         item.as_object_mut()
@@ -1789,6 +1801,93 @@ mod tests {
         assert_eq!(
             headers.get("X-Claude-Code-Session-Id").unwrap(),
             "session-1"
+        );
+    }
+
+    #[test]
+    fn message_beta_tokens_include_cache_features_without_forcing_1m() {
+        let account = Account {
+            allow_1m_models: String::new(),
+            ..test_account()
+        };
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert(
+            "anthropic-beta".to_string(),
+            "context-1m-2025-08-07,extended-cache-ttl-2025-04-11".to_string(),
+        );
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-sonnet-4-6",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert!(beta.contains("extended-cache-ttl-2025-04-11"));
+        assert!(beta.contains("cache-diagnosis-2026-04-07"));
+        assert!(!beta.contains("context-1m-2025-08-07"));
+    }
+
+    #[test]
+    fn claude_code_rewrite_skips_cached_system_blocks() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;\nPlatform: darwin\nWorking directory: /Users/real/project\n<system-reminder>Git user: real</system-reminder>",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                },
+                {
+                    "type": "text",
+                    "text": "Platform: darwin\nWorking directory: /Users/real/project"
+                }
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>Git user: real\nWorking directory: /Users/real/project</system-reminder>",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    },
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>Git user: real\nWorking directory: /Users/real/project</system-reminder>"
+                    }
+                ]
+            }]
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            parsed["system"][0]["text"],
+            "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;\nPlatform: darwin\nWorking directory: /Users/real/project\n<system-reminder>Git user: real</system-reminder>"
+        );
+        assert_eq!(
+            parsed["system"][1]["text"],
+            "Platform: linux\nWorking directory: /home/user/project"
+        );
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["text"],
+            "<system-reminder>Git user: real\nWorking directory: /Users/real/project</system-reminder>"
+        );
+        assert_eq!(
+            parsed["messages"][0]["content"][1]["text"],
+            "<system-reminder>Git user: real\nWorking directory: /home/user/project</system-reminder>"
         );
     }
 
