@@ -9,7 +9,9 @@ pub const STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
 /// Claude Code 2.1.156 抓包中的 Node runtime 版本。
 pub const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
 /// Claude Code 2.1.156 抓包中的 message beta token 集合。
-pub const MESSAGE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+///
+/// `context-1m-2025-08-07` 仍由账号白名单单独控制,不能放进必需集合。
+pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code OAuth 相关端点使用的 beta token。
 pub const OAUTH_BETA_TOKEN: &str = "oauth-2025-04-20";
 /// Claude Code triggers 端点使用的 beta token。
