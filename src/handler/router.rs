@@ -662,6 +662,21 @@ async fn get_settings(
     settings
         .entry("allowed_user_agents".into())
         .or_insert_with(|| DEFAULT_ALLOWED_USER_AGENTS.to_string());
+    settings
+        .entry("passthrough_shell".into())
+        .or_insert_with(|| {
+            crate::store::settings_store::DEFAULT_PASSTHROUGH_SHELL.to_string()
+        });
+    settings
+        .entry("passthrough_os_version".into())
+        .or_insert_with(|| {
+            crate::store::settings_store::DEFAULT_PASSTHROUGH_OS_VERSION.to_string()
+        });
+    settings
+        .entry("passthrough_working_dir".into())
+        .or_insert_with(|| {
+            crate::store::settings_store::DEFAULT_PASSTHROUGH_WORKING_DIR.to_string()
+        });
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -722,6 +737,20 @@ async fn update_settings(
     if let Some(val) = body.get("allowed_user_agents") {
         validate_user_agent_patterns(val)?;
     }
+    // 系统提示词环境透传开关:仅允许 "true" / "false"
+    for key in &[
+        "passthrough_shell",
+        "passthrough_os_version",
+        "passthrough_working_dir",
+    ] {
+        if let Some(val) = body.get(*key) {
+            if val != "true" && val != "false" {
+                return Err(AppError::BadRequest(
+                    format!("'{}' 必须是 true 或 false", key),
+                ));
+            }
+        }
+    }
     state.settings_store.upsert_many(&body).await?;
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
@@ -730,6 +759,12 @@ async fn update_settings(
         || body.contains_key("allowed_user_agents")
     {
         state.gateway_svc.reload_access_policy().await?;
+    }
+    if body.contains_key("passthrough_shell")
+        || body.contains_key("passthrough_os_version")
+        || body.contains_key("passthrough_working_dir")
+    {
+        state.gateway_svc.reload_env_passthrough().await?;
     }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;

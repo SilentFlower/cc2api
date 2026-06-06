@@ -37,6 +37,11 @@ const allowSystemRoleModels = ref('claude-opus-4-8');
 const allowedClaudeCodeVersions = ref('2.1.89-2.1.156');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
+/** 系统提示词环境字段「真值透传」开关(工作目录默认透传) */
+const passthroughShell = ref(false);
+const passthroughOsVersion = ref(false);
+const passthroughWorkingDir = ref(true);
+
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
 const logsLoading = ref(false);
@@ -128,6 +133,9 @@ async function loadSettings() {
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
     allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.156';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
+    passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
+    passthroughOsVersion.value = (data.passthrough_os_version ?? 'false') === 'true';
+    passthroughWorkingDir.value = (data.passthrough_working_dir ?? 'true') === 'true';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -184,6 +192,9 @@ async function saveSettings() {
       allow_system_role_models: allowSystemRoleModels.value.trim(),
       allowed_claude_code_versions: allowedClaudeCodeVersions.value.trim(),
       allowed_user_agents: allowedUserAgents.value.trim(),
+      passthrough_shell: passthroughShell.value ? 'true' : 'false',
+      passthrough_os_version: passthroughOsVersion.value ? 'true' : 'false',
+      passthrough_working_dir: passthroughWorkingDir.value ? 'true' : 'false',
     });
     toast('保存成功');
   } catch (e) {
@@ -357,6 +368,57 @@ onMounted(async () => {
             >全部关闭</button>
           </div>
         </div>
+      </div>
+    </Card>
+
+    <!-- 系统提示词环境透传 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">环境透传(指纹)</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            控制系统提示词 <span class="font-mono">&lt;env&gt;</span> 块中各字段是否使用客户端真实值。开启后该字段不再改写为账号预设,让模型识别真实环境;这三项仅存在于请求体,不影响请求头/遥测。<span class="font-medium">Platform 不在此列(跨通道字段,始终锁定)</span>。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">Shell</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="passthroughShell"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ passthroughShell ? '透传真实值' : '改写为预设' }}</span>
+            </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">OS Version</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="passthroughOsVersion"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ passthroughOsVersion ? '透传真实值' : '改写为预设' }}</span>
+            </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">Working directory</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="passthroughWorkingDir"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ passthroughWorkingDir ? '透传真实值' : '改写为预设' }}</span>
+            </label>
+          </div>
+        </div>
+        <p class="text-[11px] text-[#b5b0a6]">
+          开启 OS Version / Working directory 透传时,请确保账号预设平台与真机系统一致,否则会出现 Platform 与系统/路径不同系的矛盾。工作目录默认透传以避免误导模型对真实 cwd 的判断。
+        </p>
       </div>
     </Card>
 

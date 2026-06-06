@@ -9,7 +9,7 @@ use crate::model::account::{Account, AccountStatus};
 use crate::service::account::AccountService;
 use crate::service::gateway::extract_passive_usage;
 use crate::service::rewriter::{
-    clean_session_id_from_body, ordered_anthropic_headers, ClientType, Rewriter,
+    clean_session_id_from_body, ordered_anthropic_headers, ClientType, EnvPassthrough, Rewriter,
 };
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::SettingsStore;
@@ -374,9 +374,15 @@ impl PrimePollerService {
                 };
             }
         };
-        let rewritten_bytes =
-            self.rewriter
-                .rewrite_body(&minimal_bytes, "/v1/messages", account, ClientType::API);
+        // 预热请求走注入模式(ClientType::API),不触发系统提示词环境改写,
+        // 故环境透传开关在此无影响,传默认值即可。
+        let rewritten_bytes = self.rewriter.rewrite_body(
+            &minimal_bytes,
+            "/v1/messages",
+            account,
+            ClientType::API,
+            EnvPassthrough::default(),
+        );
         // 先解析 rewritten_bytes,此时 metadata._session_id 标记仍在。
         // 必须在剥除 _session_id 之前先跑 rewrite_headers:后者从 body 里的
         // _session_id 抽取 X-Claude-Code-Session-Id,与 metadata.user_id.session_id 对齐。

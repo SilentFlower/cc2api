@@ -15,6 +15,14 @@ pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str =
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS_SETTING: &str = DEFAULT_ALLOWED_USER_AGENTS;
 
+/// 系统提示词 `Shell:` 行是否默认真值透传。默认关闭(仍改写为账号预设)。
+pub const DEFAULT_PASSTHROUGH_SHELL: &str = "false";
+/// 系统提示词 `OS Version:` 行是否默认真值透传。默认关闭(仍改写为账号预设)。
+pub const DEFAULT_PASSTHROUGH_OS_VERSION: &str = "false";
+/// 系统提示词 `Working directory:` 行是否默认真值透传。默认开启:
+/// 工作目录改写会直接误导模型对真实 cwd 的判断,故默认透传真实路径。
+pub const DEFAULT_PASSTHROUGH_WORKING_DIR: &str = "true";
+
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {
     pool: AnyPool,

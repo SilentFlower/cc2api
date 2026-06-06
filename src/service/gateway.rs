@@ -19,12 +19,16 @@ use crate::service::access_policy::{
 };
 use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
-    clean_session_id_from_body, detect_client_type, ordered_anthropic_headers, ClientType, Rewriter,
+    clean_session_id_from_body, detect_client_type, ordered_anthropic_headers, ClientType,
+    EnvPassthrough, Rewriter,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
 };
-use crate::store::settings_store::{SettingsStore, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS};
+use crate::store::settings_store::{
+    SettingsStore, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_PASSTHROUGH_OS_VERSION,
+    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+};
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 /// 账号级 FIFO 排队的最长等待时长。超时后会降级到其他账号；队列上限仍由 concurrency 控制。
@@ -48,6 +52,7 @@ pub struct GatewayService {
     settings_store: Arc<SettingsStore>,
     system_role_models: RwLock<Vec<String>>,
     access_policy: RwLock<AccessPolicy>,
+    env_passthrough: RwLock<EnvPassthrough>,
 }
 
 impl GatewayService {
@@ -72,6 +77,7 @@ impl GatewayService {
                 )
                 .expect("默认访问策略必须合法"),
             ),
+            env_passthrough: RwLock::new(default_env_passthrough()),
         }
     }
 
@@ -88,6 +94,33 @@ impl GatewayService {
             .await?;
         let allowed_models = parse_system_role_model_list(&raw_allowed);
         *self.system_role_models.write().await = allowed_models;
+        Ok(())
+    }
+
+    /// 从全局设置刷新系统提示词环境字段的「真值透传」开关。
+    ///
+    /// 与访问策略/系统角色白名单一致,结果缓存在内存(`RwLock`),请求时只读缓存,
+    /// 不在每次转发时查库。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_env_passthrough(&self) -> Result<(), AppError> {
+        let shell = self
+            .settings_store
+            .get_value("passthrough_shell", DEFAULT_PASSTHROUGH_SHELL)
+            .await?;
+        let os_version = self
+            .settings_store
+            .get_value("passthrough_os_version", DEFAULT_PASSTHROUGH_OS_VERSION)
+            .await?;
+        let working_dir = self
+            .settings_store
+            .get_value("passthrough_working_dir", DEFAULT_PASSTHROUGH_WORKING_DIR)
+            .await?;
+        *self.env_passthrough.write().await = EnvPassthrough {
+            shell: parse_passthrough_flag(&shell),
+            os_version: parse_passthrough_flag(&os_version),
+            working_dir: parse_passthrough_flag(&working_dir),
+        };
         Ok(())
     }
 
@@ -294,9 +327,11 @@ impl GatewayService {
                 "request body summary BEFORE rewrite: {}",
                 safe_body_summary(&body_bytes)
             );
+            // 读取缓存的环境透传开关(内存 RwLock,不查库)
+            let env_pt = *self.env_passthrough.read().await;
             let rewritten_body =
                 self.rewriter
-                    .rewrite_body(&body_bytes, &path, &account, client_type);
+                    .rewrite_body(&body_bytes, &path, &account, client_type, env_pt);
             debug!(
                 "request body summary AFTER rewrite: {}",
                 safe_body_summary(&rewritten_body)
@@ -1238,6 +1273,20 @@ fn parse_system_role_model_list(raw: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+/// 将设置项字符串解析为开关布尔值,仅 "true" 视为开启。
+fn parse_passthrough_flag(raw: &str) -> bool {
+    raw == "true"
+}
+
+/// 构造系统提示词环境透传开关的内存初始值(reload 之前的兜底,与设置默认值保持一致)。
+fn default_env_passthrough() -> EnvPassthrough {
+    EnvPassthrough {
+        shell: parse_passthrough_flag(DEFAULT_PASSTHROUGH_SHELL),
+        os_version: parse_passthrough_flag(DEFAULT_PASSTHROUGH_OS_VERSION),
+        working_dir: parse_passthrough_flag(DEFAULT_PASSTHROUGH_WORKING_DIR),
+    }
 }
 
 fn is_system_role_model_allowed(model: &str, allowed_models: &[String]) -> bool {

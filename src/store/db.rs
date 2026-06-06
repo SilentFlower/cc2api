@@ -136,6 +136,19 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "allowed_user_agents",
             crate::store::settings_store::DEFAULT_ALLOWED_USER_AGENTS_SETTING,
         ),
+        // 系统提示词环境字段「真值透传」开关:工作目录默认透传,shell/os_version 默认改写。
+        (
+            "passthrough_shell",
+            crate::store::settings_store::DEFAULT_PASSTHROUGH_SHELL,
+        ),
+        (
+            "passthrough_os_version",
+            crate::store::settings_store::DEFAULT_PASSTHROUGH_OS_VERSION,
+        ),
+        (
+            "passthrough_working_dir",
+            crate::store::settings_store::DEFAULT_PASSTHROUGH_WORKING_DIR,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"
