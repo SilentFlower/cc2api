@@ -95,6 +95,10 @@ async fn main() {
         .reload_env_passthrough()
         .await
         .expect("load env passthrough failed");
+    gateway_svc
+        .reload_cache_control_ttl_rewrite()
+        .await
+        .expect("load cache control ttl rewrite failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 

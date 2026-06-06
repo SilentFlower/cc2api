@@ -42,6 +42,9 @@ const passthroughShell = ref(false);
 const passthroughOsVersion = ref(false);
 const passthroughWorkingDir = ref(true);
 
+/** Anthropic cache_control TTL 改写模式 */
+const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
+
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
 const logsLoading = ref(false);
@@ -136,6 +139,8 @@ async function loadSettings() {
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
     passthroughOsVersion.value = (data.passthrough_os_version ?? 'false') === 'true';
     passthroughWorkingDir.value = (data.passthrough_working_dir ?? 'true') === 'true';
+    const ttlRewrite = data.cache_control_ttl_rewrite ?? 'off';
+    cacheControlTtlRewrite.value = ttlRewrite === '5m' || ttlRewrite === '1h' ? ttlRewrite : 'off';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -195,6 +200,7 @@ async function saveSettings() {
       passthrough_shell: passthroughShell.value ? 'true' : 'false',
       passthrough_os_version: passthroughOsVersion.value ? 'true' : 'false',
       passthrough_working_dir: passthroughWorkingDir.value ? 'true' : 'false',
+      cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
     });
     toast('保存成功');
   } catch (e) {
@@ -418,6 +424,51 @@ onMounted(async () => {
         </div>
         <p class="text-[11px] text-[#b5b0a6]">
           开启 OS Version / Working directory 透传时,请确保账号预设平台与真机系统一致,否则会出现 Platform 与系统/路径不同系的矛盾。工作目录默认透传以避免误导模型对真实 cwd 的判断。
+        </p>
+      </div>
+    </Card>
+
+    <!-- Anthropic 缓存 TTL 改写 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">缓存 TTL 改写</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            仅改写请求体里已经存在的 ephemeral cache_control.ttl,不会新增缓存断点。默认不改写,保持客户端原始缓存策略。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="cacheControlTtlRewrite"
+              type="radio"
+              value="off"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">不改写</span>
+          </label>
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="cacheControlTtlRewrite"
+              type="radio"
+              value="5m"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">强制 5m</span>
+          </label>
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="cacheControlTtlRewrite"
+              type="radio"
+              value="1h"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">强制 1h</span>
+          </label>
+        </div>
+        <p class="text-[11px] text-[#b5b0a6]">
+          该设置只影响 Anthropic /v1/messages 请求中的顶层、system、messages.content、tools 已有缓存块。
         </p>
       </div>
     </Card>

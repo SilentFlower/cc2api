@@ -5,6 +5,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+use crate::error::AppError;
 use crate::model::account::{Account, BillingMode, CanonicalEnvData, CanonicalPromptEnvData};
 use crate::model::identity::{
     device_profile, process_snapshot, process_snapshot_json, request_profile, DeviceProfile,
@@ -341,6 +342,50 @@ pub struct EnvPassthrough {
     pub working_dir: bool,
 }
 
+/// Anthropic ephemeral cache_control TTL 改写模式。
+///
+/// 该设置只决定是否覆盖已有 `cache_control.type == "ephemeral"` 的 `ttl`;
+/// 不创建新的 `cache_control`,避免无意增加缓存断点。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheControlTtlRewrite {
+    /// 不改写请求体中的 cache_control ttl。
+    #[default]
+    Off,
+    /// 将已有 ephemeral cache_control 的 ttl 改写为 5m。
+    FiveMinutes,
+    /// 将已有 ephemeral cache_control 的 ttl 改写为 1h。
+    OneHour,
+}
+
+impl CacheControlTtlRewrite {
+    /// 从 settings 字符串解析 TTL 改写模式。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回枚举值,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "off" => Ok(Self::Off),
+            "5m" => Ok(Self::FiveMinutes),
+            "1h" => Ok(Self::OneHour),
+            other => Err(AppError::BadRequest(format!(
+                "'cache_control_ttl_rewrite' 必须是 off、5m 或 1h,当前值: {}",
+                other
+            ))),
+        }
+    }
+
+    /// 返回目标 TTL 字符串;关闭改写时返回 `None`。
+    ///
+    /// @return 目标 TTL,或关闭改写时的 `None`。
+    pub fn target_ttl(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::FiveMinutes => Some("5m"),
+            Self::OneHour => Some("1h"),
+        }
+    }
+}
+
 /// 处理所有请求的反检测改写。
 pub struct Rewriter;
 
@@ -593,6 +638,7 @@ impl Rewriter {
         account: &Account,
         client_type: ClientType,
         env_pt: EnvPassthrough,
+        cache_ttl_rewrite: CacheControlTtlRewrite,
     ) -> Vec<u8> {
         if body.is_empty() {
             return body.to_vec();
@@ -606,6 +652,7 @@ impl Rewriter {
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type, env_pt);
+            rewrite_existing_ephemeral_cache_control_ttl(&mut parsed, cache_ttl_rewrite);
         } else if is_event_logging_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
@@ -1406,6 +1453,69 @@ fn strip_cache_control(body: &mut serde_json::Value) {
     }
 }
 
+/// 将已有 ephemeral cache_control 的 ttl 改写为目标值。
+///
+/// 这里刻意只处理 sub2api TTL 改写同款范围,不递归 tool_result.content,
+/// 也不新增任何 cache_control,避免改变缓存断点数量。
+fn rewrite_existing_ephemeral_cache_control_ttl(
+    body: &mut serde_json::Value,
+    mode: CacheControlTtlRewrite,
+) {
+    let ttl = match mode.target_ttl() {
+        Some(ttl) => ttl,
+        None => return,
+    };
+
+    if let Some(obj) = body.as_object_mut() {
+        rewrite_block_cache_control_ttl(obj, ttl);
+    }
+
+    if let Some(sys) = body.get_mut("system").and_then(|s| s.as_array_mut()) {
+        for item in sys.iter_mut() {
+            if let Some(block) = item.as_object_mut() {
+                rewrite_block_cache_control_ttl(block, ttl);
+            }
+        }
+    }
+
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                for item in content.iter_mut() {
+                    if let Some(block) = item.as_object_mut() {
+                        rewrite_block_cache_control_ttl(block, ttl);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(block) = tool.as_object_mut() {
+                rewrite_block_cache_control_ttl(block, ttl);
+            }
+        }
+    }
+}
+
+/// 覆盖单个已有 ephemeral cache_control 的 ttl。
+fn rewrite_block_cache_control_ttl(
+    block: &mut serde_json::Map<String, serde_json::Value>,
+    ttl: &str,
+) {
+    let Some(cache_control) = block
+        .get_mut("cache_control")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    if cache_control.get("type").and_then(|value| value.as_str()) != Some("ephemeral") {
+        return;
+    }
+    cache_control.insert("ttl".into(), serde_json::Value::String(ttl.to_string()));
+}
+
 /// 按 Claude Code 2.1.156 抓包约束 API 模式的 `max_tokens`。
 fn normalize_api_max_tokens(body: &mut serde_json::Value) {
     match body.get("max_tokens").and_then(|v| v.as_f64()) {
@@ -1572,8 +1682,8 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 mod tests {
     use super::{
         cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
-        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token, ClientType,
-        EnvPassthrough, Rewriter,
+        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
+        CacheControlTtlRewrite, ClientType, EnvPassthrough, Rewriter,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1662,6 +1772,14 @@ mod tests {
         body: serde_json::Value,
         client_type: ClientType,
     ) -> serde_json::Value {
+        rewrite_messages_body_with_ttl(body, client_type, CacheControlTtlRewrite::Off)
+    }
+
+    fn rewrite_messages_body_with_ttl(
+        body: serde_json::Value,
+        client_type: ClientType,
+        cache_ttl_rewrite: CacheControlTtlRewrite,
+    ) -> serde_json::Value {
         let account = test_account();
         let rewriter = Rewriter::new();
         let out = rewriter.rewrite_body(
@@ -1670,8 +1788,203 @@ mod tests {
             &account,
             client_type,
             EnvPassthrough::default(),
+            cache_ttl_rewrite,
         );
         serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn cache_control_ttl_rewrite_parse_accepts_known_values() {
+        assert_eq!(
+            CacheControlTtlRewrite::parse("off").unwrap(),
+            CacheControlTtlRewrite::Off
+        );
+        assert_eq!(
+            CacheControlTtlRewrite::parse("5m").unwrap(),
+            CacheControlTtlRewrite::FiveMinutes
+        );
+        assert_eq!(
+            CacheControlTtlRewrite::parse("1h").unwrap(),
+            CacheControlTtlRewrite::OneHour
+        );
+    }
+
+    #[test]
+    fn cache_control_ttl_rewrite_parse_rejects_unknown_value() {
+        let err = CacheControlTtlRewrite::parse("30m").unwrap_err();
+
+        assert!(err.to_string().contains("cache_control_ttl_rewrite"));
+    }
+
+    #[test]
+    fn cache_control_ttl_rewrite_off_keeps_existing_ttl_values() {
+        let parsed = rewrite_messages_body_with_ttl(
+            json!({
+                "cache_control": { "type": "ephemeral" },
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hi",
+                        "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                    }]
+                }],
+                "tools": [{
+                    "name": "a",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+        );
+
+        assert!(parsed["cache_control"].get("ttl").is_none());
+        assert_eq!(parsed["system"][0]["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
+            json!("5m")
+        );
+        assert_eq!(parsed["tools"][0]["cache_control"]["ttl"], json!("1h"));
+    }
+
+    #[test]
+    fn cache_control_ttl_rewrite_updates_only_existing_ephemeral_breakpoints() {
+        let parsed = rewrite_messages_body_with_ttl(
+            json!({
+                "cache_control": { "type": "ephemeral" },
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "cached sys",
+                        "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                    },
+                    {
+                        "type": "text",
+                        "text": "plain sys"
+                    }
+                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hi",
+                            "cache_control": { "type": "ephemeral" }
+                        },
+                        {
+                            "type": "text",
+                            "text": "persistent",
+                            "cache_control": { "type": "persistent", "ttl": "5m" }
+                        },
+                        {
+                            "type": "tool_result",
+                            "content": [{
+                                "type": "text",
+                                "text": "nested",
+                                "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                            }]
+                        }
+                    ]
+                }],
+                "tools": [
+                    {
+                        "name": "a",
+                        "input_schema": {},
+                        "cache_control": { "type": "ephemeral" }
+                    },
+                    {
+                        "name": "b",
+                        "input_schema": {}
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::OneHour,
+        );
+        let rendered = serde_json::to_string(&parsed).unwrap();
+
+        assert_eq!(rendered.matches("\"cache_control\"").count(), 6);
+        assert_eq!(parsed["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(parsed["system"][0]["cache_control"]["ttl"], json!("1h"));
+        assert!(parsed["system"][1].get("cache_control").is_none());
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
+            json!("1h")
+        );
+        assert_eq!(
+            parsed["messages"][0]["content"][1]["cache_control"]["ttl"],
+            json!("5m")
+        );
+        assert_eq!(
+            parsed["messages"][0]["content"][2]["content"][0]["cache_control"]["ttl"],
+            json!("5m")
+        );
+        assert_eq!(parsed["tools"][0]["cache_control"]["ttl"], json!("1h"));
+        assert!(parsed["tools"][1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_control_ttl_rewrite_can_force_five_minutes() {
+        let parsed = rewrite_messages_body_with_ttl(
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hi",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    }]
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::FiveMinutes,
+        );
+
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
+            json!("5m")
+        );
+    }
+
+    #[test]
+    fn api_mode_keeps_existing_strip_cache_control_scope() {
+        let parsed = rewrite_messages_body_with_ttl(
+            json!({
+                "cache_control": { "type": "ephemeral" },
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral" }
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hi",
+                        "cache_control": { "type": "ephemeral" }
+                    }]
+                }],
+                "tools": [{
+                    "name": "a",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral" }
+                }]
+            }),
+            ClientType::API,
+            CacheControlTtlRewrite::OneHour,
+        );
+
+        assert_eq!(parsed["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(parsed["system"][0]["cache_control"]["ttl"], json!("1h"));
+        assert!(parsed["system"][1].get("cache_control").is_none());
+        assert!(parsed["messages"][0]["content"][0].get("cache_control").is_none());
+        assert_eq!(parsed["tools"][0]["cache_control"]["ttl"], json!("1h"));
     }
 
     #[test]
@@ -1870,6 +2183,7 @@ mod tests {
             &account,
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
 
@@ -2207,6 +2521,7 @@ mod tests {
             &account,
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let attrs = parsed.get("attributes").unwrap();
@@ -2261,6 +2576,7 @@ mod tests {
             &account,
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let event = &parsed["events"][0]["event_data"];
