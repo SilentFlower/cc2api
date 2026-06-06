@@ -327,6 +327,20 @@ fn wire_header_order(path: &str) -> &'static [&'static str] {
     }
 }
 
+/// 控制系统提示词 `<env>` 块中各环境字段是否「真值透传」(跳过改写)。
+///
+/// 这三项仅存在于请求体的系统提示词中,不进请求头/遥测,放开改写无跨通道连带风险。
+/// `platform` 不在此列:它是请求头/遥测/提示词三处共享的跨通道字段,必须保持一致。
+#[derive(Clone, Copy, Default)]
+pub struct EnvPassthrough {
+    /// 透传真实 `Shell:` 行。
+    pub shell: bool,
+    /// 透传真实 `OS Version:` 行。
+    pub os_version: bool,
+    /// 透传真实 `Working directory:` 行(同时跳过 home 路径前缀改写)。
+    pub working_dir: bool,
+}
+
 /// 处理所有请求的反检测改写。
 pub struct Rewriter;
 
@@ -578,6 +592,7 @@ impl Rewriter {
         path: &str,
         account: &Account,
         client_type: ClientType,
+        env_pt: EnvPassthrough,
     ) -> Vec<u8> {
         if body.is_empty() {
             return body.to_vec();
@@ -590,7 +605,7 @@ impl Rewriter {
 
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
-            self.rewrite_messages(&mut parsed, account, client_type);
+            self.rewrite_messages(&mut parsed, account, client_type, env_pt);
         } else if is_event_logging_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
@@ -630,6 +645,7 @@ impl Rewriter {
         body: &mut serde_json::Value,
         account: &Account,
         client_type: ClientType,
+        env_pt: EnvPassthrough,
     ) {
         let profile = device_profile(account);
 
@@ -641,6 +657,7 @@ impl Rewriter {
                 &profile.prompt,
                 &profile.env.version,
                 &account.billing_mode,
+                env_pt,
             );
             scrub_git_user_in_reminders(body, &account.name);
         } else {
@@ -810,6 +827,7 @@ impl Rewriter {
         pe: &CanonicalPromptEnvData,
         version: &str,
         billing_mode: &BillingMode,
+        env_pt: EnvPassthrough,
     ) {
         let version = normalize_version(version);
         let rewrite_billing = *billing_mode == BillingMode::Rewrite;
@@ -843,21 +861,31 @@ impl Rewriter {
             text = PLATFORM_REGEX
                 .replace_all(&text, &format!("Platform: {}", pe.platform))
                 .to_string();
-            text = SHELL_REGEX
-                .replace_all(&text, &format!("Shell: {}", pe.shell))
-                .to_string();
-            text = OS_VERSION_REGEX
-                .replace_all(&text, &format!("OS Version: {}", pe.os_version))
-                .to_string();
-            text = WORKING_DIR_REGEX
-                .replace_all(&text, &format!("${{1}}{}", pe.working_dir))
-                .to_string();
-            let home_prefix = if let Some(idx) = nth_index(&pe.working_dir, '/', 3) {
-                &pe.working_dir[..idx + 1]
-            } else {
-                &pe.working_dir
-            };
-            text = HOME_PATH_REGEX.replace_all(&text, home_prefix).to_string();
+            // Shell / OS Version / Working directory 仅在未开启「真值透传」时改写。
+            // 这三项只存在于请求体提示词中,不进请求头/遥测,放开不影响指纹一致性。
+            if !env_pt.shell {
+                text = SHELL_REGEX
+                    .replace_all(&text, &format!("Shell: {}", pe.shell))
+                    .to_string();
+            }
+            if !env_pt.os_version {
+                text = OS_VERSION_REGEX
+                    .replace_all(&text, &format!("OS Version: {}", pe.os_version))
+                    .to_string();
+            }
+            if !env_pt.working_dir {
+                text = WORKING_DIR_REGEX
+                    .replace_all(&text, &format!("${{1}}{}", pe.working_dir))
+                    .to_string();
+                // home 前缀改写与 working_dir 绑定:透传真实工作目录时一并跳过,
+                // 否则真实路径仍会被 home 前缀改写污染。
+                let home_prefix = if let Some(idx) = nth_index(&pe.working_dir, '/', 3) {
+                    &pe.working_dir[..idx + 1]
+                } else {
+                    &pe.working_dir
+                };
+                text = HOME_PATH_REGEX.replace_all(&text, home_prefix).to_string();
+            }
             text
         };
 
@@ -1532,7 +1560,8 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 mod tests {
     use super::{
         cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
-        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token, ClientType, Rewriter,
+        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token, ClientType,
+        EnvPassthrough, Rewriter,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1628,6 +1657,7 @@ mod tests {
             "/v1/messages",
             &account,
             client_type,
+            EnvPassthrough::default(),
         );
         serde_json::from_slice(&out).unwrap()
     }
@@ -2077,6 +2107,7 @@ mod tests {
             "/api/eval/sdk-zAZezfDKGoZuXXKe",
             &account,
             ClientType::ClaudeCode,
+            EnvPassthrough::default(),
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let attrs = parsed.get("attributes").unwrap();
@@ -2130,6 +2161,7 @@ mod tests {
             "/api/event_logging/v2/batch",
             &account,
             ClientType::ClaudeCode,
+            EnvPassthrough::default(),
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let event = &parsed["events"][0]["event_data"];

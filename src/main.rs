@@ -91,6 +91,10 @@ async fn main() {
         .reload_access_policy()
         .await
         .expect("load access policy failed");
+    gateway_svc
+        .reload_env_passthrough()
+        .await
+        .expect("load env passthrough failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 
