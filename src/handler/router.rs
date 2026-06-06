@@ -22,11 +22,11 @@ use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
-use crate::service::rewriter::CacheControlTtlRewrite;
+use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrite};
 use crate::service::telemetry::TelemetryService;
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
-    SettingsStore, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
+    SettingsStore, DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
 };
 use crate::store::token_store::TokenStore;
 
@@ -683,6 +683,9 @@ async fn get_settings(
     settings
         .entry("cache_control_ttl_rewrite".into())
         .or_insert_with(|| DEFAULT_CACHE_CONTROL_TTL_REWRITE.to_string());
+    settings
+        .entry("message_cache_control_rewrite".into())
+        .or_insert_with(|| DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -760,6 +763,9 @@ async fn update_settings(
     if let Some(val) = body.get("cache_control_ttl_rewrite") {
         CacheControlTtlRewrite::parse(val)?;
     }
+    if let Some(val) = body.get("message_cache_control_rewrite") {
+        MessageCacheControlRewrite::parse(val)?;
+    }
     state.settings_store.upsert_many(&body).await?;
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
@@ -777,6 +783,12 @@ async fn update_settings(
     }
     if body.contains_key("cache_control_ttl_rewrite") {
         state.gateway_svc.reload_cache_control_ttl_rewrite().await?;
+    }
+    if body.contains_key("message_cache_control_rewrite") {
+        state
+            .gateway_svc
+            .reload_message_cache_control_rewrite()
+            .await?;
     }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;

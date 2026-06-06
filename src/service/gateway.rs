@@ -20,15 +20,15 @@ use crate::service::access_policy::{
 use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
     clean_session_id_from_body, detect_client_type, ordered_anthropic_headers,
-    CacheControlTtlRewrite, ClientType, EnvPassthrough, Rewriter,
+    CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
 };
 use crate::store::settings_store::{
     SettingsStore, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
-    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL,
-    DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PASSTHROUGH_OS_VERSION,
+    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
 };
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -55,6 +55,7 @@ pub struct GatewayService {
     access_policy: RwLock<AccessPolicy>,
     env_passthrough: RwLock<EnvPassthrough>,
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
+    message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
 }
 
 impl GatewayService {
@@ -81,6 +82,7 @@ impl GatewayService {
             ),
             env_passthrough: RwLock::new(default_env_passthrough()),
             cache_control_ttl_rewrite: RwLock::new(default_cache_control_ttl_rewrite()),
+            message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
         }
     }
 
@@ -142,6 +144,24 @@ impl GatewayService {
             .await?;
         *self.cache_control_ttl_rewrite.write().await =
             CacheControlTtlRewrite::parse(&raw)?;
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Claude Code messages 缓存断点改写模式。
+    ///
+    /// 与 TTL 改写一样缓存到内存,避免每次 `/v1/messages` 转发都查询 settings 表。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析枚举失败时返回业务错误。
+    pub async fn reload_message_cache_control_rewrite(&self) -> Result<(), AppError> {
+        let raw = self
+            .settings_store
+            .get_value(
+                "message_cache_control_rewrite",
+                DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+            )
+            .await?;
+        *self.message_cache_control_rewrite.write().await =
+            MessageCacheControlRewrite::parse(&raw)?;
         Ok(())
     }
 
@@ -351,9 +371,16 @@ impl GatewayService {
             // 读取缓存的环境透传开关(内存 RwLock,不查库)
             let env_pt = *self.env_passthrough.read().await;
             let cache_ttl = *self.cache_control_ttl_rewrite.read().await;
-            let rewritten_body =
-                self.rewriter
-                    .rewrite_body(&body_bytes, &path, &account, client_type, env_pt, cache_ttl);
+            let message_cache = *self.message_cache_control_rewrite.read().await;
+            let rewritten_body = self.rewriter.rewrite_body(
+                &body_bytes,
+                &path,
+                &account,
+                client_type,
+                env_pt,
+                cache_ttl,
+                message_cache,
+            );
             debug!(
                 "request body summary AFTER rewrite: {}",
                 safe_body_summary(&rewritten_body)
@@ -1315,6 +1342,12 @@ fn default_env_passthrough() -> EnvPassthrough {
 fn default_cache_control_ttl_rewrite() -> CacheControlTtlRewrite {
     CacheControlTtlRewrite::parse(DEFAULT_CACHE_CONTROL_TTL_REWRITE)
         .expect("默认 cache_control TTL 改写模式必须合法")
+}
+
+/// 构造 messages cache_control 改写模式初始值(reload 之前的兜底,与设置默认值保持一致)。
+fn default_message_cache_control_rewrite() -> MessageCacheControlRewrite {
+    MessageCacheControlRewrite::parse(DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE)
+        .expect("默认 message cache_control 改写模式必须合法")
 }
 
 fn is_system_role_model_allowed(model: &str, allowed_models: &[String]) -> bool {

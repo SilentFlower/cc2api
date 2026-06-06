@@ -24,6 +24,8 @@ pub const DEFAULT_PASSTHROUGH_OS_VERSION: &str = "false";
 pub const DEFAULT_PASSTHROUGH_WORKING_DIR: &str = "true";
 /// Anthropic ephemeral cache_control TTL 改写默认关闭,保持旧请求体行为。
 pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
+/// Claude Code messages 缓存断点稳定化默认关闭,保持旧请求体行为。
+pub const DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE: &str = "off";
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

@@ -386,6 +386,36 @@ impl CacheControlTtlRewrite {
     }
 }
 
+/// Claude Code messages 缓存断点改写模式。
+///
+/// `Stable` 会先清空 `messages[].content[].cache_control`,再按固定位置重打 message
+/// 断点,避免上一轮尾部断点在下一轮变成历史中间断点后破坏缓存命中。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MessageCacheControlRewrite {
+    /// 保持客户端原始 message cache_control。
+    #[default]
+    Off,
+    /// 稳定化 message cache_control 断点。
+    Stable,
+}
+
+impl MessageCacheControlRewrite {
+    /// 从 settings 字符串解析 message 缓存断点改写模式。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回枚举值,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "off" => Ok(Self::Off),
+            "stable" => Ok(Self::Stable),
+            other => Err(AppError::BadRequest(format!(
+                "'message_cache_control_rewrite' 必须是 off 或 stable,当前值: {}",
+                other
+            ))),
+        }
+    }
+}
+
 /// 处理所有请求的反检测改写。
 pub struct Rewriter;
 
@@ -639,6 +669,7 @@ impl Rewriter {
         client_type: ClientType,
         env_pt: EnvPassthrough,
         cache_ttl_rewrite: CacheControlTtlRewrite,
+        message_cache_rewrite: MessageCacheControlRewrite,
     ) -> Vec<u8> {
         if body.is_empty() {
             return body.to_vec();
@@ -652,6 +683,7 @@ impl Rewriter {
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type, env_pt);
+            rewrite_message_cache_control(&mut parsed, client_type, message_cache_rewrite);
             rewrite_existing_ephemeral_cache_control_ttl(&mut parsed, cache_ttl_rewrite);
         } else if is_event_logging_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
@@ -1453,6 +1485,115 @@ fn strip_cache_control(body: &mut serde_json::Value) {
     }
 }
 
+/// 按配置稳定化 Claude Code messages 缓存断点。
+fn rewrite_message_cache_control(
+    body: &mut serde_json::Value,
+    client_type: ClientType,
+    mode: MessageCacheControlRewrite,
+) {
+    if client_type != ClientType::ClaudeCode || mode == MessageCacheControlRewrite::Off {
+        return;
+    }
+    strip_message_cache_control(body);
+    add_stable_message_cache_control(body);
+}
+
+/// 移除 messages 内容块中的 cache_control,不影响 system/tools 断点。
+fn strip_message_cache_control(body: &mut serde_json::Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for item in content.iter_mut() {
+            if let Some(block) = item.as_object_mut() {
+                block.remove("cache_control");
+            }
+        }
+    }
+}
+
+/// 为 messages 重新放置稳定缓存断点。
+///
+/// 规则对齐 sub2api/Parrot:最后一条 message 必打;messages 足够长时,
+/// 再打倒数第二个 user turn。这样相邻轮次能复用上一轮写出的尾部缓存段。
+fn add_stable_message_cache_control(body: &mut serde_json::Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+
+    let last_idx = messages.len() - 1;
+    add_message_cache_control_at(messages, last_idx);
+
+    if messages.len() < 4 {
+        return;
+    }
+
+    let mut user_seen = 0;
+    for idx in (0..messages.len()).rev() {
+        if messages[idx].get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        user_seen += 1;
+        if user_seen == 2 {
+            add_message_cache_control_at(messages, idx);
+            break;
+        }
+    }
+}
+
+/// 在指定 message 的最后一个可缓存内容块上设置 cache_control。
+fn add_message_cache_control_at(messages: &mut [serde_json::Value], idx: usize) {
+    let Some(msg) = messages.get_mut(idx) else {
+        return;
+    };
+    let Some(content) = msg.get_mut("content") else {
+        return;
+    };
+
+    let Some(arr) = content.as_array_mut() else {
+        return;
+    };
+    let Some(block_idx) = last_cacheable_message_block_index(arr) else {
+        return;
+    };
+    let Some(block) = arr.get_mut(block_idx).and_then(|item| item.as_object_mut()) else {
+        return;
+    };
+    block.insert("cache_control".into(), default_message_cache_control());
+}
+
+/// 返回最后一个可放置 Anthropic cache_control 的 message 内容块下标。
+fn last_cacheable_message_block_index(blocks: &[serde_json::Value]) -> Option<usize> {
+    blocks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, block)| is_cacheable_message_block(block))
+        .map(|(idx, _)| idx)
+}
+
+/// 判断 message 内容块是否可以放置 cache_control。
+fn is_cacheable_message_block(block: &serde_json::Value) -> bool {
+    let Some(block) = block.as_object() else {
+        return false;
+    };
+    !matches!(
+        block.get("type").and_then(|t| t.as_str()),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
+/// message 断点稳定化新建 cache_control 的默认值。
+fn default_message_cache_control() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+}
+
 /// 将已有 ephemeral cache_control 的 ttl 改写为目标值。
 ///
 /// 这里刻意只处理 sub2api TTL 改写同款范围,不递归 tool_result.content,
@@ -1683,7 +1824,7 @@ mod tests {
     use super::{
         cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
         matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
-        CacheControlTtlRewrite, ClientType, EnvPassthrough, Rewriter,
+        CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1772,13 +1913,32 @@ mod tests {
         body: serde_json::Value,
         client_type: ClientType,
     ) -> serde_json::Value {
-        rewrite_messages_body_with_ttl(body, client_type, CacheControlTtlRewrite::Off)
+        rewrite_messages_body_with_modes(
+            body,
+            client_type,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+        )
     }
 
     fn rewrite_messages_body_with_ttl(
         body: serde_json::Value,
         client_type: ClientType,
         cache_ttl_rewrite: CacheControlTtlRewrite,
+    ) -> serde_json::Value {
+        rewrite_messages_body_with_modes(
+            body,
+            client_type,
+            cache_ttl_rewrite,
+            MessageCacheControlRewrite::Off,
+        )
+    }
+
+    fn rewrite_messages_body_with_modes(
+        body: serde_json::Value,
+        client_type: ClientType,
+        cache_ttl_rewrite: CacheControlTtlRewrite,
+        message_cache_rewrite: MessageCacheControlRewrite,
     ) -> serde_json::Value {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -1789,6 +1949,7 @@ mod tests {
             client_type,
             EnvPassthrough::default(),
             cache_ttl_rewrite,
+            message_cache_rewrite,
         );
         serde_json::from_slice(&out).unwrap()
     }
@@ -1814,6 +1975,25 @@ mod tests {
         let err = CacheControlTtlRewrite::parse("30m").unwrap_err();
 
         assert!(err.to_string().contains("cache_control_ttl_rewrite"));
+    }
+
+    #[test]
+    fn message_cache_control_rewrite_parse_accepts_known_values() {
+        assert_eq!(
+            MessageCacheControlRewrite::parse("off").unwrap(),
+            MessageCacheControlRewrite::Off
+        );
+        assert_eq!(
+            MessageCacheControlRewrite::parse("stable").unwrap(),
+            MessageCacheControlRewrite::Stable
+        );
+    }
+
+    #[test]
+    fn message_cache_control_rewrite_parse_rejects_unknown_value() {
+        let err = MessageCacheControlRewrite::parse("last").unwrap_err();
+
+        assert!(err.to_string().contains("message_cache_control_rewrite"));
     }
 
     #[test]
@@ -1950,6 +2130,137 @@ mod tests {
             parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
             json!("5m")
         );
+    }
+
+    #[test]
+    fn message_cache_control_stable_rewrites_only_message_breakpoints() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u1",
+                            "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "a1",
+                            "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "u2-old",
+                                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                            },
+                            {
+                                "type": "text",
+                                "text": "u2"
+                            }
+                        ]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "skip me"
+                            },
+                            {
+                                "type": "text",
+                                "text": "a2"
+                            },
+                            "tail-marker"
+                        ]
+                    }
+                ],
+                "tools": [{
+                    "name": "a",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stable,
+        );
+
+        assert_eq!(parsed["system"][0]["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(parsed["tools"][0]["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
+            json!("1h")
+        );
+        assert!(parsed["messages"][1]["content"][0].get("cache_control").is_none());
+        assert!(parsed["messages"][2]["content"][0].get("cache_control").is_none());
+        assert!(parsed["messages"][2]["content"][1].get("cache_control").is_none());
+        assert!(parsed["messages"][3]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            parsed["messages"][3]["content"][1]["cache_control"]["ttl"],
+            json!("1h")
+        );
+        assert_eq!(parsed["messages"][3]["content"][2], json!("tail-marker"));
+    }
+
+    #[test]
+    fn message_cache_control_stable_keeps_string_content_unchanged() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "hello"
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Stable,
+        );
+
+        assert_eq!(parsed["messages"][0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn message_cache_control_stable_is_ignored_for_api_mode() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u1",
+                            "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "a1"
+                        }]
+                    }
+                ]
+            }),
+            ClientType::API,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stable,
+        );
+
+        assert!(parsed["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(parsed["messages"][1]["content"][0].get("cache_control").is_none());
     }
 
     #[test]
@@ -2184,6 +2495,7 @@ mod tests {
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
 
@@ -2522,6 +2834,7 @@ mod tests {
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let attrs = parsed.get("attributes").unwrap();
@@ -2577,6 +2890,7 @@ mod tests {
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let event = &parsed["events"][0]["event_data"];
@@ -2650,6 +2964,90 @@ mod tests {
         assert!(!text.contains("cch=40943"));
         assert!(!text.contains("cch=00000"));
         assert!(text.contains("cch="));
+    }
+
+    #[test]
+    fn message_cache_control_stable_recomputes_cch_after_final_body_changes() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
+            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hello"
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "ok"
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "again",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "done"
+                    }]
+                }
+            ]
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Stable,
+        );
+        let text = String::from_utf8(out.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert!(!text.contains("cch=12345"));
+        assert!(!text.contains("cch=00000"));
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
+            json!("5m")
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"][0]["cache_control"]["ttl"],
+            json!("5m")
+        );
+
+        let actual = super::CCH_VALUE_REGEX
+            .find(&text)
+            .map(|m| m.as_str().to_string())
+            .expect("cch value exists");
+        let mut placeholder_body = out;
+        let cch_pos = placeholder_body
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        let expected = String::from_utf8(compute_cch_attestation(
+            placeholder_body,
+            DEFAULT_CLAUDE_CODE_VERSION,
+        ))
+        .unwrap();
+
+        assert!(expected.contains(&actual));
     }
 
     #[test]
