@@ -48,6 +48,11 @@ const SIGNATURE_ERROR_BODY_LIMIT: usize = 1024 * 1024;
 const UPSTREAM_ERROR_LOG_BODY_LIMIT: usize = 4096;
 /// stateful usage SSE 解析保留的最大未完成行长度。
 const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
+/// stateful usage 旁路采样的最大响应体字节数。
+///
+/// 正常 Anthropic SSE 的 usage 会在尾部出现；这里仅在压缩响应上保留一份内部副本用于解压解析,
+/// 不改变转发给 Claude Code 的原始响应字节。
+const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -523,6 +528,7 @@ impl GatewayService {
                     None
                 };
                 let permit = slot_guard.defuse();
+                let content_codings = response_content_codings(resp.headers());
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
                     body,
@@ -531,6 +537,7 @@ impl GatewayService {
                     account.name.clone(),
                     self.rewriter.clone(),
                     stateful_cache_completion,
+                    content_codings,
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -946,22 +953,13 @@ fn safe_upstream_error_log_body(body: &[u8], headers: &HeaderMap) -> String {
 }
 
 fn decode_upstream_error_body(body: &[u8], headers: &HeaderMap) -> Vec<u8> {
-    let Some(encoding) = headers
-        .get(CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return body.to_vec();
-    };
+    let codings = response_content_codings(headers);
+    decode_response_body_with_codings(body, &codings)
+}
 
+fn decode_response_body_with_codings(body: &[u8], codings: &[String]) -> Vec<u8> {
     let mut decoded = body.to_vec();
-    for coding in encoding
-        .split(',')
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty() && v != "identity")
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
+    for coding in codings.iter().rev() {
         decoded = match decode_single_content_encoding(&coding, &decoded) {
             Ok(next) => next,
             Err(e) => {
@@ -976,6 +974,20 @@ fn decode_upstream_error_body(body: &[u8], headers: &HeaderMap) -> Vec<u8> {
         };
     }
     decoded
+}
+
+fn response_content_codings(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|encoding| {
+            encoding
+                .split(',')
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty() && v != "identity")
+        })
+        .collect()
 }
 
 fn decode_single_content_encoding(coding: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -1596,6 +1608,12 @@ struct SlotGuardBody {
     stateful_cache_usage: StatefulCacheUsage,
     /// 跨 frame 保留未完成的 SSE 行。
     stateful_cache_usage_buffer: String,
+    /// 压缩响应的旁路采样副本。原始 frame 仍直接透传给下游。
+    stateful_cache_usage_side_tap: Vec<u8>,
+    /// 旁路采样是否因超过上限被截断。
+    stateful_cache_usage_side_tap_truncated: bool,
+    /// 上游响应的 content-encoding 列表,用于 EOF 后解压旁路副本。
+    response_content_codings: Vec<String>,
     /// 请求改写器,用于提交 stateful 缓存状态。
     rewriter: Arc<Rewriter>,
     /// 请求开始时间，用于计算首字耗时。
@@ -1614,6 +1632,7 @@ impl SlotGuardBody {
         account_name: String,
         rewriter: Arc<Rewriter>,
         stateful_cache_completion: Option<StatefulCacheCompletion>,
+        response_content_codings: Vec<String>,
     ) -> Self {
         Self {
             inner,
@@ -1621,6 +1640,9 @@ impl SlotGuardBody {
             stateful_cache_completion,
             stateful_cache_usage: StatefulCacheUsage::default(),
             stateful_cache_usage_buffer: String::new(),
+            stateful_cache_usage_side_tap: Vec::new(),
+            stateful_cache_usage_side_tap_truncated: false,
+            response_content_codings,
             rewriter,
             req_start,
             account_name,
@@ -1658,11 +1680,30 @@ impl http_body::Body for SlotGuardBody {
             );
             self.stateful_cache_usage = usage;
             self.stateful_cache_usage_buffer = buffer;
+            if !self.response_content_codings.is_empty() {
+                if let Some(bytes) = frame.data_ref() {
+                    let mut side_tap = std::mem::take(&mut self.stateful_cache_usage_side_tap);
+                    let mut side_tap_truncated = self.stateful_cache_usage_side_tap_truncated;
+                    append_stateful_usage_side_tap(
+                        &mut side_tap,
+                        &mut side_tap_truncated,
+                        bytes,
+                    );
+                    self.stateful_cache_usage_side_tap = side_tap;
+                    self.stateful_cache_usage_side_tap_truncated = side_tap_truncated;
+                }
+            }
         }
         if let std::task::Poll::Ready(None) = &result {
             let mut usage = self.stateful_cache_usage;
             let mut buffer = std::mem::take(&mut self.stateful_cache_usage_buffer);
             flush_stateful_cache_usage_buffer(&mut usage, &mut buffer);
+            merge_stateful_cache_usage_from_compressed_side_tap(
+                &mut usage,
+                &self.response_content_codings,
+                &self.stateful_cache_usage_side_tap,
+                self.stateful_cache_usage_side_tap_truncated,
+            );
             self.stateful_cache_usage = usage;
             self.stateful_cache_usage_buffer = buffer;
             let completion = self.stateful_cache_completion.take();
@@ -1692,6 +1733,34 @@ fn observed_stateful_cache_usage(usage: StatefulCacheUsage) -> Option<StatefulCa
     } else {
         Some(usage)
     }
+}
+
+fn append_stateful_usage_side_tap(buffer: &mut Vec<u8>, truncated: &mut bool, bytes: &[u8]) {
+    if *truncated {
+        return;
+    }
+    let remaining = STATEFUL_USAGE_SIDE_TAP_LIMIT.saturating_sub(buffer.len());
+    if bytes.len() <= remaining {
+        buffer.extend_from_slice(bytes);
+    } else {
+        buffer.extend_from_slice(&bytes[..remaining]);
+        *truncated = true;
+    }
+}
+
+fn merge_stateful_cache_usage_from_compressed_side_tap(
+    usage: &mut StatefulCacheUsage,
+    codings: &[String],
+    compressed: &[u8],
+    truncated: bool,
+) {
+    if codings.is_empty() || compressed.is_empty() || truncated {
+        return;
+    }
+    let decoded = decode_response_body_with_codings(compressed, codings);
+    let mut buffer = String::new();
+    update_stateful_cache_usage_from_bytes(usage, &mut buffer, &decoded);
+    flush_stateful_cache_usage_buffer(usage, &mut buffer);
 }
 
 /// 从响应 frame 中提取 prompt cache usage。
@@ -1889,6 +1958,30 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
 
         assert_eq!(usage.cache_read_input_tokens, 73_308);
         assert_eq!(usage.cache_creation_input_tokens, 160_700);
+    }
+
+    #[test]
+    fn stateful_cache_usage_parser_reads_gzip_side_tap() {
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(
+                br#"data: {"type":"message_delta","usage":{"cache_read_input_tokens":73310,"cache_creation_input_tokens":153804}}
+"#,
+            )
+            .expect("write gzip");
+        let compressed = encoder.finish().expect("finish gzip");
+        let mut usage = StatefulCacheUsage::default();
+
+        super::merge_stateful_cache_usage_from_compressed_side_tap(
+            &mut usage,
+            &["gzip".to_string()],
+            &compressed,
+            false,
+        );
+
+        assert_eq!(usage.cache_read_input_tokens, 73_310);
+        assert_eq!(usage.cache_creation_input_tokens, 153_804);
     }
 
     #[test]
