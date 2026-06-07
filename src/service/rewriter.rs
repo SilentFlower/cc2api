@@ -1529,6 +1529,8 @@ const STATEFUL_SPIKE_RATIO: usize = 3;
 const STATEFUL_SPIKE_ABSOLUTE_DELTA: usize = 128;
 /// 并发 sibling 与主线相差超过该值且无 anchor 命中时,不允许覆盖主线状态。
 const STATEFUL_PARALLEL_DELTA: usize = CACHE_LOOKBACK_STRIDE * 2;
+/// 主线达到一个 lookback 窗口后才认为成熟,避免 1-block 启动请求锁死会话。
+const STATEFUL_BOOTSTRAP_BLOCKS: usize = CACHE_LOOKBACK_STRIDE;
 
 impl Rewriter {
     /// 按配置改写 Claude Code messages 缓存断点。
@@ -2035,6 +2037,7 @@ enum StatefulPromotion {
     MissingSession,
     NoReusableAnchor,
     ColdStart,
+    BootstrapUpdated,
 }
 
 impl StatefulPromotion {
@@ -2047,6 +2050,7 @@ impl StatefulPromotion {
             Self::MissingSession => "missing_session",
             Self::NoReusableAnchor => "ignored_no_reuse",
             Self::ColdStart => "cold_start",
+            Self::BootstrapUpdated => "bootstrap_updated",
         }
     }
 }
@@ -2245,6 +2249,25 @@ fn select_stateful_message_cache_control_positions(
         };
     }
 
+    if is_stateful_profile_bootstrap(&snapshot.normal_profile) {
+        return StatefulCacheBreakpointSelection {
+            selected: base.selected,
+            available_slots: base.available_slots,
+            message_content_blocks: base.message_content_blocks,
+            normal_block_count,
+            reused_count: anchor_positions.len(),
+            request_class: StatefulRequestClass::NormalLinear,
+            promotion: if has_session_key {
+                StatefulPromotion::BootstrapUpdated
+            } else {
+                StatefulPromotion::MissingSession
+            },
+            should_promote: has_session_key,
+            snapshot_generation: Some(snapshot.generation),
+            skip_reason: base.skip_reason,
+        };
+    }
+
     if matches!(request_class, StatefulRequestClass::ParallelSibling) && anchor_positions.len() < 2
     {
         return StatefulCacheBreakpointSelection {
@@ -2376,10 +2399,16 @@ fn classify_stateful_request(
         return StatefulRequestClass::TransientSpike;
     }
     let delta = profile.block_count.abs_diff(normal.block_count);
-    if delta > STATEFUL_PARALLEL_DELTA && reused_count < 2 {
+    if !is_stateful_profile_bootstrap(normal) && delta > STATEFUL_PARALLEL_DELTA && reused_count < 2
+    {
         return StatefulRequestClass::ParallelSibling;
     }
     StatefulRequestClass::NormalLinear
+}
+
+/// 判断主线是否仍处于冷启动阶段。
+fn is_stateful_profile_bootstrap(profile: &StatefulRequestProfile) -> bool {
+    profile.block_count < STATEFUL_BOOTSTRAP_BLOCKS
 }
 
 /// 判断当前请求是否明显是相对主线的暴涨请求。
@@ -2494,7 +2523,6 @@ fn message_block_fingerprint_at(
     let block = content.get(position.1)?;
     let block_type = block_type_of(block).unwrap_or("unknown");
     let prev_hash = neighbor_block_hash(content, position.1.checked_sub(1));
-    let next_hash = neighbor_block_hash(content, Some(position.1 + 1));
     let payload = serde_json::json!({
         "role": role,
         "block_type": block_type,
@@ -2502,7 +2530,6 @@ fn message_block_fingerprint_at(
         "block_idx": position.1,
         "block_hash": stable_json_hash(block),
         "prev_hash": prev_hash,
-        "next_hash": next_hash,
     });
     Some(stable_json_hash(&payload))
 }
@@ -4864,6 +4891,58 @@ mod tests {
     }
 
     #[test]
+    fn message_cache_control_stateful_bootstrap_promotes_past_tiny_first_request() {
+        let rewriter = Rewriter::new();
+        let first = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-bootstrap", 1),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        assert_eq!(message_cache_control_positions(&first), vec![(0, 0)]);
+
+        for count in [2, 12, 22] {
+            let parsed = rewrite_messages_body_with_rewriter(
+                &rewriter,
+                stateful_session_body("session-bootstrap", count),
+                ClientType::ClaudeCode,
+                CacheControlTtlRewrite::Off,
+                MessageCacheControlRewrite::Stateful,
+            );
+            assert!(!message_cache_control_positions(&parsed).is_empty());
+        }
+
+        let snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get("1:session-bootstrap")
+            .expect("snapshot");
+        assert_eq!(snapshot.normal_profile.block_count, 22);
+
+        let mature = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-bootstrap", 36),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let mature_fingerprints = message_cache_fingerprints(&mature);
+        let reused = mature_fingerprints
+            .iter()
+            .filter(|fingerprint| {
+                snapshot
+                    .normal_anchors
+                    .iter()
+                    .any(|anchor| &anchor.fingerprint == *fingerprint)
+            })
+            .count();
+
+        assert!(reused >= 1);
+    }
+
+    #[test]
     fn message_cache_control_stateful_spike_does_not_pollute_normal_anchors() {
         let rewriter = Rewriter::new();
         let first = rewrite_messages_body_with_rewriter(
@@ -5010,6 +5089,31 @@ mod tests {
         assert!(
             super::anchors_share_fingerprint(&snapshot.normal_anchors, &first_anchors) == false
         );
+    }
+
+    #[test]
+    fn message_cache_control_stateful_appended_neighbor_keeps_anchor_match() {
+        let first = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "same" }
+                ]
+            }]
+        });
+        let second = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "same" },
+                    { "type": "text", "text": "new-neighbor" }
+                ]
+            }]
+        });
+        let anchor = super::anchor_record_at(&first, (0, 0)).expect("anchor");
+        let positions = super::find_stateful_anchor_positions(&second, &[anchor]);
+
+        assert_eq!(positions, vec![(0, 0)]);
     }
 
     #[test]
