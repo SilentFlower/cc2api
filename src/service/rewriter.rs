@@ -1997,25 +1997,12 @@ fn push_unique_position(
     }
 }
 
-/// 从尾部找到最后一个可放置断点的 message block。
+/// 从尾部找到最新可放置断点的 message block。
 fn find_tail_message_cache_breakpoint(
     body: &serde_json::Value,
     message_blocks: &[(usize, usize)],
     mode: CacheBreakpointMode,
 ) -> Option<(usize, (usize, usize))> {
-    if matches!(mode, CacheBreakpointMode::Auto) {
-        if let Some(found) = (0..message_blocks.len()).rev().find_map(|idx| {
-            let position = message_blocks[idx];
-            if is_preferred_auto_message_block_at(body, position) {
-                Some((idx, position))
-            } else {
-                None
-            }
-        }) {
-            return Some(found);
-        }
-    }
-
     (0..message_blocks.len()).rev().find_map(|idx| {
         let position = message_blocks[idx];
         if is_cacheable_message_block_at(body, position, mode) {
@@ -2034,24 +2021,26 @@ fn find_window_message_cache_breakpoint(
     cursor: usize,
     mode: CacheBreakpointMode,
 ) -> Option<(usize, (usize, usize))> {
-    match mode {
-        CacheBreakpointMode::Rolling => (window_start..cursor).find_map(|idx| {
-            let position = message_blocks[idx];
-            if is_cacheable_message_block_at(body, position, mode) {
-                Some((idx, position))
-            } else {
-                None
-            }
-        }),
-        CacheBreakpointMode::Auto => (window_start..cursor).find_map(|idx| {
-            let position = message_blocks[idx];
-            if is_preferred_auto_message_block_at(body, position) {
-                Some((idx, position))
-            } else {
-                None
-            }
-        }),
+    let preferred = (window_start..cursor).find_map(|idx| {
+        let position = message_blocks[idx];
+        if is_preferred_auto_message_block_at(body, position) {
+            Some((idx, position))
+        } else {
+            None
+        }
+    });
+    if preferred.is_some() || matches!(mode, CacheBreakpointMode::Auto) {
+        return preferred;
     }
+
+    (window_start..cursor).find_map(|idx| {
+        let position = message_blocks[idx];
+        if is_cacheable_message_block_at(body, position, mode) {
+            Some((idx, position))
+        } else {
+            None
+        }
+    })
 }
 
 /// 构造缓存断点诊断标签,只记录结构化位置和 block 类型,避免日志泄漏 prompt 文本。
@@ -3514,12 +3503,73 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 0), (1, 0)]
+            vec![(0, 0), (2, 0)]
         );
         assert!(parsed["messages"][1]["content"][1]
             .get("cache_control")
             .is_none());
+        assert!(parsed["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_some());
         assert!(parsed["messages"][3]["content"][1]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_auto_marks_latest_tool_result_tail() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "initial prompt"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "older assistant boundary"
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_big",
+                            "content": "large result that must become the newest stable tail"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_tail",
+                            "name": "Read",
+                            "input": { "file_path": "/tmp/tail" }
+                        }]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Auto,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (2, 0)]
+        );
+        assert!(parsed["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_some());
+        assert!(parsed["messages"][3]["content"][0]
             .get("cache_control")
             .is_none());
     }
@@ -3700,6 +3750,160 @@ mod tests {
         assert!(parsed["messages"][0]["content"][19]
             .get("cache_control")
             .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_prefers_text_before_tool_result_in_window() {
+        let mut messages = Vec::new();
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "anchor"
+            }]
+        }));
+        for idx in 1..6 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_before_{}", idx),
+                    "name": "Read",
+                    "input": { "file_path": format!("/tmp/before-{}", idx) }
+                }]
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_window",
+                "content": "window result"
+            }]
+        }));
+        for idx in 7..12 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_gap_{}", idx),
+                    "name": "Read",
+                    "input": { "file_path": format!("/tmp/gap-{}", idx) }
+                }]
+            }));
+        }
+        messages.push(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "stable window text"
+            }]
+        }));
+        for idx in 13..25 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_after_{}", idx),
+                    "name": "Read",
+                    "input": { "file_path": format!("/tmp/after-{}", idx) }
+                }]
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_tail",
+                "content": "tail result"
+            }]
+        }));
+
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (12, 0), (25, 0)]
+        );
+        assert!(parsed["messages"][6]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_falls_back_to_tool_result_when_window_has_no_text() {
+        let mut messages = Vec::new();
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "anchor"
+            }]
+        }));
+        for idx in 1..6 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_before_{}", idx),
+                    "name": "Read",
+                    "input": { "file_path": format!("/tmp/before-{}", idx) }
+                }]
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_window",
+                "content": "window fallback"
+            }]
+        }));
+        for idx in 7..25 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_gap_{}", idx),
+                    "name": "Read",
+                    "input": { "file_path": format!("/tmp/gap-{}", idx) }
+                }]
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_tail",
+                "content": "tail result"
+            }]
+        }));
+
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (6, 0), (25, 0)]
+        );
+        for idx in 7..25 {
+            assert!(parsed["messages"][idx]["content"][0]
+                .get("cache_control")
+                .is_none());
+        }
     }
 
     #[test]
