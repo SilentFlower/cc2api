@@ -21,7 +21,7 @@ use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
     clean_session_id_from_body, detect_client_type, ordered_anthropic_headers,
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
-    StatefulCacheCompletion,
+    StatefulCacheCompletion, StatefulCacheUsage,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
@@ -46,6 +46,8 @@ const UPSTREAM_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::f
 const SIGNATURE_ERROR_BODY_LIMIT: usize = 1024 * 1024;
 /// 上游错误响应日志最多输出的字符数，避免异常错误体刷屏。
 const UPSTREAM_ERROR_LOG_BODY_LIMIT: usize = 4096;
+/// stateful usage SSE 解析保留的最大未完成行长度。
+const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -1590,6 +1592,10 @@ struct SlotGuardBody {
     permit: Option<OwnedSemaphorePermit>,
     /// stateful 缓存状态只在上游响应体读到 EOF 后提交。
     stateful_cache_completion: Option<StatefulCacheCompletion>,
+    /// 上游 Anthropic 响应中已观察到的 prompt cache 使用量。
+    stateful_cache_usage: StatefulCacheUsage,
+    /// 跨 frame 保留未完成的 SSE 行。
+    stateful_cache_usage_buffer: String,
     /// 请求改写器,用于提交 stateful 缓存状态。
     rewriter: Arc<Rewriter>,
     /// 请求开始时间，用于计算首字耗时。
@@ -1613,6 +1619,8 @@ impl SlotGuardBody {
             inner,
             permit: Some(permit),
             stateful_cache_completion,
+            stateful_cache_usage: StatefulCacheUsage::default(),
+            stateful_cache_usage_buffer: String::new(),
             rewriter,
             req_start,
             account_name,
@@ -1640,9 +1648,27 @@ impl http_body::Body for SlotGuardBody {
                 );
             }
         }
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &result {
+            let mut usage = self.stateful_cache_usage;
+            let mut buffer = std::mem::take(&mut self.stateful_cache_usage_buffer);
+            update_stateful_cache_usage_from_frame(
+                &mut usage,
+                &mut buffer,
+                frame,
+            );
+            self.stateful_cache_usage = usage;
+            self.stateful_cache_usage_buffer = buffer;
+        }
         if let std::task::Poll::Ready(None) = &result {
+            let mut usage = self.stateful_cache_usage;
+            let mut buffer = std::mem::take(&mut self.stateful_cache_usage_buffer);
+            flush_stateful_cache_usage_buffer(&mut usage, &mut buffer);
+            self.stateful_cache_usage = usage;
+            self.stateful_cache_usage_buffer = buffer;
             let completion = self.stateful_cache_completion.take();
-            self.rewriter.complete_stateful_cache(completion);
+            let usage = observed_stateful_cache_usage(self.stateful_cache_usage);
+            self.rewriter
+                .complete_stateful_cache_with_usage(completion, usage);
         } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
             // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
             let _ = self.stateful_cache_completion.take();
@@ -1656,6 +1682,107 @@ impl http_body::Body for SlotGuardBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// 返回已经观察到的 Anthropic prompt cache usage。
+fn observed_stateful_cache_usage(usage: StatefulCacheUsage) -> Option<StatefulCacheUsage> {
+    if usage.cache_read_input_tokens == 0 && usage.cache_creation_input_tokens == 0 {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
+/// 从响应 frame 中提取 prompt cache usage。
+fn update_stateful_cache_usage_from_frame(
+    usage: &mut StatefulCacheUsage,
+    buffer: &mut String,
+    frame: &http_body::Frame<bytes::Bytes>,
+) {
+    if let Some(bytes) = frame.data_ref() {
+        update_stateful_cache_usage_from_bytes(usage, buffer, bytes);
+    }
+}
+
+/// 从 SSE 或非流式 JSON 响应片段中提取 prompt cache usage。
+fn update_stateful_cache_usage_from_bytes(
+    usage: &mut StatefulCacheUsage,
+    buffer: &mut String,
+    bytes: &[u8],
+) {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        merge_stateful_cache_usage_from_value(usage, &value);
+    }
+
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    if buffer.len() > STATEFUL_USAGE_BUFFER_LIMIT {
+        let keep_from = buffer.len() - STATEFUL_USAGE_BUFFER_LIMIT;
+        buffer.drain(..keep_from);
+        if let Some(newline_idx) = buffer.find('\n') {
+            buffer.drain(..=newline_idx);
+        }
+    }
+    let complete_len = match buffer.rfind('\n') {
+        Some(index) => index + 1,
+        None => return,
+    };
+    let complete = buffer[..complete_len].to_string();
+    buffer.drain(..complete_len);
+
+    merge_stateful_cache_usage_from_lines(usage, complete.lines());
+}
+
+/// 在流结束时解析最后一个没有换行结尾的 SSE data 行。
+fn flush_stateful_cache_usage_buffer(usage: &mut StatefulCacheUsage, buffer: &mut String) {
+    if buffer.is_empty() {
+        return;
+    }
+    let remaining = std::mem::take(buffer);
+    merge_stateful_cache_usage_from_lines(usage, remaining.lines());
+}
+
+/// 从 SSE 行集合中合并 prompt cache usage。
+fn merge_stateful_cache_usage_from_lines<'a>(
+    usage: &mut StatefulCacheUsage,
+    lines: impl Iterator<Item = &'a str>,
+) {
+    for line in lines {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            merge_stateful_cache_usage_from_value(usage, &value);
+        }
+    }
+}
+
+/// 合并 Anthropic usage 字段,同一响应多次 delta 时取最大值。
+fn merge_stateful_cache_usage_from_value(
+    usage: &mut StatefulCacheUsage,
+    value: &serde_json::Value,
+) {
+    let Some(cache_usage) = value.get("usage") else {
+        return;
+    };
+    if let Some(cache_read_input_tokens) = cache_usage
+        .get("cache_read_input_tokens")
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_read_input_tokens =
+            usage.cache_read_input_tokens.max(cache_read_input_tokens);
+    }
+    if let Some(cache_creation_input_tokens) = cache_usage
+        .get("cache_creation_input_tokens")
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .max(cache_creation_input_tokens);
     }
 }
 
@@ -1675,16 +1802,18 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         build_message_telemetry_context, extract_message_session_id, has_system_role_message,
-        is_signature_related_error_body, is_signature_related_error_response_body,
-        is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
-        signature_retry_body_for_stage, SignatureRetryStage,
+        flush_stateful_cache_usage_buffer, is_signature_related_error_body,
+        is_signature_related_error_response_body, is_system_role_model_allowed,
+        parse_system_role_model_list, safe_body_summary, signature_retry_body_for_stage,
+        SignatureRetryStage,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body,
+        update_stateful_cache_usage_from_bytes,
     };
-    use crate::service::rewriter::ClientType;
+    use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use axum::http::header::CONTENT_ENCODING;
-    use std::io::Write;
     use serde_json::json;
+    use std::io::Write;
 
     #[test]
     fn safe_body_summary_hides_raw_body() {
@@ -1694,6 +1823,68 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn stateful_cache_usage_parser_reads_sse_usage() {
+        let mut usage = StatefulCacheUsage::default();
+        let mut buffer = String::new();
+
+        update_stateful_cache_usage_from_bytes(
+            &mut usage,
+            &mut buffer,
+            br#"event: message_delta
+data: {"type":"message_delta","usage":{"cache_read_input_tokens":70513,"cache_creation_input_tokens":148518}}
+
+"#,
+        );
+        update_stateful_cache_usage_from_bytes(
+            &mut usage,
+            &mut buffer,
+            br#"data: {"type":"message_delta","usage":{"cache_read_input_tokens":65001,"cache_creation_input_tokens":160000}}"#,
+        );
+        flush_stateful_cache_usage_buffer(&mut usage, &mut buffer);
+
+        assert_eq!(usage.cache_read_input_tokens, 70_513);
+        assert_eq!(usage.cache_creation_input_tokens, 160_000);
+    }
+
+    #[test]
+    fn stateful_cache_usage_parser_reads_json_usage() {
+        let mut usage = StatefulCacheUsage::default();
+        let mut buffer = String::new();
+
+        update_stateful_cache_usage_from_bytes(
+            &mut usage,
+            &mut buffer,
+            br#"{"id":"msg_1","usage":{"cache_read_input_tokens":12,"cache_creation_input_tokens":34}}"#,
+        );
+
+        assert_eq!(usage.cache_read_input_tokens, 12);
+        assert_eq!(usage.cache_creation_input_tokens, 34);
+    }
+
+    #[test]
+    fn stateful_cache_usage_parser_keeps_split_sse_line() {
+        let mut usage = StatefulCacheUsage::default();
+        let mut buffer = String::new();
+
+        update_stateful_cache_usage_from_bytes(
+            &mut usage,
+            &mut buffer,
+            br#"data: {"type":"message_delta","usage":{"cache_read_input_tokens":"#,
+        );
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        update_stateful_cache_usage_from_bytes(
+            &mut usage,
+            &mut buffer,
+            br#"55,"cache_creation_input_tokens":89}}
+"#,
+        );
+
+        assert_eq!(usage.cache_read_input_tokens, 55);
+        assert_eq!(usage.cache_creation_input_tokens, 89);
+        assert!(buffer.is_empty());
     }
 
     #[test]

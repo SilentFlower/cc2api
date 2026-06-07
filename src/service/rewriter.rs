@@ -441,6 +441,14 @@ pub struct StatefulCacheCompletion {
     profile: StatefulRequestProfile,
     anchors: Vec<AnchorRecord>,
     snapshot_generation: Option<u64>,
+    snapshot_cache_read_tokens: Option<u64>,
+}
+
+/// Anthropic 响应返回的 prompt cache 使用量。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatefulCacheUsage {
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
 }
 
 impl Rewriter {
@@ -748,15 +756,39 @@ impl Rewriter {
     ///
     /// @param completion `rewrite_body_with_stateful_completion` 返回的延迟提交句柄。
     pub fn complete_stateful_cache(&self, completion: Option<StatefulCacheCompletion>) {
+        self.complete_stateful_cache_with_usage(completion, None);
+    }
+
+    /// 根据上游响应 usage 提交已经被确认的 stateful 缓存状态。
+    ///
+    /// @param completion `rewrite_body_with_stateful_completion` 返回的延迟提交句柄。
+    /// @param usage 上游响应中的 cache usage；无 usage 时按完成即确认的旧行为处理。
+    pub fn complete_stateful_cache_with_usage(
+        &self,
+        completion: Option<StatefulCacheCompletion>,
+        usage: Option<StatefulCacheUsage>,
+    ) {
         let Some(completion) = completion else {
             return;
         };
+        if !stateful_completion_usage_is_trustworthy(&completion, usage) {
+            info!(
+                target: "cc2api::cache",
+                session = completion.key.as_str(),
+                snapshot_cache_read_tokens = completion.snapshot_cache_read_tokens.unwrap_or(0),
+                response_cache_read_tokens = usage.map(|u| u.cache_read_input_tokens).unwrap_or(0),
+                response_cache_creation_tokens = usage.map(|u| u.cache_creation_input_tokens).unwrap_or(0),
+                "stateful cache completion rejected by usage feedback"
+            );
+            return;
+        }
         if let Ok(mut cache) = self.stateful_cache.lock() {
             cache.promote_if_current(
                 completion.key,
                 completion.profile,
                 completion.anchors,
                 completion.snapshot_generation,
+                usage.map(|usage| usage.cache_read_input_tokens),
             );
         }
     }
@@ -1614,6 +1646,8 @@ const STATEFUL_SPIKE_ABSOLUTE_DELTA: usize = 128;
 const STATEFUL_PARALLEL_DELTA: usize = CACHE_LOOKBACK_STRIDE * 2;
 /// 主线达到一个 lookback 窗口后才认为成熟,避免 1-block 启动请求锁死会话。
 const STATEFUL_BOOTSTRAP_BLOCKS: usize = CACHE_LOOKBACK_STRIDE;
+/// 读缓存没有增长但写缓存暴涨时,拒绝把本轮断点推进成新的 stateful 主线。
+const STATEFUL_USAGE_CREATION_REJECT_THRESHOLD: u64 = 32 * 1024;
 
 impl Rewriter {
     /// 按配置改写 Claude Code messages 缓存断点。
@@ -1714,7 +1748,7 @@ impl Rewriter {
         let anchors = outcome
             .selected
             .iter()
-            .filter_map(|position| anchor_record_at(body, *position))
+            .filter_map(|position| durable_stateful_anchor_record_at(body, *position))
             .collect::<Vec<_>>();
         if anchors.is_empty() {
             return None;
@@ -1724,6 +1758,7 @@ impl Rewriter {
             profile,
             anchors,
             snapshot_generation: outcome.snapshot_generation,
+            snapshot_cache_read_tokens: snapshot.and_then(|state| state.confirmed_cache_read_tokens),
         })
     }
 }
@@ -2074,6 +2109,7 @@ struct StatefulCacheSnapshot {
     normal_profile: StatefulRequestProfile,
     normal_anchors: Vec<AnchorRecord>,
     generation: u64,
+    confirmed_cache_read_tokens: Option<u64>,
 }
 
 /// 单个会话的正常主线缓存状态。
@@ -2082,6 +2118,7 @@ struct SessionCacheState {
     normal_profile: StatefulRequestProfile,
     normal_anchors: Vec<AnchorRecord>,
     generation: u64,
+    confirmed_cache_read_tokens: Option<u64>,
 }
 
 /// 需要持久到内存中的断点记录。
@@ -2203,6 +2240,7 @@ impl StatefulCacheStore {
             normal_profile: state.normal_profile.clone(),
             normal_anchors: state.normal_anchors.clone(),
             generation: state.generation,
+            confirmed_cache_read_tokens: state.confirmed_cache_read_tokens,
         };
         self.touch(key);
         Some(snapshot)
@@ -2220,6 +2258,7 @@ impl StatefulCacheStore {
         profile: StatefulRequestProfile,
         anchors: Vec<AnchorRecord>,
         expected_generation: Option<u64>,
+        confirmed_cache_read_tokens: Option<u64>,
     ) {
         if let Some(existing) = self.sessions.get(&key) {
             if let Some(expected) = expected_generation {
@@ -2251,6 +2290,10 @@ impl StatefulCacheStore {
             }
         }
 
+        let previous_cache_read_tokens = self
+            .sessions
+            .get(&key)
+            .and_then(|state| state.confirmed_cache_read_tokens);
         let generation = self
             .sessions
             .get(&key)
@@ -2262,6 +2305,8 @@ impl StatefulCacheStore {
                 normal_profile: profile,
                 normal_anchors: anchors,
                 generation,
+                confirmed_cache_read_tokens: confirmed_cache_read_tokens
+                    .or(previous_cache_read_tokens),
             },
         );
         self.touch(&key);
@@ -2288,11 +2333,33 @@ fn anchors_share_fingerprint(left: &[AnchorRecord], right: &[AnchorRecord]) -> b
         .any(|anchor| right_fingerprints.contains(&anchor.fingerprint))
 }
 
+/// 判断本轮上游 usage 是否支持把延迟提交断点确认为新的主线。
+fn stateful_completion_usage_is_trustworthy(
+    completion: &StatefulCacheCompletion,
+    usage: Option<StatefulCacheUsage>,
+) -> bool {
+    let Some(usage) = usage else {
+        return true;
+    };
+    let Some(snapshot_read_tokens) = completion.snapshot_cache_read_tokens else {
+        return true;
+    };
+    !(usage.cache_read_input_tokens <= snapshot_read_tokens
+        && usage.cache_creation_input_tokens > STATEFUL_USAGE_CREATION_REJECT_THRESHOLD)
+}
+
 /// 计算自动缓存修复断点位置。
 fn select_auto_message_cache_control_positions(
     body: &serde_json::Value,
 ) -> CacheBreakpointSelection {
     select_message_cache_control_positions(body, CacheBreakpointMode::Auto)
+}
+
+/// 计算 stateful 可持久化的稳定文本断点位置。
+fn select_stateful_durable_message_cache_control_positions(
+    body: &serde_json::Value,
+) -> CacheBreakpointSelection {
+    select_message_cache_control_positions(body, CacheBreakpointMode::StatefulDurable)
 }
 
 /// 计算更积极的 rolling 断点位置。
@@ -2310,6 +2377,7 @@ fn select_stateful_message_cache_control_positions(
     snapshot: Option<&StatefulCacheSnapshot>,
 ) -> StatefulCacheBreakpointSelection {
     let base = select_auto_message_cache_control_positions(body);
+    let durable = select_stateful_durable_message_cache_control_positions(body);
     let normal_block_count = snapshot.map(|state| state.normal_profile.block_count);
     if base.selected.is_empty() {
         return StatefulCacheBreakpointSelection {
@@ -2331,8 +2399,14 @@ fn select_stateful_message_cache_control_positions(
     }
 
     let Some(snapshot) = snapshot else {
+        let selected = merge_stateful_anchor_and_auto_positions(
+            body,
+            durable.selected,
+            base.selected,
+            base.available_slots,
+        );
         return StatefulCacheBreakpointSelection {
-            selected: base.selected,
+            selected,
             available_slots: base.available_slots,
             message_content_blocks: base.message_content_blocks,
             normal_block_count,
@@ -2371,8 +2445,14 @@ fn select_stateful_message_cache_control_positions(
     }
 
     if is_stateful_profile_bootstrap(&snapshot.normal_profile) && anchor_positions.is_empty() {
+        let selected = merge_stateful_anchor_and_auto_positions(
+            body,
+            durable.selected,
+            base.selected,
+            base.available_slots,
+        );
         return StatefulCacheBreakpointSelection {
-            selected: base.selected,
+            selected,
             available_slots: base.available_slots,
             message_content_blocks: base.message_content_blocks,
             normal_block_count,
@@ -2422,7 +2502,11 @@ fn select_stateful_message_cache_control_positions(
     let selected = merge_stateful_anchor_and_auto_positions(
         body,
         anchor_positions,
-        base.selected,
+        durable
+            .selected
+            .into_iter()
+            .chain(base.selected)
+            .collect(),
         base.available_slots,
     );
     let reused_count = count_stateful_reused_positions(body, &selected, &snapshot.normal_anchors);
@@ -2553,7 +2637,7 @@ fn find_stateful_anchor_positions(
     let position_by_fingerprint = message_cacheable_position_fingerprint_map(
         body,
         &message_blocks,
-        CacheBreakpointMode::Auto,
+        CacheBreakpointMode::StatefulDurable,
     );
     let mut positions = anchors
         .iter()
@@ -2617,7 +2701,11 @@ fn stateful_tail_anchor_replacement(
     selected: &[(usize, usize)],
     auto_positions: &[(usize, usize)],
 ) -> Option<(usize, usize)> {
-    let tail_candidate = auto_positions.iter().copied().max()?;
+    let tail_candidate = auto_positions
+        .iter()
+        .copied()
+        .filter(|position| is_stateful_durable_anchor_at(body, *position))
+        .max()?;
     if selected.contains(&tail_candidate) {
         return None;
     }
@@ -2867,6 +2955,22 @@ fn anchor_record_at(body: &serde_json::Value, position: (usize, usize)) -> Optio
     })
 }
 
+/// 构建可持久化的 stateful 锚点记录。
+fn durable_stateful_anchor_record_at(
+    body: &serde_json::Value,
+    position: (usize, usize),
+) -> Option<AnchorRecord> {
+    if !is_stateful_durable_anchor_at(body, position) {
+        return None;
+    }
+    anchor_record_at(body, position)
+}
+
+/// 判断指定 block 是否适合作为跨请求复用的会话锚点。
+fn is_stateful_durable_anchor_at(body: &serde_json::Value, position: (usize, usize)) -> bool {
+    is_cacheable_message_block_at(body, position, CacheBreakpointMode::StatefulDurable)
+}
+
 /// 计算相邻块 hash,用于避免重复 block 被误匹配。
 fn neighbor_block_hash(content: &[serde_json::Value], index: Option<usize>) -> Option<String> {
     let index = index?;
@@ -2944,6 +3048,8 @@ enum CacheBreakpointMode {
     Auto,
     /// 激进 rolling 对照。
     Rolling,
+    /// stateful 持久化锚点,只选择稳定文本块。
+    StatefulDurable,
 }
 
 /// 计算 message 缓存断点。
@@ -3072,7 +3178,12 @@ fn find_window_message_cache_breakpoint(
             None
         }
     });
-    if preferred.is_some() || matches!(mode, CacheBreakpointMode::Auto) {
+    if preferred.is_some()
+        || matches!(
+            mode,
+            CacheBreakpointMode::Auto | CacheBreakpointMode::StatefulDurable
+        )
+    {
         return preferred;
     }
 
@@ -3326,6 +3437,9 @@ fn is_cacheable_message_block(
             "user" => matches!(block_type, Some("text" | "tool_result")),
             _ => false,
         },
+        CacheBreakpointMode::StatefulDurable => {
+            matches!(role, "user" | "assistant") && block_type == Some("text")
+        }
     }
 }
 
@@ -3809,6 +3923,36 @@ mod tests {
                 })
             })
             .collect();
+        json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "device-1",
+                    "account_uuid": "account-uuid",
+                    "session_id": session_id
+                }).to_string()
+            },
+            "messages": messages
+        })
+    }
+
+    fn stateful_tool_result_tail_body(session_id: &str, tool_result_count: usize) -> serde_json::Value {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "stable text anchor"
+            }]
+        })];
+        for idx in 0..tool_result_count {
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": format!("toolu_{}", idx),
+                    "content": format!("tool result {}", idx)
+                }]
+            }));
+        }
         json!({
             "metadata": {
                 "user_id": json!({
@@ -5284,6 +5428,123 @@ mod tests {
     }
 
     #[test]
+    fn message_cache_control_stateful_does_not_persist_tool_result_anchors() {
+        let key = "1:session-tool-result-durable".to_string();
+        let rewriter = Rewriter::new();
+        let (parsed, completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_tool_result_tail_body("session-tool-result-durable", 25),
+        );
+
+        assert!(message_cache_control_positions(&parsed)
+            .iter()
+            .any(|(message_idx, block_idx)| {
+                parsed["messages"][*message_idx]["content"][*block_idx]["type"]
+                    == json!("tool_result")
+            }));
+
+        rewriter.complete_stateful_cache(completion);
+        let snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("snapshot");
+
+        assert!(!snapshot.normal_anchors.is_empty());
+        assert!(snapshot
+            .normal_anchors
+            .iter()
+            .all(|anchor| anchor.block_type == "text"));
+    }
+
+    #[test]
+    fn message_cache_control_stateful_rejects_completion_when_usage_shows_rebuild() {
+        let key = "1:session-usage-feedback".to_string();
+        let rewriter = Rewriter::new();
+        let (_first, first_completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_session_body("session-usage-feedback", 60),
+        );
+        rewriter.complete_stateful_cache_with_usage(
+            first_completion,
+            Some(super::StatefulCacheUsage {
+                cache_read_input_tokens: 70_000,
+                cache_creation_input_tokens: 6_000,
+            }),
+        );
+        let first_snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("first snapshot");
+        assert_eq!(first_snapshot.confirmed_cache_read_tokens, Some(70_000));
+
+        let (_second, second_completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_session_body("session-usage-feedback", 79),
+        );
+        rewriter.complete_stateful_cache_with_usage(
+            second_completion,
+            Some(super::StatefulCacheUsage {
+                cache_read_input_tokens: 70_000,
+                cache_creation_input_tokens: 120_000,
+            }),
+        );
+        let rejected_snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("rejected snapshot");
+        assert_eq!(rejected_snapshot.normal_profile.block_count, 60);
+        assert_eq!(
+            rejected_snapshot.confirmed_cache_read_tokens,
+            Some(70_000)
+        );
+
+        let (_third, third_completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_session_body("session-usage-feedback", 79),
+        );
+        rewriter.complete_stateful_cache_with_usage(
+            third_completion,
+            Some(super::StatefulCacheUsage {
+                cache_read_input_tokens: 90_000,
+                cache_creation_input_tokens: 120_000,
+            }),
+        );
+        let accepted_snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("accepted snapshot");
+
+        assert_eq!(accepted_snapshot.normal_profile.block_count, 79);
+        assert_eq!(accepted_snapshot.confirmed_cache_read_tokens, Some(90_000));
+
+        let (_fourth, fourth_completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_session_body("session-usage-feedback", 98),
+        );
+        rewriter.complete_stateful_cache(fourth_completion);
+        let no_usage_snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("no usage snapshot");
+
+        assert_eq!(no_usage_snapshot.normal_profile.block_count, 98);
+        assert_eq!(
+            no_usage_snapshot.confirmed_cache_read_tokens,
+            Some(90_000)
+        );
+    }
+
+    #[test]
     fn message_cache_control_stateful_keeps_full_anchor_set_before_tail_rollover() {
         let rewriter = Rewriter::new();
         let first = rewrite_messages_body_with_rewriter(
@@ -5573,23 +5834,23 @@ mod tests {
         let first_anchors = super::select_auto_message_cache_control_positions(&first_body)
             .selected
             .iter()
-            .filter_map(|position| super::anchor_record_at(&first_body, *position))
+            .filter_map(|position| super::durable_stateful_anchor_record_at(&first_body, *position))
             .collect::<Vec<_>>();
         let second_anchors = super::select_auto_message_cache_control_positions(&second_body)
             .selected
             .iter()
-            .filter_map(|position| super::anchor_record_at(&second_body, *position))
+            .filter_map(|position| super::durable_stateful_anchor_record_at(&second_body, *position))
             .collect::<Vec<_>>();
         let stale_anchors = super::select_auto_message_cache_control_positions(&stale_body)
             .selected
             .iter()
-            .filter_map(|position| super::anchor_record_at(&stale_body, *position))
+            .filter_map(|position| super::durable_stateful_anchor_record_at(&stale_body, *position))
             .collect::<Vec<_>>();
         let mut store = super::StatefulCacheStore::default();
 
-        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None);
-        store.promote_if_current(key.clone(), second_profile, second_anchors, Some(1));
-        store.promote_if_current(key.clone(), stale_profile, stale_anchors, Some(1));
+        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None, None);
+        store.promote_if_current(key.clone(), second_profile, second_anchors, Some(1), None);
+        store.promote_if_current(key.clone(), stale_profile, stale_anchors, Some(1), None);
 
         let snapshot = store.get(&key).expect("snapshot");
         assert_eq!(snapshot.normal_profile.block_count, 82);
@@ -5609,17 +5870,17 @@ mod tests {
         let first_anchors = super::select_auto_message_cache_control_positions(&first_body)
             .selected
             .iter()
-            .filter_map(|position| super::anchor_record_at(&first_body, *position))
+            .filter_map(|position| super::durable_stateful_anchor_record_at(&first_body, *position))
             .collect::<Vec<_>>();
         let parallel_anchors = super::select_auto_message_cache_control_positions(&parallel_body)
             .selected
             .iter()
-            .filter_map(|position| super::anchor_record_at(&parallel_body, *position))
+            .filter_map(|position| super::durable_stateful_anchor_record_at(&parallel_body, *position))
             .collect::<Vec<_>>();
         let mut store = super::StatefulCacheStore::default();
 
-        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None);
-        store.promote_if_current(key.clone(), parallel_profile, parallel_anchors, None);
+        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None, None);
+        store.promote_if_current(key.clone(), parallel_profile, parallel_anchors, None, None);
 
         let snapshot = store.get(&key).expect("snapshot");
         assert_eq!(snapshot.normal_profile.block_count, 80);
