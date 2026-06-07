@@ -1115,6 +1115,8 @@ static CCH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}"
 static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
+static CLAUDE_MD_CONTENTS_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"Contents of /[^\n]*?CLAUDE\.md").unwrap());
 
 // --- CCH Attestation (xxhash64) ---
 
@@ -1566,7 +1568,6 @@ fn add_stable_message_cache_control(body: &mut serde_json::Value) {
 
 /// 为 messages 按尾部 lookback 窗口滚动放置缓存断点。
 fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
-    let has_automatic_cache = body.get("cache_control").is_some();
     let available = MAX_CACHE_BREAKPOINTS.saturating_sub(count_non_message_cache_breakpoints(body));
     if available == 0 {
         return;
@@ -1579,12 +1580,6 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
 
     let mut selected = Vec::new();
     let mut idx = positions.len() - 1;
-    if has_automatic_cache {
-        if idx < CACHE_LOOKBACK_STRIDE {
-            return;
-        }
-        idx -= CACHE_LOOKBACK_STRIDE;
-    }
     while selected.len() < available {
         selected.push(positions[idx]);
         if idx < CACHE_LOOKBACK_STRIDE {
@@ -1593,18 +1588,26 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
         idx -= CACHE_LOOKBACK_STRIDE;
     }
 
+    if selected.len() < available {
+        if let Some(boundary) = claude_code_auto_injected_boundary_position(body) {
+            if !selected.contains(&boundary) {
+                selected.push(boundary);
+            }
+        }
+    }
+
     for (message_idx, block_idx) in selected {
         add_message_cache_control_at_block(body, message_idx, block_idx);
     }
 }
 
-/// 统计非 message 内容上已经占用的 cache_control 断点数量。
+/// 统计 system/tools 上已经占用的 cache_control 断点数量。
+///
+/// 请求根级 `cache_control` 不是 Anthropic message history 的真实 block 断点,
+/// 不参与 message 侧 slot 计算,否则会误跳过尾部历史断点。
 fn count_non_message_cache_breakpoints(body: &serde_json::Value) -> usize {
     let mut count = 0;
 
-    if body.get("cache_control").is_some() {
-        count += 1;
-    }
     if let Some(sys) = body.get("system").and_then(|s| s.as_array()) {
         count += sys
             .iter()
@@ -1639,6 +1642,57 @@ fn cacheable_message_block_positions(body: &serde_json::Value) -> Vec<(usize, us
         }
     }
     positions
+}
+
+/// 返回 Claude Code 自动注入块末尾的位置。
+///
+/// Claude Code 会把 hooks、skills、CLAUDE.md、deferred-tools、MCP 资源等稳定前缀
+/// 放进首个 user message。尾部滚动断点用不满 slot 时,在该边界补一个断点,
+/// 能避免这些稳定前缀被后续真实用户内容一起重写。
+fn claude_code_auto_injected_boundary_position(body: &serde_json::Value) -> Option<(usize, usize)> {
+    let messages = body.get("messages").and_then(|m| m.as_array())?;
+    let first = messages.first()?;
+    if first.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return None;
+    }
+    let content = first.get("content").and_then(|c| c.as_array())?;
+
+    content
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| {
+            is_cacheable_message_block(block) && is_claude_code_auto_injected_block(block)
+        })
+        .map(|(block_idx, _)| (0, block_idx))
+        .last()
+}
+
+/// 判断 content block 是否属于 Claude Code 自动注入的稳定前缀。
+fn is_claude_code_auto_injected_block(block: &serde_json::Value) -> bool {
+    let Some(text) = block.as_object().and_then(|obj| {
+        if obj.get("type").and_then(|t| t.as_str()) != Some("text") {
+            return None;
+        }
+        obj.get("text").and_then(|text| text.as_str())
+    }) else {
+        return false;
+    };
+
+    if text.starts_with("<system-reminder>") && text.contains("hook success") {
+        return true;
+    }
+    if text.starts_with("<system-reminder>")
+        && (text.contains("<available-skills>") || text.contains("<plugin-skills>"))
+    {
+        return true;
+    }
+    if text.contains("<system-reminder>") && CLAUDE_MD_CONTENTS_REGEX.is_match(text) {
+        return true;
+    }
+    if text.contains("<deferred-tools>") {
+        return true;
+    }
+    text.contains("<mcp-resources>") || text.contains("Available MCP servers:")
 }
 
 /// 在指定 message content block 上设置 cache_control。
@@ -2445,10 +2499,10 @@ mod tests {
             MessageCacheControlRewrite::Rolling,
         );
 
-        assert_eq!(message_cache_control_positions(&parsed), vec![(40, 0)]);
-        assert!(parsed["messages"][59]["content"][0]
-            .get("cache_control")
-            .is_none());
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(40, 0), (59, 0)]
+        );
         assert!(parsed["cache_control"].is_object());
         assert!(parsed["system"][0]["cache_control"].is_object());
         assert!(parsed["tools"][0]["cache_control"].is_object());
@@ -2481,6 +2535,11 @@ mod tests {
                         "type": "text",
                         "text": "sys-2",
                         "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    },
+                    {
+                        "type": "text",
+                        "text": "sys-3",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
                     }
                 ],
                 "tools": [{
@@ -2499,7 +2558,123 @@ mod tests {
         assert!(parsed["cache_control"].is_object());
         assert!(parsed["system"][0]["cache_control"].is_object());
         assert!(parsed["system"][1]["cache_control"].is_object());
+        assert!(parsed["system"][2]["cache_control"].is_object());
         assert!(parsed["tools"][0]["cache_control"].is_object());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_root_cache_control_does_not_skip_short_tail() {
+        let messages: Vec<serde_json::Value> = (0..6)
+            .map(|idx| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(message_cache_control_positions(&parsed), vec![(5, 0)]);
+        assert!(parsed["cache_control"].is_object());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_marks_claude_code_auto_injected_boundary_when_slot_remains() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>The following skills are available:\n<available-skills>\n- test-skill\n</available-skills></system-reminder>"
+                        },
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>Contents of /repo/CLAUDE.md (project instructions):\n# Project</system-reminder>"
+                        },
+                        {
+                            "type": "text",
+                            "text": "real user prompt"
+                        }
+                    ]
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 1), (0, 2)]
+        );
+    }
+
+    #[test]
+    fn message_cache_control_rolling_does_not_steal_tail_slots_for_auto_boundary() {
+        let mut messages: Vec<serde_json::Value> = (0..60)
+            .map(|idx| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        messages[0] = json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<deferred-tools>\n<tool>Read</tool>\n</deferred-tools>"
+                },
+                {
+                    "type": "text",
+                    "text": "block-0"
+                }
+            ]
+        });
+
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "tools": [{
+                    "name": "a",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(40, 0), (59, 0)]
+        );
+        assert!(parsed["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
