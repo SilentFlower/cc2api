@@ -4,6 +4,7 @@ use rand::Rng;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use tracing::info;
 
 use crate::error::AppError;
 use crate::model::account::{Account, BillingMode, CanonicalEnvData, CanonicalPromptEnvData};
@@ -1727,13 +1728,26 @@ fn add_stable_message_cache_control(body: &mut serde_json::Value) {
 
 /// 为 messages 按尾部 lookback 窗口滚动放置缓存断点。
 fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
-    let available = MAX_CACHE_BREAKPOINTS.saturating_sub(count_non_message_cache_breakpoints(body));
+    let non_message_breakpoints = count_non_message_cache_breakpoints(body);
+    let available = MAX_CACHE_BREAKPOINTS.saturating_sub(non_message_breakpoints);
     if available == 0 {
+        info!(
+            target: "cc2api::cache",
+            non_message_breakpoints,
+            available_slots = available,
+            "rolling message cache_control 跳过: system/tools 已占满断点"
+        );
         return;
     }
 
     let positions = cacheable_message_block_positions(body);
     if positions.is_empty() {
+        info!(
+            target: "cc2api::cache",
+            non_message_breakpoints,
+            available_slots = available,
+            "rolling message cache_control 跳过: messages 中没有可缓存 block"
+        );
         return;
     }
 
@@ -1755,8 +1769,68 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
         }
     }
 
+    let selected_labels = selected
+        .iter()
+        .map(|(message_idx, block_idx)| {
+            message_cache_control_position_log_label(body, *message_idx, *block_idx)
+        })
+        .collect::<Vec<_>>();
+    info!(
+        target: "cc2api::cache",
+        non_message_breakpoints,
+        available_slots = available,
+        cacheable_message_blocks = positions.len(),
+        selected_count = selected.len(),
+        selected = ?selected_labels,
+        "rolling message cache_control 选点完成"
+    );
+
     for (message_idx, block_idx) in selected {
         add_message_cache_control_at_block(body, message_idx, block_idx);
+    }
+}
+
+/// 构造缓存断点诊断标签,只记录结构化位置和 block 类型,避免日志泄漏 prompt 文本。
+fn message_cache_control_position_log_label(
+    body: &serde_json::Value,
+    message_idx: usize,
+    block_idx: usize,
+) -> String {
+    let Some(message) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.get(message_idx))
+    else {
+        return format!("msg[{message_idx}].content[{block_idx}] role=? type=?");
+    };
+    let role = message
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("?");
+    let Some(block) = message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|content| content.get(block_idx))
+    else {
+        return format!("msg[{message_idx}].content[{block_idx}] role={role} type=?");
+    };
+    let block_type = block
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let tool_name = if block_type == "tool_use" {
+        block.get("name").and_then(|value| value.as_str())
+    } else {
+        None
+    };
+
+    match tool_name {
+        Some(name) => {
+            format!(
+                "msg[{message_idx}].content[{block_idx}] role={role} type={block_type} tool={name}"
+            )
+        }
+        None => format!("msg[{message_idx}].content[{block_idx}] role={role} type={block_type}"),
     }
 }
 
