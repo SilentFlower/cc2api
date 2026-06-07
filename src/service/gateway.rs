@@ -1766,7 +1766,17 @@ fn merge_stateful_cache_usage_from_value(
     usage: &mut StatefulCacheUsage,
     value: &serde_json::Value,
 ) {
-    let Some(cache_usage) = value.get("usage") else {
+    merge_stateful_cache_usage_from_usage_value(usage, value.get("usage"));
+    merge_stateful_cache_usage_from_usage_value(usage, value.pointer("/message/usage"));
+    merge_stateful_cache_usage_from_usage_value(usage, value.pointer("/delta/usage"));
+}
+
+/// 合并单个 Anthropic usage 对象。
+fn merge_stateful_cache_usage_from_usage_value(
+    usage: &mut StatefulCacheUsage,
+    cache_usage: Option<&serde_json::Value>,
+) {
+    let Some(cache_usage) = cache_usage else {
         return;
     };
     if let Some(cache_read_input_tokens) = cache_usage
@@ -1862,6 +1872,23 @@ data: {"type":"message_delta","usage":{"cache_read_input_tokens":70513,"cache_cr
 
         assert_eq!(usage.cache_read_input_tokens, 12);
         assert_eq!(usage.cache_creation_input_tokens, 34);
+    }
+
+    #[test]
+    fn stateful_cache_usage_parser_reads_nested_stream_usage() {
+        let mut usage = StatefulCacheUsage::default();
+        let mut buffer = String::new();
+
+        update_stateful_cache_usage_from_bytes(
+            &mut usage,
+            &mut buffer,
+            br#"data: {"type":"message_start","message":{"usage":{"cache_read_input_tokens":73307,"cache_creation_input_tokens":160619}}}
+data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,"cache_creation_input_tokens":160700}}}
+"#,
+        );
+
+        assert_eq!(usage.cache_read_input_tokens, 73_308);
+        assert_eq!(usage.cache_creation_input_tokens, 160_700);
     }
 
     #[test]

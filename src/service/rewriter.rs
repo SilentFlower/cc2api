@@ -783,6 +783,15 @@ impl Rewriter {
             return;
         }
         if let Ok(mut cache) = self.stateful_cache.lock() {
+            info!(
+                target: "cc2api::cache",
+                session = completion.key.as_str(),
+                snapshot_cache_read_tokens = completion.snapshot_cache_read_tokens.unwrap_or(0),
+                response_cache_read_tokens = usage.map(|u| u.cache_read_input_tokens).unwrap_or(0),
+                response_cache_creation_tokens = usage.map(|u| u.cache_creation_input_tokens).unwrap_or(0),
+                anchor_count = completion.anchors.len(),
+                "stateful cache completion accepted"
+            );
             cache.promote_if_current(
                 completion.key,
                 completion.profile,
@@ -2125,6 +2134,7 @@ struct SessionCacheState {
 #[derive(Clone)]
 struct AnchorRecord {
     fingerprint: String,
+    prefix_hash: String,
     message_idx: usize,
     block_idx: usize,
     block_type: String,
@@ -2325,12 +2335,13 @@ impl StatefulCacheStore {
 
 /// 判断两个断点集合是否至少共享一个 block 指纹。
 fn anchors_share_fingerprint(left: &[AnchorRecord], right: &[AnchorRecord]) -> bool {
-    let right_fingerprints = right
+    let right_keys = right
         .iter()
-        .map(|anchor| &anchor.fingerprint)
+        .map(|anchor| (&anchor.fingerprint, &anchor.prefix_hash))
         .collect::<HashSet<_>>();
-    left.iter()
-        .any(|anchor| right_fingerprints.contains(&anchor.fingerprint))
+    left.iter().any(|anchor| {
+        right_keys.contains(&(&anchor.fingerprint, &anchor.prefix_hash))
+    })
 }
 
 /// 判断本轮上游 usage 是否支持把延迟提交断点确认为新的主线。
@@ -2641,7 +2652,11 @@ fn find_stateful_anchor_positions(
     );
     let mut positions = anchors
         .iter()
-        .filter_map(|anchor| position_by_fingerprint.get(&anchor.fingerprint).copied())
+        .filter_map(|anchor| {
+            position_by_fingerprint
+                .get(&stateful_anchor_match_key(anchor))
+                .copied()
+        })
         .collect::<Vec<_>>();
     positions.sort_unstable();
     positions.dedup();
@@ -2759,14 +2774,14 @@ fn count_stateful_reused_positions(
     selected: &[(usize, usize)],
     anchors: &[AnchorRecord],
 ) -> usize {
-    let anchor_fingerprints = anchors
+    let anchor_keys = anchors
         .iter()
-        .map(|anchor| &anchor.fingerprint)
+        .map(stateful_anchor_match_key)
         .collect::<HashSet<_>>();
     selected
         .iter()
-        .filter_map(|position| message_block_fingerprint_at(body, *position))
-        .filter(|fingerprint| anchor_fingerprints.contains(fingerprint))
+        .filter_map(|position| stateful_anchor_match_key_at(body, *position))
+        .filter(|key| anchor_keys.contains(key))
         .count()
 }
 
@@ -2776,12 +2791,12 @@ fn stateful_selected_cache_diagnostics(
     outcome: &StatefulCacheBreakpointSelection,
     snapshot: Option<&StatefulCacheSnapshot>,
 ) -> Vec<StatefulSelectedCacheDiagnostic> {
-    let anchor_fingerprints = snapshot
+    let anchor_keys = snapshot
         .map(|snapshot| {
             snapshot
                 .normal_anchors
                 .iter()
-                .map(|anchor| anchor.fingerprint.as_str())
+                .map(stateful_anchor_match_key)
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
@@ -2796,7 +2811,10 @@ fn stateful_selected_cache_diagnostics(
                 message_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into());
             let wire_prefix_hash =
                 message_wire_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into());
-            let source = if anchor_fingerprints.contains(block_hash.as_str()) {
+            let source = if stateful_anchor_match_key_at(body, *position)
+                .map(|key| anchor_keys.contains(&key))
+                .unwrap_or(false)
+            {
                 "reused_anchor"
             } else if matches!(outcome.promotion, StatefulPromotion::BootstrapUpdated) {
                 "bootstrap"
@@ -2894,14 +2912,14 @@ fn message_cacheable_position_fingerprint_map(
     body: &serde_json::Value,
     message_blocks: &[(usize, usize)],
     mode: CacheBreakpointMode,
-) -> HashMap<String, (usize, usize)> {
+) -> HashMap<(String, String), (usize, usize)> {
     let mut map = HashMap::new();
     for position in message_blocks {
         if !is_cacheable_message_block_at(body, *position, mode) {
             continue;
         }
-        if let Some(fingerprint) = message_block_fingerprint_at(body, *position) {
-            map.insert(fingerprint, *position);
+        if let Some(key) = stateful_anchor_match_key_at(body, *position) {
+            map.insert(key, *position);
         }
     }
     map
@@ -2940,6 +2958,7 @@ fn message_block_fingerprint_at(
 /// 构建当前断点的内存锚点记录。
 fn anchor_record_at(body: &serde_json::Value, position: (usize, usize)) -> Option<AnchorRecord> {
     let fingerprint = message_block_fingerprint_at(body, position)?;
+    let prefix_hash = message_prefix_hash_at(body, position)?;
     let block = body
         .get("messages")
         .and_then(|messages| messages.as_array())
@@ -2949,10 +2968,27 @@ fn anchor_record_at(body: &serde_json::Value, position: (usize, usize)) -> Optio
         .and_then(|content| content.get(position.1))?;
     Some(AnchorRecord {
         fingerprint,
+        prefix_hash,
         message_idx: position.0,
         block_idx: position.1,
         block_type: block_type_of(block).unwrap_or("unknown").to_string(),
     })
+}
+
+/// 构造 stateful 锚点匹配键。
+fn stateful_anchor_match_key(anchor: &AnchorRecord) -> (String, String) {
+    (anchor.fingerprint.clone(), anchor.prefix_hash.clone())
+}
+
+/// 构造当前位置的 stateful 锚点匹配键。
+fn stateful_anchor_match_key_at(
+    body: &serde_json::Value,
+    position: (usize, usize),
+) -> Option<(String, String)> {
+    Some((
+        message_block_fingerprint_at(body, position)?,
+        message_prefix_hash_at(body, position)?,
+    ))
 }
 
 /// 构建可持久化的 stateful 锚点记录。
@@ -5913,6 +5949,38 @@ mod tests {
         let positions = super::find_stateful_anchor_positions(&second, &[anchor]);
 
         assert_eq!(positions, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_prefix_mismatch_rejects_anchor_match() {
+        let first = json!({
+            "system": [{
+                "type": "text",
+                "text": "old prefix"
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "same block" }
+                ]
+            }]
+        });
+        let second = json!({
+            "system": [{
+                "type": "text",
+                "text": "new prefix"
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "same block" }
+                ]
+            }]
+        });
+        let anchor = super::anchor_record_at(&first, (0, 0)).expect("anchor");
+        let positions = super::find_stateful_anchor_positions(&second, &[anchor]);
+
+        assert!(positions.is_empty());
     }
 
     #[test]
