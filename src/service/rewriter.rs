@@ -432,6 +432,17 @@ pub struct Rewriter {
     stateful_cache: Mutex<StatefulCacheStore>,
 }
 
+/// stateful 缓存断点的延迟提交句柄。
+///
+/// 网关流式响应只有在上游 body 真正读完后才提交该句柄,避免并行 tool 请求提前复用
+/// 一个 Anthropic 还没完成写入的缓存断点集合。
+pub struct StatefulCacheCompletion {
+    key: String,
+    profile: StatefulRequestProfile,
+    anchors: Vec<AnchorRecord>,
+    snapshot_generation: Option<u64>,
+}
+
 impl Rewriter {
     /// 创建请求体与请求头改写器。
     ///
@@ -689,19 +700,91 @@ impl Rewriter {
         cache_ttl_rewrite: CacheControlTtlRewrite,
         message_cache_rewrite: MessageCacheControlRewrite,
     ) -> Vec<u8> {
+        let (output, completion) = self.rewrite_body_inner(
+            body,
+            path,
+            account,
+            client_type,
+            env_pt,
+            cache_ttl_rewrite,
+            message_cache_rewrite,
+        );
+        self.complete_stateful_cache(completion);
+        output
+    }
+
+    /// 根据端点和客户端类型改写请求体,并返回需要在上游成功完成后提交的缓存状态。
+    ///
+    /// @param body 原始下游请求体。
+    /// @param path 请求路径。
+    /// @param account 当前账号。
+    /// @param client_type 客户端类型。
+    /// @param env_pt 环境透传配置。
+    /// @param cache_ttl_rewrite cache_control TTL 改写配置。
+    /// @param message_cache_rewrite message cache_control 断点改写配置。
+    /// @return 改写后的 body 与可选 stateful 延迟提交句柄。
+    pub fn rewrite_body_with_stateful_completion(
+        &self,
+        body: &[u8],
+        path: &str,
+        account: &Account,
+        client_type: ClientType,
+        env_pt: EnvPassthrough,
+        cache_ttl_rewrite: CacheControlTtlRewrite,
+        message_cache_rewrite: MessageCacheControlRewrite,
+    ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
+        self.rewrite_body_inner(
+            body,
+            path,
+            account,
+            client_type,
+            env_pt,
+            cache_ttl_rewrite,
+            message_cache_rewrite,
+        )
+    }
+
+    /// 提交已经被上游成功消费完成的 stateful 缓存状态。
+    ///
+    /// @param completion `rewrite_body_with_stateful_completion` 返回的延迟提交句柄。
+    pub fn complete_stateful_cache(&self, completion: Option<StatefulCacheCompletion>) {
+        let Some(completion) = completion else {
+            return;
+        };
+        if let Ok(mut cache) = self.stateful_cache.lock() {
+            cache.promote_if_current(
+                completion.key,
+                completion.profile,
+                completion.anchors,
+                completion.snapshot_generation,
+            );
+        }
+    }
+
+    fn rewrite_body_inner(
+        &self,
+        body: &[u8],
+        path: &str,
+        account: &Account,
+        client_type: ClientType,
+        env_pt: EnvPassthrough,
+        cache_ttl_rewrite: CacheControlTtlRewrite,
+        message_cache_rewrite: MessageCacheControlRewrite,
+    ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         if body.is_empty() {
-            return body.to_vec();
+            return (body.to_vec(), None);
         }
 
         let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(_) => return body.to_vec(), // 非 JSON，直接透传
+            Err(_) => return (body.to_vec(), None), // 非 JSON，直接透传
         };
 
+        let mut stateful_completion = None;
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type, env_pt);
-            self.rewrite_message_cache_control(
+            stateful_completion = self.rewrite_message_cache_control(
                 &mut parsed,
                 account,
                 client_type,
@@ -724,7 +807,7 @@ impl Rewriter {
             output = compute_cch_attestation(output, version);
         }
 
-        output
+        (output, stateful_completion)
     }
 
     /// 在请求体二次变更后刷新 `cch` attestation。
@@ -1540,9 +1623,9 @@ impl Rewriter {
         account: &Account,
         client_type: ClientType,
         mode: MessageCacheControlRewrite,
-    ) {
+    ) -> Option<StatefulCacheCompletion> {
         if client_type != ClientType::ClaudeCode {
-            return;
+            return None;
         }
         match mode {
             MessageCacheControlRewrite::Off => {}
@@ -1559,16 +1642,21 @@ impl Rewriter {
             MessageCacheControlRewrite::Stateful => {
                 stabilize_claude_code_cache_prefix(body);
                 strip_rewritten_cache_control(body);
-                self.add_stateful_message_cache_control(body, account);
+                return self.add_stateful_message_cache_control(body, account);
             }
         }
+        None
     }
 
     /// 为同一 Claude Code 会话放置防污染缓存断点。
     ///
     /// 这里记录的是上一轮实际发送给上游的 message block 指纹。正常线性请求会优先
     /// 复用这些断点,再补 bridge/tail；暴涨或并发异常请求只做临时选点,不覆盖主线。
-    fn add_stateful_message_cache_control(&self, body: &mut serde_json::Value, account: &Account) {
+    fn add_stateful_message_cache_control(
+        &self,
+        body: &mut serde_json::Value,
+        account: &Account,
+    ) -> Option<StatefulCacheCompletion> {
         let session_key = stateful_session_key(account, body);
         let profile = compute_stateful_request_profile(body);
         let snapshot = session_key.as_ref().and_then(|key| {
@@ -1618,10 +1706,10 @@ impl Rewriter {
         );
 
         let Some(key) = session_key else {
-            return;
+            return None;
         };
         if !outcome.should_promote {
-            return;
+            return None;
         }
         let anchors = outcome
             .selected
@@ -1629,11 +1717,14 @@ impl Rewriter {
             .filter_map(|position| anchor_record_at(body, *position))
             .collect::<Vec<_>>();
         if anchors.is_empty() {
-            return;
+            return None;
         }
-        if let Ok(mut cache) = self.stateful_cache.lock() {
-            cache.promote_if_current(key, profile, anchors, outcome.snapshot_generation);
-        }
+        Some(StatefulCacheCompletion {
+            key,
+            profile,
+            anchors,
+            snapshot_generation: outcome.snapshot_generation,
+        })
     }
 }
 
@@ -2150,6 +2241,11 @@ impl StatefulCacheStore {
                     return;
                 }
                 if is_stateful_transient_spike(&profile, &existing.normal_profile) {
+                    return;
+                }
+                // expected_generation=None 表示本请求选点时没有看到任何主线快照。若提交时
+                // 已经有其它请求先完成并建立主线,当前请求必须证明自己仍在同一条前缀上。
+                if !anchors_share_fingerprint(&anchors, &existing.normal_anchors) {
                     return;
                 }
             }
@@ -3616,6 +3712,23 @@ mod tests {
             message_cache_rewrite,
         );
         serde_json::from_slice(&out).unwrap()
+    }
+
+    fn rewrite_messages_body_with_stateful_completion(
+        rewriter: &Rewriter,
+        body: serde_json::Value,
+    ) -> (serde_json::Value, Option<super::StatefulCacheCompletion>) {
+        let account = test_account();
+        let (out, completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        (serde_json::from_slice(&out).unwrap(), completion)
     }
 
     fn message_cache_control_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
@@ -5128,6 +5241,49 @@ mod tests {
     }
 
     #[test]
+    fn message_cache_control_stateful_completion_is_delayed_until_upstream_finishes() {
+        let key = "1:session-delayed".to_string();
+        let rewriter = Rewriter::new();
+        let (first, first_completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_session_body("session-delayed", 60),
+        );
+        let first_completion = first_completion.expect("first request should create completion");
+        let first_fingerprints = message_cache_fingerprints(&first);
+
+        assert!(rewriter.stateful_cache.lock().unwrap().get(&key).is_none());
+
+        let (_second_before_completion, _pending_completion) =
+            rewrite_messages_body_with_stateful_completion(
+                &rewriter,
+                stateful_session_body("session-delayed", 63),
+            );
+        assert!(rewriter.stateful_cache.lock().unwrap().get(&key).is_none());
+
+        rewriter.complete_stateful_cache(Some(first_completion));
+        let snapshot = rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("snapshot after completion");
+        assert_eq!(snapshot.normal_profile.block_count, 60);
+
+        let (third, third_completion) = rewrite_messages_body_with_stateful_completion(
+            &rewriter,
+            stateful_session_body("session-delayed", 63),
+        );
+        let third_fingerprints = message_cache_fingerprints(&third);
+        let reused = third_fingerprints
+            .iter()
+            .filter(|fingerprint| first_fingerprints.contains(fingerprint))
+            .count();
+
+        assert!(reused >= 2);
+        rewriter.complete_stateful_cache(third_completion);
+    }
+
+    #[test]
     fn message_cache_control_stateful_keeps_full_anchor_set_before_tail_rollover() {
         let rewriter = Rewriter::new();
         let first = rewrite_messages_body_with_rewriter(
@@ -5440,6 +5596,37 @@ mod tests {
         assert!(
             super::anchors_share_fingerprint(&snapshot.normal_anchors, &first_anchors) == false
         );
+    }
+
+    #[test]
+    fn message_cache_control_stateful_cold_parallel_completion_without_shared_anchor_is_rejected() {
+        let key = "1:session-cold-parallel".to_string();
+        let first_body = stateful_session_body_with_prefix("session-cold-parallel", 80, "first");
+        let parallel_body =
+            stateful_session_body_with_prefix("session-cold-parallel", 82, "parallel");
+        let first_profile = super::compute_stateful_request_profile(&first_body);
+        let parallel_profile = super::compute_stateful_request_profile(&parallel_body);
+        let first_anchors = super::select_auto_message_cache_control_positions(&first_body)
+            .selected
+            .iter()
+            .filter_map(|position| super::anchor_record_at(&first_body, *position))
+            .collect::<Vec<_>>();
+        let parallel_anchors = super::select_auto_message_cache_control_positions(&parallel_body)
+            .selected
+            .iter()
+            .filter_map(|position| super::anchor_record_at(&parallel_body, *position))
+            .collect::<Vec<_>>();
+        let mut store = super::StatefulCacheStore::default();
+
+        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None);
+        store.promote_if_current(key.clone(), parallel_profile, parallel_anchors, None);
+
+        let snapshot = store.get(&key).expect("snapshot");
+        assert_eq!(snapshot.normal_profile.block_count, 80);
+        assert!(super::anchors_share_fingerprint(
+            &snapshot.normal_anchors,
+            &first_anchors
+        ));
     }
 
     #[test]

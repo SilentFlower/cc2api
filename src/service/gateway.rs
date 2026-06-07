@@ -21,6 +21,7 @@ use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
     clean_session_id_from_body, detect_client_type, ordered_anthropic_headers,
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
+    StatefulCacheCompletion,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
@@ -372,15 +373,17 @@ impl GatewayService {
             let env_pt = *self.env_passthrough.read().await;
             let cache_ttl = *self.cache_control_ttl_rewrite.read().await;
             let message_cache = *self.message_cache_control_rewrite.read().await;
-            let rewritten_body = self.rewriter.rewrite_body(
-                &body_bytes,
-                &path,
-                &account,
-                client_type,
-                env_pt,
-                cache_ttl,
-                message_cache,
-            );
+            let (rewritten_body, stateful_cache_completion) = self
+                .rewriter
+                .rewrite_body_with_stateful_completion(
+                    &body_bytes,
+                    &path,
+                    &account,
+                    client_type,
+                    env_pt,
+                    cache_ttl,
+                    message_cache,
+                );
             debug!(
                 "request body summary AFTER rewrite: {}",
                 safe_body_summary(&rewritten_body)
@@ -508,6 +511,15 @@ impl GatewayService {
 
             // 非 429：将响应体包装为 SlotGuardBody，流结束时归还槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                let should_complete_stateful_cache =
+                    resp.status().is_success() && signature_retry_stage.is_none();
+                // stateful 锚点描述的是本次发送给上游的 body。签名重试会换 body,非成功响应
+                // 也不会建立 prompt cache,因此这些路径不能推进会话锚点。
+                let stateful_cache_completion = if should_complete_stateful_cache {
+                    stateful_cache_completion
+                } else {
+                    None
+                };
                 let permit = slot_guard.defuse();
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
@@ -515,6 +527,8 @@ impl GatewayService {
                     permit,
                     req_start,
                     account.name.clone(),
+                    self.rewriter.clone(),
+                    stateful_cache_completion,
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -1574,6 +1588,10 @@ struct SlotGuardBody {
     inner: Body,
     /// `Some(permit)` 表示槽位尚未归还；`Drop` 时 take 让 permit 自动归还 semaphore。
     permit: Option<OwnedSemaphorePermit>,
+    /// stateful 缓存状态只在上游响应体读到 EOF 后提交。
+    stateful_cache_completion: Option<StatefulCacheCompletion>,
+    /// 请求改写器,用于提交 stateful 缓存状态。
+    rewriter: Arc<Rewriter>,
     /// 请求开始时间，用于计算首字耗时。
     req_start: std::time::Instant,
     /// 账号名称，用于日志输出。
@@ -1588,10 +1606,14 @@ impl SlotGuardBody {
         permit: OwnedSemaphorePermit,
         req_start: std::time::Instant,
         account_name: String,
+        rewriter: Arc<Rewriter>,
+        stateful_cache_completion: Option<StatefulCacheCompletion>,
     ) -> Self {
         Self {
             inner,
             permit: Some(permit),
+            stateful_cache_completion,
+            rewriter,
             req_start,
             account_name,
             first_frame_logged: false,
@@ -1617,6 +1639,13 @@ impl http_body::Body for SlotGuardBody {
                     self.account_name
                 );
             }
+        }
+        if let std::task::Poll::Ready(None) = &result {
+            let completion = self.stateful_cache_completion.take();
+            self.rewriter.complete_stateful_cache(completion);
+        } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
+            // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
+            let _ = self.stateful_cache_completion.take();
         }
         result
     }
