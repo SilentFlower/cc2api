@@ -1865,11 +1865,12 @@ fn cacheable_message_block_positions(body: &serde_json::Value) -> Vec<(usize, us
 
     let mut positions = Vec::new();
     for (message_idx, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|role| role.as_str()).unwrap_or("");
         let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
             continue;
         };
         for (block_idx, block) in content.iter().enumerate() {
-            if is_cacheable_message_block(block) {
+            if is_cacheable_message_block(role, block) {
                 positions.push((message_idx, block_idx));
             }
         }
@@ -1894,7 +1895,7 @@ fn claude_code_auto_injected_boundary_position(body: &serde_json::Value) -> Opti
         .iter()
         .enumerate()
         .filter(|(_, block)| {
-            is_cacheable_message_block(block) && is_claude_code_auto_injected_block(block)
+            is_cacheable_message_block("user", block) && is_claude_code_auto_injected_block(block)
         })
         .map(|(block_idx, _)| (0, block_idx))
         .last()
@@ -1957,6 +1958,11 @@ fn add_message_cache_control_at(messages: &mut [serde_json::Value], idx: usize) 
     let Some(msg) = messages.get_mut(idx) else {
         return;
     };
+    let role = msg
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("")
+        .to_string();
     let Some(content) = msg.get_mut("content") else {
         return;
     };
@@ -1964,7 +1970,7 @@ fn add_message_cache_control_at(messages: &mut [serde_json::Value], idx: usize) 
     let Some(arr) = content.as_array_mut() else {
         return;
     };
-    let Some(block_idx) = last_cacheable_message_block_index(arr) else {
+    let Some(block_idx) = last_cacheable_message_block_index(&role, arr) else {
         return;
     };
     let Some(block) = arr.get_mut(block_idx).and_then(|item| item.as_object_mut()) else {
@@ -1974,24 +1980,35 @@ fn add_message_cache_control_at(messages: &mut [serde_json::Value], idx: usize) 
 }
 
 /// 返回最后一个可放置 Anthropic cache_control 的 message 内容块下标。
-fn last_cacheable_message_block_index(blocks: &[serde_json::Value]) -> Option<usize> {
+fn last_cacheable_message_block_index(role: &str, blocks: &[serde_json::Value]) -> Option<usize> {
     blocks
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, block)| is_cacheable_message_block(block))
+        .find(|(_, block)| is_cacheable_message_block(role, block))
         .map(|(idx, _)| idx)
 }
 
 /// 判断 message 内容块是否可以放置 cache_control。
-fn is_cacheable_message_block(block: &serde_json::Value) -> bool {
+fn is_cacheable_message_block(role: &str, block: &serde_json::Value) -> bool {
     let Some(block) = block.as_object() else {
         return false;
     };
-    !matches!(
-        block.get("type").and_then(|t| t.as_str()),
-        Some("thinking" | "redacted_thinking")
-    )
+    let block_type = block.get("type").and_then(|t| t.as_str());
+    if matches!(
+        block_type,
+        Some("thinking" | "redacted_thinking" | "tool_use")
+    ) {
+        return false;
+    }
+
+    match role {
+        // assistant 侧只把自然语言输出作为稳定断点,避免落在 tool 调度结构上。
+        "assistant" => block_type == Some("text"),
+        // user 侧保留 Claude Code 原本常用的 text/tool_result 等内容块边界。
+        "user" => true,
+        _ => false,
+    }
 }
 
 /// message 断点稳定化新建 cache_control 的默认值。
@@ -3121,6 +3138,136 @@ mod tests {
 
         assert_eq!(message_cache_control_positions(&parsed), vec![(0, 0)]);
         assert!(parsed["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_skips_assistant_tool_use_breakpoints() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u0"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "a1"
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "Read",
+                                "input": { "file_path": "/tmp/a" }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "result"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "skip"
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_2",
+                                "name": "Bash",
+                                "input": { "command": "pwd" }
+                            }
+                        ]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(message_cache_control_positions(&parsed), vec![(2, 0)]);
+        assert!(parsed["messages"][1]["content"][1]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][3]["content"][1]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_skips_assistant_tool_use_when_stepping_back() {
+        let mut messages: Vec<serde_json::Value> = (0..22)
+            .map(|idx| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        messages.insert(
+            3,
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_mid",
+                    "name": "Read",
+                    "input": { "file_path": "/tmp/mid" }
+                }]
+            }),
+        );
+
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(2, 0), (22, 0)]
+        );
+        assert!(parsed["messages"][3]["content"][0]
             .get("cache_control")
             .is_none());
     }
