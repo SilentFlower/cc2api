@@ -2274,7 +2274,7 @@ fn select_stateful_message_cache_control_positions(
         };
     }
 
-    if is_stateful_profile_bootstrap(&snapshot.normal_profile) {
+    if is_stateful_profile_bootstrap(&snapshot.normal_profile) && anchor_positions.is_empty() {
         return StatefulCacheBreakpointSelection {
             selected: base.selected,
             available_slots: base.available_slots,
@@ -2497,13 +2497,18 @@ fn merge_stateful_anchor_and_auto_positions(
     }
 
     for position in auto_positions {
+        if !stateful_auto_position_can_follow_reused_anchors(&selected, position) {
+            continue;
+        }
         push_unique_position(&mut selected, &mut seen, position, available);
     }
     if selected.len() < available {
         if let Some(boundary) =
             claude_code_auto_injected_boundary_position(body, CacheBreakpointMode::Auto)
         {
-            push_unique_position(&mut selected, &mut seen, boundary, available);
+            if stateful_auto_position_can_follow_reused_anchors(&selected, boundary) {
+                push_unique_position(&mut selected, &mut seen, boundary, available);
+            }
         }
     }
     selected.sort_unstable();
@@ -2529,6 +2534,22 @@ fn stateful_tail_anchor_replacement(
         return None;
     }
     Some(tail_candidate)
+}
+
+/// 判断自动补点是否能追加到复用锚点之后。
+///
+/// Anthropic 的 prompt cache key 包含 cache_control 本身。已有锚点前方新增断点会改变
+/// 该锚点的真实 wire prefix,导致看似复用的旧锚点实际重新建缓存。
+fn stateful_auto_position_can_follow_reused_anchors(
+    selected: &[(usize, usize)],
+    position: (usize, usize),
+) -> bool {
+    selected
+        .iter()
+        .copied()
+        .max()
+        .map(|latest_anchor| position > latest_anchor)
+        .unwrap_or(true)
 }
 
 /// 计算两个 message content block 在请求线性 block 序列中的距离。
@@ -5169,6 +5190,55 @@ mod tests {
         assert_eq!(second_positions.len(), 4);
         assert_eq!(second_prefix, first_prefix);
         assert_ne!(second_positions[3], first_positions[3]);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_does_not_insert_auto_before_reused_anchor() {
+        let rewriter = Rewriter::new();
+        let first = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-wire-prefix", 22),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let first_positions = message_cache_control_positions(&first);
+        let reused_anchor = *first_positions.iter().max().expect("latest anchor");
+        let reused_fingerprint =
+            super::message_block_fingerprint_at(&first, reused_anchor).expect("fingerprint");
+        let first_wire_prefix =
+            super::message_wire_prefix_hash_at(&first, reused_anchor).expect("wire prefix");
+
+        let second = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-wire-prefix", 36),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let second_positions = message_cache_control_positions(&second);
+        let second_reused_anchor = second_positions
+            .iter()
+            .copied()
+            .find(|position| {
+                super::message_block_fingerprint_at(&second, *position).as_deref()
+                    == Some(reused_fingerprint.as_str())
+            })
+            .expect("reused anchor");
+        let second_wire_prefix =
+            super::message_wire_prefix_hash_at(&second, second_reused_anchor).expect("wire prefix");
+        let new_breakpoints_before_reused_anchor = second_positions
+            .iter()
+            .filter(|position| {
+                **position < second_reused_anchor && !first_positions.contains(position)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_positions, vec![(0, 0), (2, 0), (21, 0)]);
+        assert_eq!(second_reused_anchor, reused_anchor);
+        assert_eq!(first_wire_prefix, second_wire_prefix);
+        assert!(new_breakpoints_before_reused_anchor.is_empty());
+        assert_eq!(second_positions, vec![(0, 0), (2, 0), (21, 0), (35, 0)]);
     }
 
     #[test]
