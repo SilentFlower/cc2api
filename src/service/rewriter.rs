@@ -4,7 +4,6 @@ use rand::Rng;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use tracing::info;
 
 use crate::error::AppError;
@@ -390,21 +389,18 @@ impl CacheControlTtlRewrite {
 
 /// Claude Code messages 缓存断点改写模式。
 ///
-/// `Stable` 会先清空 `messages[].content[].cache_control`,再按固定位置重打 message
-/// 断点;`Rolling` 会按 Anthropic 20-block lookback 在尾部滚动放置多个断点,
-/// `Anchored` 会在 `Rolling` 基础上按 Claude Code session 保留上一轮已写断点,
-/// 用于缓解 Claude Code 并行 tool 一轮新增大量 block 后的缓存断链。
+/// `Auto` 会使用无状态保守滚动策略,稳定 Claude Code cache prefix 后只在相对稳定的
+/// message 边界放置断点。`Rolling` 保留更积极的滚动策略,方便线上对照。旧设置值
+/// `stable` / `anchored` 会兼容解析到 `Auto`,避免历史配置继续进入已废弃的实验路径。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageCacheControlRewrite {
     /// 保持客户端原始 message cache_control。
     #[default]
     Off,
-    /// 旧的固定位置 message cache_control 断点。
-    Stable,
-    /// 按尾部 block 间隔滚动放置 message cache_control 断点。
+    /// 自动缓存修复策略。
+    Auto,
+    /// 更积极的滚动断点策略。
     Rolling,
-    /// 在同一会话内优先保留上一轮已写入的滚动断点。
-    Anchored,
 }
 
 impl MessageCacheControlRewrite {
@@ -415,11 +411,10 @@ impl MessageCacheControlRewrite {
     pub fn parse(raw: &str) -> Result<Self, AppError> {
         match raw.trim() {
             "off" => Ok(Self::Off),
-            "stable" => Ok(Self::Stable),
+            "auto" | "stable" | "anchored" => Ok(Self::Auto),
             "rolling" => Ok(Self::Rolling),
-            "anchored" => Ok(Self::Anchored),
             other => Err(AppError::BadRequest(format!(
-                "'message_cache_control_rewrite' 必须是 off、stable、rolling 或 anchored,当前值: {}",
+                "'message_cache_control_rewrite' 必须是 off、auto 或 rolling,当前值: {}",
                 other
             ))),
         }
@@ -427,18 +422,14 @@ impl MessageCacheControlRewrite {
 }
 
 /// 处理所有请求的反检测改写。
-pub struct Rewriter {
-    anchored_cache: Mutex<AnchoredCacheStore>,
-}
+pub struct Rewriter;
 
 impl Rewriter {
     /// 创建请求体与请求头改写器。
     ///
-    /// @return 带有内存会话断点缓存的改写器实例。
+    /// @return 请求体与请求头改写器实例。
     pub fn new() -> Self {
-        Self {
-            anchored_cache: Mutex::new(AnchoredCacheStore::default()),
-        }
+        Self
     }
 
     // --- Header 改写 ---
@@ -1520,15 +1511,13 @@ fn strip_cache_control(body: &mut serde_json::Value) {
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// rolling 断点按 19 个真实 message content block 回退,贴近 Anthropic 20-block lookback。
 const CACHE_LOOKBACK_STRIDE: usize = 19;
-/// 会话锚定断点最多保留的 session 数量,避免单进程长期运行时无界增长。
-const ANCHORED_CACHE_MAX_SESSIONS: usize = 512;
 
 impl Rewriter {
     /// 按配置改写 Claude Code messages 缓存断点。
     fn rewrite_message_cache_control(
         &self,
         body: &mut serde_json::Value,
-        account: &Account,
+        _account: &Account,
         client_type: ClientType,
         mode: MessageCacheControlRewrite,
     ) {
@@ -1537,84 +1526,26 @@ impl Rewriter {
         }
         match mode {
             MessageCacheControlRewrite::Off => {}
-            MessageCacheControlRewrite::Stable => {
-                strip_message_cache_control(body);
-                add_stable_message_cache_control(body);
+            MessageCacheControlRewrite::Auto => {
+                stabilize_claude_code_cache_prefix(body);
+                strip_rewritten_cache_control(body);
+                add_auto_message_cache_control(body);
             }
             MessageCacheControlRewrite::Rolling => {
                 stabilize_claude_code_cache_prefix(body);
-                strip_rolling_cache_control(body);
+                strip_rewritten_cache_control(body);
                 add_rolling_message_cache_control(body);
-            }
-            MessageCacheControlRewrite::Anchored => {
-                stabilize_claude_code_cache_prefix(body);
-                strip_rolling_cache_control(body);
-                self.add_anchored_message_cache_control(body, account);
-            }
-        }
-    }
-
-    /// 为同一 Claude Code 会话放置“锚定滚动”缓存断点。
-    ///
-    /// Anthropic 的 lookback 只能命中“之前请求已经写过”的断点。纯 rolling
-    /// 每轮按尾部重算会让旧断点漂移,并行 tool 一轮新增大量 block 后容易回到
-    /// system/tools floor。这里先复用上一轮已经写过的 block 指纹,再把空位补给尾部。
-    fn add_anchored_message_cache_control(&self, body: &mut serde_json::Value, account: &Account) {
-        let session_key = anchored_session_key(account, body);
-        let remembered = session_key.as_ref().and_then(|key| {
-            self.anchored_cache
-                .lock()
-                .ok()
-                .and_then(|mut cache| cache.get(key))
-        });
-        let outcome =
-            select_anchored_message_cache_control_positions(body, remembered.as_deref());
-
-        let selected_labels = outcome
-            .selected
-            .iter()
-            .map(|(message_idx, block_idx)| {
-                message_cache_control_position_log_label(body, *message_idx, *block_idx)
-            })
-            .collect::<Vec<_>>();
-        info!(
-            target: "cc2api::cache",
-            mode = "anchored",
-            session = session_key.as_deref().unwrap_or("missing"),
-            available_slots = outcome.available_slots,
-            message_content_blocks = outcome.message_content_blocks,
-            reused_count = outcome.reused_count,
-            selected_count = outcome.selected.len(),
-            selected = ?selected_labels,
-            skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
-            "anchored message cache_control 选点完成"
-        );
-
-        for (message_idx, block_idx) in &outcome.selected {
-            add_message_cache_control_at_block(body, *message_idx, *block_idx);
-        }
-
-        if let Some(key) = session_key {
-            let anchors = outcome
-                .selected
-                .iter()
-                .filter_map(|position| message_block_fingerprint_at(body, *position))
-                .collect::<Vec<_>>();
-            if !anchors.is_empty() {
-                if let Ok(mut cache) = self.anchored_cache.lock() {
-                    cache.insert(key, anchors);
-                }
             }
         }
     }
 }
 
-/// 移除 rolling 模式要重新接管的所有缓存断点。
+/// 移除 auto / rolling 模式要重新接管的所有缓存断点。
 ///
-/// rolling 的目标是把 4 个 breakpoint 预算尽量用于 message history。top-level
+/// 这两个模式的目标是把 4 个 breakpoint 预算尽量用于 message history。top-level
 /// automatic caching 与 system/tools 显式断点都会占用 slot,会让并行 tool 的尾部
 /// 历史只剩 1-2 个断点,无法覆盖真实 20-block lookback。
-fn strip_rolling_cache_control(body: &mut serde_json::Value) {
+fn strip_rewritten_cache_control(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("cache_control");
     }
@@ -1887,39 +1818,34 @@ fn sort_deferred_tools_text(text: &str) -> Option<String> {
     }
 }
 
-/// 为 messages 重新放置稳定缓存断点。
-///
-/// 规则对齐 sub2api/Parrot:最后一条 message 必打;messages 足够长时,
-/// 再打倒数第二个 user turn。这样相邻轮次能复用上一轮写出的尾部缓存段。
-fn add_stable_message_cache_control(body: &mut serde_json::Value) {
-    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return;
-    };
-    if messages.is_empty() {
-        return;
-    }
+/// 为 messages 放置自动缓存修复断点。
+fn add_auto_message_cache_control(body: &mut serde_json::Value) {
+    let outcome = select_auto_message_cache_control_positions(body);
 
-    let last_idx = messages.len() - 1;
-    add_message_cache_control_at(messages, last_idx);
+    let selected_labels = outcome
+        .selected
+        .iter()
+        .map(|(message_idx, block_idx)| {
+            message_cache_control_position_log_label(body, *message_idx, *block_idx)
+        })
+        .collect::<Vec<_>>();
+    info!(
+        target: "cc2api::cache",
+        mode = "auto",
+        available_slots = outcome.available_slots,
+        message_content_blocks = outcome.message_content_blocks,
+        selected_count = outcome.selected.len(),
+        selected = ?selected_labels,
+        skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
+        "auto message cache_control 选点完成"
+    );
 
-    if messages.len() < 4 {
-        return;
-    }
-
-    let mut user_seen = 0;
-    for idx in (0..messages.len()).rev() {
-        if messages[idx].get("role").and_then(|r| r.as_str()) != Some("user") {
-            continue;
-        }
-        user_seen += 1;
-        if user_seen == 2 {
-            add_message_cache_control_at(messages, idx);
-            break;
-        }
+    for (message_idx, block_idx) in outcome.selected {
+        add_message_cache_control_at_block(body, message_idx, block_idx);
     }
 }
 
-/// 为 messages 按尾部 lookback 窗口滚动放置缓存断点。
+/// 为 messages 放置更积极的 rolling 缓存断点。
 fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
     let outcome = select_rolling_message_cache_control_positions(body);
 
@@ -1951,29 +1877,36 @@ struct CacheBreakpointSelection {
     selected: Vec<(usize, usize)>,
     available_slots: usize,
     message_content_blocks: usize,
-    reused_count: usize,
     skip_reason: Option<String>,
 }
 
-/// 计算无状态 rolling 断点位置。
+/// 计算自动缓存修复断点位置。
+fn select_auto_message_cache_control_positions(
+    body: &serde_json::Value,
+) -> CacheBreakpointSelection {
+    select_message_cache_control_positions(body, CacheBreakpointMode::Auto)
+}
+
+/// 计算更积极的 rolling 断点位置。
 fn select_rolling_message_cache_control_positions(
     body: &serde_json::Value,
 ) -> CacheBreakpointSelection {
-    select_message_cache_control_positions(body, None)
+    select_message_cache_control_positions(body, CacheBreakpointMode::Rolling)
 }
 
-/// 计算会话锚定 rolling 断点位置。
-fn select_anchored_message_cache_control_positions(
-    body: &serde_json::Value,
-    remembered: Option<&[String]>,
-) -> CacheBreakpointSelection {
-    select_message_cache_control_positions(body, remembered)
+/// 缓存断点选点模式。
+#[derive(Clone, Copy)]
+enum CacheBreakpointMode {
+    /// 保守自动修复。
+    Auto,
+    /// 激进 rolling 对照。
+    Rolling,
 }
 
-/// 统一计算 rolling / anchored 的 message 缓存断点。
+/// 计算 message 缓存断点。
 fn select_message_cache_control_positions(
     body: &serde_json::Value,
-    remembered: Option<&[String]>,
+    mode: CacheBreakpointMode,
 ) -> CacheBreakpointSelection {
     let non_message_breakpoints = count_non_message_cache_breakpoints(body);
     let available = MAX_CACHE_BREAKPOINTS.saturating_sub(non_message_breakpoints);
@@ -1982,7 +1915,6 @@ fn select_message_cache_control_positions(
             selected: Vec::new(),
             available_slots: available,
             message_content_blocks: 0,
-            reused_count: 0,
             skip_reason: Some("no_messages".into()),
         };
     };
@@ -1992,7 +1924,6 @@ fn select_message_cache_control_positions(
             selected: Vec::new(),
             available_slots: available,
             message_content_blocks: message_blocks.len(),
-            reused_count: 0,
             skip_reason: Some("no_available_slots".into()),
         };
     }
@@ -2001,34 +1932,20 @@ fn select_message_cache_control_positions(
             selected: Vec::new(),
             available_slots: available,
             message_content_blocks: 0,
-            reused_count: 0,
             skip_reason: Some("no_content_blocks".into()),
         };
     }
 
-    let Some((tail_idx, tail_position)) = find_tail_cacheable_message_block(body, &message_blocks)
+    let Some((tail_idx, tail_position)) =
+        find_tail_message_cache_breakpoint(body, &message_blocks, mode)
     else {
         return CacheBreakpointSelection {
             selected: Vec::new(),
             available_slots: available,
             message_content_blocks: message_blocks.len(),
-            reused_count: 0,
             skip_reason: Some("no_cacheable_blocks".into()),
         };
     };
-
-    if let Some(remembered) = remembered.filter(|anchors| !anchors.is_empty()) {
-        if let Some(outcome) = select_session_anchored_positions(
-            body,
-            &message_blocks,
-            available,
-            tail_idx,
-            tail_position,
-            remembered,
-        ) {
-            return outcome;
-        }
-    }
 
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
@@ -2036,14 +1953,9 @@ fn select_message_cache_control_positions(
     let mut cursor = tail_idx;
     while selected.len() < available && cursor > 0 {
         let window_start = cursor.saturating_sub(CACHE_LOOKBACK_STRIDE);
-        if let Some((position_idx, position)) = (window_start..cursor).find_map(|idx| {
-            let position = message_blocks[idx];
-            if is_cacheable_message_block_at(body, position) {
-                Some((idx, position))
-            } else {
-                None
-            }
-        }) {
+        if let Some((position_idx, position)) =
+            find_window_message_cache_breakpoint(body, &message_blocks, window_start, cursor, mode)
+        {
             push_unique_position(&mut selected, &mut seen, position, available);
             cursor = position_idx;
             continue;
@@ -2055,7 +1967,7 @@ fn select_message_cache_control_positions(
     }
 
     if selected.len() < available {
-        if let Some(boundary) = claude_code_auto_injected_boundary_position(body) {
+        if let Some(boundary) = claude_code_auto_injected_boundary_position(body, mode) {
             push_unique_position(&mut selected, &mut seen, boundary, available);
         }
     }
@@ -2066,95 +1978,8 @@ fn select_message_cache_control_positions(
         selected,
         available_slots: available,
         message_content_blocks: message_blocks.len(),
-        reused_count: 0,
         skip_reason: None,
     }
-}
-
-/// 以“上一轮最新断点”为读缓存锚点,再向当前尾部补桥接断点。
-fn select_session_anchored_positions(
-    body: &serde_json::Value,
-    message_blocks: &[(usize, usize)],
-    available: usize,
-    tail_idx: usize,
-    tail_position: (usize, usize),
-    remembered: &[String],
-) -> Option<CacheBreakpointSelection> {
-    let position_by_fingerprint = message_cacheable_position_fingerprint_map(body, message_blocks);
-    let index_by_position = message_blocks
-        .iter()
-        .enumerate()
-        .map(|(idx, position)| (*position, idx))
-        .collect::<HashMap<_, _>>();
-    let remembered_set = remembered.iter().collect::<HashSet<_>>();
-    let mut remembered_positions = remembered
-        .iter()
-        .filter_map(|fingerprint| {
-            let position = position_by_fingerprint.get(fingerprint).copied()?;
-            let idx = index_by_position.get(&position).copied()?;
-            Some((idx, position))
-        })
-        .collect::<Vec<_>>();
-    remembered_positions.sort_unstable_by_key(|(idx, _)| *idx);
-
-    let Some((anchor_idx, anchor_position)) = remembered_positions.last().copied() else {
-        return None;
-    };
-
-    let mut selected = Vec::new();
-    let mut seen = HashSet::new();
-    push_unique_position(&mut selected, &mut seen, anchor_position, available);
-
-    let mut cursor = anchor_idx;
-    while selected.len() + 1 < available
-        && tail_idx > cursor
-        && tail_idx - cursor > CACHE_LOOKBACK_STRIDE
-    {
-        let window_end = (cursor + CACHE_LOOKBACK_STRIDE).min(tail_idx);
-        if let Some((position_idx, position)) = ((cursor + 1)..=window_end).rev().find_map(|idx| {
-            let position = message_blocks[idx];
-            if is_cacheable_message_block_at(body, position) {
-                Some((idx, position))
-            } else {
-                None
-            }
-        }) {
-            push_unique_position(&mut selected, &mut seen, position, available);
-            cursor = position_idx;
-        } else {
-            cursor = window_end;
-        }
-    }
-
-    push_unique_position(&mut selected, &mut seen, tail_position, available);
-
-    for (_, position) in remembered_positions.iter().rev().skip(1) {
-        if selected.len() >= available {
-            break;
-        }
-        push_unique_position(&mut selected, &mut seen, *position, available);
-    }
-
-    if selected.len() < available {
-        if let Some(boundary) = claude_code_auto_injected_boundary_position(body) {
-            push_unique_position(&mut selected, &mut seen, boundary, available);
-        }
-    }
-
-    selected.sort_unstable();
-    let reused_count = selected
-        .iter()
-        .filter_map(|position| message_block_fingerprint_at(body, *position))
-        .filter(|fingerprint| remembered_set.contains(fingerprint))
-        .count();
-
-    Some(CacheBreakpointSelection {
-        selected,
-        available_slots: available,
-        message_content_blocks: message_blocks.len(),
-        reused_count,
-        skip_reason: None,
-    })
 }
 
 /// 追加未选择过的位置,并保持不超过可用断点数量。
@@ -2173,13 +1998,27 @@ fn push_unique_position(
 }
 
 /// 从尾部找到最后一个可放置断点的 message block。
-fn find_tail_cacheable_message_block(
+fn find_tail_message_cache_breakpoint(
     body: &serde_json::Value,
     message_blocks: &[(usize, usize)],
+    mode: CacheBreakpointMode,
 ) -> Option<(usize, (usize, usize))> {
+    if matches!(mode, CacheBreakpointMode::Auto) {
+        if let Some(found) = (0..message_blocks.len()).rev().find_map(|idx| {
+            let position = message_blocks[idx];
+            if is_preferred_auto_message_block_at(body, position) {
+                Some((idx, position))
+            } else {
+                None
+            }
+        }) {
+            return Some(found);
+        }
+    }
+
     (0..message_blocks.len()).rev().find_map(|idx| {
         let position = message_blocks[idx];
-        if is_cacheable_message_block_at(body, position) {
+        if is_cacheable_message_block_at(body, position, mode) {
             Some((idx, position))
         } else {
             None
@@ -2187,111 +2026,31 @@ fn find_tail_cacheable_message_block(
     })
 }
 
-/// 构建可缓存 message block 指纹到当前位置的映射。
-fn message_cacheable_position_fingerprint_map(
+/// 在 lookback 窗口中找到下一个缓存断点。
+fn find_window_message_cache_breakpoint(
     body: &serde_json::Value,
     message_blocks: &[(usize, usize)],
-) -> HashMap<String, (usize, usize)> {
-    let mut map = HashMap::new();
-    for position in message_blocks {
-        if !is_cacheable_message_block_at(body, *position) {
-            continue;
-        }
-        if let Some(fingerprint) = message_block_fingerprint_at(body, *position) {
-            map.insert(fingerprint, *position);
-        }
-    }
-    map
-}
-
-/// 返回指定 message block 的稳定指纹。
-fn message_block_fingerprint_at(
-    body: &serde_json::Value,
-    position: (usize, usize),
-) -> Option<String> {
-    let message = body
-        .get("messages")
-        .and_then(|messages| messages.as_array())
-        .and_then(|messages| messages.get(position.0))?;
-    let role = message.get("role").and_then(|role| role.as_str()).unwrap_or("");
-    let block = message
-        .get("content")
-        .and_then(|content| content.as_array())
-        .and_then(|content| content.get(position.1))?;
-    let mut stable_block = block.clone();
-    if let Some(obj) = stable_block.as_object_mut() {
-        obj.remove("cache_control");
-    }
-    let payload = serde_json::json!({
-        "role": role,
-        "block": stable_block,
-    });
-    let bytes = serde_json::to_vec(&payload).ok()?;
-    Some(hex::encode(Sha256::digest(bytes)))
-}
-
-/// 提取会话级锚定断点缓存 key。
-fn anchored_session_key(account: &Account, body: &serde_json::Value) -> Option<String> {
-    let session_id = extract_claude_code_session_id(body)?;
-    Some(format!("{}:{}", account.id, session_id))
-}
-
-/// 从 Claude Code metadata.user_id 中提取 session_id。
-fn extract_claude_code_session_id(body: &serde_json::Value) -> Option<String> {
-    let user_id = body
-        .get("metadata")
-        .and_then(|metadata| metadata.get("user_id"))
-        .and_then(|user_id| user_id.as_str())?;
-
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = parsed.get("session_id").and_then(|value| value.as_str()) {
-            if !session_id.is_empty() {
-                return Some(session_id.to_string());
+    window_start: usize,
+    cursor: usize,
+    mode: CacheBreakpointMode,
+) -> Option<(usize, (usize, usize))> {
+    match mode {
+        CacheBreakpointMode::Rolling => (window_start..cursor).find_map(|idx| {
+            let position = message_blocks[idx];
+            if is_cacheable_message_block_at(body, position, mode) {
+                Some((idx, position))
+            } else {
+                None
             }
-        }
-    }
-
-    user_id
-        .rfind("_session_")
-        .map(|idx| user_id[idx + 9..].to_string())
-        .filter(|session_id| !session_id.is_empty())
-}
-
-/// anchored 模式的内存会话断点缓存。
-#[derive(Default)]
-struct AnchoredCacheStore {
-    order: Vec<String>,
-    anchors_by_session: HashMap<String, Vec<String>>,
-}
-
-impl AnchoredCacheStore {
-    /// 读取某个 session 的上一轮断点指纹,并把它标记为最近使用。
-    ///
-    /// @param key 会话缓存 key。
-    /// @return 命中时返回断点指纹列表。
-    fn get(&mut self, key: &str) -> Option<Vec<String>> {
-        let anchors = self.anchors_by_session.get(key).cloned()?;
-        self.touch(key);
-        Some(anchors)
-    }
-
-    /// 写入某个 session 最新发往上游的断点指纹。
-    ///
-    /// @param key 会话缓存 key。
-    /// @param anchors 本轮实际放置的 message block 指纹。
-    fn insert(&mut self, key: String, anchors: Vec<String>) {
-        self.anchors_by_session.insert(key.clone(), anchors);
-        self.touch(&key);
-        while self.order.len() > ANCHORED_CACHE_MAX_SESSIONS {
-            let old = self.order.remove(0);
-            self.anchors_by_session.remove(&old);
-        }
-    }
-
-    /// 将 session key 移动到 LRU 队尾。
-    fn touch(&mut self, key: &str) {
-        self.order.retain(|item| item != key);
-        self.order.push(key.to_string());
+        }),
+        CacheBreakpointMode::Auto => (window_start..cursor).find_map(|idx| {
+            let position = message_blocks[idx];
+            if is_preferred_auto_message_block_at(body, position) {
+                Some((idx, position))
+            } else {
+                None
+            }
+        }),
     }
 }
 
@@ -2379,7 +2138,11 @@ fn message_block_positions(body: &serde_json::Value) -> Option<Vec<(usize, usize
 }
 
 /// 判断指定 message content block 是否可以直接放置 cache_control。
-fn is_cacheable_message_block_at(body: &serde_json::Value, position: (usize, usize)) -> bool {
+fn is_cacheable_message_block_at(
+    body: &serde_json::Value,
+    position: (usize, usize),
+    mode: CacheBreakpointMode,
+) -> bool {
     let Some(message) = body
         .get("messages")
         .and_then(|messages| messages.as_array())
@@ -2398,7 +2161,34 @@ fn is_cacheable_message_block_at(body: &serde_json::Value, position: (usize, usi
     else {
         return false;
     };
-    is_cacheable_message_block(role, block)
+    is_cacheable_message_block(role, block, mode)
+}
+
+/// 判断指定 message content block 是否是 auto 模式优先选择的稳定边界。
+fn is_preferred_auto_message_block_at(
+    body: &serde_json::Value,
+    position: (usize, usize),
+) -> bool {
+    let Some(message) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.get(position.0))
+    else {
+        return false;
+    };
+    let role = message
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("");
+    let Some(block) = message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|content| content.get(position.1))
+    else {
+        return false;
+    };
+    let block_type = block.get("type").and_then(|value| value.as_str());
+    matches!(role, "user" | "assistant") && block_type == Some("text")
 }
 
 /// 返回 Claude Code 自动注入块末尾的位置。
@@ -2406,7 +2196,10 @@ fn is_cacheable_message_block_at(body: &serde_json::Value, position: (usize, usi
 /// Claude Code 会把 hooks、skills、CLAUDE.md、deferred-tools、MCP 资源等稳定前缀
 /// 放进首个 user message。尾部滚动断点用不满 slot 时,在该边界补一个断点,
 /// 能避免这些稳定前缀被后续真实用户内容一起重写。
-fn claude_code_auto_injected_boundary_position(body: &serde_json::Value) -> Option<(usize, usize)> {
+fn claude_code_auto_injected_boundary_position(
+    body: &serde_json::Value,
+    mode: CacheBreakpointMode,
+) -> Option<(usize, usize)> {
     let messages = body.get("messages").and_then(|m| m.as_array())?;
     let first = messages.first()?;
     if first.get("role").and_then(|role| role.as_str()) != Some("user") {
@@ -2418,7 +2211,8 @@ fn claude_code_auto_injected_boundary_position(body: &serde_json::Value) -> Opti
         .iter()
         .enumerate()
         .filter(|(_, block)| {
-            is_cacheable_message_block("user", block) && is_claude_code_auto_injected_block(block)
+            is_cacheable_message_block("user", block, mode)
+                && is_claude_code_auto_injected_block(block)
         })
         .map(|(block_idx, _)| (0, block_idx))
         .last()
@@ -2476,44 +2270,12 @@ fn add_message_cache_control_at_block(
     block.insert("cache_control".into(), default_message_cache_control());
 }
 
-/// 在指定 message 的最后一个可缓存内容块上设置 cache_control。
-fn add_message_cache_control_at(messages: &mut [serde_json::Value], idx: usize) {
-    let Some(msg) = messages.get_mut(idx) else {
-        return;
-    };
-    let role = msg
-        .get("role")
-        .and_then(|role| role.as_str())
-        .unwrap_or("")
-        .to_string();
-    let Some(content) = msg.get_mut("content") else {
-        return;
-    };
-
-    let Some(arr) = content.as_array_mut() else {
-        return;
-    };
-    let Some(block_idx) = last_cacheable_message_block_index(&role, arr) else {
-        return;
-    };
-    let Some(block) = arr.get_mut(block_idx).and_then(|item| item.as_object_mut()) else {
-        return;
-    };
-    block.insert("cache_control".into(), default_message_cache_control());
-}
-
-/// 返回最后一个可放置 Anthropic cache_control 的 message 内容块下标。
-fn last_cacheable_message_block_index(role: &str, blocks: &[serde_json::Value]) -> Option<usize> {
-    blocks
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, block)| is_cacheable_message_block(role, block))
-        .map(|(idx, _)| idx)
-}
-
 /// 判断 message 内容块是否可以放置 cache_control。
-fn is_cacheable_message_block(role: &str, block: &serde_json::Value) -> bool {
+fn is_cacheable_message_block(
+    role: &str,
+    block: &serde_json::Value,
+    mode: CacheBreakpointMode,
+) -> bool {
     let Some(block) = block.as_object() else {
         return false;
     };
@@ -2522,11 +2284,19 @@ fn is_cacheable_message_block(role: &str, block: &serde_json::Value) -> bool {
         return false;
     }
 
-    match role {
-        // Anthropic 文档允许 text/tool_use/tool_result 作为缓存断点；thinking 只能随前缀被缓存。
-        "assistant" => matches!(block_type, Some("text" | "tool_use")),
-        "user" => matches!(block_type, Some("text" | "tool_result")),
-        _ => false,
+    match mode {
+        CacheBreakpointMode::Auto => match role {
+            // assistant tool_use 是并行工具调度结构,自动修复不把它作为稳定缓存边界。
+            "assistant" => block_type == Some("text"),
+            "user" => matches!(block_type, Some("text" | "tool_result")),
+            _ => false,
+        },
+        CacheBreakpointMode::Rolling => match role {
+            // assistant tool_use 是并行调度结构,rolling 也不把它作为缓存边界。
+            "assistant" => block_type == Some("text"),
+            "user" => matches!(block_type, Some("text" | "tool_result")),
+            _ => false,
+        },
     }
 }
 
@@ -2895,47 +2665,6 @@ mod tests {
         serde_json::from_slice(&out).unwrap()
     }
 
-    fn rewrite_messages_body_with_rewriter(
-        rewriter: &Rewriter,
-        body: serde_json::Value,
-        message_cache_rewrite: MessageCacheControlRewrite,
-    ) -> serde_json::Value {
-        let account = test_account();
-        let out = rewriter.rewrite_body(
-            &serde_json::to_vec(&body).unwrap(),
-            "/v1/messages",
-            &account,
-            ClientType::ClaudeCode,
-            EnvPassthrough::default(),
-            CacheControlTtlRewrite::Off,
-            message_cache_rewrite,
-        );
-        serde_json::from_slice(&out).unwrap()
-    }
-
-    fn message_text_blocks(start: usize, end: usize) -> Vec<serde_json::Value> {
-        (start..end)
-            .map(|idx| {
-                json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": format!("block-{}", idx)
-                    }]
-                })
-            })
-            .collect()
-    }
-
-    fn body_with_session(messages: Vec<serde_json::Value>) -> serde_json::Value {
-        json!({
-            "metadata": {
-                "user_id": "{\"session_id\":\"session-a\"}"
-            },
-            "messages": messages
-        })
-    }
-
     fn message_cache_control_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
         let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
             return Vec::new();
@@ -2985,8 +2714,12 @@ mod tests {
             MessageCacheControlRewrite::Off
         );
         assert_eq!(
+            MessageCacheControlRewrite::parse("auto").unwrap(),
+            MessageCacheControlRewrite::Auto
+        );
+        assert_eq!(
             MessageCacheControlRewrite::parse("stable").unwrap(),
-            MessageCacheControlRewrite::Stable
+            MessageCacheControlRewrite::Auto
         );
         assert_eq!(
             MessageCacheControlRewrite::parse("rolling").unwrap(),
@@ -2994,7 +2727,7 @@ mod tests {
         );
         assert_eq!(
             MessageCacheControlRewrite::parse("anchored").unwrap(),
-            MessageCacheControlRewrite::Anchored
+            MessageCacheControlRewrite::Auto
         );
     }
 
@@ -3142,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_stable_rewrites_only_message_breakpoints() {
+    fn message_cache_control_auto_rewrites_cache_breakpoints() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "system": [{
@@ -3204,11 +2937,11 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Stable,
+            MessageCacheControlRewrite::Auto,
         );
 
-        assert_eq!(parsed["system"][0]["cache_control"]["ttl"], json!("1h"));
-        assert_eq!(parsed["tools"][0]["cache_control"]["ttl"], json!("1h"));
+        assert!(parsed["system"][0].get("cache_control").is_none());
+        assert!(parsed["tools"][0].get("cache_control").is_none());
         assert_eq!(
             parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
             json!("1h")
@@ -3233,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_stable_keeps_string_content_unchanged() {
+    fn message_cache_control_auto_keeps_string_content_unchanged() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "messages": [{
@@ -3243,14 +2976,14 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::FiveMinutes,
-            MessageCacheControlRewrite::Stable,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(parsed["messages"][0]["content"], json!("hello"));
     }
 
     #[test]
-    fn message_cache_control_rolling_places_tail_breakpoints_within_lookback() {
+    fn message_cache_control_auto_places_tail_breakpoints_within_lookback() {
         let messages: Vec<serde_json::Value> = (0..45)
             .map(|idx| {
                 json!({
@@ -3269,7 +3002,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         let positions = message_cache_control_positions(&parsed);
@@ -3281,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_takes_over_non_message_breakpoint_slots() {
+    fn message_cache_control_auto_takes_over_non_message_breakpoint_slots() {
         let messages: Vec<serde_json::Value> = (0..60)
             .map(|idx| {
                 json!({
@@ -3310,7 +3043,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3323,7 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_clears_full_non_message_breakpoint_slots() {
+    fn message_cache_control_auto_clears_full_non_message_breakpoint_slots() {
         let messages: Vec<serde_json::Value> = (0..60)
             .map(|idx| {
                 json!({
@@ -3365,7 +3098,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3380,7 +3113,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_root_cache_control_does_not_skip_short_tail() {
+    fn message_cache_control_auto_root_cache_control_does_not_skip_short_tail() {
         let messages: Vec<serde_json::Value> = (0..6)
             .map(|idx| {
                 json!({
@@ -3399,7 +3132,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3410,7 +3143,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_marks_claude_code_auto_injected_boundary_when_slot_remains() {
+    fn message_cache_control_auto_marks_claude_code_auto_injected_boundary_when_slot_remains() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "messages": [{
@@ -3433,7 +3166,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3443,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_stabilizes_tools_order_by_name() {
+    fn message_cache_control_auto_stabilizes_tools_order_by_name() {
         let body = |tools: serde_json::Value| {
             json!({
                 "tools": tools,
@@ -3465,7 +3198,7 @@ mod tests {
             ])),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
         let second = rewrite_messages_body_with_modes(
             body(json!([
@@ -3475,7 +3208,7 @@ mod tests {
             ])),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(first["tools"], second["tools"]);
@@ -3485,7 +3218,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_stabilizes_system_skills_and_deferred_tools_lists() {
+    fn message_cache_control_auto_stabilizes_system_skills_and_deferred_tools_lists() {
         let body = |skills: &str, deferred: &str| {
             json!({
                 "system": [
@@ -3518,13 +3251,13 @@ mod tests {
             body(skills_unsorted, deferred_unsorted),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
         let second = rewrite_messages_body_with_modes(
             body(skills_sorted, deferred_sorted),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(first["system"], second["system"]);
@@ -3533,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_keeps_multiline_skill_entries_intact() {
+    fn message_cache_control_auto_keeps_multiline_skill_entries_intact() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "system": [{
@@ -3550,7 +3283,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3560,7 +3293,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_stabilizes_first_user_auto_injected_lists() {
+    fn message_cache_control_auto_stabilizes_first_user_auto_injected_lists() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "messages": [{
@@ -3583,7 +3316,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3601,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_stable_does_not_sort_tools() {
+    fn message_cache_control_stable_alias_uses_auto_sorting() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "tools": [
@@ -3618,15 +3351,15 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Stable,
+            MessageCacheControlRewrite::parse("stable").unwrap(),
         );
 
-        assert_eq!(parsed["tools"][0]["name"], json!("Write"));
-        assert_eq!(parsed["tools"][1]["name"], json!("Read"));
+        assert_eq!(parsed["tools"][0]["name"], json!("Read"));
+        assert_eq!(parsed["tools"][1]["name"], json!("Write"));
     }
 
     #[test]
-    fn message_cache_control_rolling_does_not_steal_tail_slots_for_auto_boundary() {
+    fn message_cache_control_auto_does_not_steal_tail_slots_for_auto_boundary() {
         let mut messages: Vec<serde_json::Value> = (0..60)
             .map(|idx| {
                 json!({
@@ -3668,7 +3401,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(
@@ -3681,7 +3414,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_skips_uncacheable_tail_blocks() {
+    fn message_cache_control_auto_skips_uncacheable_tail_blocks() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "messages": [
@@ -3703,7 +3436,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert_eq!(message_cache_control_positions(&parsed), vec![(0, 0)]);
@@ -3713,7 +3446,86 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_allows_tool_use_and_tool_result_breakpoints() {
+    fn message_cache_control_auto_avoids_assistant_tool_use_breakpoints() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u0"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "a1"
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "Read",
+                                "input": { "file_path": "/tmp/a" }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "result"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "skip"
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_2",
+                                "name": "Bash",
+                                "input": { "command": "pwd" }
+                            }
+                        ]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Auto,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (1, 0)]
+        );
+        assert!(parsed["messages"][1]["content"][1]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][3]["content"][1]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_avoids_tool_use_but_allows_tool_result_breakpoints() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "system": [{
@@ -3781,18 +3593,69 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 0), (3, 1)]
+            vec![(0, 0), (2, 0)]
         );
         assert!(parsed["messages"][1]["content"][1]
             .get("cache_control")
             .is_none());
-        assert!(parsed["messages"][3]["content"][1]
+        assert!(parsed["messages"][2]["content"][0]
             .get("cache_control")
             .is_some());
+        assert!(parsed["messages"][3]["content"][1]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
-    fn message_cache_control_rolling_counts_uncacheable_blocks_for_lookback() {
+    fn message_cache_control_auto_counts_blocks_without_using_tool_use_breakpoints() {
+        let mut blocks = Vec::new();
+        blocks.push(json!({
+            "type": "text",
+            "text": "anchor"
+        }));
+        for idx in 0..18 {
+            blocks.push(json!({
+                "type": "thinking",
+                "thinking": format!("thinking-{}", idx)
+            }));
+        }
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": "toolu_tail",
+            "name": "Read",
+            "input": { "file_path": "/tmp/tail" }
+        }));
+        blocks.push(json!({
+            "type": "text",
+            "text": "tail"
+        }));
+
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [{
+                    "role": "assistant",
+                    "content": blocks
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Auto,
+        );
+
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (0, 20)]
+        );
+        assert!(parsed["messages"][0]["content"][18]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][0]["content"][19]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_counts_blocks_without_using_tool_use_breakpoints() {
         let mut blocks = Vec::new();
         blocks.push(json!({
             "type": "text",
@@ -3829,9 +3692,75 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 0), (0, 19), (0, 20)]
+            vec![(0, 0), (0, 20)]
         );
         assert!(parsed["messages"][0]["content"][18]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][0]["content"][19]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_auto_stabilizes_adjacent_tool_use_and_results() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_b",
+                                "name": "Bash",
+                                "input": { "command": "pwd" }
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_a",
+                                "name": "Read",
+                                "input": { "file_path": "/tmp/a" }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_b",
+                                "content": "b"
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_a",
+                                "content": "a"
+                            }
+                        ]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Auto,
+        );
+
+        assert_eq!(parsed["messages"][0]["content"][0]["id"], json!("toolu_a"));
+        assert_eq!(parsed["messages"][0]["content"][1]["id"], json!("toolu_b"));
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["tool_use_id"],
+            json!("toolu_a")
+        );
+        assert_eq!(
+            parsed["messages"][1]["content"][1]["tool_use_id"],
+            json!("toolu_b")
+        );
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(1, 1)]
+        );
+        assert!(parsed["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
     }
@@ -3892,12 +3821,15 @@ mod tests {
         );
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 0), (1, 1)]
+            vec![(1, 0), (1, 1)]
         );
+        assert!(parsed["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
-    fn message_cache_control_rolling_ttl_rewrite_updates_created_breakpoints() {
+    fn message_cache_control_auto_ttl_rewrite_updates_created_breakpoints() {
         let messages: Vec<serde_json::Value> = (0..22)
             .map(|idx| {
                 json!({
@@ -3915,7 +3847,7 @@ mod tests {
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::FiveMinutes,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         for (message_idx, block_idx) in message_cache_control_positions(&parsed) {
@@ -3927,167 +3859,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_anchored_reuses_previous_session_breakpoints() {
-        let rewriter = Rewriter::new();
-        let first = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            body_with_session(message_text_blocks(0, 60)),
-            MessageCacheControlRewrite::Anchored,
-        );
-        assert_eq!(
-            message_cache_control_positions(&first),
-            vec![(2, 0), (21, 0), (40, 0), (59, 0)]
-        );
-
-        let second = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            body_with_session(message_text_blocks(0, 80)),
-            MessageCacheControlRewrite::Anchored,
-        );
-
-        assert_eq!(
-            message_cache_control_positions(&second),
-            vec![(40, 0), (59, 0), (78, 0), (79, 0)]
-        );
-    }
-
-    #[test]
-    fn message_cache_control_anchored_bridges_large_growth_to_new_tail() {
-        let rewriter = Rewriter::new();
-        let _ = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            body_with_session(message_text_blocks(0, 60)),
-            MessageCacheControlRewrite::Anchored,
-        );
-        let second = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            body_with_session(message_text_blocks(0, 100)),
-            MessageCacheControlRewrite::Anchored,
-        );
-
-        assert_eq!(
-            message_cache_control_positions(&second),
-            vec![(59, 0), (78, 0), (97, 0), (99, 0)]
-        );
-    }
-
-    #[test]
-    fn message_cache_control_anchored_does_not_reuse_other_session_breakpoints() {
-        let rewriter = Rewriter::new();
-        let _ = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            body_with_session(message_text_blocks(0, 60)),
-            MessageCacheControlRewrite::Anchored,
-        );
-        let second = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            json!({
-                "metadata": {
-                    "user_id": "{\"session_id\":\"session-b\"}"
-                },
-                "messages": message_text_blocks(0, 80)
-            }),
-            MessageCacheControlRewrite::Anchored,
-        );
-
-        assert_eq!(
-            message_cache_control_positions(&second),
-            vec![(22, 0), (41, 0), (60, 0), (79, 0)]
-        );
-    }
-
-    #[test]
-    fn message_cache_control_anchored_without_session_falls_back_to_rolling() {
-        let rewriter = Rewriter::new();
-        let parsed = rewrite_messages_body_with_rewriter(
-            &rewriter,
-            json!({
-                "messages": message_text_blocks(0, 45)
-            }),
-            MessageCacheControlRewrite::Anchored,
-        );
-
-        assert_eq!(
-            message_cache_control_positions(&parsed),
-            vec![(0, 0), (6, 0), (25, 0), (44, 0)]
-        );
-    }
-
-    #[test]
-    fn message_cache_control_anchored_ttl_rewrite_updates_created_breakpoints() {
-        let account = test_account();
-        let rewriter = Rewriter::new();
-        let out = rewriter.rewrite_body(
-            &serde_json::to_vec(&body_with_session(message_text_blocks(0, 60))).unwrap(),
-            "/v1/messages",
-            &account,
-            ClientType::ClaudeCode,
-            EnvPassthrough::default(),
-            CacheControlTtlRewrite::FiveMinutes,
-            MessageCacheControlRewrite::Anchored,
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-
-        for (message_idx, block_idx) in message_cache_control_positions(&parsed) {
-            assert_eq!(
-                parsed["messages"][message_idx]["content"][block_idx]["cache_control"]["ttl"],
-                json!("5m")
-            );
-        }
-    }
-
-    #[test]
-    fn message_cache_control_anchored_recomputes_cch_after_final_body_changes() {
-        let account = test_account();
-        let rewriter = Rewriter::new();
-        let body = json!({
-            "metadata": {
-                "user_id": "{\"session_id\":\"session-c\"}"
-            },
-            "system": [{
-                "type": "text",
-                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
-            }],
-            "messages": message_text_blocks(0, 60)
-        });
-
-        let out = rewriter.rewrite_body(
-            &serde_json::to_vec(&body).unwrap(),
-            "/v1/messages",
-            &account,
-            ClientType::ClaudeCode,
-            EnvPassthrough::default(),
-            CacheControlTtlRewrite::FiveMinutes,
-            MessageCacheControlRewrite::Anchored,
-        );
-        let text = String::from_utf8(out.clone()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-
-        assert!(!text.contains("cch=12345"));
-        assert!(!text.contains("cch=00000"));
-        assert_eq!(message_cache_control_positions(&parsed).len(), 4);
-
-        let actual = super::CCH_VALUE_REGEX
-            .find(&text)
-            .map(|m| m.as_str().to_string())
-            .expect("cch value exists");
-        let mut placeholder_body = out;
-        let cch_pos = placeholder_body
-            .windows(super::CCH_PLACEHOLDER.len())
-            .position(|window| window.starts_with(b"cch="))
-            .expect("cch value position");
-        placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
-
-        assert!(expected.contains(&actual));
-    }
-
-    #[test]
-    fn message_cache_control_stable_is_ignored_for_api_mode() {
+    fn message_cache_control_auto_alias_is_ignored_for_api_mode() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "messages": [
@@ -4110,7 +3882,7 @@ mod tests {
             }),
             ClientType::API,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Stable,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert!(parsed["messages"][0]["content"][0]
@@ -4122,7 +3894,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_is_ignored_for_api_mode() {
+    fn message_cache_control_auto_is_ignored_for_api_mode() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "messages": [
@@ -4145,7 +3917,7 @@ mod tests {
             }),
             ClientType::API,
             CacheControlTtlRewrite::Off,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
 
         assert!(parsed["messages"][0]["content"][0]
@@ -4862,7 +4634,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_stable_recomputes_cch_after_final_body_changes() {
+    fn message_cache_control_legacy_recomputes_cch_after_final_body_changes() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -4910,7 +4682,7 @@ mod tests {
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
-            MessageCacheControlRewrite::Stable,
+            MessageCacheControlRewrite::Auto,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -4946,7 +4718,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_recomputes_cch_after_final_body_changes() {
+    fn message_cache_control_auto_recomputes_cch_after_final_body_changes() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let messages: Vec<serde_json::Value> = (0..60)
@@ -4975,7 +4747,7 @@ mod tests {
             ClientType::ClaudeCode,
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
-            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Auto,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();

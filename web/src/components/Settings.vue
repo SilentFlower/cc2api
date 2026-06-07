@@ -46,7 +46,7 @@ const passthroughWorkingDir = ref(true);
 const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 
 /** Claude Code messages 缓存断点改写模式 */
-const messageCacheControlRewrite = ref<'off' | 'stable' | 'rolling' | 'anchored'>('off');
+const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling'>('off');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -145,10 +145,13 @@ async function loadSettings() {
     const ttlRewrite = data.cache_control_ttl_rewrite ?? 'off';
     cacheControlTtlRewrite.value = ttlRewrite === '5m' || ttlRewrite === '1h' ? ttlRewrite : 'off';
     const messageCacheRewrite = data.message_cache_control_rewrite ?? 'off';
-    messageCacheControlRewrite.value =
-      messageCacheRewrite === 'stable' || messageCacheRewrite === 'rolling' || messageCacheRewrite === 'anchored'
-        ? messageCacheRewrite
-        : 'off';
+    if (messageCacheRewrite === 'auto' || messageCacheRewrite === 'rolling') {
+      messageCacheControlRewrite.value = messageCacheRewrite;
+    } else if (messageCacheRewrite === 'stable' || messageCacheRewrite === 'anchored') {
+      messageCacheControlRewrite.value = 'auto';
+    } else {
+      messageCacheControlRewrite.value = 'off';
+    }
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -451,10 +454,10 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">messages 缓存断点</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              会话锚定会在 rolling 基础上复用同一 Claude Code session 的旧断点并桥接到当前尾部。stable 是旧策略,不推荐并行 tool 长会话。
+              自动修复是推荐的保守策略,会避开 assistant tool_use 这类高抖动边界。滚动断点更积极使用 user tool_result,用于线上对照。
             </p>
           </div>
-          <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
               <input
                 v-model="messageCacheControlRewrite"
@@ -468,28 +471,19 @@ onMounted(async () => {
               <input
                 v-model="messageCacheControlRewrite"
                 type="radio"
+                value="auto"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">自动修复</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="messageCacheControlRewrite"
+                type="radio"
                 value="rolling"
                 class="accent-[#c4704f] w-4 h-4"
               />
               <span class="text-sm text-[#29261e]">滚动断点</span>
-            </label>
-            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-              <input
-                v-model="messageCacheControlRewrite"
-                type="radio"
-                value="anchored"
-                class="accent-[#c4704f] w-4 h-4"
-              />
-              <span class="text-sm text-[#29261e]">会话锚定</span>
-            </label>
-            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-              <input
-                v-model="messageCacheControlRewrite"
-                type="radio"
-                value="stable"
-                class="accent-[#c4704f] w-4 h-4"
-              />
-              <span class="text-sm text-[#29261e]">旧稳定重打</span>
             </label>
           </div>
         </div>
