@@ -389,14 +389,17 @@ impl CacheControlTtlRewrite {
 /// Claude Code messages 缓存断点改写模式。
 ///
 /// `Stable` 会先清空 `messages[].content[].cache_control`,再按固定位置重打 message
-/// 断点,避免上一轮尾部断点在下一轮变成历史中间断点后破坏缓存命中。
+/// 断点;`Rolling` 会按 Anthropic 20-block lookback 在尾部滚动放置多个断点,
+/// 用于缓解 Claude Code 并行 tool 一轮新增大量 block 后的缓存断链。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageCacheControlRewrite {
     /// 保持客户端原始 message cache_control。
     #[default]
     Off,
-    /// 稳定化 message cache_control 断点。
+    /// 旧的固定位置 message cache_control 断点。
     Stable,
+    /// 按尾部 block 间隔滚动放置 message cache_control 断点。
+    Rolling,
 }
 
 impl MessageCacheControlRewrite {
@@ -408,8 +411,9 @@ impl MessageCacheControlRewrite {
         match raw.trim() {
             "off" => Ok(Self::Off),
             "stable" => Ok(Self::Stable),
+            "rolling" => Ok(Self::Rolling),
             other => Err(AppError::BadRequest(format!(
-                "'message_cache_control_rewrite' 必须是 off 或 stable,当前值: {}",
+                "'message_cache_control_rewrite' 必须是 off、stable 或 rolling,当前值: {}",
                 other
             ))),
         }
@@ -1144,8 +1148,7 @@ fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
 
 fn find_cch_value(body: &[u8]) -> Option<usize> {
     body.windows(CCH_PLACEHOLDER.len()).position(|window| {
-        window.starts_with(b"cch=")
-            && window[4..].iter().all(|b| b.is_ascii_hexdigit())
+        window.starts_with(b"cch=") && window[4..].iter().all(|b| b.is_ascii_hexdigit())
     })
 }
 
@@ -1485,17 +1488,31 @@ fn strip_cache_control(body: &mut serde_json::Value) {
     }
 }
 
-/// 按配置稳定化 Claude Code messages 缓存断点。
+/// Anthropic 单个请求允许的 cache_control 断点数量上限。
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+/// Anthropic 每个断点最多回看 20 个 block,断点自身占 1 个位置。
+const CACHE_LOOKBACK_STRIDE: usize = 19;
+
+/// 按配置改写 Claude Code messages 缓存断点。
 fn rewrite_message_cache_control(
     body: &mut serde_json::Value,
     client_type: ClientType,
     mode: MessageCacheControlRewrite,
 ) {
-    if client_type != ClientType::ClaudeCode || mode == MessageCacheControlRewrite::Off {
+    if client_type != ClientType::ClaudeCode {
         return;
     }
-    strip_message_cache_control(body);
-    add_stable_message_cache_control(body);
+    match mode {
+        MessageCacheControlRewrite::Off => {}
+        MessageCacheControlRewrite::Stable => {
+            strip_message_cache_control(body);
+            add_stable_message_cache_control(body);
+        }
+        MessageCacheControlRewrite::Rolling => {
+            strip_message_cache_control(body);
+            add_rolling_message_cache_control(body);
+        }
+    }
 }
 
 /// 移除 messages 内容块中的 cache_control,不影响 system/tools 断点。
@@ -1545,6 +1562,107 @@ fn add_stable_message_cache_control(body: &mut serde_json::Value) {
             break;
         }
     }
+}
+
+/// 为 messages 按尾部 lookback 窗口滚动放置缓存断点。
+fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
+    let has_automatic_cache = body.get("cache_control").is_some();
+    let available = MAX_CACHE_BREAKPOINTS.saturating_sub(count_non_message_cache_breakpoints(body));
+    if available == 0 {
+        return;
+    }
+
+    let positions = cacheable_message_block_positions(body);
+    if positions.is_empty() {
+        return;
+    }
+
+    let mut selected = Vec::new();
+    let mut idx = positions.len() - 1;
+    if has_automatic_cache {
+        if idx < CACHE_LOOKBACK_STRIDE {
+            return;
+        }
+        idx -= CACHE_LOOKBACK_STRIDE;
+    }
+    while selected.len() < available {
+        selected.push(positions[idx]);
+        if idx < CACHE_LOOKBACK_STRIDE {
+            break;
+        }
+        idx -= CACHE_LOOKBACK_STRIDE;
+    }
+
+    for (message_idx, block_idx) in selected {
+        add_message_cache_control_at_block(body, message_idx, block_idx);
+    }
+}
+
+/// 统计非 message 内容上已经占用的 cache_control 断点数量。
+fn count_non_message_cache_breakpoints(body: &serde_json::Value) -> usize {
+    let mut count = 0;
+
+    if body.get("cache_control").is_some() {
+        count += 1;
+    }
+    if let Some(sys) = body.get("system").and_then(|s| s.as_array()) {
+        count += sys
+            .iter()
+            .filter(|item| item.get("cache_control").is_some())
+            .count();
+    }
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        count += tools
+            .iter()
+            .filter(|tool| tool.get("cache_control").is_some())
+            .count();
+    }
+
+    count
+}
+
+/// 按请求原始顺序收集可直接放置 message cache_control 的顶层 block 位置。
+fn cacheable_message_block_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut positions = Vec::new();
+    for (message_idx, msg) in messages.iter().enumerate() {
+        let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for (block_idx, block) in content.iter().enumerate() {
+            if is_cacheable_message_block(block) {
+                positions.push((message_idx, block_idx));
+            }
+        }
+    }
+    positions
+}
+
+/// 在指定 message content block 上设置 cache_control。
+fn add_message_cache_control_at_block(
+    body: &mut serde_json::Value,
+    message_idx: usize,
+    block_idx: usize,
+) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    let Some(msg) = messages.get_mut(message_idx) else {
+        return;
+    };
+    let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    let Some(block) = content
+        .get_mut(block_idx)
+        .and_then(|item| item.as_object_mut())
+    else {
+        return;
+    };
+    block.insert("cache_control".into(), default_message_cache_control());
 }
 
 /// 在指定 message 的最后一个可缓存内容块上设置 cache_control。
@@ -1823,8 +1941,8 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 mod tests {
     use super::{
         cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
-        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
-        CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
+        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token, CacheControlTtlRewrite,
+        ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1954,6 +2072,25 @@ mod tests {
         serde_json::from_slice(&out).unwrap()
     }
 
+    fn message_cache_control_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
+        let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+            return Vec::new();
+        };
+
+        let mut positions = Vec::new();
+        for (message_idx, msg) in messages.iter().enumerate() {
+            let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for (block_idx, block) in content.iter().enumerate() {
+                if block.get("cache_control").is_some() {
+                    positions.push((message_idx, block_idx));
+                }
+            }
+        }
+        positions
+    }
+
     #[test]
     fn cache_control_ttl_rewrite_parse_accepts_known_values() {
         assert_eq!(
@@ -1986,6 +2123,10 @@ mod tests {
         assert_eq!(
             MessageCacheControlRewrite::parse("stable").unwrap(),
             MessageCacheControlRewrite::Stable
+        );
+        assert_eq!(
+            MessageCacheControlRewrite::parse("rolling").unwrap(),
+            MessageCacheControlRewrite::Rolling
         );
     }
 
@@ -2204,10 +2345,18 @@ mod tests {
             parsed["messages"][0]["content"][0]["cache_control"]["ttl"],
             json!("1h")
         );
-        assert!(parsed["messages"][1]["content"][0].get("cache_control").is_none());
-        assert!(parsed["messages"][2]["content"][0].get("cache_control").is_none());
-        assert!(parsed["messages"][2]["content"][1].get("cache_control").is_none());
-        assert!(parsed["messages"][3]["content"][0].get("cache_control").is_none());
+        assert!(parsed["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][2]["content"][1]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][3]["content"][0]
+            .get("cache_control")
+            .is_none());
         assert_eq!(
             parsed["messages"][3]["content"][1]["cache_control"]["ttl"],
             json!("1h")
@@ -2230,6 +2379,189 @@ mod tests {
         );
 
         assert_eq!(parsed["messages"][0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn message_cache_control_rolling_places_tail_breakpoints_within_lookback() {
+        let messages: Vec<serde_json::Value> = (0..45)
+            .map(|idx| {
+                json!({
+                    "role": if idx % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx),
+                        "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                    }]
+                })
+            })
+            .collect();
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        let positions = message_cache_control_positions(&parsed);
+
+        assert_eq!(positions, vec![(6, 0), (25, 0), (44, 0)]);
+        for pair in positions.windows(2) {
+            assert!(pair[1].0 - pair[0].0 <= 20);
+        }
+    }
+
+    #[test]
+    fn message_cache_control_rolling_respects_non_message_breakpoint_slots() {
+        let messages: Vec<serde_json::Value> = (0..60)
+            .map(|idx| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+                "system": [{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "tools": [{
+                    "name": "a",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(message_cache_control_positions(&parsed), vec![(40, 0)]);
+        assert!(parsed["messages"][59]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["cache_control"].is_object());
+        assert!(parsed["system"][0]["cache_control"].is_object());
+        assert!(parsed["tools"][0]["cache_control"].is_object());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_adds_no_message_breakpoint_when_slots_are_full() {
+        let messages: Vec<serde_json::Value> = (0..60)
+            .map(|idx| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx),
+                        "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                    }]
+                })
+            })
+            .collect();
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "sys-1",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    },
+                    {
+                        "type": "text",
+                        "text": "sys-2",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    }
+                ],
+                "tools": [{
+                    "name": "a",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert!(message_cache_control_positions(&parsed).is_empty());
+        assert!(parsed["cache_control"].is_object());
+        assert!(parsed["system"][0]["cache_control"].is_object());
+        assert!(parsed["system"][1]["cache_control"].is_object());
+        assert!(parsed["tools"][0]["cache_control"].is_object());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_skips_uncacheable_tail_blocks() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "cacheable"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "skip"
+                        }]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(message_cache_control_positions(&parsed), vec![(0, 0)]);
+        assert!(parsed["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_ttl_rewrite_updates_created_breakpoints() {
+        let messages: Vec<serde_json::Value> = (0..22)
+            .map(|idx| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": messages
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        for (message_idx, block_idx) in message_cache_control_positions(&parsed) {
+            assert_eq!(
+                parsed["messages"][message_idx]["content"][block_idx]["cache_control"]["ttl"],
+                json!("5m")
+            );
+        }
     }
 
     #[test]
@@ -2259,8 +2591,47 @@ mod tests {
             MessageCacheControlRewrite::Stable,
         );
 
-        assert!(parsed["messages"][0]["content"][0].get("cache_control").is_none());
-        assert!(parsed["messages"][1]["content"][0].get("cache_control").is_none());
+        assert!(parsed["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_is_ignored_for_api_mode() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u1",
+                            "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "a1"
+                        }]
+                    }
+                ]
+            }),
+            ClientType::API,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert!(parsed["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(parsed["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -2294,7 +2665,9 @@ mod tests {
         assert_eq!(parsed["cache_control"]["ttl"], json!("1h"));
         assert_eq!(parsed["system"][0]["cache_control"]["ttl"], json!("1h"));
         assert!(parsed["system"][1].get("cache_control").is_none());
-        assert!(parsed["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(parsed["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
         assert_eq!(parsed["tools"][0]["cache_control"]["ttl"], json!("1h"));
     }
 
@@ -3030,6 +3403,64 @@ mod tests {
             parsed["messages"][3]["content"][0]["cache_control"]["ttl"],
             json!("5m")
         );
+
+        let actual = super::CCH_VALUE_REGEX
+            .find(&text)
+            .map(|m| m.as_str().to_string())
+            .expect("cch value exists");
+        let mut placeholder_body = out;
+        let cch_pos = placeholder_body
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        let expected = String::from_utf8(compute_cch_attestation(
+            placeholder_body,
+            DEFAULT_CLAUDE_CODE_VERSION,
+        ))
+        .unwrap();
+
+        assert!(expected.contains(&actual));
+    }
+
+    #[test]
+    fn message_cache_control_rolling_recomputes_cch_after_final_body_changes() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let messages: Vec<serde_json::Value> = (0..25)
+            .map(|idx| {
+                json!({
+                    "role": if idx % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        let body = json!({
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
+            }],
+            "messages": messages
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Rolling,
+        );
+        let text = String::from_utf8(out.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert!(!text.contains("cch=12345"));
+        assert!(!text.contains("cch=00000"));
+        assert_eq!(message_cache_control_positions(&parsed).len(), 2);
 
         let actual = super::CCH_VALUE_REGEX
             .find(&text)
