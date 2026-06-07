@@ -46,7 +46,7 @@ const passthroughWorkingDir = ref(true);
 const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 
 /** Claude Code messages 缓存断点改写模式 */
-const messageCacheControlRewrite = ref<'off' | 'stable'>('off');
+const messageCacheControlRewrite = ref<'off' | 'stable' | 'rolling'>('off');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -145,7 +145,10 @@ async function loadSettings() {
     const ttlRewrite = data.cache_control_ttl_rewrite ?? 'off';
     cacheControlTtlRewrite.value = ttlRewrite === '5m' || ttlRewrite === '1h' ? ttlRewrite : 'off';
     const messageCacheRewrite = data.message_cache_control_rewrite ?? 'off';
-    messageCacheControlRewrite.value = messageCacheRewrite === 'stable' ? 'stable' : 'off';
+    messageCacheControlRewrite.value =
+      messageCacheRewrite === 'stable' || messageCacheRewrite === 'rolling'
+        ? messageCacheRewrite
+        : 'off';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -448,10 +451,10 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">messages 缓存断点</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              stable 会清理 messages[].content[] 原有 cache_control,再按最后一条 message 和倒数第二个 user turn 重打稳定断点。
+              rolling 会清理 messages[].content[] 原有 cache_control,再按 Anthropic 20-block lookback 在尾部滚动补断点。stable 是旧策略,不推荐并行 tool 长会话。
             </p>
           </div>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
               <input
                 v-model="messageCacheControlRewrite"
@@ -465,10 +468,19 @@ onMounted(async () => {
               <input
                 v-model="messageCacheControlRewrite"
                 type="radio"
+                value="rolling"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">滚动断点</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="messageCacheControlRewrite"
+                type="radio"
                 value="stable"
                 class="accent-[#c4704f] w-4 h-4"
               />
-              <span class="text-sm text-[#29261e]">稳定重打</span>
+              <span class="text-sm text-[#29261e]">旧稳定重打</span>
             </label>
           </div>
         </div>
@@ -477,7 +489,7 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">cache_control.ttl</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              仅改写请求体里已经存在或由稳定重打创建的 ephemeral cache_control.ttl。
+              仅改写请求体里已经存在或由 messages 缓存断点策略创建的 ephemeral cache_control.ttl。
             </p>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
