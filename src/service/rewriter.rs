@@ -4,6 +4,7 @@ use rand::Rng;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use tracing::info;
 
 use crate::error::AppError;
@@ -390,8 +391,10 @@ impl CacheControlTtlRewrite {
 /// Claude Code messages 缓存断点改写模式。
 ///
 /// `Auto` 会使用无状态保守滚动策略,稳定 Claude Code cache prefix 后只在相对稳定的
-/// message 边界放置断点。`Rolling` 保留更积极的滚动策略,方便线上对照。旧设置值
-/// `stable` / `anchored` 会兼容解析到 `Auto`,避免历史配置继续进入已废弃的实验路径。
+/// message 边界放置断点。`Rolling` 保留更积极的滚动策略,方便线上对照。
+/// `Stateful` 在 `Auto` 基础上按会话保留上一轮实际发送的断点指纹,并避免异常暴涨
+/// 请求污染正常主线。旧设置值 `stable` / `anchored` 会兼容解析到 `Auto`,
+/// 避免历史配置继续进入已废弃的实验路径。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageCacheControlRewrite {
     /// 保持客户端原始 message cache_control。
@@ -401,6 +404,8 @@ pub enum MessageCacheControlRewrite {
     Auto,
     /// 更积极的滚动断点策略。
     Rolling,
+    /// 会话级防污染缓存断点策略。
+    Stateful,
 }
 
 impl MessageCacheControlRewrite {
@@ -413,8 +418,9 @@ impl MessageCacheControlRewrite {
             "off" => Ok(Self::Off),
             "auto" | "stable" | "anchored" => Ok(Self::Auto),
             "rolling" => Ok(Self::Rolling),
+            "stateful" => Ok(Self::Stateful),
             other => Err(AppError::BadRequest(format!(
-                "'message_cache_control_rewrite' 必须是 off、auto 或 rolling,当前值: {}",
+                "'message_cache_control_rewrite' 必须是 off、auto、rolling 或 stateful,当前值: {}",
                 other
             ))),
         }
@@ -422,14 +428,18 @@ impl MessageCacheControlRewrite {
 }
 
 /// 处理所有请求的反检测改写。
-pub struct Rewriter;
+pub struct Rewriter {
+    stateful_cache: Mutex<StatefulCacheStore>,
+}
 
 impl Rewriter {
     /// 创建请求体与请求头改写器。
     ///
     /// @return 请求体与请求头改写器实例。
     pub fn new() -> Self {
-        Self
+        Self {
+            stateful_cache: Mutex::new(StatefulCacheStore::default()),
+        }
     }
 
     // --- Header 改写 ---
@@ -1511,13 +1521,21 @@ fn strip_cache_control(body: &mut serde_json::Value) {
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// rolling 断点按 19 个真实 message content block 回退,贴近 Anthropic 20-block lookback。
 const CACHE_LOOKBACK_STRIDE: usize = 19;
+/// stateful 模式最多保留的会话数量,避免单进程长期运行时内存无界增长。
+const STATEFUL_CACHE_MAX_SESSIONS: usize = 512;
+/// 当前请求相比主线超过 3 倍时,视为可能的 Claude Code 内部暴涨请求。
+const STATEFUL_SPIKE_RATIO: usize = 3;
+/// 当前请求相比主线多出 128 个 block 以上时,才结合倍数判断为暴涨。
+const STATEFUL_SPIKE_ABSOLUTE_DELTA: usize = 128;
+/// 并发 sibling 与主线相差超过该值且无 anchor 命中时,不允许覆盖主线状态。
+const STATEFUL_PARALLEL_DELTA: usize = CACHE_LOOKBACK_STRIDE * 2;
 
 impl Rewriter {
     /// 按配置改写 Claude Code messages 缓存断点。
     fn rewrite_message_cache_control(
         &self,
         body: &mut serde_json::Value,
-        _account: &Account,
+        account: &Account,
         client_type: ClientType,
         mode: MessageCacheControlRewrite,
     ) {
@@ -1536,6 +1554,77 @@ impl Rewriter {
                 strip_rewritten_cache_control(body);
                 add_rolling_message_cache_control(body);
             }
+            MessageCacheControlRewrite::Stateful => {
+                stabilize_claude_code_cache_prefix(body);
+                strip_rewritten_cache_control(body);
+                self.add_stateful_message_cache_control(body, account);
+            }
+        }
+    }
+
+    /// 为同一 Claude Code 会话放置防污染缓存断点。
+    ///
+    /// 这里记录的是上一轮实际发送给上游的 message block 指纹。正常线性请求会优先
+    /// 复用这些断点,再补 bridge/tail；暴涨或并发异常请求只做临时选点,不覆盖主线。
+    fn add_stateful_message_cache_control(&self, body: &mut serde_json::Value, account: &Account) {
+        let session_key = stateful_session_key(account, body);
+        let profile = compute_stateful_request_profile(body);
+        let snapshot = session_key.as_ref().and_then(|key| {
+            self.stateful_cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.get(key))
+        });
+        let outcome = select_stateful_message_cache_control_positions(
+            body,
+            profile.clone(),
+            session_key.is_some(),
+            snapshot.as_ref(),
+        );
+
+        let selected_labels = outcome
+            .selected
+            .iter()
+            .map(|(message_idx, block_idx)| {
+                message_cache_control_position_log_label(body, *message_idx, *block_idx)
+            })
+            .collect::<Vec<_>>();
+        info!(
+            target: "cc2api::cache",
+            mode = "stateful",
+            session = session_key.as_deref().unwrap_or("missing"),
+            request_class = outcome.request_class.as_str(),
+            available_slots = outcome.available_slots,
+            block_count = outcome.message_content_blocks,
+            normal_block_count = outcome.normal_block_count.unwrap_or(0),
+            reused_count = outcome.reused_count,
+            selected_count = outcome.selected.len(),
+            promotion = outcome.promotion.as_str(),
+            selected = ?selected_labels,
+            skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
+            "stateful message cache_control 选点完成"
+        );
+
+        for (message_idx, block_idx) in &outcome.selected {
+            add_message_cache_control_at_block(body, *message_idx, *block_idx);
+        }
+
+        let Some(key) = session_key else {
+            return;
+        };
+        if !outcome.should_promote {
+            return;
+        }
+        let anchors = outcome
+            .selected
+            .iter()
+            .filter_map(|position| anchor_record_at(body, *position))
+            .collect::<Vec<_>>();
+        if anchors.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.stateful_cache.lock() {
+            cache.promote_if_current(key, profile, anchors, outcome.snapshot_generation);
         }
     }
 }
@@ -1880,6 +1969,200 @@ struct CacheBreakpointSelection {
     skip_reason: Option<String>,
 }
 
+/// stateful 会话缓存快照,用于锁外完成选点。
+#[derive(Clone)]
+struct StatefulCacheSnapshot {
+    normal_profile: StatefulRequestProfile,
+    normal_anchors: Vec<AnchorRecord>,
+    generation: u64,
+}
+
+/// 单个会话的正常主线缓存状态。
+#[derive(Clone)]
+struct SessionCacheState {
+    normal_profile: StatefulRequestProfile,
+    normal_anchors: Vec<AnchorRecord>,
+    generation: u64,
+}
+
+/// 需要持久到内存中的断点记录。
+#[derive(Clone)]
+struct AnchorRecord {
+    fingerprint: String,
+    message_idx: usize,
+    block_idx: usize,
+    block_type: String,
+}
+
+/// 当前请求的结构画像。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatefulRequestProfile {
+    block_count: usize,
+    message_count: usize,
+    tool_result_count: usize,
+    assistant_tool_use_count: usize,
+    last_user_text_hash: Option<String>,
+    tail_role_type: String,
+}
+
+/// stateful 请求分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatefulRequestClass {
+    NormalLinear,
+    TransientSpike,
+    ParallelSibling,
+    Unknown,
+}
+
+impl StatefulRequestClass {
+    /// 返回日志中使用的稳定分类名。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NormalLinear => "normal_linear",
+            Self::TransientSpike => "transient_spike",
+            Self::ParallelSibling => "parallel_sibling",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// stateful 主线状态更新决策。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatefulPromotion {
+    Updated,
+    IgnoredSpike,
+    IgnoredParallel,
+    MissingSession,
+    NoReusableAnchor,
+    ColdStart,
+}
+
+impl StatefulPromotion {
+    /// 返回日志中使用的稳定更新原因。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Updated => "updated",
+            Self::IgnoredSpike => "ignored_spike",
+            Self::IgnoredParallel => "ignored_parallel",
+            Self::MissingSession => "missing_session",
+            Self::NoReusableAnchor => "ignored_no_reuse",
+            Self::ColdStart => "cold_start",
+        }
+    }
+}
+
+/// stateful 断点选点结果。
+struct StatefulCacheBreakpointSelection {
+    selected: Vec<(usize, usize)>,
+    available_slots: usize,
+    message_content_blocks: usize,
+    normal_block_count: Option<usize>,
+    reused_count: usize,
+    request_class: StatefulRequestClass,
+    promotion: StatefulPromotion,
+    should_promote: bool,
+    snapshot_generation: Option<u64>,
+    skip_reason: Option<String>,
+}
+
+/// stateful 模式的内存会话断点缓存。
+#[derive(Default)]
+struct StatefulCacheStore {
+    order: Vec<String>,
+    sessions: HashMap<String, SessionCacheState>,
+}
+
+impl StatefulCacheStore {
+    /// 读取某个 session 的主线快照,并标记为最近使用。
+    ///
+    /// @param key 会话缓存 key。
+    /// @return 命中时返回可锁外使用的主线快照。
+    fn get(&mut self, key: &str) -> Option<StatefulCacheSnapshot> {
+        let state = self.sessions.get(key)?;
+        let snapshot = StatefulCacheSnapshot {
+            normal_profile: state.normal_profile.clone(),
+            normal_anchors: state.normal_anchors.clone(),
+            generation: state.generation,
+        };
+        self.touch(key);
+        Some(snapshot)
+    }
+
+    /// 在快照未被其它请求推进时更新主线状态。
+    ///
+    /// @param key 会话缓存 key。
+    /// @param profile 当前请求画像。
+    /// @param anchors 当前请求实际放置的断点记录。
+    /// @param expected_generation 选点时看到的 generation；冷启动为 `None`。
+    fn promote_if_current(
+        &mut self,
+        key: String,
+        profile: StatefulRequestProfile,
+        anchors: Vec<AnchorRecord>,
+        expected_generation: Option<u64>,
+    ) {
+        if let Some(existing) = self.sessions.get(&key) {
+            if let Some(expected) = expected_generation {
+                if existing.generation != expected {
+                    if profile.block_count < existing.normal_profile.block_count {
+                        return;
+                    }
+                    if !anchors_share_fingerprint(&anchors, &existing.normal_anchors) {
+                        return;
+                    }
+                    let class =
+                        classify_stateful_request(&profile, Some(&existing.normal_profile), 0);
+                    if class != StatefulRequestClass::NormalLinear {
+                        return;
+                    }
+                }
+            } else {
+                if profile.block_count < existing.normal_profile.block_count {
+                    return;
+                }
+                if is_stateful_transient_spike(&profile, &existing.normal_profile) {
+                    return;
+                }
+            }
+        }
+
+        let generation = self
+            .sessions
+            .get(&key)
+            .map(|state| state.generation.saturating_add(1))
+            .unwrap_or(1);
+        self.sessions.insert(
+            key.clone(),
+            SessionCacheState {
+                normal_profile: profile,
+                normal_anchors: anchors,
+                generation,
+            },
+        );
+        self.touch(&key);
+        while self.order.len() > STATEFUL_CACHE_MAX_SESSIONS {
+            let old = self.order.remove(0);
+            self.sessions.remove(&old);
+        }
+    }
+
+    /// 将 session key 移动到 LRU 队尾。
+    fn touch(&mut self, key: &str) {
+        self.order.retain(|item| item != key);
+        self.order.push(key.to_string());
+    }
+}
+
+/// 判断两个断点集合是否至少共享一个 block 指纹。
+fn anchors_share_fingerprint(left: &[AnchorRecord], right: &[AnchorRecord]) -> bool {
+    let right_fingerprints = right
+        .iter()
+        .map(|anchor| &anchor.fingerprint)
+        .collect::<HashSet<_>>();
+    left.iter()
+        .any(|anchor| right_fingerprints.contains(&anchor.fingerprint))
+}
+
 /// 计算自动缓存修复断点位置。
 fn select_auto_message_cache_control_positions(
     body: &serde_json::Value,
@@ -1892,6 +2175,418 @@ fn select_rolling_message_cache_control_positions(
     body: &serde_json::Value,
 ) -> CacheBreakpointSelection {
     select_message_cache_control_positions(body, CacheBreakpointMode::Rolling)
+}
+
+/// 计算 stateful 防污染缓存断点位置。
+fn select_stateful_message_cache_control_positions(
+    body: &serde_json::Value,
+    profile: StatefulRequestProfile,
+    has_session_key: bool,
+    snapshot: Option<&StatefulCacheSnapshot>,
+) -> StatefulCacheBreakpointSelection {
+    let base = select_auto_message_cache_control_positions(body);
+    let normal_block_count = snapshot.map(|state| state.normal_profile.block_count);
+    if base.selected.is_empty() {
+        return StatefulCacheBreakpointSelection {
+            selected: base.selected,
+            available_slots: base.available_slots,
+            message_content_blocks: base.message_content_blocks,
+            normal_block_count,
+            reused_count: 0,
+            request_class: StatefulRequestClass::Unknown,
+            promotion: if has_session_key {
+                StatefulPromotion::NoReusableAnchor
+            } else {
+                StatefulPromotion::MissingSession
+            },
+            should_promote: false,
+            snapshot_generation: snapshot.map(|state| state.generation),
+            skip_reason: base.skip_reason,
+        };
+    }
+
+    let Some(snapshot) = snapshot else {
+        return StatefulCacheBreakpointSelection {
+            selected: base.selected,
+            available_slots: base.available_slots,
+            message_content_blocks: base.message_content_blocks,
+            normal_block_count,
+            reused_count: 0,
+            request_class: StatefulRequestClass::Unknown,
+            promotion: if has_session_key {
+                StatefulPromotion::ColdStart
+            } else {
+                StatefulPromotion::MissingSession
+            },
+            should_promote: has_session_key,
+            snapshot_generation: None,
+            skip_reason: base.skip_reason,
+        };
+    };
+
+    let anchor_positions = find_stateful_anchor_positions(body, &snapshot.normal_anchors);
+    let request_class = classify_stateful_request(
+        &profile,
+        Some(&snapshot.normal_profile),
+        anchor_positions.len(),
+    );
+    if matches!(request_class, StatefulRequestClass::TransientSpike) {
+        return StatefulCacheBreakpointSelection {
+            selected: base.selected,
+            available_slots: base.available_slots,
+            message_content_blocks: base.message_content_blocks,
+            normal_block_count,
+            reused_count: anchor_positions.len(),
+            request_class,
+            promotion: StatefulPromotion::IgnoredSpike,
+            should_promote: false,
+            snapshot_generation: Some(snapshot.generation),
+            skip_reason: base.skip_reason,
+        };
+    }
+
+    if matches!(request_class, StatefulRequestClass::ParallelSibling) && anchor_positions.len() < 2
+    {
+        return StatefulCacheBreakpointSelection {
+            selected: base.selected,
+            available_slots: base.available_slots,
+            message_content_blocks: base.message_content_blocks,
+            normal_block_count,
+            reused_count: 0,
+            request_class,
+            promotion: StatefulPromotion::IgnoredParallel,
+            should_promote: false,
+            snapshot_generation: Some(snapshot.generation),
+            skip_reason: base.skip_reason,
+        };
+    }
+    if anchor_positions.is_empty() {
+        return StatefulCacheBreakpointSelection {
+            selected: base.selected,
+            available_slots: base.available_slots,
+            message_content_blocks: base.message_content_blocks,
+            normal_block_count,
+            reused_count: 0,
+            request_class,
+            promotion: StatefulPromotion::NoReusableAnchor,
+            should_promote: false,
+            snapshot_generation: Some(snapshot.generation),
+            skip_reason: base.skip_reason,
+        };
+    }
+
+    let selected = merge_stateful_anchor_and_auto_positions(
+        body,
+        anchor_positions,
+        base.selected,
+        base.available_slots,
+    );
+    let reused_count = count_stateful_reused_positions(body, &selected, &snapshot.normal_anchors);
+    let should_promote = has_session_key
+        && (reused_count > 0
+            || matches!(
+                request_class,
+                StatefulRequestClass::NormalLinear | StatefulRequestClass::Unknown
+            ));
+    let promotion = if should_promote {
+        StatefulPromotion::Updated
+    } else if has_session_key {
+        StatefulPromotion::NoReusableAnchor
+    } else {
+        StatefulPromotion::MissingSession
+    };
+
+    StatefulCacheBreakpointSelection {
+        selected,
+        available_slots: base.available_slots,
+        message_content_blocks: base.message_content_blocks,
+        normal_block_count,
+        reused_count,
+        request_class,
+        promotion,
+        should_promote,
+        snapshot_generation: Some(snapshot.generation),
+        skip_reason: base.skip_reason,
+    }
+}
+
+/// 计算当前请求的结构画像。
+fn compute_stateful_request_profile(body: &serde_json::Value) -> StatefulRequestProfile {
+    let messages = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let message_blocks = message_block_positions(body).unwrap_or_default();
+    let mut tool_result_count = 0;
+    let mut assistant_tool_use_count = 0;
+    let mut last_user_text_hash = None;
+    let mut tail_role_type = String::new();
+
+    for (message_idx, block_idx) in &message_blocks {
+        let Some(message) = messages.get(*message_idx) else {
+            continue;
+        };
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("");
+        let Some(block) = message
+            .get("content")
+            .and_then(|content| content.as_array())
+            .and_then(|content| content.get(*block_idx))
+        else {
+            continue;
+        };
+        let block_type = block_type_of(block).unwrap_or("unknown");
+        if role == "user" && block_type == "tool_result" {
+            tool_result_count += 1;
+        }
+        if role == "assistant" && block_type == "tool_use" {
+            assistant_tool_use_count += 1;
+        }
+        if role == "user" && block_type == "text" {
+            if let Some(text) = block.get("text").and_then(|text| text.as_str()) {
+                last_user_text_hash = Some(hash_text(text));
+            }
+        }
+        tail_role_type = format!("{role}:{block_type}");
+    }
+
+    StatefulRequestProfile {
+        block_count: message_blocks.len(),
+        message_count: messages.len(),
+        tool_result_count,
+        assistant_tool_use_count,
+        last_user_text_hash,
+        tail_role_type,
+    }
+}
+
+/// 判断当前请求相对主线属于哪类形态。
+fn classify_stateful_request(
+    profile: &StatefulRequestProfile,
+    normal: Option<&StatefulRequestProfile>,
+    reused_count: usize,
+) -> StatefulRequestClass {
+    let Some(normal) = normal else {
+        return StatefulRequestClass::Unknown;
+    };
+    if is_stateful_transient_spike(profile, normal) {
+        return StatefulRequestClass::TransientSpike;
+    }
+    let delta = profile.block_count.abs_diff(normal.block_count);
+    if delta > STATEFUL_PARALLEL_DELTA && reused_count < 2 {
+        return StatefulRequestClass::ParallelSibling;
+    }
+    StatefulRequestClass::NormalLinear
+}
+
+/// 判断当前请求是否明显是相对主线的暴涨请求。
+fn is_stateful_transient_spike(
+    profile: &StatefulRequestProfile,
+    normal: &StatefulRequestProfile,
+) -> bool {
+    profile.block_count > normal.block_count.saturating_mul(STATEFUL_SPIKE_RATIO)
+        && profile.block_count.saturating_sub(normal.block_count) > STATEFUL_SPIKE_ABSOLUTE_DELTA
+}
+
+/// 查找上一轮断点在当前请求中的位置。
+fn find_stateful_anchor_positions(
+    body: &serde_json::Value,
+    anchors: &[AnchorRecord],
+) -> Vec<(usize, usize)> {
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+    let message_blocks = message_block_positions(body).unwrap_or_default();
+    let position_by_fingerprint = message_cacheable_position_fingerprint_map(
+        body,
+        &message_blocks,
+        CacheBreakpointMode::Auto,
+    );
+    let mut positions = anchors
+        .iter()
+        .filter_map(|anchor| position_by_fingerprint.get(&anchor.fingerprint).copied())
+        .collect::<Vec<_>>();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+/// 合并复用锚点与当前 auto 选点。
+fn merge_stateful_anchor_and_auto_positions(
+    body: &serde_json::Value,
+    anchor_positions: Vec<(usize, usize)>,
+    auto_positions: Vec<(usize, usize)>,
+    available: usize,
+) -> Vec<(usize, usize)> {
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for position in anchor_positions.iter().rev().take(2).rev() {
+        push_unique_position(&mut selected, &mut seen, *position, available);
+    }
+    for position in auto_positions {
+        push_unique_position(&mut selected, &mut seen, position, available);
+    }
+    if selected.len() < available {
+        if let Some(boundary) =
+            claude_code_auto_injected_boundary_position(body, CacheBreakpointMode::Auto)
+        {
+            push_unique_position(&mut selected, &mut seen, boundary, available);
+        }
+    }
+    selected.sort_unstable();
+    selected
+}
+
+/// 统计本轮实际选中位置中复用了多少历史锚点。
+fn count_stateful_reused_positions(
+    body: &serde_json::Value,
+    selected: &[(usize, usize)],
+    anchors: &[AnchorRecord],
+) -> usize {
+    let anchor_fingerprints = anchors
+        .iter()
+        .map(|anchor| &anchor.fingerprint)
+        .collect::<HashSet<_>>();
+    selected
+        .iter()
+        .filter_map(|position| message_block_fingerprint_at(body, *position))
+        .filter(|fingerprint| anchor_fingerprints.contains(fingerprint))
+        .count()
+}
+
+/// 构建可缓存 message block 指纹到当前位置的映射。
+fn message_cacheable_position_fingerprint_map(
+    body: &serde_json::Value,
+    message_blocks: &[(usize, usize)],
+    mode: CacheBreakpointMode,
+) -> HashMap<String, (usize, usize)> {
+    let mut map = HashMap::new();
+    for position in message_blocks {
+        if !is_cacheable_message_block_at(body, *position, mode) {
+            continue;
+        }
+        if let Some(fingerprint) = message_block_fingerprint_at(body, *position) {
+            map.insert(fingerprint, *position);
+        }
+    }
+    map
+}
+
+/// 返回指定 message block 的稳定指纹。
+fn message_block_fingerprint_at(
+    body: &serde_json::Value,
+    position: (usize, usize),
+) -> Option<String> {
+    let messages = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())?;
+    let message = messages.get(position.0)?;
+    let role = message
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("");
+    let content = message
+        .get("content")
+        .and_then(|content| content.as_array())?;
+    let block = content.get(position.1)?;
+    let block_type = block_type_of(block).unwrap_or("unknown");
+    let prev_hash = neighbor_block_hash(content, position.1.checked_sub(1));
+    let next_hash = neighbor_block_hash(content, Some(position.1 + 1));
+    let payload = serde_json::json!({
+        "role": role,
+        "block_type": block_type,
+        "message_idx": position.0,
+        "block_idx": position.1,
+        "block_hash": stable_json_hash(block),
+        "prev_hash": prev_hash,
+        "next_hash": next_hash,
+    });
+    Some(stable_json_hash(&payload))
+}
+
+/// 构建当前断点的内存锚点记录。
+fn anchor_record_at(body: &serde_json::Value, position: (usize, usize)) -> Option<AnchorRecord> {
+    let fingerprint = message_block_fingerprint_at(body, position)?;
+    let block = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.get(position.0))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())
+        .and_then(|content| content.get(position.1))?;
+    Some(AnchorRecord {
+        fingerprint,
+        message_idx: position.0,
+        block_idx: position.1,
+        block_type: block_type_of(block).unwrap_or("unknown").to_string(),
+    })
+}
+
+/// 计算相邻块 hash,用于避免重复 block 被误匹配。
+fn neighbor_block_hash(content: &[serde_json::Value], index: Option<usize>) -> Option<String> {
+    let index = index?;
+    content.get(index).map(stable_json_hash)
+}
+
+/// 计算剥离 cache_control 后的 JSON hash。
+fn stable_json_hash(value: &serde_json::Value) -> String {
+    let mut stable = value.clone();
+    strip_cache_control_recursive(&mut stable);
+    let bytes = serde_json::to_vec(&stable).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// 递归剥离 `cache_control`,保证指纹不受本次改写影响。
+fn strip_cache_control_recursive(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("cache_control");
+            for child in map.values_mut() {
+                strip_cache_control_recursive(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                strip_cache_control_recursive(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 计算文本 hash。
+fn hash_text(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// 提取 stateful 会话缓存 key。
+fn stateful_session_key(account: &Account, body: &serde_json::Value) -> Option<String> {
+    let session_id = extract_claude_code_session_id(body)?;
+    Some(format!("{}:{}", account.id, session_id))
+}
+
+/// 从 Claude Code metadata.user_id 中提取 session_id。
+fn extract_claude_code_session_id(body: &serde_json::Value) -> Option<String> {
+    let user_id = body
+        .get("metadata")
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(|user_id| user_id.as_str())?;
+
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(user_id) {
+        if let Some(session_id) = parsed.get("session_id").and_then(|value| value.as_str()) {
+            if !session_id.is_empty() {
+                return Some(session_id.to_string());
+            }
+        }
+    }
+
+    user_id
+        .rfind("_session_")
+        .map(|idx| user_id[idx + 9..].to_string())
+        .filter(|session_id| !session_id.is_empty())
 }
 
 /// 缓存断点选点模式。
@@ -2154,10 +2849,7 @@ fn is_cacheable_message_block_at(
 }
 
 /// 判断指定 message content block 是否是 auto 模式优先选择的稳定边界。
-fn is_preferred_auto_message_block_at(
-    body: &serde_json::Value,
-    position: (usize, usize),
-) -> bool {
+fn is_preferred_auto_message_block_at(body: &serde_json::Value, position: (usize, usize)) -> bool {
     let Some(message) = body
         .get("messages")
         .and_then(|messages| messages.as_array())
@@ -2654,6 +3346,26 @@ mod tests {
         serde_json::from_slice(&out).unwrap()
     }
 
+    fn rewrite_messages_body_with_rewriter(
+        rewriter: &Rewriter,
+        body: serde_json::Value,
+        client_type: ClientType,
+        cache_ttl_rewrite: CacheControlTtlRewrite,
+        message_cache_rewrite: MessageCacheControlRewrite,
+    ) -> serde_json::Value {
+        let account = test_account();
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            client_type,
+            EnvPassthrough::default(),
+            cache_ttl_rewrite,
+            message_cache_rewrite,
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
     fn message_cache_control_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
         let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
             return Vec::new();
@@ -2671,6 +3383,65 @@ mod tests {
             }
         }
         positions
+    }
+
+    fn message_cache_fingerprints(body: &serde_json::Value) -> Vec<String> {
+        message_cache_control_positions(body)
+            .into_iter()
+            .filter_map(|position| super::message_block_fingerprint_at(body, position))
+            .collect()
+    }
+
+    fn stateful_session_body(session_id: &str, block_count: usize) -> serde_json::Value {
+        let messages: Vec<serde_json::Value> = (0..block_count)
+            .map(|idx| {
+                json!({
+                    "role": if idx % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{
+                        "type": "text",
+                        "text": format!("main-block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "device-1",
+                    "account_uuid": "account-uuid",
+                    "session_id": session_id
+                }).to_string()
+            },
+            "messages": messages
+        })
+    }
+
+    fn stateful_session_body_with_prefix(
+        session_id: &str,
+        block_count: usize,
+        prefix: &str,
+    ) -> serde_json::Value {
+        let messages: Vec<serde_json::Value> = (0..block_count)
+            .map(|idx| {
+                json!({
+                    "role": if idx % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{
+                        "type": "text",
+                        "text": format!("{}-block-{}", prefix, idx)
+                    }]
+                })
+            })
+            .collect();
+        json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "device-1",
+                    "account_uuid": "account-uuid",
+                    "session_id": session_id
+                }).to_string()
+            },
+            "messages": messages
+        })
     }
 
     #[test]
@@ -2713,6 +3484,10 @@ mod tests {
         assert_eq!(
             MessageCacheControlRewrite::parse("rolling").unwrap(),
             MessageCacheControlRewrite::Rolling
+        );
+        assert_eq!(
+            MessageCacheControlRewrite::parse("stateful").unwrap(),
+            MessageCacheControlRewrite::Stateful
         );
         assert_eq!(
             MessageCacheControlRewrite::parse("anchored").unwrap(),
@@ -3960,10 +4735,7 @@ mod tests {
             parsed["messages"][1]["content"][1]["tool_use_id"],
             json!("toolu_b")
         );
-        assert_eq!(
-            message_cache_control_positions(&parsed),
-            vec![(1, 1)]
-        );
+        assert_eq!(message_cache_control_positions(&parsed), vec![(1, 1)]);
         assert!(parsed["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
@@ -4060,6 +4832,257 @@ mod tests {
                 json!("5m")
             );
         }
+    }
+
+    #[test]
+    fn message_cache_control_stateful_reuses_previous_normal_anchors() {
+        let rewriter = Rewriter::new();
+        let first = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-reuse", 60),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let first_fingerprints = message_cache_fingerprints(&first);
+
+        let second = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-reuse", 63),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let second_fingerprints = message_cache_fingerprints(&second);
+        let reused = second_fingerprints
+            .iter()
+            .filter(|fingerprint| first_fingerprints.contains(fingerprint))
+            .count();
+
+        assert!(reused >= 2);
+        assert_eq!(message_cache_control_positions(&second).len(), 4);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_spike_does_not_pollute_normal_anchors() {
+        let rewriter = Rewriter::new();
+        let first = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-spike", 76),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let first_fingerprints = message_cache_fingerprints(&first);
+
+        let spike = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-spike", 567),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        assert_eq!(message_cache_control_positions(&spike).len(), 4);
+
+        let recovered = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-spike", 78),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let recovered_fingerprints = message_cache_fingerprints(&recovered);
+        let reused = recovered_fingerprints
+            .iter()
+            .filter(|fingerprint| first_fingerprints.contains(fingerprint))
+            .count();
+
+        assert!(reused >= 2);
+        assert_eq!(message_cache_control_positions(&recovered).len(), 4);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_parallel_sibling_without_anchor_does_not_overwrite() {
+        let rewriter = Rewriter::new();
+        let normal = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-parallel", 80),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let normal_fingerprints = message_cache_fingerprints(&normal);
+
+        let divergent = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-parallel", 30),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        assert!(!message_cache_control_positions(&divergent).is_empty());
+
+        let resumed = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-parallel", 82),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let resumed_fingerprints = message_cache_fingerprints(&resumed);
+        let reused = resumed_fingerprints
+            .iter()
+            .filter(|fingerprint| normal_fingerprints.contains(fingerprint))
+            .count();
+
+        assert!(reused >= 2);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_miss_does_not_replace_existing_normal_anchors() {
+        let rewriter = Rewriter::new();
+        let normal = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body_with_prefix("session-miss", 80, "normal"),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let normal_fingerprints = message_cache_fingerprints(&normal);
+
+        let miss = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body_with_prefix("session-miss", 80, "different"),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        assert!(!message_cache_control_positions(&miss).is_empty());
+
+        let resumed = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body_with_prefix("session-miss", 82, "normal"),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let resumed_fingerprints = message_cache_fingerprints(&resumed);
+        let reused = resumed_fingerprints
+            .iter()
+            .filter(|fingerprint| normal_fingerprints.contains(fingerprint))
+            .count();
+
+        assert!(reused >= 2);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_stale_generation_without_shared_anchor_is_rejected() {
+        let key = "1:session-stale".to_string();
+        let first_body = stateful_session_body_with_prefix("session-stale", 80, "first");
+        let second_body = stateful_session_body_with_prefix("session-stale", 82, "second");
+        let stale_body = stateful_session_body_with_prefix("session-stale", 81, "stale");
+        let first_profile = super::compute_stateful_request_profile(&first_body);
+        let second_profile = super::compute_stateful_request_profile(&second_body);
+        let stale_profile = super::compute_stateful_request_profile(&stale_body);
+        let first_anchors = super::select_auto_message_cache_control_positions(&first_body)
+            .selected
+            .iter()
+            .filter_map(|position| super::anchor_record_at(&first_body, *position))
+            .collect::<Vec<_>>();
+        let second_anchors = super::select_auto_message_cache_control_positions(&second_body)
+            .selected
+            .iter()
+            .filter_map(|position| super::anchor_record_at(&second_body, *position))
+            .collect::<Vec<_>>();
+        let stale_anchors = super::select_auto_message_cache_control_positions(&stale_body)
+            .selected
+            .iter()
+            .filter_map(|position| super::anchor_record_at(&stale_body, *position))
+            .collect::<Vec<_>>();
+        let mut store = super::StatefulCacheStore::default();
+
+        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None);
+        store.promote_if_current(key.clone(), second_profile, second_anchors, Some(1));
+        store.promote_if_current(key.clone(), stale_profile, stale_anchors, Some(1));
+
+        let snapshot = store.get(&key).expect("snapshot");
+        assert_eq!(snapshot.normal_profile.block_count, 82);
+        assert!(
+            super::anchors_share_fingerprint(&snapshot.normal_anchors, &first_anchors) == false
+        );
+    }
+
+    #[test]
+    fn message_cache_control_stateful_duplicate_blocks_require_context_match() {
+        let first = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "before-a" },
+                    { "type": "text", "text": "same" },
+                    { "type": "text", "text": "after-a" },
+                    { "type": "text", "text": "same" },
+                    { "type": "text", "text": "after-b" }
+                ]
+            }]
+        });
+        let second = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "before-a" },
+                    { "type": "text", "text": "same" },
+                    { "type": "text", "text": "after-a" },
+                    { "type": "text", "text": "inserted" },
+                    { "type": "text", "text": "same" },
+                    { "type": "text", "text": "after-b" }
+                ]
+            }]
+        });
+        let anchor = super::anchor_record_at(&first, (0, 3)).expect("anchor");
+        let positions = super::find_stateful_anchor_positions(&second, &[anchor]);
+
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn message_cache_control_stateful_ttl_rewrite_updates_created_breakpoints() {
+        let parsed = rewrite_messages_body_with_modes(
+            stateful_session_body("session-ttl", 22),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Stateful,
+        );
+
+        for (message_idx, block_idx) in message_cache_control_positions(&parsed) {
+            assert_eq!(
+                parsed["messages"][message_idx]["content"][block_idx]["cache_control"]["ttl"],
+                json!("5m")
+            );
+        }
+    }
+
+    #[test]
+    fn message_cache_control_stateful_is_ignored_for_api_mode() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "u1",
+                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                    }]
+                }]
+            }),
+            ClientType::API,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+
+        assert!(parsed["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -4952,6 +5975,54 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
             MessageCacheControlRewrite::Auto,
+        );
+        let text = String::from_utf8(out.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert!(!text.contains("cch=12345"));
+        assert!(!text.contains("cch=00000"));
+        assert_eq!(message_cache_control_positions(&parsed).len(), 4);
+
+        let actual = super::CCH_VALUE_REGEX
+            .find(&text)
+            .map(|m| m.as_str().to_string())
+            .expect("cch value exists");
+        let mut placeholder_body = out;
+        let cch_pos = placeholder_body
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        let expected = String::from_utf8(compute_cch_attestation(
+            placeholder_body,
+            DEFAULT_CLAUDE_CODE_VERSION,
+        ))
+        .unwrap();
+
+        assert!(expected.contains(&actual));
+    }
+
+    #[test]
+    fn message_cache_control_stateful_recomputes_cch_after_final_body_changes() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut body = stateful_session_body("session-cch", 60);
+        body.as_object_mut().unwrap().insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
+            }]),
+        );
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Stateful,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
