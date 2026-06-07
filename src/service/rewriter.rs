@@ -1591,6 +1591,9 @@ impl Rewriter {
                 message_cache_control_position_log_label(body, *message_idx, *block_idx)
             })
             .collect::<Vec<_>>();
+        let selected_diagnostics =
+            stateful_selected_cache_diagnostics(body, &outcome, snapshot.as_ref());
+        let prefix_diagnostics = cache_prefix_diagnostics(body);
         info!(
             target: "cc2api::cache",
             mode = "stateful",
@@ -1603,6 +1606,8 @@ impl Rewriter {
             selected_count = outcome.selected.len(),
             promotion = outcome.promotion.as_str(),
             selected = ?selected_labels,
+            selected_diag = ?selected_diagnostics,
+            prefix_diag = ?prefix_diagnostics,
             skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
             "stateful message cache_control 选点完成"
         );
@@ -2069,6 +2074,24 @@ struct StatefulCacheBreakpointSelection {
     skip_reason: Option<String>,
 }
 
+/// 单个 stateful 断点的 hash 诊断信息。
+#[derive(Debug, PartialEq, Eq)]
+struct StatefulSelectedCacheDiagnostic {
+    label: String,
+    source: &'static str,
+    block_hash: String,
+    prefix_hash: String,
+}
+
+/// cache prefix 的分段 hash 诊断信息。
+#[derive(Debug, PartialEq, Eq)]
+struct CachePrefixDiagnostics {
+    root_hash: String,
+    system_hash: String,
+    tools_hash: String,
+    messages_hash: String,
+}
+
 /// stateful 模式的内存会话断点缓存。
 #[derive(Default)]
 struct StatefulCacheStore {
@@ -2484,6 +2507,98 @@ fn count_stateful_reused_positions(
         .filter_map(|position| message_block_fingerprint_at(body, *position))
         .filter(|fingerprint| anchor_fingerprints.contains(fingerprint))
         .count()
+}
+
+/// 构造 stateful 选点诊断信息,只记录 hash 和结构标签,不记录 prompt 原文。
+fn stateful_selected_cache_diagnostics(
+    body: &serde_json::Value,
+    outcome: &StatefulCacheBreakpointSelection,
+    snapshot: Option<&StatefulCacheSnapshot>,
+) -> Vec<StatefulSelectedCacheDiagnostic> {
+    let anchor_fingerprints = snapshot
+        .map(|snapshot| {
+            snapshot
+                .normal_anchors
+                .iter()
+                .map(|anchor| anchor.fingerprint.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    outcome
+        .selected
+        .iter()
+        .map(|position| {
+            let block_hash =
+                message_block_fingerprint_at(body, *position).unwrap_or_else(|| "missing".into());
+            let prefix_hash =
+                message_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into());
+            let source = if anchor_fingerprints.contains(block_hash.as_str()) {
+                "reused_anchor"
+            } else if matches!(outcome.promotion, StatefulPromotion::BootstrapUpdated) {
+                "bootstrap"
+            } else {
+                "auto"
+            };
+            StatefulSelectedCacheDiagnostic {
+                label: message_cache_control_position_log_label(body, position.0, position.1),
+                source,
+                block_hash: short_hash(&block_hash),
+                prefix_hash: short_hash(&prefix_hash),
+            }
+        })
+        .collect()
+}
+
+/// 构造请求主要前缀段的 hash 诊断信息。
+fn cache_prefix_diagnostics(body: &serde_json::Value) -> CachePrefixDiagnostics {
+    CachePrefixDiagnostics {
+        root_hash: short_hash(&body_root_without_messages_hash(body)),
+        system_hash: short_hash(&stable_json_hash(
+            body.get("system").unwrap_or(&serde_json::Value::Null),
+        )),
+        tools_hash: short_hash(&stable_json_hash(
+            body.get("tools").unwrap_or(&serde_json::Value::Null),
+        )),
+        messages_hash: short_hash(&stable_json_hash(
+            body.get("messages").unwrap_or(&serde_json::Value::Null),
+        )),
+    }
+}
+
+/// 计算指定 message block 之前完整请求前缀的 hash。
+fn message_prefix_hash_at(body: &serde_json::Value, position: (usize, usize)) -> Option<String> {
+    let mut prefix = body.clone();
+    let messages = prefix
+        .get_mut("messages")
+        .and_then(|value| value.as_array_mut())?;
+    if position.0 >= messages.len() {
+        return None;
+    }
+    messages.truncate(position.0 + 1);
+    let message = messages.get_mut(position.0)?;
+    let content = message
+        .get_mut("content")
+        .and_then(|value| value.as_array_mut())?;
+    if position.1 >= content.len() {
+        return None;
+    }
+    content.truncate(position.1 + 1);
+    Some(stable_json_hash(&prefix))
+}
+
+/// 计算不含 messages 的请求根级 hash。
+fn body_root_without_messages_hash(body: &serde_json::Value) -> String {
+    let mut root = body.clone();
+    if let Some(map) = root.as_object_mut() {
+        map.remove("messages");
+    }
+    stable_json_hash(&root)
+}
+
+/// 缩短 hash 便于日志横向比较。
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 /// 构建可缓存 message block 指纹到当前位置的映射。
@@ -5114,6 +5229,90 @@ mod tests {
         let positions = super::find_stateful_anchor_positions(&second, &[anchor]);
 
         assert_eq!(positions, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_diagnostics_use_hashes_without_prompt_text() {
+        let body = json!({
+            "system": [{
+                "type": "text",
+                "text": "secret-system-text"
+            }],
+            "tools": [{
+                "name": "Read",
+                "description": "secret-tool-text"
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "secret-user-text" },
+                    { "type": "text", "text": "secret-next-text" }
+                ]
+            }]
+        });
+        let outcome = super::StatefulCacheBreakpointSelection {
+            selected: vec![(0, 0)],
+            available_slots: 4,
+            message_content_blocks: 2,
+            normal_block_count: None,
+            reused_count: 0,
+            request_class: super::StatefulRequestClass::Unknown,
+            promotion: super::StatefulPromotion::ColdStart,
+            should_promote: true,
+            snapshot_generation: None,
+            skip_reason: None,
+        };
+
+        let selected = super::stateful_selected_cache_diagnostics(&body, &outcome, None);
+        let prefix = super::cache_prefix_diagnostics(&body);
+        let rendered = format!("{selected:?} {prefix:?}");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].source, "auto");
+        assert!(!rendered.contains("secret-system-text"));
+        assert!(!rendered.contains("secret-tool-text"));
+        assert!(!rendered.contains("secret-user-text"));
+        assert!(!rendered.contains("secret-next-text"));
+        assert_eq!(selected[0].block_hash.len(), 12);
+        assert_eq!(selected[0].prefix_hash.len(), 12);
+        assert_eq!(prefix.root_hash.len(), 12);
+        assert_eq!(prefix.system_hash.len(), 12);
+        assert_eq!(prefix.tools_hash.len(), 12);
+        assert_eq!(prefix.messages_hash.len(), 12);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_prefix_hash_changes_when_prefix_changes() {
+        let first = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "same" }
+                ]
+            }]
+        });
+        let second = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "same" },
+                    { "type": "text", "text": "next" }
+                ]
+            }]
+        });
+
+        assert_eq!(
+            super::message_block_fingerprint_at(&first, (0, 0)),
+            super::message_block_fingerprint_at(&second, (0, 0))
+        );
+        assert_eq!(
+            super::message_prefix_hash_at(&first, (0, 0)),
+            super::message_prefix_hash_at(&second, (0, 0))
+        );
+        assert_ne!(
+            super::message_prefix_hash_at(&first, (0, 0)),
+            super::message_prefix_hash_at(&second, (0, 1))
+        );
     }
 
     #[test]
