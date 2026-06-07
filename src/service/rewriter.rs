@@ -1501,8 +1501,8 @@ fn strip_cache_control(body: &mut serde_json::Value) {
 
 /// Anthropic 单个请求允许的 cache_control 断点数量上限。
 const MAX_CACHE_BREAKPOINTS: usize = 4;
-/// Anthropic 每个断点最多回看 20 个 block,断点自身占 1 个位置。
-const CACHE_LOOKBACK_STRIDE: usize = 19;
+/// rolling 断点按 10 个真实 message content block 回退,给 Anthropic 20-block lookback 留余量。
+const CACHE_LOOKBACK_STRIDE: usize = 10;
 
 /// 按配置改写 Claude Code messages 缓存断点。
 fn rewrite_message_cache_control(
@@ -1521,10 +1521,36 @@ fn rewrite_message_cache_control(
         }
         MessageCacheControlRewrite::Rolling => {
             stabilize_claude_code_cache_prefix(body);
-            strip_message_cache_control(body);
+            strip_rolling_cache_control(body);
             add_rolling_message_cache_control(body);
         }
     }
+}
+
+/// 移除 rolling 模式要重新接管的所有缓存断点。
+///
+/// rolling 的目标是把 4 个 breakpoint 预算尽量用于 message history。top-level
+/// automatic caching 与 system/tools 显式断点都会占用 slot,会让并行 tool 的尾部
+/// 历史只剩 1-2 个断点,无法覆盖真实 20-block lookback。
+fn strip_rolling_cache_control(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("cache_control");
+    }
+    if let Some(sys) = body.get_mut("system").and_then(|s| s.as_array_mut()) {
+        for item in sys.iter_mut() {
+            if let Some(block) = item.as_object_mut() {
+                block.remove("cache_control");
+            }
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(block) = tool.as_object_mut() {
+                block.remove("cache_control");
+            }
+        }
+    }
+    strip_message_cache_control(body);
 }
 
 /// 移除 messages 内容块中的 cache_control,不影响 system/tools 断点。
@@ -1551,6 +1577,7 @@ fn strip_message_cache_control(body: &mut serde_json::Value) {
 fn stabilize_claude_code_cache_prefix(body: &mut serde_json::Value) {
     sort_tools_by_name(body);
     sort_auto_injected_text_lists(body);
+    sort_parallel_tool_blocks(body);
 }
 
 /// 将 `tools[]` 按工具名排序,保持每个工具对象内容不变。
@@ -1621,6 +1648,90 @@ fn sort_auto_injected_text_block(block: &mut serde_json::Value) {
     if let Some(sorted) = sorted {
         obj.insert("text".into(), serde_json::Value::String(sorted));
     }
+}
+
+/// 稳定化同一批并行 tool_use / tool_result 的块顺序。
+///
+/// Claude Code 并行工具返回顺序可能随实际完成时间抖动。这里只排序连续的同类块,
+/// 不跨过 text/thinking 等语义边界,避免改变对话结构。
+fn sort_parallel_tool_blocks(body: &mut serde_json::Value) {
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(|messages| messages.as_array_mut())
+    else {
+        return;
+    };
+
+    for message in messages.iter_mut() {
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(content) = message
+            .get_mut("content")
+            .and_then(|content| content.as_array_mut())
+        else {
+            continue;
+        };
+        match role.as_str() {
+            "assistant" => sort_contiguous_blocks_by_key(content, "tool_use", tool_use_sort_key),
+            "user" => sort_contiguous_blocks_by_key(content, "tool_result", tool_result_sort_key),
+            _ => {}
+        }
+    }
+}
+
+/// 对连续同类 block 片段排序,其他 block 保持原位。
+fn sort_contiguous_blocks_by_key<F>(blocks: &mut [serde_json::Value], block_type: &str, key_fn: F)
+where
+    F: Fn(&serde_json::Value) -> String,
+{
+    let mut start = 0;
+    while start < blocks.len() {
+        while start < blocks.len() && block_type_of(&blocks[start]) != Some(block_type) {
+            start += 1;
+        }
+        let mut end = start;
+        while end < blocks.len() && block_type_of(&blocks[end]) == Some(block_type) {
+            end += 1;
+        }
+        if end.saturating_sub(start) > 1 {
+            blocks[start..end].sort_by_key(|block| key_fn(block));
+        }
+        start = end;
+    }
+}
+
+/// 返回 content block 的类型。
+fn block_type_of(block: &serde_json::Value) -> Option<&str> {
+    block.get("type").and_then(|value| value.as_str())
+}
+
+/// 构造 tool_use 稳定排序键。
+fn tool_use_sort_key(block: &serde_json::Value) -> String {
+    let id = block
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let name = block
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let input = block
+        .get("input")
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    format!("{id}\u{0}{name}\u{0}{input}")
+}
+
+/// 构造 tool_result 稳定排序键。
+fn tool_result_sort_key(block: &serde_json::Value) -> String {
+    block
+        .get("tool_use_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 判断文本是否是 Claude Code skills 列表。
@@ -1740,8 +1851,7 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
         return;
     }
 
-    let positions = cacheable_message_block_positions(body);
-    if positions.is_empty() {
+    let Some(message_blocks) = message_block_positions(body) else {
         info!(
             target: "cc2api::cache",
             non_message_breakpoints,
@@ -1749,16 +1859,55 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
             "rolling message cache_control 跳过: messages 中没有可缓存 block"
         );
         return;
+    };
+    if message_blocks.is_empty() {
+        info!(
+            target: "cc2api::cache",
+            non_message_breakpoints,
+            available_slots = available,
+            "rolling message cache_control 跳过: messages 中没有 content block"
+        );
+        return;
     }
 
-    let mut selected = Vec::new();
-    let mut idx = positions.len() - 1;
-    while selected.len() < available {
-        selected.push(positions[idx]);
-        if idx < CACHE_LOOKBACK_STRIDE {
+    let Some((tail_idx, tail_position)) = (0..message_blocks.len()).rev().find_map(|idx| {
+        let position = message_blocks[idx];
+        if is_cacheable_message_block_at(body, position) {
+            Some((idx, position))
+        } else {
+            None
+        }
+    }) else {
+        info!(
+            target: "cc2api::cache",
+            non_message_breakpoints,
+            available_slots = available,
+            message_content_blocks = message_blocks.len(),
+            "rolling message cache_control 跳过: messages 中没有可放置断点的 block"
+        );
+        return;
+    };
+
+    let mut selected = vec![tail_position];
+    let mut cursor = tail_idx;
+    while selected.len() < available && cursor > 0 {
+        let window_start = cursor.saturating_sub(CACHE_LOOKBACK_STRIDE);
+        if let Some((position_idx, position)) = (window_start..cursor).find_map(|idx| {
+            let position = message_blocks[idx];
+            if is_cacheable_message_block_at(body, position) {
+                Some((idx, position))
+            } else {
+                None
+            }
+        }) {
+            selected.push(position);
+            cursor = position_idx;
+            continue;
+        }
+        if window_start == 0 {
             break;
         }
-        idx -= CACHE_LOOKBACK_STRIDE;
+        cursor = window_start;
     }
 
     if selected.len() < available {
@@ -1779,7 +1928,7 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
         target: "cc2api::cache",
         non_message_breakpoints,
         available_slots = available,
-        cacheable_message_blocks = positions.len(),
+        message_content_blocks = message_blocks.len(),
         selected_count = selected.len(),
         selected = ?selected_labels,
         "rolling message cache_control 选点完成"
@@ -1857,25 +2006,43 @@ fn count_non_message_cache_breakpoints(body: &serde_json::Value) -> usize {
     count
 }
 
-/// 按请求原始顺序收集可直接放置 message cache_control 的顶层 block 位置。
-fn cacheable_message_block_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
-    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
-        return Vec::new();
-    };
+/// 按请求原始顺序收集 message 顶层 content block 位置。
+fn message_block_positions(body: &serde_json::Value) -> Option<Vec<(usize, usize)>> {
+    let messages = body.get("messages").and_then(|m| m.as_array())?;
 
     let mut positions = Vec::new();
     for (message_idx, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(|role| role.as_str()).unwrap_or("");
         let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
             continue;
         };
-        for (block_idx, block) in content.iter().enumerate() {
-            if is_cacheable_message_block(role, block) {
-                positions.push((message_idx, block_idx));
-            }
+        for block_idx in 0..content.len() {
+            positions.push((message_idx, block_idx));
         }
     }
-    positions
+    Some(positions)
+}
+
+/// 判断指定 message content block 是否可以直接放置 cache_control。
+fn is_cacheable_message_block_at(body: &serde_json::Value, position: (usize, usize)) -> bool {
+    let Some(message) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.get(position.0))
+    else {
+        return false;
+    };
+    let role = message
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("");
+    let Some(block) = message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|content| content.get(position.1))
+    else {
+        return false;
+    };
+    is_cacheable_message_block(role, block)
 }
 
 /// 返回 Claude Code 自动注入块末尾的位置。
@@ -1995,18 +2162,14 @@ fn is_cacheable_message_block(role: &str, block: &serde_json::Value) -> bool {
         return false;
     };
     let block_type = block.get("type").and_then(|t| t.as_str());
-    if matches!(
-        block_type,
-        Some("thinking" | "redacted_thinking" | "tool_use")
-    ) {
+    if matches!(block_type, Some("thinking" | "redacted_thinking")) {
         return false;
     }
 
     match role {
-        // assistant 侧只把自然语言输出作为稳定断点,避免落在 tool 调度结构上。
-        "assistant" => block_type == Some("text"),
-        // user 侧保留 Claude Code 原本常用的 text/tool_result 等内容块边界。
-        "user" => true,
+        // Anthropic 文档允许 text/tool_use/tool_result 作为缓存断点；thinking 只能随前缀被缓存。
+        "assistant" => matches!(block_type, Some("text" | "tool_use")),
+        "user" => matches!(block_type, Some("text" | "tool_result")),
         _ => false,
     }
 }
@@ -2710,14 +2873,14 @@ mod tests {
 
         let positions = message_cache_control_positions(&parsed);
 
-        assert_eq!(positions, vec![(6, 0), (25, 0), (44, 0)]);
+        assert_eq!(positions, vec![(14, 0), (24, 0), (34, 0), (44, 0)]);
         for pair in positions.windows(2) {
-            assert!(pair[1].0 - pair[0].0 <= 20);
+            assert!(pair[1].0 - pair[0].0 <= 10);
         }
     }
 
     #[test]
-    fn message_cache_control_rolling_respects_non_message_breakpoint_slots() {
+    fn message_cache_control_rolling_takes_over_non_message_breakpoint_slots() {
         let messages: Vec<serde_json::Value> = (0..60)
             .map(|idx| {
                 json!({
@@ -2751,15 +2914,15 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(40, 0), (59, 0)]
+            vec![(29, 0), (39, 0), (49, 0), (59, 0)]
         );
-        assert!(parsed["cache_control"].is_object());
-        assert!(parsed["system"][0]["cache_control"].is_object());
-        assert!(parsed["tools"][0]["cache_control"].is_object());
+        assert!(parsed.get("cache_control").is_none());
+        assert!(parsed["system"][0].get("cache_control").is_none());
+        assert!(parsed["tools"][0].get("cache_control").is_none());
     }
 
     #[test]
-    fn message_cache_control_rolling_adds_no_message_breakpoint_when_slots_are_full() {
+    fn message_cache_control_rolling_clears_full_non_message_breakpoint_slots() {
         let messages: Vec<serde_json::Value> = (0..60)
             .map(|idx| {
                 json!({
@@ -2804,12 +2967,15 @@ mod tests {
             MessageCacheControlRewrite::Rolling,
         );
 
-        assert!(message_cache_control_positions(&parsed).is_empty());
-        assert!(parsed["cache_control"].is_object());
-        assert!(parsed["system"][0]["cache_control"].is_object());
-        assert!(parsed["system"][1]["cache_control"].is_object());
-        assert!(parsed["system"][2]["cache_control"].is_object());
-        assert!(parsed["tools"][0]["cache_control"].is_object());
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(29, 0), (39, 0), (49, 0), (59, 0)]
+        );
+        assert!(parsed.get("cache_control").is_none());
+        assert!(parsed["system"][0].get("cache_control").is_none());
+        assert!(parsed["system"][1].get("cache_control").is_none());
+        assert!(parsed["system"][2].get("cache_control").is_none());
+        assert!(parsed["tools"][0].get("cache_control").is_none());
     }
 
     #[test]
@@ -2835,8 +3001,11 @@ mod tests {
             MessageCacheControlRewrite::Rolling,
         );
 
-        assert_eq!(message_cache_control_positions(&parsed), vec![(5, 0)]);
-        assert!(parsed["cache_control"].is_object());
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (5, 0)]
+        );
+        assert!(parsed.get("cache_control").is_none());
     }
 
     #[test]
@@ -2868,7 +3037,7 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 1), (0, 2)]
+            vec![(0, 0), (0, 1), (0, 2)]
         );
     }
 
@@ -3026,7 +3195,7 @@ mod tests {
         );
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 1), (0, 2)]
+            vec![(0, 0), (0, 1), (0, 2)]
         );
     }
 
@@ -3103,7 +3272,7 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(40, 0), (59, 0)]
+            vec![(29, 0), (39, 0), (49, 0), (59, 0)]
         );
         assert!(parsed["messages"][0]["content"][0]
             .get("cache_control")
@@ -3143,7 +3312,7 @@ mod tests {
     }
 
     #[test]
-    fn message_cache_control_rolling_skips_assistant_tool_use_breakpoints() {
+    fn message_cache_control_rolling_allows_tool_use_and_tool_result_breakpoints() {
         let parsed = rewrite_messages_body_with_modes(
             json!({
                 "system": [{
@@ -3209,54 +3378,48 @@ mod tests {
             MessageCacheControlRewrite::Rolling,
         );
 
-        assert_eq!(message_cache_control_positions(&parsed), vec![(2, 0)]);
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (3, 1)]
+        );
         assert!(parsed["messages"][1]["content"][1]
             .get("cache_control")
             .is_none());
         assert!(parsed["messages"][3]["content"][1]
             .get("cache_control")
-            .is_none());
+            .is_some());
     }
 
     #[test]
-    fn message_cache_control_rolling_skips_assistant_tool_use_when_stepping_back() {
-        let mut messages: Vec<serde_json::Value> = (0..22)
-            .map(|idx| {
-                json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": format!("block-{}", idx)
-                    }]
-                })
-            })
-            .collect();
-        messages.insert(
-            3,
-            json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "toolu_mid",
-                    "name": "Read",
-                    "input": { "file_path": "/tmp/mid" }
-                }]
-            }),
-        );
+    fn message_cache_control_rolling_counts_uncacheable_blocks_for_lookback() {
+        let mut blocks = Vec::new();
+        blocks.push(json!({
+            "type": "text",
+            "text": "anchor"
+        }));
+        for idx in 0..18 {
+            blocks.push(json!({
+                "type": "thinking",
+                "thinking": format!("thinking-{}", idx)
+            }));
+        }
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": "toolu_tail",
+            "name": "Read",
+            "input": { "file_path": "/tmp/tail" }
+        }));
+        blocks.push(json!({
+            "type": "text",
+            "text": "tail"
+        }));
 
         let parsed = rewrite_messages_body_with_modes(
             json!({
-                "system": [{
-                    "type": "text",
-                    "text": "sys",
-                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
-                }],
-                "tools": [{
-                    "name": "Read",
-                    "input_schema": {},
-                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
-                }],
-                "messages": messages
+                "messages": [{
+                    "role": "assistant",
+                    "content": blocks
+                }]
             }),
             ClientType::ClaudeCode,
             CacheControlTtlRewrite::Off,
@@ -3265,11 +3428,71 @@ mod tests {
 
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(2, 0), (22, 0)]
+            vec![(0, 0), (0, 19), (0, 20)]
         );
-        assert!(parsed["messages"][3]["content"][0]
+        assert!(parsed["messages"][0]["content"][18]
             .get("cache_control")
             .is_none());
+    }
+
+    #[test]
+    fn message_cache_control_rolling_stabilizes_adjacent_tool_use_and_results() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_b",
+                                "name": "Bash",
+                                "input": { "command": "pwd" }
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_a",
+                                "name": "Read",
+                                "input": { "file_path": "/tmp/a" }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_b",
+                                "content": "b"
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_a",
+                                "content": "a"
+                            }
+                        ]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(parsed["messages"][0]["content"][0]["id"], json!("toolu_a"));
+        assert_eq!(parsed["messages"][0]["content"][1]["id"], json!("toolu_b"));
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["tool_use_id"],
+            json!("toolu_a")
+        );
+        assert_eq!(
+            parsed["messages"][1]["content"][1]["tool_use_id"],
+            json!("toolu_b")
+        );
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 0), (1, 1)]
+        );
     }
 
     #[test]
@@ -4198,7 +4421,7 @@ mod tests {
 
         assert!(!text.contains("cch=12345"));
         assert!(!text.contains("cch=00000"));
-        assert_eq!(message_cache_control_positions(&parsed).len(), 2);
+        assert_eq!(message_cache_control_positions(&parsed).len(), 4);
 
         let actual = super::CCH_VALUE_REGEX
             .find(&text)
