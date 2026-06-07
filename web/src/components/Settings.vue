@@ -46,7 +46,7 @@ const passthroughWorkingDir = ref(true);
 const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 
 /** Claude Code messages 缓存断点改写模式 */
-const messageCacheControlRewrite = ref<'off' | 'stable' | 'rolling'>('off');
+const messageCacheControlRewrite = ref<'off' | 'stable' | 'rolling' | 'anchored'>('off');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -146,7 +146,7 @@ async function loadSettings() {
     cacheControlTtlRewrite.value = ttlRewrite === '5m' || ttlRewrite === '1h' ? ttlRewrite : 'off';
     const messageCacheRewrite = data.message_cache_control_rewrite ?? 'off';
     messageCacheControlRewrite.value =
-      messageCacheRewrite === 'stable' || messageCacheRewrite === 'rolling'
+      messageCacheRewrite === 'stable' || messageCacheRewrite === 'rolling' || messageCacheRewrite === 'anchored'
         ? messageCacheRewrite
         : 'off';
     loaded.value = true;
@@ -451,10 +451,10 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">messages 缓存断点</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              rolling 会清理 messages[].content[] 原有 cache_control,再按 Anthropic 20-block lookback 在尾部滚动补断点。stable 是旧策略,不推荐并行 tool 长会话。
+              会话锚定会在 rolling 基础上复用同一 Claude Code session 的旧断点并桥接到当前尾部。stable 是旧策略,不推荐并行 tool 长会话。
             </p>
           </div>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
               <input
                 v-model="messageCacheControlRewrite"
@@ -472,6 +472,15 @@ onMounted(async () => {
                 class="accent-[#c4704f] w-4 h-4"
               />
               <span class="text-sm text-[#29261e]">滚动断点</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="messageCacheControlRewrite"
+                type="radio"
+                value="anchored"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">会话锚定</span>
             </label>
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
               <input
