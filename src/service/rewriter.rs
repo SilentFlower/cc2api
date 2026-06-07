@@ -1591,6 +1591,11 @@ impl Rewriter {
                 message_cache_control_position_log_label(body, *message_idx, *block_idx)
             })
             .collect::<Vec<_>>();
+
+        for (message_idx, block_idx) in &outcome.selected {
+            add_message_cache_control_at_block(body, *message_idx, *block_idx);
+        }
+
         let selected_diagnostics =
             stateful_selected_cache_diagnostics(body, &outcome, snapshot.as_ref());
         let prefix_diagnostics = cache_prefix_diagnostics(body);
@@ -1611,10 +1616,6 @@ impl Rewriter {
             skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
             "stateful message cache_control 选点完成"
         );
-
-        for (message_idx, block_idx) in &outcome.selected {
-            add_message_cache_control_at_block(body, *message_idx, *block_idx);
-        }
 
         let Some(key) = session_key else {
             return;
@@ -2081,6 +2082,7 @@ struct StatefulSelectedCacheDiagnostic {
     source: &'static str,
     block_hash: String,
     prefix_hash: String,
+    wire_prefix_hash: String,
 }
 
 /// cache prefix 的分段 hash 诊断信息。
@@ -2475,9 +2477,25 @@ fn merge_stateful_anchor_and_auto_positions(
 ) -> Vec<(usize, usize)> {
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
-    for position in anchor_positions.iter().rev().take(2).rev() {
-        push_unique_position(&mut selected, &mut seen, *position, available);
+    for position in anchor_positions {
+        push_unique_position(&mut selected, &mut seen, position, available);
     }
+
+    // 已经占满 slot 时优先保持旧断点集合。只有尾部离最后一个旧断点足够远,
+    // 才替换最后一个旧断点创建新尾部缓存,避免每轮正常增长都重建 cache。
+    if selected.len() >= available {
+        if let Some(replacement) =
+            stateful_tail_anchor_replacement(body, &selected, &auto_positions)
+        {
+            selected.sort_unstable();
+            selected.pop();
+            seen = selected.iter().copied().collect();
+            push_unique_position(&mut selected, &mut seen, replacement, available);
+        }
+        selected.sort_unstable();
+        return selected;
+    }
+
     for position in auto_positions {
         push_unique_position(&mut selected, &mut seen, position, available);
     }
@@ -2490,6 +2508,44 @@ fn merge_stateful_anchor_and_auto_positions(
     }
     selected.sort_unstable();
     selected
+}
+
+/// 判断是否应该用当前尾部断点替换上一轮最后一个断点。
+fn stateful_tail_anchor_replacement(
+    body: &serde_json::Value,
+    selected: &[(usize, usize)],
+    auto_positions: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    let tail_candidate = auto_positions.iter().copied().max()?;
+    if selected.contains(&tail_candidate) {
+        return None;
+    }
+    let latest_anchor = selected.iter().copied().max()?;
+    if tail_candidate <= latest_anchor {
+        return None;
+    }
+    let distance = message_block_rank_distance(body, latest_anchor, tail_candidate)?;
+    if distance < CACHE_LOOKBACK_STRIDE {
+        return None;
+    }
+    Some(tail_candidate)
+}
+
+/// 计算两个 message content block 在请求线性 block 序列中的距离。
+fn message_block_rank_distance(
+    body: &serde_json::Value,
+    from: (usize, usize),
+    to: (usize, usize),
+) -> Option<usize> {
+    let message_blocks = message_block_positions(body)?;
+    let ranks = message_blocks
+        .iter()
+        .enumerate()
+        .map(|(rank, position)| (*position, rank))
+        .collect::<HashMap<_, _>>();
+    let from_rank = ranks.get(&from)?;
+    let to_rank = ranks.get(&to)?;
+    to_rank.checked_sub(*from_rank)
 }
 
 /// 统计本轮实际选中位置中复用了多少历史锚点。
@@ -2533,6 +2589,8 @@ fn stateful_selected_cache_diagnostics(
                 message_block_fingerprint_at(body, *position).unwrap_or_else(|| "missing".into());
             let prefix_hash =
                 message_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into());
+            let wire_prefix_hash =
+                message_wire_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into());
             let source = if anchor_fingerprints.contains(block_hash.as_str()) {
                 "reused_anchor"
             } else if matches!(outcome.promotion, StatefulPromotion::BootstrapUpdated) {
@@ -2545,6 +2603,7 @@ fn stateful_selected_cache_diagnostics(
                 source,
                 block_hash: short_hash(&block_hash),
                 prefix_hash: short_hash(&prefix_hash),
+                wire_prefix_hash: short_hash(&wire_prefix_hash),
             }
         })
         .collect()
@@ -2585,6 +2644,30 @@ fn message_prefix_hash_at(body: &serde_json::Value, position: (usize, usize)) ->
     }
     content.truncate(position.1 + 1);
     Some(stable_json_hash(&prefix))
+}
+
+/// 计算指定 message block 之前包含 cache_control 的真实上游前缀 hash。
+fn message_wire_prefix_hash_at(
+    body: &serde_json::Value,
+    position: (usize, usize),
+) -> Option<String> {
+    let mut prefix = body.clone();
+    let messages = prefix
+        .get_mut("messages")
+        .and_then(|value| value.as_array_mut())?;
+    if position.0 >= messages.len() {
+        return None;
+    }
+    messages.truncate(position.0 + 1);
+    let message = messages.get_mut(position.0)?;
+    let content = message
+        .get_mut("content")
+        .and_then(|value| value.as_array_mut())?;
+    if position.1 >= content.len() {
+        return None;
+    }
+    content.truncate(position.1 + 1);
+    Some(wire_json_hash(&prefix))
 }
 
 /// 计算不含 messages 的请求根级 hash。
@@ -2678,6 +2761,12 @@ fn stable_json_hash(value: &serde_json::Value) -> String {
     let mut stable = value.clone();
     strip_cache_control_recursive(&mut stable);
     let bytes = serde_json::to_vec(&stable).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// 计算保留 cache_control 的 JSON hash,用于比对真实上游缓存前缀。
+fn wire_json_hash(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -3531,6 +3620,18 @@ mod tests {
         message_cache_control_positions(body)
             .into_iter()
             .filter_map(|position| super::message_block_fingerprint_at(body, position))
+            .collect()
+    }
+
+    fn message_cache_positions_and_fingerprints(
+        body: &serde_json::Value,
+    ) -> Vec<((usize, usize), String)> {
+        message_cache_control_positions(body)
+            .into_iter()
+            .filter_map(|position| {
+                super::message_block_fingerprint_at(body, position)
+                    .map(|fingerprint| (position, fingerprint))
+            })
             .collect()
     }
 
@@ -5006,6 +5107,71 @@ mod tests {
     }
 
     #[test]
+    fn message_cache_control_stateful_keeps_full_anchor_set_before_tail_rollover() {
+        let rewriter = Rewriter::new();
+        let first = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-sticky", 48),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let first_positions = message_cache_positions_and_fingerprints(&first);
+
+        let second = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-sticky", 48),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let second_positions = message_cache_positions_and_fingerprints(&second);
+
+        let third = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-sticky", 66),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let third_positions = message_cache_positions_and_fingerprints(&third);
+
+        assert_eq!(first_positions.len(), 4);
+        assert_eq!(second_positions, first_positions);
+        assert_eq!(third_positions, first_positions);
+    }
+
+    #[test]
+    fn message_cache_control_stateful_rolls_one_tail_anchor_after_lookback() {
+        let rewriter = Rewriter::new();
+        let first = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-rollover", 48),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let first_positions = message_cache_positions_and_fingerprints(&first);
+
+        let second = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-rollover", 67),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        let second_positions = message_cache_positions_and_fingerprints(&second);
+
+        let first_prefix = first_positions.iter().take(3).cloned().collect::<Vec<_>>();
+        let second_prefix = second_positions.iter().take(3).cloned().collect::<Vec<_>>();
+
+        assert_eq!(first_positions.len(), 4);
+        assert_eq!(second_positions.len(), 4);
+        assert_eq!(second_prefix, first_prefix);
+        assert_ne!(second_positions[3], first_positions[3]);
+    }
+
+    #[test]
     fn message_cache_control_stateful_bootstrap_promotes_past_tiny_first_request() {
         let rewriter = Rewriter::new();
         let first = rewrite_messages_body_with_rewriter(
@@ -5275,6 +5441,7 @@ mod tests {
         assert!(!rendered.contains("secret-next-text"));
         assert_eq!(selected[0].block_hash.len(), 12);
         assert_eq!(selected[0].prefix_hash.len(), 12);
+        assert_eq!(selected[0].wire_prefix_hash.len(), 12);
         assert_eq!(prefix.root_hash.len(), 12);
         assert_eq!(prefix.system_hash.len(), 12);
         assert_eq!(prefix.tools_hash.len(), 12);
