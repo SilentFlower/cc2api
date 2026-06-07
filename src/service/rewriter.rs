@@ -1117,6 +1117,14 @@ static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
 static CLAUDE_MD_CONTENTS_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"Contents of /[^\n]*?CLAUDE\.md").unwrap());
+static SKILLS_LIST_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)^(.+?\n\n)(- .+?)(\n</system-reminder>\s*)$").unwrap());
+static DEFERRED_TOOLS_LIST_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?s)^(<system-reminder>\nThe following deferred tools are now available[^\n]*\n)(.+?)(\n</system-reminder>\s*)$",
+    )
+    .unwrap()
+});
 
 // --- CCH Attestation (xxhash64) ---
 
@@ -1511,6 +1519,7 @@ fn rewrite_message_cache_control(
             add_stable_message_cache_control(body);
         }
         MessageCacheControlRewrite::Rolling => {
+            stabilize_claude_code_cache_prefix(body);
             strip_message_cache_control(body);
             add_rolling_message_cache_control(body);
         }
@@ -1531,6 +1540,156 @@ fn strip_message_cache_control(body: &mut serde_json::Value) {
                 block.remove("cache_control");
             }
         }
+    }
+}
+
+/// 稳定化 Claude Code prompt cache 的 tools/system 前缀顺序。
+///
+/// Anthropic cache prefix 顺序是 tools -> system -> messages；如果并行 tool 让
+/// tools 或自动注入列表的顺序抖动，message 断点再正确也无法命中旧前缀。
+fn stabilize_claude_code_cache_prefix(body: &mut serde_json::Value) {
+    sort_tools_by_name(body);
+    sort_auto_injected_text_lists(body);
+}
+
+/// 将 `tools[]` 按工具名排序,保持每个工具对象内容不变。
+fn sort_tools_by_name(body: &mut serde_json::Value) {
+    let Some(tools) = body.get_mut("tools").and_then(|tools| tools.as_array_mut()) else {
+        return;
+    };
+    tools.sort_by(|a, b| {
+        let a_name = a.get("name").and_then(|name| name.as_str()).unwrap_or("");
+        let b_name = b.get("name").and_then(|name| name.as_str()).unwrap_or("");
+        a_name.cmp(b_name)
+    });
+}
+
+/// 排序 system 和首个 user message 中 Claude Code 自动注入的列表文本。
+fn sort_auto_injected_text_lists(body: &mut serde_json::Value) {
+    if let Some(system) = body
+        .get_mut("system")
+        .and_then(|system| system.as_array_mut())
+    {
+        for block in system.iter_mut() {
+            sort_auto_injected_text_block(block);
+        }
+    }
+
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(|messages| messages.as_array_mut())
+    else {
+        return;
+    };
+    let Some(first) = messages.first_mut() else {
+        return;
+    };
+    if first.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return;
+    }
+    let Some(content) = first
+        .get_mut("content")
+        .and_then(|content| content.as_array_mut())
+    else {
+        return;
+    };
+    for block in content.iter_mut() {
+        sort_auto_injected_text_block(block);
+    }
+}
+
+/// 对单个文本 block 中的 skills / deferred tools 列表做确定性排序。
+fn sort_auto_injected_text_block(block: &mut serde_json::Value) {
+    let Some(obj) = block.as_object_mut() else {
+        return;
+    };
+    if obj.get("type").and_then(|value| value.as_str()) != Some("text") {
+        return;
+    }
+    let Some(text) = obj.get("text").and_then(|value| value.as_str()) else {
+        return;
+    };
+
+    let sorted = if is_sortable_skills_text(text) {
+        sort_skills_text(text)
+    } else if is_sortable_deferred_tools_text(text) {
+        sort_deferred_tools_text(text)
+    } else {
+        None
+    };
+    if let Some(sorted) = sorted {
+        obj.insert("text".into(), serde_json::Value::String(sorted));
+    }
+}
+
+/// 判断文本是否是 Claude Code skills 列表。
+fn is_sortable_skills_text(text: &str) -> bool {
+    text.contains("User-invocable skills")
+        || text.starts_with("<system-reminder>The following skills are available")
+        || text.starts_with("<system-reminder>\nThe following skills are available")
+        || text.contains("<available-skills>")
+        || text.contains("<plugin-skills>")
+}
+
+/// 判断文本是否是 Claude Code deferred tools 列表。
+fn is_sortable_deferred_tools_text(text: &str) -> bool {
+    text.contains("deferred tools are now available")
+}
+
+/// 按条目排序 skills 列表文本。
+fn sort_skills_text(text: &str) -> Option<String> {
+    let captures = SKILLS_LIST_REGEX.captures(text)?;
+    let header = captures.get(1)?.as_str();
+    let entries = captures.get(2)?.as_str();
+    let footer = captures.get(3)?.as_str();
+    let mut parts = split_skill_entries(entries);
+    parts.sort_unstable();
+    let sorted_entries = parts.join("\n");
+    let sorted = format!("{}{}{}", header, sorted_entries, footer);
+    if sorted == text {
+        None
+    } else {
+        Some(sorted)
+    }
+}
+
+/// 按 `- ` 条目边界拆分 skills 文本,避免把多行描述拆散后重排。
+fn split_skill_entries(entries: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in entries.lines() {
+        if line.starts_with("- ") && !current.is_empty() {
+            parts.push(current);
+            current = String::new();
+        } else if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// 按条目排序 deferred tools 列表文本。
+fn sort_deferred_tools_text(text: &str) -> Option<String> {
+    let captures = DEFERRED_TOOLS_LIST_REGEX.captures(text)?;
+    let header = captures.get(1)?.as_str();
+    let entries = captures.get(2)?.as_str();
+    let footer = captures.get(3)?.as_str();
+    let mut parts: Vec<&str> = entries
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    parts.sort_unstable();
+    let sorted_entries = parts.join("\n");
+    let sorted = format!("{}{}{}", header, sorted_entries, footer);
+    if sorted == text {
+        None
+    } else {
+        Some(sorted)
     }
 }
 
@@ -1689,7 +1848,7 @@ fn is_claude_code_auto_injected_block(block: &serde_json::Value) -> bool {
     if text.contains("<system-reminder>") && CLAUDE_MD_CONTENTS_REGEX.is_match(text) {
         return true;
     }
-    if text.contains("<deferred-tools>") {
+    if text.contains("<deferred-tools>") || is_sortable_deferred_tools_text(text) {
         return true;
     }
     text.contains("<mcp-resources>") || text.contains("Available MCP servers:")
@@ -2620,6 +2779,189 @@ mod tests {
             message_cache_control_positions(&parsed),
             vec![(0, 1), (0, 2)]
         );
+    }
+
+    #[test]
+    fn message_cache_control_rolling_stabilizes_tools_order_by_name() {
+        let body = |tools: serde_json::Value| {
+            json!({
+                "tools": tools,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hello"
+                    }]
+                }]
+            })
+        };
+
+        let first = rewrite_messages_body_with_modes(
+            body(json!([
+                { "name": "Write", "description": "w", "input_schema": { "type": "object" } },
+                { "name": "Bash", "description": "b", "input_schema": { "type": "object" } },
+                { "name": "Read", "description": "r", "input_schema": { "type": "object" } }
+            ])),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+        let second = rewrite_messages_body_with_modes(
+            body(json!([
+                { "name": "Read", "description": "r", "input_schema": { "type": "object" } },
+                { "name": "Write", "description": "w", "input_schema": { "type": "object" } },
+                { "name": "Bash", "description": "b", "input_schema": { "type": "object" } }
+            ])),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(first["tools"], second["tools"]);
+        assert_eq!(first["tools"][0]["name"], json!("Bash"));
+        assert_eq!(first["tools"][1]["name"], json!("Read"));
+        assert_eq!(first["tools"][2]["name"], json!("Write"));
+    }
+
+    #[test]
+    fn message_cache_control_rolling_stabilizes_system_skills_and_deferred_tools_lists() {
+        let body = |skills: &str, deferred: &str| {
+            json!({
+                "system": [
+                    {
+                        "type": "text",
+                        "text": skills
+                    },
+                    {
+                        "type": "text",
+                        "text": deferred
+                    }
+                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hello"
+                    }]
+                }]
+            })
+        };
+        let skills_unsorted =
+            "User-invocable skills:\n\n- zeta: z\n- alpha: a\n- middle: m\n</system-reminder>";
+        let skills_sorted =
+            "User-invocable skills:\n\n- alpha: a\n- middle: m\n- zeta: z\n</system-reminder>";
+        let deferred_unsorted = "<system-reminder>\nThe following deferred tools are now available:\nWrite\nBash\nRead\n</system-reminder>";
+        let deferred_sorted = "<system-reminder>\nThe following deferred tools are now available:\nBash\nRead\nWrite\n</system-reminder>";
+
+        let first = rewrite_messages_body_with_modes(
+            body(skills_unsorted, deferred_unsorted),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+        let second = rewrite_messages_body_with_modes(
+            body(skills_sorted, deferred_sorted),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(first["system"], second["system"]);
+        assert_eq!(first["system"][0]["text"], json!(skills_sorted));
+        assert_eq!(first["system"][1]["text"], json!(deferred_sorted));
+    }
+
+    #[test]
+    fn message_cache_control_rolling_keeps_multiline_skill_entries_intact() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "User-invocable skills:\n\n- zeta: z\n  second line\n- alpha: a\n  more detail\n</system-reminder>"
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hello"
+                    }]
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            parsed["system"][0]["text"],
+            json!("User-invocable skills:\n\n- alpha: a\n  more detail\n- zeta: z\n  second line\n</system-reminder>")
+        );
+    }
+
+    #[test]
+    fn message_cache_control_rolling_stabilizes_first_user_auto_injected_lists() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>The following skills are available:\n\n- zeta: z\n- alpha: a\n</system-reminder>"
+                        },
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>\nThe following deferred tools are now available:\nWrite\nBash\n</system-reminder>"
+                        },
+                        {
+                            "type": "text",
+                            "text": "real user prompt"
+                        }
+                    ]
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Rolling,
+        );
+
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["text"],
+            json!("<system-reminder>The following skills are available:\n\n- alpha: a\n- zeta: z\n</system-reminder>")
+        );
+        assert_eq!(
+            parsed["messages"][0]["content"][1]["text"],
+            json!("<system-reminder>\nThe following deferred tools are now available:\nBash\nWrite\n</system-reminder>")
+        );
+        assert_eq!(
+            message_cache_control_positions(&parsed),
+            vec![(0, 1), (0, 2)]
+        );
+    }
+
+    #[test]
+    fn message_cache_control_stable_does_not_sort_tools() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "tools": [
+                    { "name": "Write", "input_schema": {} },
+                    { "name": "Read", "input_schema": {} }
+                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hello"
+                    }]
+                }]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stable,
+        );
+
+        assert_eq!(parsed["tools"][0]["name"], json!("Write"));
+        assert_eq!(parsed["tools"][1]["name"], json!("Read"));
     }
 
     #[test]
