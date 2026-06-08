@@ -72,6 +72,16 @@ pub enum ClientType {
     API,
 }
 
+impl ClientType {
+    /// 返回日志中使用的稳定客户端类型名。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::API => "api",
+        }
+    }
+}
+
 const API_MAX_TOKENS_LIMIT: u64 = 64000;
 const API_DEFAULT_MAX_TOKENS: u64 = 32000;
 
@@ -1754,12 +1764,12 @@ impl Rewriter {
             MessageCacheControlRewrite::Auto => {
                 stabilize_claude_code_cache_prefix(body);
                 strip_cache_control_for_message_rewrite(body, client_type);
-                add_auto_message_cache_control(body);
+                add_auto_message_cache_control(body, client_type);
             }
             MessageCacheControlRewrite::Rolling => {
                 stabilize_claude_code_cache_prefix(body);
                 strip_cache_control_for_message_rewrite(body, client_type);
-                add_rolling_message_cache_control(body);
+                add_rolling_message_cache_control(body, client_type);
             }
             MessageCacheControlRewrite::Stateful => {
                 stabilize_claude_code_cache_prefix(body);
@@ -2132,9 +2142,8 @@ fn sort_deferred_tools_text(text: &str) -> Option<String> {
 }
 
 /// 为 messages 放置自动缓存修复断点。
-fn add_auto_message_cache_control(body: &mut serde_json::Value) {
+fn add_auto_message_cache_control(body: &mut serde_json::Value, client_type: ClientType) {
     let outcome = select_auto_message_cache_control_positions(body);
-
     let selected_labels = outcome
         .selected
         .iter()
@@ -2142,26 +2151,35 @@ fn add_auto_message_cache_control(body: &mut serde_json::Value) {
             message_cache_control_position_log_label(body, *message_idx, *block_idx)
         })
         .collect::<Vec<_>>();
+    for (message_idx, block_idx) in &outcome.selected {
+        add_message_cache_control_at_block(body, *message_idx, *block_idx);
+    }
+
+    let selected_diagnostics = selected_cache_diagnostics(body, &outcome.selected, "auto");
+    let prefix_diagnostics = cache_prefix_diagnostics(body);
+    let system_breakpoints = count_system_cache_breakpoints(body);
+    let tool_breakpoints = count_tool_cache_breakpoints(body);
     info!(
         target: "cc2api::cache",
         mode = "auto",
+        client_type = client_type.as_str(),
         available_slots = outcome.available_slots,
         message_content_blocks = outcome.message_content_blocks,
+        system_breakpoints,
+        tool_breakpoints,
+        final_breakpoints = system_breakpoints + tool_breakpoints + outcome.selected.len(),
         selected_count = outcome.selected.len(),
         selected = ?selected_labels,
+        selected_diag = ?selected_diagnostics,
+        prefix_diag = ?prefix_diagnostics,
         skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
         "auto message cache_control 选点完成"
     );
-
-    for (message_idx, block_idx) in outcome.selected {
-        add_message_cache_control_at_block(body, message_idx, block_idx);
-    }
 }
 
 /// 为 messages 放置更积极的 rolling 缓存断点。
-fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
+fn add_rolling_message_cache_control(body: &mut serde_json::Value, client_type: ClientType) {
     let outcome = select_rolling_message_cache_control_positions(body);
-
     let selected_labels = outcome
         .selected
         .iter()
@@ -2169,20 +2187,30 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value) {
             message_cache_control_position_log_label(body, *message_idx, *block_idx)
         })
         .collect::<Vec<_>>();
+    for (message_idx, block_idx) in &outcome.selected {
+        add_message_cache_control_at_block(body, *message_idx, *block_idx);
+    }
+
+    let selected_diagnostics = selected_cache_diagnostics(body, &outcome.selected, "rolling");
+    let prefix_diagnostics = cache_prefix_diagnostics(body);
+    let system_breakpoints = count_system_cache_breakpoints(body);
+    let tool_breakpoints = count_tool_cache_breakpoints(body);
     info!(
         target: "cc2api::cache",
         mode = "rolling",
+        client_type = client_type.as_str(),
         available_slots = outcome.available_slots,
         message_content_blocks = outcome.message_content_blocks,
+        system_breakpoints,
+        tool_breakpoints,
+        final_breakpoints = system_breakpoints + tool_breakpoints + outcome.selected.len(),
         selected_count = outcome.selected.len(),
         selected = ?selected_labels,
+        selected_diag = ?selected_diagnostics,
+        prefix_diag = ?prefix_diagnostics,
         skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
         "rolling message cache_control 选点完成"
     );
-
-    for (message_idx, block_idx) in outcome.selected {
-        add_message_cache_control_at_block(body, message_idx, block_idx);
-    }
 }
 
 /// 断点选点结果。
@@ -2933,6 +2961,30 @@ fn stateful_selected_cache_diagnostics(
         .collect()
 }
 
+/// 构造 auto / rolling 选点诊断信息,只记录结构标签与 hash。
+fn selected_cache_diagnostics(
+    body: &serde_json::Value,
+    positions: &[(usize, usize)],
+    source: &'static str,
+) -> Vec<StatefulSelectedCacheDiagnostic> {
+    positions
+        .iter()
+        .map(|position| StatefulSelectedCacheDiagnostic {
+            label: message_cache_control_position_log_label(body, position.0, position.1),
+            source,
+            block_hash: short_hash(
+                &message_block_fingerprint_at(body, *position).unwrap_or_else(|| "missing".into()),
+            ),
+            prefix_hash: short_hash(
+                &message_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into()),
+            ),
+            wire_prefix_hash: short_hash(
+                &message_wire_prefix_hash_at(body, *position).unwrap_or_else(|| "missing".into()),
+            ),
+        })
+        .collect()
+}
+
 /// 构造请求主要前缀段的 hash 诊断信息。
 fn cache_prefix_diagnostics(body: &serde_json::Value) -> CachePrefixDiagnostics {
     CachePrefixDiagnostics {
@@ -3383,22 +3435,32 @@ fn message_cache_control_position_log_label(
 /// 请求根级 `cache_control` 不是 Anthropic message history 的真实 block 断点,
 /// 不参与 message 侧 slot 计算,否则会误跳过尾部历史断点。
 fn count_non_message_cache_breakpoints(body: &serde_json::Value) -> usize {
-    let mut count = 0;
+    count_system_cache_breakpoints(body) + count_tool_cache_breakpoints(body)
+}
 
-    if let Some(sys) = body.get("system").and_then(|s| s.as_array()) {
-        count += sys
-            .iter()
-            .filter(|item| item.get("cache_control").is_some())
-            .count();
-    }
-    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-        count += tools
-            .iter()
-            .filter(|tool| tool.get("cache_control").is_some())
-            .count();
-    }
+/// 统计 system 上已经占用的 cache_control 断点数量。
+fn count_system_cache_breakpoints(body: &serde_json::Value) -> usize {
+    body.get("system")
+        .and_then(|s| s.as_array())
+        .map(|sys| {
+            sys.iter()
+                .filter(|item| item.get("cache_control").is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
 
-    count
+/// 统计 tools 上已经占用的 cache_control 断点数量。
+fn count_tool_cache_breakpoints(body: &serde_json::Value) -> usize {
+    body.get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.get("cache_control").is_some())
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// 按请求原始顺序收集 message 顶层 content block 位置。
@@ -3696,7 +3758,7 @@ fn strip_empty_text_blocks(body: &mut serde_json::Value) {
             }
             true
         });
-        // Handle tool_result nested content
+        // 递归清理 tool_result 里的嵌套空文本,避免上游拒绝空 block。
         for item in blocks.iter_mut() {
             if let Some(block) = item.as_object_mut() {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
@@ -3747,13 +3809,22 @@ pub fn detect_client_type(user_agent: &str, path: &str, body: &serde_json::Value
     let ua_lower = user_agent.to_lowercase();
     let is_claude_code_ua =
         ua_lower.starts_with("claude-code/") || ua_lower.starts_with("claude-cli/");
-    if !is_claude_code_ua {
-        return ClientType::API;
+    let has_valid_metadata = has_valid_claude_code_metadata_user_id(body);
+    let client_type = if is_claude_code_ua {
+        ClientType::ClaudeCode
+    } else {
+        ClientType::API
+    };
+    if path.starts_with("/v1/messages") {
+        info!(
+            target: "cc2api::cache",
+            client_type = client_type.as_str(),
+            is_claude_code_ua,
+            has_valid_metadata,
+            "Anthropic client type detected"
+        );
     }
-    if !path.starts_with("/v1/messages") || has_valid_claude_code_metadata_user_id(body) {
-        return ClientType::ClaudeCode;
-    }
-    ClientType::API
+    client_type
 }
 
 /// 判断 metadata.user_id 是否符合真实 Claude Code legacy 或 JSON 形态。
@@ -6801,7 +6872,7 @@ mod tests {
     }
 
     #[test]
-    fn client_type_requires_claude_code_ua_and_valid_metadata() {
+    fn client_type_uses_claude_code_ua_as_authoritative_signal() {
         let valid_json_user_id = json!({
             "device_id": "device-1",
             "account_uuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -6840,7 +6911,7 @@ mod tests {
                 "/v1/messages",
                 &json!({"metadata": {"user_id": "session_abc"}})
             ),
-            ClientType::API
+            ClientType::ClaudeCode
         );
         assert_eq!(
             super::detect_client_type(
@@ -6848,7 +6919,7 @@ mod tests {
                 "/v1/messages",
                 &json!({"messages": []})
             ),
-            ClientType::API
+            ClientType::ClaudeCode
         );
         assert_eq!(
             super::detect_client_type(
