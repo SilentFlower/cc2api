@@ -74,7 +74,7 @@ pub enum ClientType {
 
 impl ClientType {
     /// 返回日志中使用的稳定客户端类型名。
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude_code",
             Self::API => "api",
@@ -396,6 +396,15 @@ impl CacheControlTtlRewrite {
             Self::OneHour => Some("1h"),
         }
     }
+
+    /// 返回日志中使用的稳定设置名。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
 }
 
 /// Claude Code messages 缓存断点改写模式。
@@ -423,7 +432,7 @@ pub enum MessageCacheControlRewrite {
 
 impl MessageCacheControlRewrite {
     /// 返回日志中使用的稳定设置名。
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Auto => "auto",
@@ -475,6 +484,8 @@ pub struct StatefulCacheCompletion {
 pub struct StatefulCacheUsage {
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    pub cache_creation_ephemeral_5m_input_tokens: u64,
+    pub cache_creation_ephemeral_1h_input_tokens: u64,
 }
 
 impl Rewriter {
@@ -4057,7 +4068,7 @@ pub fn detect_client_type(user_agent: &str, path: &str, body: &serde_json::Value
     let ua_lower = user_agent.to_lowercase();
     let is_claude_code_ua =
         ua_lower.starts_with("claude-code/") || ua_lower.starts_with("claude-cli/");
-    let has_valid_metadata = has_valid_claude_code_metadata_user_id(body);
+    let metadata_diag = claude_code_metadata_user_id_diagnostic(body);
     let client_type = if is_claude_code_ua {
         ClientType::ClaudeCode
     } else {
@@ -4066,10 +4077,10 @@ pub fn detect_client_type(user_agent: &str, path: &str, body: &serde_json::Value
     if path.starts_with("/v1/messages") {
         info!(
             target: "cc2api::cache",
-            client_type = client_type.as_str(),
-            is_claude_code_ua,
-            has_valid_metadata,
-            "Anthropic client type detected"
+            "[缓存诊断] 客户端识别: type={} ua={} metadata={}",
+            client_type.as_str(),
+            if is_claude_code_ua { "claude_code" } else { "api" },
+            metadata_diag.human_summary()
         );
     }
     client_type
@@ -4077,45 +4088,225 @@ pub fn detect_client_type(user_agent: &str, path: &str, body: &serde_json::Value
 
 /// 判断 metadata.user_id 是否符合真实 Claude Code legacy 或 JSON 形态。
 fn has_valid_claude_code_metadata_user_id(body: &serde_json::Value) -> bool {
-    let Some(user_id) = body
-        .get("metadata")
-        .and_then(|metadata| metadata.get("user_id"))
-        .and_then(|user_id| user_id.as_str())
-        .map(str::trim)
-        .filter(|user_id| !user_id.is_empty())
-    else {
-        return false;
+    claude_code_metadata_user_id_diagnostic(body).valid
+}
+
+/// `metadata.user_id` 的脱敏诊断信息。
+struct MetadataUserIdDiagnostic {
+    valid: bool,
+    reason: &'static str,
+    metadata_type: &'static str,
+    metadata_keys: Vec<String>,
+    user_id_type: &'static str,
+    user_id_len: usize,
+    user_id_hash: String,
+    user_id_json_keys: Vec<String>,
+    has_device_id: bool,
+    has_account_uuid: bool,
+    has_session_id: bool,
+    account_uuid_like: bool,
+    session_uuid_like: bool,
+    legacy_account_marker: bool,
+    legacy_session_marker: bool,
+}
+
+impl MetadataUserIdDiagnostic {
+    /// 生成人类可读的脱敏摘要。
+    fn human_summary(&self) -> String {
+        let keys = if self.metadata_keys.is_empty() {
+            "-".to_string()
+        } else {
+            self.metadata_keys.join(",")
+        };
+        let json_keys = if self.user_id_json_keys.is_empty() {
+            "-".to_string()
+        } else {
+            self.user_id_json_keys.join(",")
+        };
+        if self.valid {
+            return format!(
+                "ok(reason={},uid={} len={} hash={} keys={} json_keys={})",
+                self.reason,
+                self.user_id_type,
+                self.user_id_len,
+                empty_dash(&self.user_id_hash),
+                keys,
+                json_keys
+            );
+        }
+        format!(
+            "invalid(reason={},meta={} keys={},uid={} len={} hash={},json_keys={},json_fields=device:{}/account:{}/session:{},uuid=account:{}/session:{},legacy=account:{}/session:{})",
+            self.reason,
+            self.metadata_type,
+            keys,
+            self.user_id_type,
+            self.user_id_len,
+            empty_dash(&self.user_id_hash),
+            json_keys,
+            yes_no(self.has_device_id),
+            yes_no(self.has_account_uuid),
+            yes_no(self.has_session_id),
+            yes_no(self.account_uuid_like),
+            yes_no(self.session_uuid_like),
+            yes_no(self.legacy_account_marker),
+            yes_no(self.legacy_session_marker)
+        )
+    }
+}
+
+/// 生成 `metadata.user_id` 诊断,只记录结构、长度与 hash,不记录原值。
+fn claude_code_metadata_user_id_diagnostic(body: &serde_json::Value) -> MetadataUserIdDiagnostic {
+    let Some(metadata) = body.get("metadata") else {
+        return metadata_user_id_diag("missing_metadata");
+    };
+    let Some(metadata_obj) = metadata.as_object() else {
+        let mut diag = metadata_user_id_diag("metadata_not_object");
+        diag.metadata_type = json_type_name(metadata);
+        return diag;
     };
 
+    let mut metadata_keys = metadata_obj.keys().cloned().collect::<Vec<_>>();
+    metadata_keys.sort();
+    let Some(user_id_value) = metadata_obj.get("user_id") else {
+        let mut diag = metadata_user_id_diag("missing_user_id");
+        diag.metadata_type = "object";
+        diag.metadata_keys = metadata_keys;
+        return diag;
+    };
+    let Some(user_id) = user_id_value.as_str().map(str::trim) else {
+        let mut diag = metadata_user_id_diag("user_id_not_string");
+        diag.metadata_type = "object";
+        diag.metadata_keys = metadata_keys;
+        diag.user_id_type = json_type_name(user_id_value);
+        return diag;
+    };
+    if user_id.is_empty() {
+        let mut diag = metadata_user_id_diag("user_id_empty");
+        diag.metadata_type = "object";
+        diag.metadata_keys = metadata_keys;
+        diag.user_id_type = "string";
+        return diag;
+    }
+
+    let mut diag = metadata_user_id_diag("invalid_user_id");
+    diag.metadata_type = "object";
+    diag.metadata_keys = metadata_keys;
+    diag.user_id_type = "string";
+    diag.user_id_len = user_id.len();
+    diag.user_id_hash = short_sha256(user_id.as_bytes());
+
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(user_id) {
-        let has_device_id = parsed
+        let Some(parsed_obj) = parsed.as_object() else {
+            diag.reason = "json_user_id_not_object";
+            return diag;
+        };
+        diag.user_id_json_keys = parsed_obj.keys().cloned().collect();
+        diag.user_id_json_keys.sort();
+        diag.has_device_id = parsed_obj
             .get("device_id")
             .and_then(|value| value.as_str())
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);
-        let account_ok = parsed
+        diag.has_account_uuid = parsed_obj
+            .get("account_uuid")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        diag.has_session_id = parsed_obj
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        diag.account_uuid_like = parsed_obj
             .get("account_uuid")
             .and_then(|value| value.as_str())
             .map(is_uuid_like)
             .unwrap_or(false);
-        let session_ok = parsed
+        diag.session_uuid_like = parsed_obj
             .get("session_id")
             .and_then(|value| value.as_str())
             .map(is_uuid_like)
             .unwrap_or(false);
-        return has_device_id && account_ok && session_ok;
+        diag.valid = diag.has_device_id && diag.account_uuid_like && diag.session_uuid_like;
+        diag.reason = if diag.valid {
+            "valid_json"
+        } else {
+            "invalid_json_shape"
+        };
+        return diag;
     }
 
+    diag.legacy_account_marker = user_id.contains("_account_");
+    diag.legacy_session_marker = user_id.contains("_session_");
     let Some(account_idx) = user_id.find("_account_") else {
-        return false;
+        diag.reason = "missing_legacy_account_marker";
+        return diag;
     };
     let Some(session_idx) = user_id[account_idx + 9..].find("_session_") else {
-        return false;
+        diag.reason = "missing_legacy_session_marker";
+        return diag;
     };
     let session_idx = account_idx + 9 + session_idx;
     let account_uuid = &user_id[account_idx + 9..session_idx];
     let session_uuid = &user_id[session_idx + 9..];
-    user_id.starts_with("user_") && is_uuid_like(account_uuid) && is_uuid_like(session_uuid)
+    diag.account_uuid_like = is_uuid_like(account_uuid);
+    diag.session_uuid_like = is_uuid_like(session_uuid);
+    diag.valid = user_id.starts_with("user_") && diag.account_uuid_like && diag.session_uuid_like;
+    diag.reason = if diag.valid {
+        "valid_legacy"
+    } else {
+        "invalid_legacy_shape"
+    };
+    diag
+}
+
+/// 构造空白 `metadata.user_id` 诊断。
+fn metadata_user_id_diag(reason: &'static str) -> MetadataUserIdDiagnostic {
+    MetadataUserIdDiagnostic {
+        valid: false,
+        reason,
+        metadata_type: "missing",
+        metadata_keys: Vec::new(),
+        user_id_type: "missing",
+        user_id_len: 0,
+        user_id_hash: String::new(),
+        user_id_json_keys: Vec::new(),
+        has_device_id: false,
+        has_account_uuid: false,
+        has_session_id: false,
+        account_uuid_like: false,
+        session_uuid_like: false,
+        legacy_account_marker: false,
+        legacy_session_marker: false,
+    }
+}
+
+/// 返回 JSON 值的简短类型名。
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// 计算日志用 12 位 SHA-256 摘要。
+fn short_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..6])
+}
+
+/// bool 的中文短值,让日志更容易肉眼扫读。
+fn yes_no(value: bool) -> &'static str {
+    if value { "Y" } else { "N" }
+}
+
+/// 空字符串在日志里显示为 `-`。
+fn empty_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
 }
 
 /// 校验 UUID 字符串格式,避免普通 API metadata 误触 ClaudeCode 分支。
@@ -6070,6 +6261,7 @@ mod tests {
             Some(super::StatefulCacheUsage {
                 cache_read_input_tokens: 70_000,
                 cache_creation_input_tokens: 6_000,
+                ..Default::default()
             }),
         );
         let first_snapshot = rewriter
@@ -6089,6 +6281,7 @@ mod tests {
             Some(super::StatefulCacheUsage {
                 cache_read_input_tokens: 70_000,
                 cache_creation_input_tokens: 120_000,
+                ..Default::default()
             }),
         );
         let rejected_snapshot = rewriter
@@ -6109,6 +6302,7 @@ mod tests {
             Some(super::StatefulCacheUsage {
                 cache_read_input_tokens: 90_000,
                 cache_creation_input_tokens: 120_000,
+                ..Default::default()
             }),
         );
         let accepted_snapshot = rewriter

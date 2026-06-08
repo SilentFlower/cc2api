@@ -393,6 +393,18 @@ impl GatewayService {
             // 重新解析改写后的 body
             let rewritten_body_map: serde_json::Value =
                 serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
+            let cache_usage_context = if path.starts_with("/v1/messages") {
+                Some(CacheUsageLogContext::from_request(
+                    &body_map,
+                    &rewritten_body_map,
+                    client_type,
+                    cache_ttl,
+                    message_cache,
+                    &account.name,
+                ))
+            } else {
+                None
+            };
 
             // 改写 header
             let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
@@ -527,6 +539,7 @@ impl GatewayService {
                     self.rewriter.clone(),
                     stateful_cache_completion,
                     content_codings,
+                    cache_usage_context,
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -1445,6 +1458,71 @@ fn extract_message_session_id(body: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn count_messages(body: &serde_json::Value) -> usize {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| messages.len())
+        .unwrap_or(0)
+}
+
+fn count_message_content_blocks(body: &serde_json::Value) -> usize {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|message| match message.get("content") {
+                    Some(serde_json::Value::Array(content)) => content.len(),
+                    Some(serde_json::Value::String(_)) => 1,
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn count_cache_breakpoints_in_array_field(body: &serde_json::Value, field: &str) -> usize {
+    body.get(field)
+        .and_then(|items| items.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("cache_control").is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn count_message_cache_breakpoints(body: &serde_json::Value) -> usize {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .get("content")
+                        .and_then(|content| content.as_array())
+                })
+                .flat_map(|content| content.iter())
+                .filter(|block| block.get("cache_control").is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn stable_body_hash_for_log(body: &serde_json::Value) -> String {
+    match serde_json::to_vec(body) {
+        Ok(bytes) => short_hash_for_log(&bytes),
+        Err(_) => "serialize_error".into(),
+    }
+}
+
+fn short_hash_for_log(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..6])
+}
+
 fn count_system_prompt_blocks(body: &serde_json::Value) -> usize {
     match body.get("system") {
         Some(serde_json::Value::Array(items)) => items
@@ -1604,8 +1682,81 @@ struct SlotGuardBody {
     req_start: std::time::Instant,
     /// 账号名称，用于日志输出。
     account_name: String,
+    /// prompt cache usage 诊断上下文。
+    cache_usage_context: Option<CacheUsageLogContext>,
     /// 是否已收到第一个 frame。
     first_frame_logged: bool,
+}
+
+/// prompt cache usage 日志上下文,只保存脱敏后的请求结构信息。
+#[derive(Clone)]
+struct CacheUsageLogContext {
+    client_type: ClientType,
+    model: String,
+    message_cache_mode: MessageCacheControlRewrite,
+    ttl_mode: CacheControlTtlRewrite,
+    account_name: String,
+    session_hash: String,
+    request_hash: String,
+    message_count: usize,
+    message_content_blocks: usize,
+    system_breakpoints: usize,
+    tool_breakpoints: usize,
+    message_breakpoints: usize,
+}
+
+impl CacheUsageLogContext {
+    /// 从原始请求和最终上游请求构造脱敏 usage 诊断上下文。
+    fn from_request(
+        original_body: &serde_json::Value,
+        rewritten_body: &serde_json::Value,
+        client_type: ClientType,
+        ttl_mode: CacheControlTtlRewrite,
+        message_cache_mode: MessageCacheControlRewrite,
+        account_name: &str,
+    ) -> Self {
+        let model = original_body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let session_id = extract_message_session_id(rewritten_body)
+            .or_else(|| crate::service::rewriter::extract_session_id_from_body(rewritten_body))
+            .unwrap_or_default();
+        Self {
+            client_type,
+            model,
+            message_cache_mode,
+            ttl_mode,
+            account_name: account_name.to_string(),
+            session_hash: short_hash_for_log(session_id.as_bytes()),
+            request_hash: stable_body_hash_for_log(rewritten_body),
+            message_count: count_messages(rewritten_body),
+            message_content_blocks: count_message_content_blocks(rewritten_body),
+            system_breakpoints: count_cache_breakpoints_in_array_field(rewritten_body, "system"),
+            tool_breakpoints: count_cache_breakpoints_in_array_field(rewritten_body, "tools"),
+            message_breakpoints: count_message_cache_breakpoints(rewritten_body),
+        }
+    }
+
+    /// 生成人类可读的请求摘要。
+    fn human_summary(&self) -> String {
+        format!(
+            "客户端={} 模型={} 账号={} 模式={} ttl={} session={} req={} 消息={}/blocks={} 断点msg/system/tool={}/{}/{}",
+            self.client_type.as_str(),
+            display_or_dash(&self.model),
+            self.account_name,
+            self.message_cache_mode.as_str(),
+            self.ttl_mode.as_str(),
+            display_or_dash(&self.session_hash),
+            self.request_hash,
+            self.message_count,
+            self.message_content_blocks,
+            self.message_breakpoints,
+            self.system_breakpoints,
+            self.tool_breakpoints
+        )
+    }
 }
 
 impl SlotGuardBody {
@@ -1617,6 +1768,7 @@ impl SlotGuardBody {
         rewriter: Arc<Rewriter>,
         stateful_cache_completion: Option<StatefulCacheCompletion>,
         response_content_codings: Vec<String>,
+        cache_usage_context: Option<CacheUsageLogContext>,
     ) -> Self {
         Self {
             inner,
@@ -1630,6 +1782,7 @@ impl SlotGuardBody {
             rewriter,
             req_start,
             account_name,
+            cache_usage_context,
             first_frame_logged: false,
         }
     }
@@ -1684,10 +1837,12 @@ impl http_body::Body for SlotGuardBody {
             self.stateful_cache_usage_buffer = buffer;
             let completion = self.stateful_cache_completion.take();
             let usage = observed_stateful_cache_usage(self.stateful_cache_usage);
+            log_prompt_cache_usage(self.cache_usage_context.as_ref(), usage);
             self.rewriter
                 .complete_stateful_cache_with_usage(completion, usage);
         } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
             // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
+            log_prompt_cache_usage_read_error(self.cache_usage_context.as_ref());
             let _ = self.stateful_cache_completion.take();
         }
         result
@@ -1704,11 +1859,80 @@ impl http_body::Body for SlotGuardBody {
 
 /// 返回已经观察到的 Anthropic prompt cache usage。
 fn observed_stateful_cache_usage(usage: StatefulCacheUsage) -> Option<StatefulCacheUsage> {
-    if usage.cache_read_input_tokens == 0 && usage.cache_creation_input_tokens == 0 {
+    if usage.cache_read_input_tokens == 0
+        && usage.cache_creation_input_tokens == 0
+        && usage.cache_creation_ephemeral_5m_input_tokens == 0
+        && usage.cache_creation_ephemeral_1h_input_tokens == 0
+    {
         None
     } else {
         Some(usage)
     }
+}
+
+/// 输出上游实际返回的 prompt cache usage。
+fn log_prompt_cache_usage(
+    context: Option<&CacheUsageLogContext>,
+    usage: Option<StatefulCacheUsage>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let usage = usage.unwrap_or_default();
+    info!(
+        target: "cc2api::cache",
+        "[缓存诊断] usage: 读={} 写={} (5m={},1h={}) 命中率≈{} {}",
+        format_tokens(usage.cache_read_input_tokens),
+        format_tokens(usage.cache_creation_input_tokens),
+        format_tokens(usage.cache_creation_ephemeral_5m_input_tokens),
+        format_tokens(usage.cache_creation_ephemeral_1h_input_tokens),
+        cache_hit_ratio_label(&usage),
+        context.human_summary()
+    );
+}
+
+/// 输出响应体读取失败时的 prompt cache usage 诊断占位。
+fn log_prompt_cache_usage_read_error(context: Option<&CacheUsageLogContext>) {
+    let Some(context) = context else {
+        return;
+    };
+    warn!(
+        target: "cc2api::cache",
+        "[缓存诊断] usage: 响应流读取失败,无法解析缓存读写 {}",
+        context.human_summary()
+    );
+}
+
+/// 格式化 token 数,便于人工阅读。
+fn format_tokens(value: u64) -> String {
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (idx, ch) in s.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+/// 粗略显示 prompt cache 命中读占比。
+fn cache_hit_ratio_label(usage: &StatefulCacheUsage) -> String {
+    let total = usage
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens);
+    if total == 0 {
+        return "0%".into();
+    }
+    format!(
+        "{}%",
+        usage.cache_read_input_tokens.saturating_mul(100) / total
+    )
+}
+
+/// 空字符串在日志里显示为 `-`。
+fn display_or_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
 }
 
 fn append_stateful_usage_side_tap(buffer: &mut Vec<u8>, truncated: &mut bool, bytes: &[u8]) {
@@ -1838,6 +2062,24 @@ fn merge_stateful_cache_usage_from_usage_value(
             .cache_creation_input_tokens
             .max(cache_creation_input_tokens);
     }
+    if let Some(cache_creation_ephemeral_5m_input_tokens) = cache_usage
+        .get("cache_creation")
+        .and_then(|cache_creation| cache_creation.get("ephemeral_5m_input_tokens"))
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_creation_ephemeral_5m_input_tokens = usage
+            .cache_creation_ephemeral_5m_input_tokens
+            .max(cache_creation_ephemeral_5m_input_tokens);
+    }
+    if let Some(cache_creation_ephemeral_1h_input_tokens) = cache_usage
+        .get("cache_creation")
+        .and_then(|cache_creation| cache_creation.get("ephemeral_1h_input_tokens"))
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_creation_ephemeral_1h_input_tokens = usage
+            .cache_creation_ephemeral_1h_input_tokens
+            .max(cache_creation_ephemeral_1h_input_tokens);
+    }
 }
 
 impl Drop for SlotGuardBody {
@@ -1887,19 +2129,21 @@ mod tests {
             &mut usage,
             &mut buffer,
             br#"event: message_delta
-data: {"type":"message_delta","usage":{"cache_read_input_tokens":70513,"cache_creation_input_tokens":148518}}
+data: {"type":"message_delta","usage":{"cache_read_input_tokens":70513,"cache_creation_input_tokens":148518,"cache_creation":{"ephemeral_5m_input_tokens":12,"ephemeral_1h_input_tokens":34}}}
 
 "#,
         );
         update_stateful_cache_usage_from_bytes(
             &mut usage,
             &mut buffer,
-            br#"data: {"type":"message_delta","usage":{"cache_read_input_tokens":65001,"cache_creation_input_tokens":160000}}"#,
+            br#"data: {"type":"message_delta","usage":{"cache_read_input_tokens":65001,"cache_creation_input_tokens":160000,"cache_creation":{"ephemeral_5m_input_tokens":56,"ephemeral_1h_input_tokens":78}}}"#,
         );
         flush_stateful_cache_usage_buffer(&mut usage, &mut buffer);
 
         assert_eq!(usage.cache_read_input_tokens, 70_513);
         assert_eq!(usage.cache_creation_input_tokens, 160_000);
+        assert_eq!(usage.cache_creation_ephemeral_5m_input_tokens, 56);
+        assert_eq!(usage.cache_creation_ephemeral_1h_input_tokens, 78);
     }
 
     #[test]
