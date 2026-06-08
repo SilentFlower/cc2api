@@ -442,6 +442,7 @@ pub struct StatefulCacheCompletion {
     anchors: Vec<AnchorRecord>,
     snapshot_generation: Option<u64>,
     snapshot_cache_read_tokens: Option<u64>,
+    has_reused_anchor: bool,
 }
 
 /// Anthropic 响应返回的 prompt cache 使用量。
@@ -798,6 +799,7 @@ impl Rewriter {
                 completion.anchors,
                 completion.snapshot_generation,
                 usage.map(|usage| usage.cache_read_input_tokens),
+                completion.has_reused_anchor,
             );
         }
     }
@@ -1066,7 +1068,7 @@ impl Rewriter {
             } else {
                 let mut bytes = [0u8; 2];
                 rand::thread_rng().fill(&mut bytes);
-                format!("{:x}", u16::from_be_bytes(bytes))[..3].to_string()
+                random_cc_version_suffix(bytes)
             }
         } else {
             String::new()
@@ -1328,6 +1330,10 @@ fn compute_cc_version_suffix(first_user_message_text: &str, version: &str) -> St
     let input = format!("{}{}{}", CCH_SALT, picked, version);
     let hash = Sha256::digest(input.as_bytes());
     format!("{:x}", hash)[..3].to_string()
+}
+
+fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
+    format!("{:04x}", u16::from_be_bytes(bytes))[..3].to_string()
 }
 
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
@@ -1768,6 +1774,7 @@ impl Rewriter {
             anchors,
             snapshot_generation: outcome.snapshot_generation,
             snapshot_cache_read_tokens: snapshot.and_then(|state| state.confirmed_cache_read_tokens),
+            has_reused_anchor: outcome.reused_count > 0,
         })
     }
 }
@@ -2269,7 +2276,15 @@ impl StatefulCacheStore {
         anchors: Vec<AnchorRecord>,
         expected_generation: Option<u64>,
         confirmed_cache_read_tokens: Option<u64>,
+        has_reused_anchor: bool,
     ) {
+        if should_delay_stateful_cold_start_promotion(
+            &profile,
+            expected_generation,
+            has_reused_anchor,
+        ) {
+            return;
+        }
         if let Some(existing) = self.sessions.get(&key) {
             if let Some(expected) = expected_generation {
                 if existing.generation != expected {
@@ -2286,6 +2301,9 @@ impl StatefulCacheStore {
                     }
                 }
             } else {
+                if !has_reused_anchor && profile.block_count < STATEFUL_BOOTSTRAP_BLOCKS {
+                    return;
+                }
                 if profile.block_count < existing.normal_profile.block_count {
                     return;
                 }
@@ -2331,6 +2349,20 @@ impl StatefulCacheStore {
         self.order.retain(|item| item != key);
         self.order.push(key.to_string());
     }
+}
+
+/// 判断冷启动请求是否只应临时打断点,不写入会话主线。
+///
+/// Claude Code 并行 tool 会在一个新会话开始时发出 1-2 个极小请求；这些请求可以
+/// 临时降低单次成本,但没有足够历史证明自己是主线,不能成为后续 stateful anchor。
+fn should_delay_stateful_cold_start_promotion(
+    profile: &StatefulRequestProfile,
+    expected_generation: Option<u64>,
+    has_reused_anchor: bool,
+) -> bool {
+    expected_generation.is_none()
+        && !has_reused_anchor
+        && profile.block_count < STATEFUL_BOOTSTRAP_BLOCKS
 }
 
 /// 判断两个断点集合是否至少共享一个 block 指纹。
@@ -5705,8 +5737,14 @@ mod tests {
             MessageCacheControlRewrite::Stateful,
         );
         assert_eq!(message_cache_control_positions(&first), vec![(0, 0)]);
+        assert!(rewriter
+            .stateful_cache
+            .lock()
+            .unwrap()
+            .get("1:session-bootstrap")
+            .is_none());
 
-        for count in [2, 12, 22] {
+        for count in [2, 12] {
             let parsed = rewrite_messages_body_with_rewriter(
                 &rewriter,
                 stateful_session_body("session-bootstrap", count),
@@ -5715,7 +5753,22 @@ mod tests {
                 MessageCacheControlRewrite::Stateful,
             );
             assert!(!message_cache_control_positions(&parsed).is_empty());
+            assert!(rewriter
+                .stateful_cache
+                .lock()
+                .unwrap()
+                .get("1:session-bootstrap")
+                .is_none());
         }
+
+        let bootstrap = rewrite_messages_body_with_rewriter(
+            &rewriter,
+            stateful_session_body("session-bootstrap", 22),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+        );
+        assert!(!message_cache_control_positions(&bootstrap).is_empty());
 
         let snapshot = rewriter
             .stateful_cache
@@ -5884,9 +5937,30 @@ mod tests {
             .collect::<Vec<_>>();
         let mut store = super::StatefulCacheStore::default();
 
-        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None, None);
-        store.promote_if_current(key.clone(), second_profile, second_anchors, Some(1), None);
-        store.promote_if_current(key.clone(), stale_profile, stale_anchors, Some(1), None);
+        store.promote_if_current(
+            key.clone(),
+            first_profile,
+            first_anchors.clone(),
+            None,
+            None,
+            false,
+        );
+        store.promote_if_current(
+            key.clone(),
+            second_profile,
+            second_anchors,
+            Some(1),
+            None,
+            true,
+        );
+        store.promote_if_current(
+            key.clone(),
+            stale_profile,
+            stale_anchors,
+            Some(1),
+            None,
+            false,
+        );
 
         let snapshot = store.get(&key).expect("snapshot");
         assert_eq!(snapshot.normal_profile.block_count, 82);
@@ -5915,8 +5989,22 @@ mod tests {
             .collect::<Vec<_>>();
         let mut store = super::StatefulCacheStore::default();
 
-        store.promote_if_current(key.clone(), first_profile, first_anchors.clone(), None, None);
-        store.promote_if_current(key.clone(), parallel_profile, parallel_anchors, None, None);
+        store.promote_if_current(
+            key.clone(),
+            first_profile,
+            first_anchors.clone(),
+            None,
+            None,
+            false,
+        );
+        store.promote_if_current(
+            key.clone(),
+            parallel_profile,
+            parallel_anchors,
+            None,
+            None,
+            false,
+        );
 
         let snapshot = store.get(&key).expect("snapshot");
         assert_eq!(snapshot.normal_profile.block_count, 80);
@@ -6877,6 +6965,13 @@ mod tests {
             compute_cc_version_suffix("abcd你fghijklmnopqrstuv", "2.1.156"),
             "45e"
         );
+    }
+
+    #[test]
+    fn random_cc_version_suffix_is_always_three_chars() {
+        assert_eq!(super::random_cc_version_suffix([0, 1]), "000");
+        assert_eq!(super::random_cc_version_suffix([0x0f, 0xff]), "0ff");
+        assert_eq!(super::random_cc_version_suffix([0xff, 0xff]), "fff");
     }
 
     #[test]
