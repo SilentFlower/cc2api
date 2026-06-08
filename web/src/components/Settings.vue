@@ -46,7 +46,7 @@ const passthroughWorkingDir = ref(true);
 const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 
 /** Claude Code messages 缓存断点改写模式 */
-const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful'>('off');
+const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' | 'sub2api'>('off');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -145,7 +145,7 @@ async function loadSettings() {
     const ttlRewrite = data.cache_control_ttl_rewrite ?? 'off';
     cacheControlTtlRewrite.value = ttlRewrite === '5m' || ttlRewrite === '1h' ? ttlRewrite : 'off';
     const messageCacheRewrite = data.message_cache_control_rewrite ?? 'off';
-    if (messageCacheRewrite === 'auto' || messageCacheRewrite === 'rolling' || messageCacheRewrite === 'stateful') {
+    if (messageCacheRewrite === 'auto' || messageCacheRewrite === 'rolling' || messageCacheRewrite === 'stateful' || messageCacheRewrite === 'sub2api') {
       messageCacheControlRewrite.value = messageCacheRewrite;
     } else if (messageCacheRewrite === 'stable' || messageCacheRewrite === 'anchored') {
       messageCacheControlRewrite.value = 'auto';
@@ -457,7 +457,7 @@ onMounted(async () => {
               会话防污染会记住同一 Claude Code session 的正常主线断点,并忽略并行 tool 或停止恢复触发的异常暴涨请求。
             </p>
           </div>
-          <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
               <input
                 v-model="messageCacheControlRewrite"
@@ -493,6 +493,15 @@ onMounted(async () => {
                 class="accent-[#c4704f] w-4 h-4"
               />
               <span class="text-sm text-[#29261e]">滚动断点</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="messageCacheControlRewrite"
+                type="radio"
+                value="sub2api"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">sub2api 断点</span>
             </label>
           </div>
         </div>

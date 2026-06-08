@@ -403,8 +403,9 @@ impl CacheControlTtlRewrite {
 /// `Auto` 会使用无状态保守滚动策略,稳定 Claude Code cache prefix 后只在相对稳定的
 /// message 边界放置断点。`Rolling` 保留更积极的滚动策略,方便线上对照。
 /// `Stateful` 在 `Auto` 基础上按会话保留上一轮实际发送的断点指纹,并避免异常暴涨
-/// 请求污染正常主线。旧设置值 `stable` / `anchored` 会兼容解析到 `Auto`,
-/// 避免历史配置继续进入已废弃的实验路径。
+/// 请求污染正常主线。`Sub2api` 使用最后一条 message + 倒数第二个 user message
+/// 的通用稳定断点策略,用于 API 模式默认策略和 Claude Code 对照实验。旧设置值
+/// `stable` / `anchored` 会兼容解析到 `Auto`,避免历史配置继续进入已废弃的实验路径。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageCacheControlRewrite {
     /// 保持客户端原始 message cache_control。
@@ -416,9 +417,22 @@ pub enum MessageCacheControlRewrite {
     Rolling,
     /// 会话级防污染缓存断点策略。
     Stateful,
+    /// sub2api 风格的通用稳定尾部断点策略。
+    Sub2api,
 }
 
 impl MessageCacheControlRewrite {
+    /// 返回日志中使用的稳定设置名。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Rolling => "rolling",
+            Self::Stateful => "stateful",
+            Self::Sub2api => "sub2api",
+        }
+    }
+
     /// 从 settings 字符串解析 message 缓存断点改写模式。
     ///
     /// @param raw settings 中保存的原始字符串。
@@ -429,8 +443,9 @@ impl MessageCacheControlRewrite {
             "auto" | "stable" | "anchored" => Ok(Self::Auto),
             "rolling" => Ok(Self::Rolling),
             "stateful" => Ok(Self::Stateful),
+            "sub2api" => Ok(Self::Sub2api),
             other => Err(AppError::BadRequest(format!(
-                "'message_cache_control_rewrite' 必须是 off、auto、rolling 或 stateful,当前值: {}",
+                "'message_cache_control_rewrite' 必须是 off、auto、rolling、stateful 或 sub2api,当前值: {}",
                 other
             ))),
         }
@@ -1759,6 +1774,20 @@ impl Rewriter {
         client_type: ClientType,
         mode: MessageCacheControlRewrite,
     ) -> Option<StatefulCacheCompletion> {
+        if client_type == ClientType::API {
+            match mode {
+                MessageCacheControlRewrite::Off => {}
+                MessageCacheControlRewrite::Auto
+                | MessageCacheControlRewrite::Rolling
+                | MessageCacheControlRewrite::Stateful
+                | MessageCacheControlRewrite::Sub2api => {
+                    strip_message_cache_control(body);
+                    add_sub2api_message_cache_control(body, mode, client_type);
+                }
+            }
+            return None;
+        }
+
         match mode {
             MessageCacheControlRewrite::Off => {}
             MessageCacheControlRewrite::Auto => {
@@ -1775,6 +1804,10 @@ impl Rewriter {
                 stabilize_claude_code_cache_prefix(body);
                 strip_cache_control_for_message_rewrite(body, client_type);
                 return self.add_stateful_message_cache_control(body, account);
+            }
+            MessageCacheControlRewrite::Sub2api => {
+                strip_message_cache_control(body);
+                add_sub2api_message_cache_control(body, mode, client_type);
             }
         }
         None
@@ -2213,6 +2246,52 @@ fn add_rolling_message_cache_control(body: &mut serde_json::Value, client_type: 
     );
 }
 
+/// 放置 sub2api 风格的稳定 message 断点。
+///
+/// API 客户端没有 Claude Code 并行 tool 的固定历史形态；这里不复用 rolling/lookback
+/// 算法，避免长历史里断点持续漂移导致上游反复重建 prefix。Claude Code 显式选择
+/// `sub2api` 模式时也使用同一算法,便于和 sub2api 行为做线上对照。
+fn add_sub2api_message_cache_control(
+    body: &mut serde_json::Value,
+    configured_mode: MessageCacheControlRewrite,
+    client_type: ClientType,
+) {
+    normalize_sub2api_message_cache_candidate_contents(body);
+    let outcome = select_sub2api_message_cache_control_positions(body);
+    for (message_idx, block_idx) in &outcome.selected {
+        add_message_cache_control_at_block(body, *message_idx, *block_idx);
+    }
+
+    let selected_labels = outcome
+        .selected
+        .iter()
+        .map(|(message_idx, block_idx)| {
+            message_cache_control_position_log_label(body, *message_idx, *block_idx)
+        })
+        .collect::<Vec<_>>();
+    let selected_diagnostics = selected_cache_diagnostics(body, &outcome.selected, "sub2api");
+    let prefix_diagnostics = cache_prefix_diagnostics(body);
+    let system_breakpoints = count_system_cache_breakpoints(body);
+    let tool_breakpoints = count_tool_cache_breakpoints(body);
+    info!(
+        target: "cc2api::cache",
+        mode = "sub2api",
+        configured_mode = configured_mode.as_str(),
+        client_type = client_type.as_str(),
+        available_slots = outcome.available_slots,
+        message_content_blocks = outcome.message_content_blocks,
+        system_breakpoints,
+        tool_breakpoints,
+        final_breakpoints = system_breakpoints + tool_breakpoints + outcome.selected.len(),
+        selected_count = outcome.selected.len(),
+        selected = ?selected_labels,
+        selected_diag = ?selected_diagnostics,
+        prefix_diag = ?prefix_diagnostics,
+        skip_reason = outcome.skip_reason.as_deref().unwrap_or(""),
+        "sub2api message cache_control 选点完成"
+    );
+}
+
 /// 断点选点结果。
 struct CacheBreakpointSelection {
     selected: Vec<(usize, usize)>,
@@ -2511,6 +2590,155 @@ fn select_rolling_message_cache_control_positions(
     body: &serde_json::Value,
 ) -> CacheBreakpointSelection {
     select_message_cache_control_positions(body, CacheBreakpointMode::Rolling)
+}
+
+/// 计算 sub2api 风格的 message 缓存断点。
+///
+/// 对齐 sub2api 的非 Claude Code 客户端策略：最后一条 message 一个断点；
+/// messages 数量达到 4 时，再给倒数第二个 user message 一个断点。
+fn select_sub2api_message_cache_control_positions(
+    body: &serde_json::Value,
+) -> CacheBreakpointSelection {
+    let non_message_breakpoints = count_non_message_cache_breakpoints(body);
+    let available = MAX_CACHE_BREAKPOINTS.saturating_sub(non_message_breakpoints);
+    let Some(messages) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+    else {
+        return CacheBreakpointSelection {
+            selected: Vec::new(),
+            available_slots: available,
+            message_content_blocks: 0,
+            skip_reason: Some("no_messages".into()),
+        };
+    };
+    let message_content_blocks = message_block_positions(body)
+        .map(|blocks| blocks.len())
+        .unwrap_or(0);
+
+    if available == 0 {
+        return CacheBreakpointSelection {
+            selected: Vec::new(),
+            available_slots: available,
+            message_content_blocks,
+            skip_reason: Some("no_available_slots".into()),
+        };
+    }
+    if messages.is_empty() {
+        return CacheBreakpointSelection {
+            selected: Vec::new(),
+            available_slots: available,
+            message_content_blocks,
+            skip_reason: Some("no_messages".into()),
+        };
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(position) =
+        find_last_cacheable_block_in_message(body, messages.len() - 1, CacheBreakpointMode::Auto)
+    {
+        push_unique_position(&mut selected, &mut seen, position, available);
+    }
+    if messages.len() >= 4 {
+        let mut user_count = 0;
+        for message_idx in (0..messages.len()).rev() {
+            if messages[message_idx]
+                .get("role")
+                .and_then(|role| role.as_str())
+                != Some("user")
+            {
+                continue;
+            }
+            user_count += 1;
+            if user_count != 2 {
+                continue;
+            }
+            if let Some(position) =
+                find_last_cacheable_block_in_message(body, message_idx, CacheBreakpointMode::Auto)
+            {
+                push_unique_position(&mut selected, &mut seen, position, available);
+            }
+            break;
+        }
+    }
+    selected.sort_unstable();
+
+    let skip_reason = if selected.is_empty() {
+        Some("no_cacheable_blocks".into())
+    } else {
+        None
+    };
+    CacheBreakpointSelection {
+        selected,
+        available_slots: available,
+        message_content_blocks,
+        skip_reason,
+    }
+}
+
+/// sub2api 风格断点策略兼容 string content。
+///
+/// sub2api 会把被选中 message 的字符串 content 升级为 text block 数组后再打断点；
+/// 这里提前只规范化两个候选 message，避免改变其它历史消息结构。
+fn normalize_sub2api_message_cache_candidate_contents(body: &mut serde_json::Value) {
+    let Some(messages) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+    else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+
+    let mut indexes = vec![messages.len() - 1];
+    if messages.len() >= 4 {
+        let mut user_count = 0;
+        for message_idx in (0..messages.len()).rev() {
+            if messages[message_idx]
+                .get("role")
+                .and_then(|role| role.as_str())
+                != Some("user")
+            {
+                continue;
+            }
+            user_count += 1;
+            if user_count == 2 {
+                indexes.push(message_idx);
+                break;
+            }
+        }
+    }
+
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(|messages| messages.as_array_mut())
+    else {
+        return;
+    };
+    for message_idx in indexes {
+        normalize_message_string_content(messages.get_mut(message_idx));
+    }
+}
+
+/// 将单条 message 的字符串 content 升级为单个 text block。
+fn normalize_message_string_content(message: Option<&mut serde_json::Value>) {
+    let Some(message) = message else {
+        return;
+    };
+    let Some(content) = message.get("content").cloned() else {
+        return;
+    };
+    let serde_json::Value::String(text) = content else {
+        return;
+    };
+    if let Some(obj) = message.as_object_mut() {
+        obj.insert(
+            "content".into(),
+            serde_json::json!([{ "type": "text", "text": text }]),
+        );
+    }
 }
 
 /// 计算 stateful 防污染缓存断点位置。
@@ -3384,6 +3612,26 @@ fn find_window_message_cache_breakpoint(
             None
         }
     })
+}
+
+/// 查找某条 message 内最后一个可放置 cache_control 的 content block。
+fn find_last_cacheable_block_in_message(
+    body: &serde_json::Value,
+    message_idx: usize,
+    mode: CacheBreakpointMode,
+) -> Option<(usize, usize)> {
+    let content_len = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.get(message_idx))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())
+        .map(|content| content.len())?;
+
+    (0..content_len)
+        .rev()
+        .map(|block_idx| (message_idx, block_idx))
+        .find(|position| is_cacheable_message_block_at(body, *position, mode))
 }
 
 /// 构造缓存断点诊断标签,只记录结构化位置和 block 类型,避免日志泄漏 prompt 文本。
@@ -4300,6 +4548,10 @@ mod tests {
         assert_eq!(
             MessageCacheControlRewrite::parse("stateful").unwrap(),
             MessageCacheControlRewrite::Stateful
+        );
+        assert_eq!(
+            MessageCacheControlRewrite::parse("sub2api").unwrap(),
+            MessageCacheControlRewrite::Sub2api
         );
         assert_eq!(
             MessageCacheControlRewrite::parse("anchored").unwrap(),
@@ -6539,10 +6791,7 @@ mod tests {
             MessageCacheControlRewrite::Auto,
         );
 
-        assert_eq!(
-            message_cache_control_positions(&parsed),
-            vec![(0, 0), (1, 0)]
-        );
+        assert_eq!(message_cache_control_positions(&parsed), vec![(1, 0)]);
         assert_eq!(parsed["system"][2]["cache_control"]["ttl"], json!("1h"));
     }
 
@@ -6573,11 +6822,130 @@ mod tests {
             MessageCacheControlRewrite::Auto,
         );
 
+        assert_eq!(message_cache_control_positions(&parsed), vec![(1, 0)]);
+        assert_eq!(parsed["system"][2]["cache_control"]["ttl"], json!("1h"));
+    }
+
+    #[test]
+    fn message_cache_control_api_modes_use_sub2api_style_breakpoints() {
+        for mode in [
+            MessageCacheControlRewrite::Auto,
+            MessageCacheControlRewrite::Rolling,
+            MessageCacheControlRewrite::Stateful,
+            MessageCacheControlRewrite::Sub2api,
+        ] {
+            let parsed = rewrite_messages_body_with_modes(
+                json!({
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "u1"
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "text",
+                                "text": "a1"
+                            }]
+                        },
+                        {
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": "u2",
+                                "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                            }]
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "Read",
+                                "input": {}
+                            }]
+                        },
+                        {
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "result"
+                            }]
+                        }
+                    ]
+                }),
+                ClientType::API,
+                CacheControlTtlRewrite::Off,
+                mode,
+            );
+
+            assert_eq!(
+                message_cache_control_positions(&parsed),
+                vec![(2, 0), (4, 0)]
+            );
+            assert_eq!(parsed["messages"][0]["content"], json!("u1"));
+            assert_eq!(parsed["system"][2]["cache_control"]["ttl"], json!("1h"));
+        }
+    }
+
+    #[test]
+    fn message_cache_control_sub2api_applies_to_claude_code_mode() {
+        let parsed = rewrite_messages_body_with_modes(
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "system",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {},
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u1",
+                            "cache_control": { "type": "ephemeral", "ttl": "5m" }
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "a1"
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "u2"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "a2"
+                        }]
+                    }
+                ]
+            }),
+            ClientType::ClaudeCode,
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Sub2api,
+        );
+
         assert_eq!(
             message_cache_control_positions(&parsed),
-            vec![(0, 0), (1, 0)]
+            vec![(0, 0), (3, 0)]
         );
-        assert_eq!(parsed["system"][2]["cache_control"]["ttl"], json!("1h"));
+        assert!(parsed["system"][0].get("cache_control").is_some());
+        assert!(parsed["tools"][0].get("cache_control").is_some());
     }
 
     #[test]
