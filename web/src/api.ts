@@ -50,6 +50,11 @@ export interface Account {
   subscription_type?: string | null
   concurrency: number
   priority: number
+  rpm_limit: number
+  rpm_current?: number
+  rpm_remaining?: number | null
+  rpm_window_reset_at?: string
+  rpm_saturated?: boolean
   auto_telemetry: boolean
   auto_poll_usage: boolean
   allow_1m_models: string

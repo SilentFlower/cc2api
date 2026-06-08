@@ -187,6 +187,12 @@ async fn list_accounts(
         });
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
         obj["queued_requests"] = serde_json::json!(si.queued);
+        if let Ok(rpm) = state.account_svc.get_account_rpm_status(a).await {
+            obj["rpm_current"] = serde_json::json!(rpm.current);
+            obj["rpm_remaining"] = serde_json::json!(rpm.remaining);
+            obj["rpm_window_reset_at"] = serde_json::json!(rpm.window_reset_at.to_rfc3339());
+            obj["rpm_saturated"] = serde_json::json!(rpm.saturated);
+        }
         data.push(obj);
     }
 
@@ -216,6 +222,7 @@ struct CreateAccountRequest {
     subscription_type: Option<String>,
     concurrency: Option<i32>,
     priority: Option<i32>,
+    rpm_limit: Option<i32>,
     auto_telemetry: Option<bool>,
     auto_poll_usage: Option<bool>,
     allow_1m_models: Option<String>,
@@ -259,6 +266,7 @@ async fn create_account(
         subscription_type: req.subscription_type,
         concurrency: req.concurrency.unwrap_or(3),
         priority: req.priority.unwrap_or(50),
+        rpm_limit: req.rpm_limit.unwrap_or(0).max(0),
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),
@@ -337,6 +345,9 @@ async fn update_account(
         if priority > 0 {
             existing.priority = priority as i32;
         }
+    }
+    if let Some(rpm_limit) = updates.get("rpm_limit").and_then(|v| v.as_i64()) {
+        existing.rpm_limit = rpm_limit.max(0) as i32;
     }
     if let Some(status) = updates.get("status").and_then(|v| v.as_str()) {
         if !status.is_empty() {

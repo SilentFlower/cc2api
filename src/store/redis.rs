@@ -2,7 +2,7 @@ use redis::AsyncCommands;
 use std::time::Duration;
 
 use crate::error::AppError;
-use crate::store::cache::CacheStore;
+use crate::store::cache::{CacheStore, RpmAcquire};
 
 pub struct RedisStore {
     client: redis::aio::ConnectionManager,
@@ -30,6 +30,10 @@ impl RedisStore {
             .map_err(|e| AppError::Internal(format!("redis connect: {}", e)))?;
         Ok(Self { client: mgr })
     }
+}
+
+fn rpm_key(account_id: i64, minute_ts: i64) -> String {
+    format!("rpm:{}:{}", account_id, minute_ts)
 }
 
 #[axum::async_trait]
@@ -111,6 +115,54 @@ impl CacheStore for RedisStore {
             .ok()
             .flatten()
             .unwrap_or(0)
+    }
+
+    async fn get_account_rpm(&self, account_id: i64, minute_ts: i64) -> Result<i64, AppError> {
+        let key = rpm_key(account_id, minute_ts);
+        self.client
+            .clone()
+            .get::<_, Option<i64>>(key)
+            .await
+            .map(|v| v.unwrap_or(0))
+            .map_err(|e| AppError::Internal(format!("redis rpm get: {}", e)))
+    }
+
+    async fn try_acquire_account_rpm(
+        &self,
+        account_id: i64,
+        minute_ts: i64,
+        limit: i32,
+        ttl: Duration,
+    ) -> Result<RpmAcquire, AppError> {
+        if limit <= 0 {
+            return Ok(RpmAcquire { acquired: true, current: 0 });
+        }
+        let key = rpm_key(account_id, minute_ts);
+        let mut conn = self.client.clone();
+        let val: i64 = conn
+            .incr(&key, 1i64)
+            .await
+            .map_err(|e| AppError::Internal(format!("redis rpm incr: {}", e)))?;
+        if val == 1 {
+            let _: () = conn
+                .expire(&key, ttl.as_secs().max(1) as i64)
+                .await
+                .unwrap_or(());
+        }
+        if val > limit as i64 {
+            let current = conn
+                .decr::<_, _, i64>(&key, 1i64)
+                .await
+                .unwrap_or(limit as i64);
+            return Ok(RpmAcquire {
+                acquired: false,
+                current,
+            });
+        }
+        Ok(RpmAcquire {
+            acquired: true,
+            current: val,
+        })
     }
 
     async fn acquire_lock(

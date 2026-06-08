@@ -1,6 +1,12 @@
 use crate::error::AppError;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy)]
+pub struct RpmAcquire {
+    pub acquired: bool,
+    pub current: i64,
+}
+
 #[axum::async_trait]
 pub trait CacheStore: Send + Sync {
     async fn get_session_account_id(&self, session_hash: &str) -> Result<Option<i64>, AppError>;
@@ -15,6 +21,16 @@ pub trait CacheStore: Send + Sync {
     async fn release_slot(&self, key: &str);
     /// 获取指定 key 的当前槽位占用数（用于负载感知选择）。
     async fn get_slot_count(&self, key: &str) -> i64;
+    /// 获取账号在指定分钟窗口内的 RPM 计数。
+    async fn get_account_rpm(&self, account_id: i64, minute_ts: i64) -> Result<i64, AppError>;
+    /// 预占一个账号 RPM 名额，超过上限时不保留递增。
+    async fn try_acquire_account_rpm(
+        &self,
+        account_id: i64,
+        minute_ts: i64,
+        limit: i32,
+        ttl: Duration,
+    ) -> Result<RpmAcquire, AppError>;
     async fn acquire_lock(
         &self,
         key: &str,

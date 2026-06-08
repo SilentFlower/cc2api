@@ -4,10 +4,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
-use tokio::time::sleep;
-use tracing::warn;
+use tokio::time::{sleep, Instant};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -21,6 +21,9 @@ const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
 const OAUTH_LOCK_TTL: Duration = Duration::from_secs(30);
 const OAUTH_WAIT_RETRY: Duration = Duration::from_millis(500);
 const OAUTH_WAIT_ATTEMPTS: usize = 20;
+const RPM_KEY_TTL: Duration = Duration::from_secs(120);
+const RPM_WAIT_MAX: Duration = Duration::from_secs(5);
+const RPM_WAIT_STEP: Duration = Duration::from_millis(250);
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
@@ -60,6 +63,30 @@ pub struct AccountScoreInfo {
     pub current_concurrency: i64,
     /// 当前等待队列中的请求数。
     pub queued: i64,
+}
+
+/// 账号当前分钟 RPM 状态，用于调度判断和管理端展示。
+pub struct AccountRpmStatus {
+    pub limit: i32,
+    pub current: i64,
+    pub remaining: Option<i64>,
+    pub window_reset_at: chrono::DateTime<Utc>,
+    pub saturated: bool,
+}
+
+/// 账号选择结果，携带是否命中粘性会话。
+pub struct SelectedAccount {
+    pub account: Account,
+    pub sticky: bool,
+    pub should_bind_session: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpmAdmissionAction {
+    Allow,
+    Wait,
+    Skip,
+    Reject,
 }
 
 /// 评分权重默认值。
@@ -396,6 +423,25 @@ impl AccountService {
         exclude_ids: &[i64],
         allowed_ids: &[i64],
     ) -> Result<Account, AppError> {
+        let selected = self
+            .select_account_with_context(session_hash, exclude_ids, allowed_ids)
+            .await?;
+        if selected.should_bind_session {
+            let _ = self
+                .bind_selected_session(session_hash, selected.account.id)
+                .await;
+        }
+        Ok(selected.account)
+    }
+
+    /// 使用粘性会话为请求选择账号，并返回是否命中粘性绑定。
+    /// `exclude_ids` 为令牌的不可用账号，`allowed_ids` 为令牌的可用账号（空表示不限制）。
+    pub async fn select_account_with_context(
+        &self,
+        session_hash: &str,
+        exclude_ids: &[i64],
+        allowed_ids: &[i64],
+    ) -> Result<SelectedAccount, AppError> {
         // 检查粘性会话
         if !session_hash.is_empty() {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
@@ -410,7 +456,11 @@ impl AccountService {
                             let _ = self.cache.set_session_account_id(
                                 session_hash, account_id, STICKY_SESSION_TTL,
                             ).await;
-                            return Ok(account);
+                            return Ok(SelectedAccount {
+                                account,
+                                sticky: true,
+                                should_bind_session: false,
+                            });
                         }
                     }
                     // 过期绑定，删除
@@ -423,13 +473,19 @@ impl AccountService {
         let accounts = self.store.list_schedulable().await?;
 
         // 过滤：排除项 + 可用账号限制
-        let candidates: Vec<Account> = accounts
+        let mut candidates: Vec<Account> = accounts
             .into_iter()
             .filter(|a| {
                 !exclude_ids.contains(&a.id)
                     && (allowed_ids.is_empty() || allowed_ids.contains(&a.id))
             })
             .collect();
+
+        // 新会话优先避开当前分钟 RPM 已满账号；若全部已满，保留候选交给后续 admission 等待/拒绝。
+        let rpm_available = self.filter_rpm_available(&candidates).await;
+        if !rpm_available.is_empty() {
+            candidates = rpm_available;
+        }
 
         if candidates.is_empty() {
             return Err(AppError::ServiceUnavailable(
@@ -440,15 +496,184 @@ impl AccountService {
         // 按优先级分组，同优先级内按综合评分选择（5h 用量 + 并发负载）
         let selected = self.select_by_score(&candidates).await;
 
-        // 绑定粘性会话
-        if !session_hash.is_empty() {
-            let _ = self
-                .cache
-                .set_session_account_id(session_hash, selected.id, STICKY_SESSION_TTL)
-                .await;
+        Ok(SelectedAccount {
+            account: selected,
+            sticky: false,
+            should_bind_session: !session_hash.is_empty(),
+        })
+    }
+
+    /// 在请求真正进入所选账号后提交粘性会话绑定。
+    ///
+    /// 新会话选择阶段不能提前写绑定：如果随后 RPM admission 发现账号已满并换号，
+    /// 提前绑定会把下一轮误判成粘性请求，导致本应换号的请求被留在满载账号上等待或拒绝。
+    pub async fn bind_selected_session(
+        &self,
+        session_hash: &str,
+        account_id: i64,
+    ) -> Result<(), AppError> {
+        if session_hash.is_empty() {
+            return Ok(());
+        }
+        self.cache
+            .set_session_account_id(session_hash, account_id, STICKY_SESSION_TTL)
+            .await
+    }
+
+    async fn filter_rpm_available(&self, accounts: &[Account]) -> Vec<Account> {
+        let mut available = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            if account.rpm_limit <= 0 {
+                available.push(account.clone());
+                continue;
+            }
+            match self.get_account_rpm_status(account).await {
+                Ok(status) if !status.saturated => available.push(account.clone()),
+                Ok(_) => {
+                    info!(
+                        "[RPM] 账号={} id={} 当前已满 动作=skip 粘性=false",
+                        account.name, account.id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[RPM] 账号={} id={} 状态读取失败 动作=allow 错误={}",
+                        account.name, account.id, e
+                    );
+                    available.push(account.clone());
+                }
+            }
+        }
+        available
+    }
+
+    /// 返回账号当前分钟 RPM 状态。读取失败由调用方决定是否失败开放。
+    pub async fn get_account_rpm_status(&self, account: &Account) -> Result<AccountRpmStatus, AppError> {
+        let (minute_ts, reset_at) = current_rpm_window();
+        let limit = account.rpm_limit.max(0);
+        let current = self.cache.get_account_rpm(account.id, minute_ts).await?;
+        let remaining = if limit > 0 {
+            Some((limit as i64 - current).max(0))
+        } else {
+            None
+        };
+        Ok(AccountRpmStatus {
+            limit,
+            current,
+            remaining,
+            window_reset_at: reset_at,
+            saturated: limit > 0 && current >= limit as i64,
+        })
+    }
+
+    /// 在发往上游前预占账号 RPM。粘性会话超限时等待；非粘性请求超限时让 gateway 换号。
+    pub async fn acquire_account_rpm(
+        &self,
+        account: &Account,
+        sticky: bool,
+        session_hash: &str,
+    ) -> Result<(), AppError> {
+        if account.rpm_limit <= 0 {
+            return Ok(());
         }
 
-        Ok(selected)
+        let deadline = Instant::now() + RPM_WAIT_MAX;
+        loop {
+            let (minute_ts, reset_at) = current_rpm_window();
+            match self
+                .cache
+                .try_acquire_account_rpm(account.id, minute_ts, account.rpm_limit, RPM_KEY_TTL)
+                .await
+            {
+                Ok(result) if result.acquired => {
+                    self.log_rpm_action(
+                        account,
+                        result.current,
+                        sticky,
+                        RpmAdmissionAction::Allow,
+                        None,
+                        session_hash,
+                    );
+                    return Ok(());
+                }
+                Ok(result) if !sticky => {
+                    self.log_rpm_action(
+                        account,
+                        result.current,
+                        sticky,
+                        RpmAdmissionAction::Skip,
+                        None,
+                        session_hash,
+                    );
+                    return Err(AppError::ServiceUnavailable("account rpm limit reached".into()));
+                }
+                Ok(result) => {
+                    let now = Utc::now();
+                    let until_reset = (reset_at - now)
+                        .to_std()
+                        .unwrap_or_else(|_| Duration::from_millis(0));
+                    let remaining_budget = deadline.saturating_duration_since(Instant::now());
+                    if remaining_budget.is_zero() {
+                        self.log_rpm_action(
+                            account,
+                            result.current,
+                            sticky,
+                            RpmAdmissionAction::Reject,
+                            Some("wait_timeout"),
+                            session_hash,
+                        );
+                        return Err(AppError::TooManyRequests(
+                            "sticky account rpm limit reached".into(),
+                        ));
+                    }
+                    let wait = until_reset.min(RPM_WAIT_STEP).min(remaining_budget);
+                    self.log_rpm_action(
+                        account,
+                        result.current,
+                        sticky,
+                        RpmAdmissionAction::Wait,
+                        Some(&format!("{}ms", wait.as_millis())),
+                        session_hash,
+                    );
+                    sleep(wait).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "[RPM] 账号={} id={} 预占失败 动作=allow 粘性={} 错误={}",
+                        account.name, account.id, sticky, e
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn log_rpm_action(
+        &self,
+        account: &Account,
+        current: i64,
+        sticky: bool,
+        action: RpmAdmissionAction,
+        detail: Option<&str>,
+        session_hash: &str,
+    ) {
+        let action_label = match action {
+            RpmAdmissionAction::Allow => "allow",
+            RpmAdmissionAction::Wait => "wait",
+            RpmAdmissionAction::Skip => "skip",
+            RpmAdmissionAction::Reject => "reject",
+        };
+        let session = short_session_hash(session_hash);
+        match detail {
+            Some(detail) => info!(
+                "[RPM] 账号={} id={} 当前={} 限制={} 粘性={} 动作={} 详情={} session={}",
+                account.name, account.id, current, account.rpm_limit, sticky, action_label, detail, session
+            ),
+            None => info!(
+                "[RPM] 账号={} id={} 当前={} 限制={} 粘性={} 动作={} session={}",
+                account.name, account.id, current, account.rpm_limit, sticky, action_label, session
+            ),
+        }
     }
 
     /// 获取或懒创建账号的 FIFO 排队器。
@@ -854,6 +1079,24 @@ impl AccountService {
             queued,
         }
     }
+}
+
+fn current_rpm_window() -> (i64, chrono::DateTime<Utc>) {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let minute_ts = now_secs / 60;
+    let reset_secs = (minute_ts + 1) * 60;
+    let reset_at = chrono::DateTime::<Utc>::from_timestamp(reset_secs, 0).unwrap_or_else(Utc::now);
+    (minute_ts, reset_at)
+}
+
+fn short_session_hash(session_hash: &str) -> String {
+    if session_hash.is_empty() {
+        return "-".to_string();
+    }
+    session_hash.chars().take(8).collect()
 }
 
 /// 计算指定窗口的有效用量详情：utilization × 阶梯衰减因子。

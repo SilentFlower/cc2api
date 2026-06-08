@@ -65,6 +65,7 @@ const form = ref({
   subscription_type: '',
   concurrency: 3,
   priority: 50,
+  rpm_limit: 0,
   auto_telemetry: false,
   auto_poll_usage: false,
   allow_1m_models: 'opus',
@@ -143,6 +144,7 @@ function openCreate() {
     subscription_type: '',
     concurrency: 3,
     priority: 50,
+    rpm_limit: 0,
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: 'opus',
@@ -171,6 +173,7 @@ function openEdit(a: Account) {
     subscription_type: a.subscription_type || '',
     concurrency: a.concurrency,
     priority: a.priority,
+    rpm_limit: a.rpm_limit ?? 0,
     auto_telemetry: a.auto_telemetry ?? false,
     auto_poll_usage: a.auto_poll_usage ?? false,
     allow_1m_models: a.allow_1m_models ?? 'opus',
@@ -208,6 +211,7 @@ async function save() {
       updates.subscription_type = form.value.subscription_type || null;
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
+      updates.rpm_limit = form.value.rpm_limit;
       updates.auto_telemetry = form.value.auto_telemetry;
       updates.auto_poll_usage = form.value.auto_poll_usage;
       updates.allow_1m_models = form.value.allow_1m_models;
@@ -233,6 +237,7 @@ async function save() {
         subscription_type: form.value.subscription_type || null,
         concurrency: form.value.concurrency,
         priority: form.value.priority,
+        rpm_limit: form.value.rpm_limit,
         auto_telemetry: form.value.auto_telemetry,
         auto_poll_usage: form.value.auto_poll_usage,
         allow_1m_models: form.value.allow_1m_models,
@@ -409,6 +414,29 @@ function authTypeLabel(authType: string): string {
 }
 
 /**
+ * 格式化当前分钟 RPM 状态。
+ * @param account 账号对象
+ */
+function rpmLabel(account: Account): string {
+  if (!account.rpm_limit || account.rpm_limit <= 0) return '未限制';
+  const current = account.rpm_current ?? 0;
+  return account.rpm_saturated ? `已满 ${current}/${account.rpm_limit}` : `${current}/${account.rpm_limit}`;
+}
+
+/**
+ * 获取 RPM 文本颜色。
+ * @param account 账号对象
+ */
+function rpmClass(account: Account): string {
+  if (!account.rpm_limit || account.rpm_limit <= 0) return 'text-[#8c8475]';
+  if (account.rpm_saturated) return 'text-red-500';
+  const current = account.rpm_current ?? 0;
+  const ratio = current / account.rpm_limit;
+  if (ratio >= 0.8) return 'text-amber-600';
+  return 'text-[#29261e]';
+}
+
+/**
  * 获取当前账号显示的凭证摘要
  * @param account 账号对象
  */
@@ -527,6 +555,7 @@ function applyOAuthResult() {
     subscription_type: '',
     concurrency: 3,
     priority: 50,
+    rpm_limit: 0,
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: 'opus',
@@ -621,7 +650,7 @@ async function copyText(text: string) {
 
           <!-- 信息 -->
           <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
-            <div class="grid grid-cols-3 gap-3">
+            <div class="grid grid-cols-4 gap-3">
               <div class="text-center relative"
                    @mouseenter="showScoreTooltip($event, a)"
                    @mouseleave="hideScoreTooltip">
@@ -640,6 +669,12 @@ async function copyText(text: string) {
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">排队</p>
                 <p class="text-sm font-medium" :class="(a.queued_requests ?? 0) > 0 ? 'text-amber-600' : 'text-[#29261e]'">
                   {{ a.queued_requests ?? 0 }}
+                </p>
+              </div>
+              <div class="text-center">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">RPM</p>
+                <p class="text-sm font-medium" :class="rpmClass(a)">
+                  {{ rpmLabel(a) }}
                 </p>
               </div>
             </div>
@@ -1152,13 +1187,23 @@ async function copyText(text: string) {
               逗号分隔的子串列表(大小写不敏感)。留空 = 所有模型都过滤掉 context-1m-2025-08-07。默认 "opus" 只放行 Opus 家族。
             </p>
           </div>
-          <div class="flex gap-4">
+          <div class="grid grid-cols-3 gap-3">
             <div class="flex-1 space-y-2">
               <Label class="text-[#5c5647] text-sm">并发数</Label>
               <Input
                 v-model.number="form.concurrency"
                 type="number"
                 min="1"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+              />
+            </div>
+            <div class="flex-1 space-y-2">
+              <Label class="text-[#5c5647] text-sm">RPM 上限</Label>
+              <Input
+                v-model.number="form.rpm_limit"
+                type="number"
+                min="0"
+                placeholder="0 表示不限制"
                 class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
               />
             </div>

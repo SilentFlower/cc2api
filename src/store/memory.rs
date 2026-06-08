@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::error::AppError;
-use crate::store::cache::CacheStore;
+use crate::store::cache::{CacheStore, RpmAcquire};
 
 struct SessionEntry {
     account_id: i64,
@@ -15,10 +15,16 @@ struct LockEntry {
     expires_at: tokio::time::Instant,
 }
 
+struct RpmEntry {
+    count: i64,
+    expires_at: tokio::time::Instant,
+}
+
 pub struct MemoryStore {
     sessions: Mutex<HashMap<String, SessionEntry>>,
     slots: Mutex<HashMap<String, i64>>,
     locks: Mutex<HashMap<String, LockEntry>>,
+    rpm: Mutex<HashMap<String, RpmEntry>>,
 }
 
 impl MemoryStore {
@@ -27,8 +33,13 @@ impl MemoryStore {
             sessions: Mutex::new(HashMap::new()),
             slots: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            rpm: Mutex::new(HashMap::new()),
         }
     }
+}
+
+fn rpm_key(account_id: i64, minute_ts: i64) -> String {
+    format!("rpm:{}:{}", account_id, minute_ts)
 }
 
 #[axum::async_trait]
@@ -93,6 +104,52 @@ impl CacheStore for MemoryStore {
     async fn get_slot_count(&self, key: &str) -> i64 {
         let slots = self.slots.lock().await;
         slots.get(key).copied().unwrap_or(0)
+    }
+
+    async fn get_account_rpm(&self, account_id: i64, minute_ts: i64) -> Result<i64, AppError> {
+        let mut rpm = self.rpm.lock().await;
+        let key = rpm_key(account_id, minute_ts);
+        if let Some(entry) = rpm.get(&key) {
+            if tokio::time::Instant::now() <= entry.expires_at {
+                return Ok(entry.count);
+            }
+            rpm.remove(&key);
+        }
+        Ok(0)
+    }
+
+    async fn try_acquire_account_rpm(
+        &self,
+        account_id: i64,
+        minute_ts: i64,
+        limit: i32,
+        ttl: Duration,
+    ) -> Result<RpmAcquire, AppError> {
+        if limit <= 0 {
+            return Ok(RpmAcquire { acquired: true, current: 0 });
+        }
+        let mut rpm = self.rpm.lock().await;
+        let now = tokio::time::Instant::now();
+        let key = rpm_key(account_id, minute_ts);
+        if rpm.get(&key).is_some_and(|entry| now > entry.expires_at) {
+            rpm.remove(&key);
+        }
+        let entry = rpm.entry(key).or_insert(RpmEntry {
+            count: 0,
+            expires_at: now + ttl,
+        });
+        if entry.count >= limit as i64 {
+            return Ok(RpmAcquire {
+                acquired: false,
+                current: entry.count,
+            });
+        }
+        entry.count += 1;
+        entry.expires_at = now + ttl;
+        Ok(RpmAcquire {
+            acquired: true,
+            current: entry.count,
+        })
     }
 
     async fn acquire_lock(

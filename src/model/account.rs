@@ -169,6 +169,9 @@ pub struct Account {
     pub concurrency: i32,
     #[serde(default = "default_priority")]
     pub priority: i32,
+    /// 账号级每分钟请求数上限，0 表示不限制。
+    #[serde(default)]
+    pub rpm_limit: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limited_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]

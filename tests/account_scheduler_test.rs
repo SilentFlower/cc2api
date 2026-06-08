@@ -54,6 +54,7 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
         subscription_type: None,
         concurrency: 3,
         priority: 50,
+        rpm_limit: 0,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),
@@ -268,6 +269,138 @@ async fn test_select_account_fails_when_all_disabled() {
     match result.unwrap_err() {
         AppError::ServiceUnavailable(_) => {} // 预期
         e => panic!("expected ServiceUnavailable, got: {:?}", e),
+    }
+}
+
+// ─── RPM 调度测试 ───────────────────────────────────────────
+
+#[tokio::test]
+async fn test_rpm_disabled_allows_repeated_admission() {
+    let (_store, svc) = setup().await;
+    let account = create_test_account(&svc, "rpm-off@example.com").await;
+
+    svc.acquire_account_rpm(&account, false, "")
+        .await
+        .expect("rpm disabled should allow first request");
+    svc.acquire_account_rpm(&account, false, "")
+        .await
+        .expect("rpm disabled should allow repeated requests");
+
+    let status = svc.get_account_rpm_status(&account).await.unwrap();
+    assert_eq!(status.limit, 0);
+    assert_eq!(status.current, 0);
+    assert_eq!(status.remaining, None);
+    assert!(!status.saturated);
+}
+
+#[tokio::test]
+async fn test_non_sticky_selection_skips_rpm_saturated_account() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "rpm-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "rpm-free@example.com").await;
+    a1.priority = 10;
+    a1.rpm_limit = 1;
+    a2.priority = 20;
+    a2.rpm_limit = 1;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+
+    svc.acquire_account_rpm(&a1, false, "")
+        .await
+        .expect("first request should consume a1 rpm");
+
+    let selected = svc.select_account("", &[], &[]).await.unwrap();
+    assert_eq!(selected.id, a2.id);
+}
+
+#[tokio::test]
+async fn test_sticky_selection_does_not_switch_when_rpm_saturated() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "sticky-rpm-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "sticky-rpm-free@example.com").await;
+    a1.priority = 10;
+    a1.rpm_limit = 1;
+    a2.priority = 20;
+    a2.rpm_limit = 1;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+
+    let session_hash = "sticky-rpm-session";
+    let selected = svc
+        .select_account_with_context(session_hash, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(!selected.sticky);
+    assert!(selected.should_bind_session);
+
+    svc.acquire_account_rpm(&a1, false, session_hash)
+        .await
+        .expect("first request should consume sticky account rpm");
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .expect("successful request should bind sticky session");
+
+    let selected = svc
+        .select_account_with_context(session_hash, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
+}
+
+#[tokio::test]
+async fn test_uncommitted_session_selection_does_not_pollute_rpm_retry() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "rpm-retry-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "rpm-retry-free@example.com").await;
+    a1.priority = 10;
+    a1.rpm_limit = 1;
+    a2.priority = 20;
+    a2.rpm_limit = 1;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+
+    let session_hash = "rpm-retry-session";
+    svc.acquire_account_rpm(&a1, false, "")
+        .await
+        .expect("first request should saturate a1 rpm");
+
+    let selected = svc
+        .select_account_with_context(session_hash, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a2.id);
+    assert!(!selected.sticky);
+    assert!(selected.should_bind_session);
+
+    let selected = svc
+        .select_account_with_context(session_hash, &[a2.id], &[])
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(!selected.sticky);
+}
+
+#[tokio::test]
+async fn test_sticky_rpm_saturation_rejects_instead_of_switching() {
+    let (_store, svc) = setup().await;
+    let mut account = create_test_account(&svc, "sticky-rpm-reject@example.com").await;
+    account.rpm_limit = 1;
+    svc.update_account(&account).await.unwrap();
+
+    svc.acquire_account_rpm(&account, true, "sticky-rpm-reject")
+        .await
+        .expect("first sticky request should consume rpm");
+
+    let started = std::time::Instant::now();
+    let result = svc
+        .acquire_account_rpm(&account, true, "sticky-rpm-reject")
+        .await;
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    match result.unwrap_err() {
+        AppError::TooManyRequests(_) => {}
+        e => panic!("expected TooManyRequests, got: {:?}", e),
     }
 }
 

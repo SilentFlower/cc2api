@@ -94,6 +94,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await
+        .ok();
 
     // api_tokens 表
     let token_schema = if driver == "sqlite" { SQLITE_TOKENS_SCHEMA } else { PG_TOKENS_SCHEMA };
@@ -202,6 +206,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     billing_mode    TEXT NOT NULL DEFAULT 'strip',
     concurrency     INTEGER NOT NULL DEFAULT 3,
     priority        INTEGER NOT NULL DEFAULT 50,
+    rpm_limit       INTEGER NOT NULL DEFAULT 0,
     rate_limited_at      TEXT,
     rate_limit_reset_at  TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -231,6 +236,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     billing_mode    TEXT NOT NULL DEFAULT 'strip',
     concurrency     INT NOT NULL DEFAULT 3,
     priority        INT NOT NULL DEFAULT 50,
+    rpm_limit       INT NOT NULL DEFAULT 0,
     rate_limited_at      TIMESTAMPTZ,
     rate_limit_reset_at  TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -106,6 +106,7 @@ impl AccountStore {
             subscription_type: row.try_get::<Option<String>, _>("subscription_type").unwrap_or(None),
             concurrency: row.try_get::<i32, _>("concurrency").unwrap_or(3),
             priority: row.try_get::<i32, _>("priority").unwrap_or(50),
+            rpm_limit: row.try_get::<i32, _>("rpm_limit").unwrap_or(0),
             rate_limited_at: Self::parse_optional_time(row, "rate_limited_at"),
             rate_limit_reset_at: Self::parse_optional_time(row, "rate_limit_reset_at"),
             disable_reason: row.try_get::<String, _>("disable_reason").unwrap_or_default(),
@@ -151,8 +152,8 @@ impl AccountStore {
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
-                concurrency, priority, auto_telemetry, auto_poll_usage, allow_1m_models)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+                concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
             RETURNING id, created_at, updated_at"#,
             self.ts(9), self.ts(10), "$11"
         );
@@ -178,6 +179,7 @@ impl AccountStore {
         .bind(&a.subscription_type)
         .bind(a.concurrency)
         .bind(a.priority)
+        .bind(a.rpm_limit)
         .bind(auto_telemetry_int)
         .bind(auto_poll_usage_int)
         .bind(&a.allow_1m_models)
@@ -200,8 +202,8 @@ impl AccountStore {
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid=$13, organization_uuid=$14, subscription_type=$15,
-                concurrency=$16, priority=$17, auto_telemetry=$18, auto_poll_usage=$19, allow_1m_models=$20, updated_at={}
-            WHERE id=$21"#,
+                concurrency=$16, priority=$17, rpm_limit=$18, auto_telemetry=$19, auto_poll_usage=$20, allow_1m_models=$21, updated_at={}
+            WHERE id=$22"#,
             self.ts(8), self.ts(9), self.now_expr()
         );
         sqlx::query(&q)
@@ -222,6 +224,7 @@ impl AccountStore {
             .bind(&a.subscription_type)
             .bind(a.concurrency)
             .bind(a.priority)
+            .bind(a.rpm_limit)
             .bind(auto_telemetry_int)
             .bind(auto_poll_usage_int)
             .bind(&a.allow_1m_models)
@@ -449,7 +452,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     oauth_expires_at, oauth_refreshed_at, auth_error, proxy_url, device_id,
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
-    concurrency, priority, rate_limited_at, rate_limit_reset_at,
+    concurrency, priority, rpm_limit, rate_limited_at, rate_limit_reset_at,
     disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
 

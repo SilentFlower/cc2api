@@ -267,18 +267,18 @@ impl GatewayService {
             let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
             // 选择账号
             let t0 = std::time::Instant::now();
-            let account = match self
+            let selected = match self
                 .account_svc
-                .select_account(&session_hash, &exclude_ids, &allowed_ids)
+                .select_account_with_context(&session_hash, &exclude_ids, &allowed_ids)
                 .await
             {
-                Ok(a) => {
+                Ok(selected) => {
                     info!(
                         "[耗时] 账号选择: {:.0}ms → {}",
                         t0.elapsed().as_millis(),
-                        a.name
+                        selected.account.name
                     );
-                    a
+                    selected
                 }
                 Err(_) if last_resp.is_some() => {
                     // 无可用账号但有上一次的 429 响应，返回给客户端
@@ -297,12 +297,15 @@ impl GatewayService {
                     )));
                 }
             };
+            let account = selected.account;
+            let sticky_account = selected.sticky;
+            let should_bind_session = selected.should_bind_session;
 
             if attempt > 0 {
                 warn!("429 retry attempt {} with account {}", attempt, account.id);
             }
 
-            // 自动遥测：拦截遥测请求 + 激活会话
+            // 自动遥测端点只返回本地假响应，不应进入 RPM 或上游转发。
             if account.auto_telemetry {
                 use crate::service::telemetry::{
                     fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
@@ -317,12 +320,21 @@ impl GatewayService {
                     debug!("telemetry: intercepted {} for account {}", path, account.id);
                     return Ok(axum::Json(body).into_response());
                 }
+            }
 
-                if path.starts_with("/v1/messages") {
-                    let t_tel = std::time::Instant::now();
-                    self.telemetry_svc.activate_session(&account).await;
-                    info!("[耗时] 遥测激活: {:.0}ms", t_tel.elapsed().as_millis());
+            // RPM admission 放在并发槽位之前：粘性会话超限时等待/拒绝,非粘性请求超限时换号。
+            // 这样不会因为 RPM 等待长期占用账号并发槽位,也不会把已有粘性会话随意切到其他账号。
+            match self
+                .account_svc
+                .acquire_account_rpm(&account, sticky_account, &session_hash)
+                .await
+            {
+                Ok(()) => {}
+                Err(AppError::ServiceUnavailable(_)) if !sticky_account => {
+                    exclude_ids.push(account.id);
+                    continue;
                 }
+                Err(e) => return Err(e),
             }
 
             // 获取并发槽位：走账号级 FIFO 排队器（tokio Semaphore 按调用顺序授予 permit）
@@ -418,18 +430,14 @@ impl GatewayService {
             );
 
             let telemetry_context = if account.auto_telemetry && path.starts_with("/v1/messages") {
-                let context = build_message_telemetry_context(
+                Some(build_message_telemetry_context(
                     &body_map,
                     &rewritten_body_map,
                     body_bytes.len(),
                     rewritten_body.len(),
                     client_type,
                     attempt,
-                );
-                self.telemetry_svc
-                    .record_message_request(&account, context.clone())
-                    .await;
-                Some(context)
+                ))
             } else {
                 None
             };
@@ -449,6 +457,28 @@ impl GatewayService {
             );
             let mut final_headers = rewritten_headers;
             final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+
+            if account.auto_telemetry && path.starts_with("/v1/messages") {
+                // 遥测会话会启动后台上游请求，必须等 RPM/槽位/改写/Token 全部成功后再激活，
+                // 避免被 RPM 跳过的账号产生额外上游副作用。
+                let t_tel = std::time::Instant::now();
+                self.telemetry_svc.activate_session(&account).await;
+                if let Some(context) = telemetry_context.clone() {
+                    self.telemetry_svc
+                        .record_message_request(&account, context)
+                        .await;
+                }
+                info!("[耗时] 遥测激活: {:.0}ms", t_tel.elapsed().as_millis());
+            }
+
+            if should_bind_session {
+                // 新会话绑定必须等到当前账号真正准备发往上游后再提交，避免 RPM/排队/Token
+                // 失败把 session 提前污染到未实际承载请求的账号上。
+                let _ = self
+                    .account_svc
+                    .bind_selected_session(&session_hash, account.id)
+                    .await;
+            }
 
             // 转发到上游
             let t_upstream = std::time::Instant::now();

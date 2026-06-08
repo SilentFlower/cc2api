@@ -42,6 +42,7 @@ fn new_account(email: &str) -> Account {
         subscription_type: None,
         concurrency: 3,
         priority: 50,
+        rpm_limit: 0,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),

@@ -53,6 +53,7 @@ async fn create_test_account(svc: &AccountService, email: &str, priority: i32) -
         subscription_type: None,
         concurrency: 3,
         priority,
+        rpm_limit: 0,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),
@@ -135,6 +136,9 @@ async fn test_retry_with_sticky_session_falls_back_on_429() {
     // 首次选号，建立粘性会话绑定到 a1
     let selected = svc.select_account(session_hash, &[], &[]).await.unwrap();
     assert_eq!(selected.id, a1.id);
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .expect("successful request should bind sticky session");
 
     // 模拟 a1 收到 429，隔离并加入排除列表
     let reset_at = Utc::now() + Duration::hours(5);
