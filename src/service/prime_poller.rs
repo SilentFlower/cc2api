@@ -9,8 +9,8 @@ use crate::model::account::{Account, AccountStatus};
 use crate::service::account::AccountService;
 use crate::service::gateway::extract_passive_usage;
 use crate::service::rewriter::{
-    clean_session_id_from_body, ordered_anthropic_headers, CacheControlTtlRewrite, ClientType,
-    EnvPassthrough, MessageCacheControlRewrite, Rewriter,
+    CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
+    ordered_anthropic_headers,
 };
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::SettingsStore;
@@ -386,11 +386,8 @@ impl PrimePollerService {
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
         );
-        // 先解析 rewritten_bytes,此时 metadata._session_id 标记仍在。
-        // 必须在剥除 _session_id 之前先跑 rewrite_headers:后者从 body 里的
-        // _session_id 抽取 X-Claude-Code-Session-Id,与 metadata.user_id.session_id 对齐。
-        // 若先剥再生成 header,header 会 fallback 到新 UUID,body/header 的 session 不一致。
-        let mut body_value: serde_json::Value =
+        // rewriter 已把 metadata.user_id 写成最终上游 body；header 直接从同一字段提取 session_id。
+        let body_value: serde_json::Value =
             serde_json::from_slice(&rewritten_bytes).unwrap_or(serde_json::Value::Null);
 
         let empty_in: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -404,13 +401,9 @@ impl PrimePollerService {
         );
         headers.insert("authorization".into(), format!("Bearer {}", token));
 
-        // header 生成完毕,可以剥掉内部 _session_id 标记,再序列化成最终 wire bytes。
-        clean_session_id_from_body(&mut body_value);
-        let final_bytes = serde_json::to_vec(&body_value).unwrap_or(rewritten_bytes);
-
         // 走定制 tlsfp 客户端,复用账号的 proxy_url。
         let client = crate::tlsfp::make_request_client(&account.proxy_url);
-        let mut req = client.post(UPSTREAM_URL).body(final_bytes);
+        let mut req = client.post(UPSTREAM_URL).body(rewritten_bytes);
         for (k, v) in ordered_anthropic_headers("/v1/messages", &headers) {
             req = req.header(k, v);
         }

@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header::CONTENT_ENCODING, response::Parts, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_ENCODING, response::Parts};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
@@ -14,22 +14,21 @@ use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::access_policy::{
-    access_policy_error_response, AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
-    DEFAULT_ALLOWED_USER_AGENTS,
+    AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+    access_policy_error_response,
 };
 use crate::service::account::{AccountService, QueueWaitError};
 use crate::service::rewriter::{
-    clean_session_id_from_body, detect_client_type, ordered_anthropic_headers,
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
-    StatefulCacheCompletion, StatefulCacheUsage,
+    StatefulCacheCompletion, StatefulCacheUsage, detect_client_type, ordered_anthropic_headers,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
 };
 use crate::store::settings_store::{
-    SettingsStore, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
+    DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
     DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PASSTHROUGH_OS_VERSION,
-    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR, SettingsStore,
 };
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -100,10 +99,7 @@ impl GatewayService {
     pub async fn reload_system_role_models(&self) -> Result<(), AppError> {
         let raw_allowed = self
             .settings_store
-            .get_value(
-                "allow_system_role_models",
-                DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
-            )
+            .get_value("allow_system_role_models", DEFAULT_ALLOW_SYSTEM_ROLE_MODELS)
             .await?;
         let allowed_models = parse_system_role_model_list(&raw_allowed);
         *self.system_role_models.write().await = allowed_models;
@@ -150,8 +146,7 @@ impl GatewayService {
                 DEFAULT_CACHE_CONTROL_TTL_REWRITE,
             )
             .await?;
-        *self.cache_control_ttl_rewrite.write().await =
-            CacheControlTtlRewrite::parse(&raw)?;
+        *self.cache_control_ttl_rewrite.write().await = CacheControlTtlRewrite::parse(&raw)?;
         Ok(())
     }
 
@@ -251,7 +246,7 @@ impl GatewayService {
         }
 
         // 检测客户端类型
-        let client_type = detect_client_type(&ua, &body_map);
+        let client_type = detect_client_type(&ua, &path, &body_map);
 
         // 生成会话哈希
         let session_hash =
@@ -380,9 +375,8 @@ impl GatewayService {
             let env_pt = *self.env_passthrough.read().await;
             let cache_ttl = *self.cache_control_ttl_rewrite.read().await;
             let message_cache = *self.message_cache_control_rewrite.read().await;
-            let (rewritten_body, stateful_cache_completion) = self
-                .rewriter
-                .rewrite_body_with_stateful_completion(
+            let (rewritten_body, stateful_cache_completion) =
+                self.rewriter.rewrite_body_with_stateful_completion(
                     &body_bytes,
                     &path,
                     &account,
@@ -397,7 +391,7 @@ impl GatewayService {
             );
 
             // 重新解析改写后的 body
-            let mut rewritten_body_map: serde_json::Value =
+            let rewritten_body_map: serde_json::Value =
                 serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
 
             // 改写 header
@@ -411,7 +405,6 @@ impl GatewayService {
                 &rewritten_body_map,
             );
 
-            // 清理 body 中的 _session_id 标记并重新序列化
             let telemetry_context = if account.auto_telemetry && path.starts_with("/v1/messages") {
                 let context = build_message_telemetry_context(
                     &body_map,
@@ -429,12 +422,7 @@ impl GatewayService {
                 None
             };
 
-            let final_body = if client_type == ClientType::API {
-                clean_session_id_from_body(&mut rewritten_body_map);
-                serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
-            } else {
-                rewritten_body.clone()
-            };
+            let final_body = rewritten_body.clone();
 
             let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
                 Ok(t) => t,
@@ -491,6 +479,7 @@ impl GatewayService {
                     &final_headers,
                     &final_body,
                     &account,
+                    client_type,
                     resp,
                 )
                 .await?;
@@ -562,6 +551,7 @@ impl GatewayService {
     /// @param headers 已改写并携带 upstream token 的请求头。
     /// @param body 已改写后的原始上游请求体。
     /// @param account 当前已选账号，重试必须复用该账号。
+    /// @param client_type 原始客户端类型，用于判断 API mimicry 生成的 CCH 是否需要刷新。
     /// @param resp 首次上游响应。
     /// @return 返回最终响应和最后执行的 signature retry 阶段。
     async fn maybe_retry_signature_error(
@@ -572,6 +562,7 @@ impl GatewayService {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
         account: &Account,
+        client_type: ClientType,
         resp: Response,
     ) -> Result<(Response, Option<SignatureRetryStage>), AppError> {
         if path != "/v1/messages" || resp.status() != StatusCode::BAD_REQUEST {
@@ -595,7 +586,9 @@ impl GatewayService {
             let Some(retry_body) = retry_body else {
                 continue;
             };
-            let retry_body = self.rewriter.refresh_cch_attestation(retry_body, account);
+            let retry_body =
+                self.rewriter
+                    .refresh_cch_attestation(retry_body, account, client_type);
 
             last_stage = Some(stage);
             warn!(
@@ -793,8 +786,9 @@ impl GatewayService {
                 safe_upstream_error_log_body(&body_bytes, &response_headers)
             );
 
-            let mut rb = Response::builder()
-                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+            let mut rb = Response::builder().status(
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            );
             for (k, v) in response_headers.iter() {
                 if is_gateway_fingerprint_header(k.as_str()) {
                     continue;
@@ -1165,7 +1159,9 @@ fn strip_messages_request(body: &[u8], strip_tools: bool) -> Option<Vec<u8>> {
 fn remove_thinking_dependent_context_strategies(
     obj: &mut serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    let Some(context_management) = obj.get_mut("context_management").and_then(|v| v.as_object_mut())
+    let Some(context_management) = obj
+        .get_mut("context_management")
+        .and_then(|v| v.as_object_mut())
     else {
         return false;
     };
@@ -1258,9 +1254,7 @@ fn sanitize_content_block(block: serde_json::Value, strip_tools: bool) -> BlockS
         }
         "redacted_thinking" => BlockSanitizeResult::Remove,
         "tool_use" if strip_tools => BlockSanitizeResult::Replace(tool_use_text_block(&obj)),
-        "tool_result" if strip_tools => {
-            BlockSanitizeResult::Replace(tool_result_text_block(&obj))
-        }
+        "tool_result" if strip_tools => BlockSanitizeResult::Replace(tool_result_text_block(&obj)),
         "" => {
             if let Some(thinking) = obj.get("thinking").and_then(|t| t.as_str()) {
                 if thinking.is_empty() {
@@ -1334,12 +1328,9 @@ fn has_system_role_message(body: &serde_json::Value) -> bool {
     body.get("messages")
         .and_then(|m| m.as_array())
         .map(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("role")
-                    .and_then(|role| role.as_str())
-                    == Some("system")
-            })
+            messages
+                .iter()
+                .any(|message| message.get("role").and_then(|role| role.as_str()) == Some("system"))
         })
         .unwrap_or(false)
 }
@@ -1382,10 +1373,7 @@ fn is_system_role_model_allowed(model: &str, allowed_models: &[String]) -> bool 
     allowed_models.iter().any(|allowed| allowed == model)
 }
 
-fn system_role_model_error_body(
-    model: &str,
-    allowed_models: &[String],
-) -> serde_json::Value {
+fn system_role_model_error_body(model: &str, allowed_models: &[String]) -> serde_json::Value {
     let message = "messages[].role=system is not allowed for this model";
     serde_json::json!({
         "type": "error",
@@ -1545,11 +1533,7 @@ pub(crate) fn extract_passive_usage(
         }
     }
 
-    if has_window {
-        Some(usage)
-    } else {
-        None
-    }
+    if has_window { Some(usage) } else { None }
 }
 
 /// 将响应头中的重置时间统一转为 RFC3339 格式。
@@ -1673,22 +1657,14 @@ impl http_body::Body for SlotGuardBody {
         if let std::task::Poll::Ready(Some(Ok(frame))) = &result {
             let mut usage = self.stateful_cache_usage;
             let mut buffer = std::mem::take(&mut self.stateful_cache_usage_buffer);
-            update_stateful_cache_usage_from_frame(
-                &mut usage,
-                &mut buffer,
-                frame,
-            );
+            update_stateful_cache_usage_from_frame(&mut usage, &mut buffer, frame);
             self.stateful_cache_usage = usage;
             self.stateful_cache_usage_buffer = buffer;
             if !self.response_content_codings.is_empty() {
                 if let Some(bytes) = frame.data_ref() {
                     let mut side_tap = std::mem::take(&mut self.stateful_cache_usage_side_tap);
                     let mut side_tap_truncated = self.stateful_cache_usage_side_tap_truncated;
-                    append_stateful_usage_side_tap(
-                        &mut side_tap,
-                        &mut side_tap_truncated,
-                        bytes,
-                    );
+                    append_stateful_usage_side_tap(&mut side_tap, &mut side_tap_truncated, bytes);
                     self.stateful_cache_usage_side_tap = side_tap;
                     self.stateful_cache_usage_side_tap_truncated = side_tap_truncated;
                 }
@@ -1852,8 +1828,7 @@ fn merge_stateful_cache_usage_from_usage_value(
         .get("cache_read_input_tokens")
         .and_then(|tokens| tokens.as_u64())
     {
-        usage.cache_read_input_tokens =
-            usage.cache_read_input_tokens.max(cache_read_input_tokens);
+        usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(cache_read_input_tokens);
     }
     if let Some(cache_creation_input_tokens) = cache_usage
         .get("cache_creation_input_tokens")
@@ -1880,12 +1855,11 @@ impl Drop for SlotGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_message_telemetry_context, extract_message_session_id, has_system_role_message,
-        flush_stateful_cache_usage_buffer, is_signature_related_error_body,
-        is_signature_related_error_response_body, is_system_role_model_allowed,
-        parse_system_role_model_list, safe_body_summary, signature_retry_body_for_stage,
-        SignatureRetryStage,
-        strip_signature_sensitive_blocks_from_messages_request,
+        SignatureRetryStage, build_message_telemetry_context, extract_message_session_id,
+        flush_stateful_cache_usage_buffer, has_system_role_message,
+        is_signature_related_error_body, is_signature_related_error_response_body,
+        is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
+        signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body,
         update_stateful_cache_usage_from_bytes,
     };
@@ -1962,8 +1936,7 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
 
     #[test]
     fn stateful_cache_usage_parser_reads_gzip_side_tap() {
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
             .write_all(
                 br#"data: {"type":"message_delta","usage":{"cache_read_input_tokens":73310,"cache_creation_input_tokens":153804}}
@@ -2029,14 +2002,16 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
     #[test]
     fn signature_error_detector_matches_compressed_upstream_body() {
         let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#;
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(body).unwrap();
         let compressed = encoder.finish().unwrap();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
 
-        assert!(is_signature_related_error_response_body(&compressed, &headers));
+        assert!(is_signature_related_error_response_body(
+            &compressed,
+            &headers
+        ));
     }
 
     #[test]
@@ -2067,7 +2042,10 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
 
         assert!(value.get("thinking").is_none());
         let assistant_blocks = value["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(assistant_blocks[0], json!({"type":"text","text":"secret plan"}));
+        assert_eq!(
+            assistant_blocks[0],
+            json!({"type":"text","text":"secret plan"})
+        );
         assert_eq!(assistant_blocks[1]["type"], "tool_use");
         let user_blocks = value["messages"][1]["content"].as_array().unwrap();
         assert_eq!(user_blocks, &vec![json!({"type":"text","text":"ok"})]);
@@ -2131,16 +2109,28 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
         let assistant_blocks = value["messages"][0]["content"].as_array().unwrap();
         assert_eq!(assistant_blocks.len(), 1);
         assert_eq!(assistant_blocks[0]["type"], "text");
-        assert!(assistant_blocks[0]["text"].as_str().unwrap().contains("(tool_use)"));
-        assert!(assistant_blocks[0]["text"].as_str().unwrap().contains("name=Bash"));
+        assert!(
+            assistant_blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("(tool_use)")
+        );
+        assert!(
+            assistant_blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("name=Bash")
+        );
 
         let user_blocks = value["messages"][1]["content"].as_array().unwrap();
         assert_eq!(user_blocks.len(), 1);
         assert_eq!(user_blocks[0]["type"], "text");
-        assert!(user_blocks[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("(tool_result)"));
+        assert!(
+            user_blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("(tool_result)")
+        );
 
         let empty_blocks = value["messages"][2]["content"].as_array().unwrap();
         assert_eq!(
@@ -2194,10 +2184,12 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
             thinking_and_tools["messages"][0]["content"][1]["type"],
             "text"
         );
-        assert!(thinking_and_tools["messages"][0]["content"][1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("(tool_use)"));
+        assert!(
+            thinking_and_tools["messages"][0]["content"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("(tool_use)")
+        );
     }
 
     #[test]
@@ -2246,7 +2238,7 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
     }
 
     #[test]
-    fn message_context_falls_back_to_internal_session_id() {
+    fn message_context_ignores_removed_internal_session_marker() {
         let rewritten_body = json!({
             "metadata": {
                 "_session_id": "fallback-session"
@@ -2265,7 +2257,7 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
             0,
         );
 
-        assert_eq!(context.session_id.as_deref(), Some("fallback-session"));
+        assert_eq!(context.session_id, None);
         assert_eq!(context.system_prompt_block_count, 1);
         assert_eq!(context.client_type, "api");
     }
@@ -2284,14 +2276,15 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
         assert!(!has_system_role_message(&json!({
             "messages": [{"role": "assistant", "content": "ok"}]
         })));
-        assert!(!has_system_role_message(&json!({"system": "top level only"})));
+        assert!(!has_system_role_message(
+            &json!({"system": "top level only"})
+        ));
     }
 
     #[test]
     fn system_role_model_list_uses_exact_trimmed_matches() {
-        let allowed = parse_system_role_model_list(
-            " claude-opus-4-8,claude-sonnet-4-6,,claude.test:model ",
-        );
+        let allowed =
+            parse_system_role_model_list(" claude-opus-4-8,claude-sonnet-4-6,,claude.test:model ");
 
         assert_eq!(
             allowed,
