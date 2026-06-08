@@ -4086,14 +4086,10 @@ pub fn detect_client_type(user_agent: &str, path: &str, body: &serde_json::Value
     client_type
 }
 
-/// 判断 metadata.user_id 是否符合真实 Claude Code legacy 或 JSON 形态。
-fn has_valid_claude_code_metadata_user_id(body: &serde_json::Value) -> bool {
-    claude_code_metadata_user_id_diagnostic(body).valid
-}
-
 /// `metadata.user_id` 的脱敏诊断信息。
 struct MetadataUserIdDiagnostic {
-    valid: bool,
+    strict_valid: bool,
+    session_usable: bool,
     reason: &'static str,
     metadata_type: &'static str,
     metadata_keys: Vec<String>,
@@ -4123,9 +4119,19 @@ impl MetadataUserIdDiagnostic {
         } else {
             self.user_id_json_keys.join(",")
         };
-        if self.valid {
+        let status = if self.strict_valid {
+            "ok"
+        } else if self.session_usable {
+            "present"
+        } else if matches!(self.reason, "missing_metadata" | "missing_user_id") {
+            "missing"
+        } else {
+            "invalid"
+        };
+        if self.strict_valid {
             return format!(
-                "ok(reason={},uid={} len={} hash={} keys={} json_keys={})",
+                "{}(reason={},strict=Y,uid={} len={} hash={} keys={} json_keys={})",
+                status,
                 self.reason,
                 self.user_id_type,
                 self.user_id_len,
@@ -4135,8 +4141,10 @@ impl MetadataUserIdDiagnostic {
             );
         }
         format!(
-            "invalid(reason={},meta={} keys={},uid={} len={} hash={},json_keys={},json_fields=device:{}/account:{}/session:{},uuid=account:{}/session:{},legacy=account:{}/session:{})",
+            "{}(reason={},strict={},meta={} keys={},uid={} len={} hash={},json_keys={},json_fields=device:{}/account:{}/session:{},uuid=account:{}/session:{},legacy=account:{}/session:{})",
+            status,
             self.reason,
+            yes_no(self.strict_valid),
             self.metadata_type,
             keys,
             self.user_id_type,
@@ -4227,9 +4235,12 @@ fn claude_code_metadata_user_id_diagnostic(body: &serde_json::Value) -> Metadata
             .and_then(|value| value.as_str())
             .map(is_uuid_like)
             .unwrap_or(false);
-        diag.valid = diag.has_device_id && diag.account_uuid_like && diag.session_uuid_like;
-        diag.reason = if diag.valid {
+        diag.session_usable = diag.has_session_id;
+        diag.strict_valid = diag.has_device_id && diag.account_uuid_like && diag.session_uuid_like;
+        diag.reason = if diag.strict_valid {
             "valid_json"
+        } else if diag.session_usable {
+            "json_session_present"
         } else {
             "invalid_json_shape"
         };
@@ -4251,9 +4262,13 @@ fn claude_code_metadata_user_id_diagnostic(body: &serde_json::Value) -> Metadata
     let session_uuid = &user_id[session_idx + 9..];
     diag.account_uuid_like = is_uuid_like(account_uuid);
     diag.session_uuid_like = is_uuid_like(session_uuid);
-    diag.valid = user_id.starts_with("user_") && diag.account_uuid_like && diag.session_uuid_like;
-    diag.reason = if diag.valid {
+    diag.session_usable = !session_uuid.trim().is_empty();
+    diag.strict_valid =
+        user_id.starts_with("user_") && diag.account_uuid_like && diag.session_uuid_like;
+    diag.reason = if diag.strict_valid {
         "valid_legacy"
+    } else if diag.session_usable {
+        "legacy_session_present"
     } else {
         "invalid_legacy_shape"
     };
@@ -4263,7 +4278,8 @@ fn claude_code_metadata_user_id_diagnostic(body: &serde_json::Value) -> Metadata
 /// 构造空白 `metadata.user_id` 诊断。
 fn metadata_user_id_diag(reason: &'static str) -> MetadataUserIdDiagnostic {
     MetadataUserIdDiagnostic {
-        valid: false,
+        strict_valid: false,
+        session_usable: false,
         reason,
         metadata_type: "missing",
         metadata_keys: Vec::new(),
@@ -7491,6 +7507,29 @@ mod tests {
             ),
             ClientType::ClaudeCode
         );
+    }
+
+    #[test]
+    fn metadata_user_id_diagnostic_treats_json_session_as_present() {
+        let user_id = json!({
+            "device_id": "device-1",
+            "account_uuid": "not-a-uuid",
+            "session_id": "123e4567-e89b-12d3-a456-426614174000"
+        })
+        .to_string();
+
+        let diag = super::claude_code_metadata_user_id_diagnostic(
+            &json!({"metadata": {"user_id": user_id}}),
+        );
+        let summary = diag.human_summary();
+
+        assert!(summary.starts_with("present("), "{summary}");
+        assert!(summary.contains("reason=json_session_present"), "{summary}");
+        assert!(
+            summary.contains("json_fields=device:Y/account:Y/session:Y"),
+            "{summary}"
+        );
+        assert!(summary.contains("uuid=account:N/session:Y"), "{summary}");
     }
 
     #[test]
