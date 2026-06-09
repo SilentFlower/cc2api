@@ -13,9 +13,10 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    CODE_TRIGGERS_BETA_TOKEN, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN,
-    STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
-    claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
+    CODE_TRIGGERS_BETA_TOKEN, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
+    MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION,
+    STAINLESS_RUNTIME_VERSION, claude_cli_user_agent, claude_code_user_agent,
+    growthbook_user_agent, is_event_logging_path, normalize_version,
 };
 
 /// header wire 大小写映射。
@@ -39,6 +40,11 @@ static HEADER_WIRE_CASING: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     );
     m.insert("anthropic-version", "anthropic-version");
     m.insert("anthropic-beta", "anthropic-beta");
+    m.insert(
+        "anthropic-mcp-client-capabilities",
+        "anthropic-mcp-client-capabilities",
+    );
+    m.insert("mcp-protocol-version", "mcp-protocol-version");
     m.insert("x-app", "x-app");
     m.insert("x-service-name", "x-service-name");
     m.insert("anthropic-client-platform", "anthropic-client-platform");
@@ -134,7 +140,7 @@ fn beta_header_for_model(model_id: &str) -> &'static str {
     MESSAGE_BETA_TOKENS
 }
 
-/// 根据 endpoint 返回 Claude Code 2.1.156 的必需 beta token。
+/// 根据 endpoint 返回 Claude Code 2.1.169 的必需 beta token。
 fn beta_header_for_path(path: &str, model_id: &str) -> &'static str {
     if is_event_logging_path(path)
         || path.starts_with("/api/eval/")
@@ -160,7 +166,7 @@ fn requires_anthropic_beta(path: &str) -> bool {
 
 /// 判断该 endpoint 是否应该主动发送 JSON content-type。
 ///
-/// 2.1.156 抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
+/// 2.1.169 抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
 /// “值正确但 header 集合不像真实客户端”的 wire 指纹偏差。
 fn requires_json_content_type(path: &str) -> bool {
     !(path == "/"
@@ -170,7 +176,7 @@ fn requires_json_content_type(path: &str) -> bool {
         || path.starts_with("/api/claude_code_penguin_mode"))
 }
 
-/// 按 Claude Code 2.1.156 抓包中的 endpoint wire 顺序组织上游 header。
+/// 按 Claude Code 2.1.169 抓包中的 endpoint wire 顺序组织上游 header。
 ///
 /// reqwest/hyper 是否保留大小写仍取决于底层 HTTP 实现；这里至少保证应用层
 /// profile 的集合和插入顺序稳定，避免继续依赖 HashMap 的随机遍历顺序。
@@ -321,7 +327,9 @@ fn wire_header_order(path: &str) -> &'static [&'static str] {
             "Content-Type",
             "User-Agent",
             "anthropic-beta",
+            "anthropic-mcp-client-capabilities",
             "anthropic-version",
+            "mcp-protocol-version",
             "Connection",
             "Host",
         ]
@@ -516,7 +524,7 @@ impl Rewriter {
         let mut out = HashMap::new();
 
         if client_type == ClientType::API {
-            // API 模式：使用按 endpoint 拆分的 Claude Code 2.1.156 header profile。
+            // API 模式：使用按 endpoint 拆分的 Claude Code 2.1.169 header profile。
             out.insert("Accept".into(), "application/json".into());
             if requires_anthropic_beta(path) {
                 out.insert(
@@ -568,7 +576,12 @@ impl Rewriter {
             } else if path.starts_with("/v1/mcp_servers") {
                 out.insert("Accept".into(), "application/json, text/plain, */*".into());
                 out.insert("User-Agent".into(), "axios/1.15.2".into());
+                out.insert(
+                    "anthropic-mcp-client-capabilities".into(),
+                    MCP_CLIENT_CAPABILITIES.into(),
+                );
                 out.insert("anthropic-version".into(), "2023-06-01".into());
+                out.insert("mcp-protocol-version".into(), MCP_PROTOCOL_VERSION.into());
                 out.insert(
                     "accept-encoding".into(),
                     "gzip, compress, deflate, br".into(),
@@ -625,6 +638,8 @@ impl Rewriter {
                 "accept-language",
                 "anthropic-beta",
                 "anthropic-version",
+                "anthropic-mcp-client-capabilities",
+                "mcp-protocol-version",
                 "anthropic-dangerous-direct-browser-access",
                 "x-app",
                 "sec-fetch-mode",
@@ -725,6 +740,13 @@ impl Rewriter {
             }
             if path.starts_with("/v1/mcp_servers") || path.starts_with("/v1/code/triggers") {
                 out.insert("anthropic-version".into(), "2023-06-01".into());
+            }
+            if path.starts_with("/v1/mcp_servers") {
+                out.insert(
+                    "anthropic-mcp-client-capabilities".into(),
+                    MCP_CLIENT_CAPABILITIES.into(),
+                );
+                out.insert("mcp-protocol-version".into(), MCP_PROTOCOL_VERSION.into());
             }
         }
 
@@ -4428,8 +4450,8 @@ mod tests {
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION,
-        STAINLESS_RUNTIME_VERSION,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
+        MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
     };
     use base64::Engine;
     use chrono::Utc;
@@ -7757,6 +7779,38 @@ mod tests {
             "mcp-servers-2025-12-04"
         );
         assert_eq!(mcp_headers.get("User-Agent").unwrap(), "axios/1.15.2");
+        assert_eq!(
+            mcp_headers
+                .get("anthropic-mcp-client-capabilities")
+                .unwrap(),
+            MCP_CLIENT_CAPABILITIES
+        );
+        assert_eq!(
+            mcp_headers.get("mcp-protocol-version").unwrap(),
+            MCP_PROTOCOL_VERSION
+        );
+
+        let mut incoming_mcp_headers = std::collections::HashMap::new();
+        incoming_mcp_headers.insert("User-Agent".to_string(), "claude-cli/2.1.169".to_string());
+        incoming_mcp_headers.insert("anthropic-beta".to_string(), "client-token".to_string());
+        let cc_mcp_headers = rewriter.rewrite_headers(
+            &incoming_mcp_headers,
+            "/v1/mcp_servers",
+            &account,
+            ClientType::ClaudeCode,
+            "",
+            &body,
+        );
+        assert_eq!(
+            cc_mcp_headers
+                .get("anthropic-mcp-client-capabilities")
+                .unwrap(),
+            MCP_CLIENT_CAPABILITIES
+        );
+        assert_eq!(
+            cc_mcp_headers.get("mcp-protocol-version").unwrap(),
+            MCP_PROTOCOL_VERSION
+        );
 
         let registry_headers = rewriter.rewrite_headers(
             &empty,
@@ -7942,7 +7996,9 @@ mod tests {
                 "Content-Type",
                 "User-Agent",
                 "anthropic-beta",
+                "anthropic-mcp-client-capabilities",
                 "anthropic-version",
+                "mcp-protocol-version",
                 "Connection",
                 "Host",
             ]

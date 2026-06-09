@@ -18,6 +18,10 @@ pub const OAUTH_BETA_TOKEN: &str = "oauth-2025-04-20";
 pub const CODE_TRIGGERS_BETA_TOKEN: &str = "ccr-triggers-2026-01-30";
 /// Claude Code MCP servers 端点使用的 beta token。
 pub const MCP_SERVERS_BETA_TOKEN: &str = "mcp-servers-2025-12-04";
+/// Claude Code 2.1.169 MCP servers 请求声明的客户端能力。
+pub const MCP_CLIENT_CAPABILITIES: &str = "eyJyb290cyI6e30sImVsaWNpdGF0aW9uIjp7fX0=";
+/// Claude Code 2.1.169 MCP servers 请求声明的协议版本。
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 /// Claude Code 2.1.169 的 event logging v2 路径。
 pub const EVENT_LOGGING_V2_PATH: &str = "/api/event_logging/v2/batch";
 /// 旧版 event logging 路径，保留用于客户端请求兼容。
