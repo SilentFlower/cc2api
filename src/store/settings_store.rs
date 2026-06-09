@@ -27,6 +27,12 @@ pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
 pub const DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE: &str = "off";
 /// 代理 HTTP 客户端连接池默认开启,用于复用同一代理下的底层连接。
 pub const DEFAULT_PROXY_CLIENT_POOL_ENABLED: &str = "true";
+/// 标题/`Warmup` 预热请求本地拦截默认关闭,避免升级后改变请求行为。
+pub const DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED: &str = "false";
+/// Suggestion Mode 请求本地拦截默认关闭,由管理员显式开启。
+pub const DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED: &str = "false";
+/// Claude Code Haiku `max_tokens=1` 探测请求本地拦截默认关闭,由管理员显式开启。
+pub const DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED: &str = "false";
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

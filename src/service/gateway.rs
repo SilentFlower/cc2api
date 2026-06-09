@@ -27,8 +27,10 @@ use crate::service::telemetry::{
 };
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PASSTHROUGH_OS_VERSION,
-    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR, SettingsStore,
+    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    SettingsStore,
 };
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -58,6 +60,57 @@ struct RateLimitResponseDecision {
     delay: std::time::Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarmupInterceptConfig {
+    title_enabled: bool,
+    suggestion_enabled: bool,
+    haiku_probe_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmupInterceptType {
+    TextTitle,
+    JsonTitle,
+    Suggestion,
+    HaikuProbe,
+}
+
+impl WarmupInterceptType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TextTitle => "text_title",
+            Self::JsonTitle => "json_title",
+            Self::Suggestion => "suggestion",
+            Self::HaikuProbe => "haiku_probe",
+        }
+    }
+
+    fn message_id(self) -> &'static str {
+        match self {
+            Self::TextTitle => "msg_mock_warmup",
+            Self::JsonTitle => "msg_mock_title",
+            Self::Suggestion => "msg_mock_suggestion",
+            Self::HaikuProbe => "msg_mock_haiku_probe",
+        }
+    }
+
+    fn mock_text(self) -> &'static str {
+        match self {
+            Self::TextTitle => "New Conversation",
+            Self::JsonTitle => "{\"title\":\"New Conversation\"}",
+            Self::Suggestion => "",
+            Self::HaikuProbe => "#",
+        }
+    }
+
+    fn stop_reason(self) -> &'static str {
+        match self {
+            Self::HaikuProbe => "max_tokens",
+            Self::TextTitle | Self::JsonTitle | Self::Suggestion => "end_turn",
+        }
+    }
+}
+
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
@@ -68,6 +121,7 @@ pub struct GatewayService {
     env_passthrough: RwLock<EnvPassthrough>,
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
+    warmup_intercept_config: RwLock<WarmupInterceptConfig>,
 }
 
 impl GatewayService {
@@ -95,6 +149,7 @@ impl GatewayService {
             env_passthrough: RwLock::new(default_env_passthrough()),
             cache_control_ttl_rewrite: RwLock::new(default_cache_control_ttl_rewrite()),
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
+            warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
         }
     }
 
@@ -170,6 +225,41 @@ impl GatewayService {
             .await?;
         *self.message_cache_control_rewrite.write().await =
             MessageCacheControlRewrite::parse(&raw)?;
+        Ok(())
+    }
+
+    /// 从全局设置刷新预热/辅助请求拦截配置。
+    ///
+    /// 配置缓存到内存,让 `/v1/messages` 热路径只读 `RwLock`,不在每次请求时查库。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_warmup_intercept_config(&self) -> Result<(), AppError> {
+        let title = self
+            .settings_store
+            .get_value(
+                "intercept_warmup_title_enabled",
+                DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
+            )
+            .await?;
+        let suggestion = self
+            .settings_store
+            .get_value(
+                "intercept_warmup_suggestion_enabled",
+                DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+            )
+            .await?;
+        let haiku_probe = self
+            .settings_store
+            .get_value(
+                "intercept_warmup_haiku_probe_enabled",
+                DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+            )
+            .await?;
+        *self.warmup_intercept_config.write().await = WarmupInterceptConfig {
+            title_enabled: parse_setting_flag(&title),
+            suggestion_enabled: parse_setting_flag(&suggestion),
+            haiku_probe_enabled: parse_setting_flag(&haiku_probe),
+        };
         Ok(())
     }
 
@@ -309,6 +399,31 @@ impl GatewayService {
 
             if attempt > 0 {
                 warn!("429 retry attempt {} with account {}", attempt, account.id);
+            }
+
+            if path.starts_with("/v1/messages") {
+                let warmup_config = *self.warmup_intercept_config.read().await;
+                if let Some(intercept_type) =
+                    detect_warmup_intercept(&body_map, client_type, warmup_config)
+                {
+                    if should_bind_session {
+                        let _ = self
+                            .account_svc
+                            .bind_selected_session(&session_hash, account.id)
+                            .await;
+                    }
+                    info!(
+                        "warmup intercept: type={} account={} model={} stream={}",
+                        intercept_type.as_str(),
+                        account.id,
+                        body_map
+                            .get("model")
+                            .and_then(|model| model.as_str())
+                            .unwrap_or_default(),
+                        is_streaming_messages_request(&body_map)
+                    );
+                    return Ok(mock_warmup_intercept_response(intercept_type, &body_map)?);
+                }
             }
 
             // 自动遥测端点只返回本地假响应，不应进入 RPM 或上游转发。
@@ -1152,6 +1267,248 @@ fn response_from_buffered(parts: Parts, body: Bytes) -> Response {
     Response::from_parts(parts, Body::from(body))
 }
 
+fn detect_warmup_intercept(
+    body: &serde_json::Value,
+    client_type: ClientType,
+    config: WarmupInterceptConfig,
+) -> Option<WarmupInterceptType> {
+    if config.haiku_probe_enabled && is_haiku_probe_request(body, client_type) {
+        return Some(WarmupInterceptType::HaikuProbe);
+    }
+    if config.suggestion_enabled && is_suggestion_mode_request(body) {
+        return Some(WarmupInterceptType::Suggestion);
+    }
+    if config.title_enabled {
+        if is_json_title_request(body) {
+            return Some(WarmupInterceptType::JsonTitle);
+        }
+        if is_text_title_or_warmup_request(body) {
+            return Some(WarmupInterceptType::TextTitle);
+        }
+    }
+    None
+}
+
+fn is_haiku_probe_request(body: &serde_json::Value, client_type: ClientType) -> bool {
+    client_type == ClientType::ClaudeCode
+        && !is_streaming_messages_request(body)
+        && body
+            .get("model")
+            .and_then(|model| model.as_str())
+            .map(|model| model.to_ascii_lowercase().contains("haiku"))
+            .unwrap_or(false)
+        && body.get("max_tokens").and_then(|tokens| tokens.as_u64()) == Some(1)
+}
+
+fn is_suggestion_mode_request(body: &serde_json::Value) -> bool {
+    let Some(messages) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+    else {
+        return false;
+    };
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    if last.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return false;
+    }
+    first_text_from_content(last.get("content"))
+        .map(|text| text.starts_with("[SUGGESTION MODE:"))
+        .unwrap_or(false)
+}
+
+fn is_json_title_request(body: &serde_json::Value) -> bool {
+    system_text_items(body).any(|text| {
+        text.contains(
+            "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session",
+        )
+    })
+}
+
+fn is_text_title_or_warmup_request(body: &serde_json::Value) -> bool {
+    request_text_items(body).any(|text| {
+        text.contains("Please write a 5-10 word title for the following conversation:")
+            || text == "Warmup"
+    }) || system_text_items(body).any(|text| {
+        text.contains(
+            "nalyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title",
+        )
+    })
+}
+
+fn is_streaming_messages_request(body: &serde_json::Value) -> bool {
+    body.get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or(false)
+}
+
+fn request_text_items<'a>(body: &'a serde_json::Value) -> impl Iterator<Item = &'a str> {
+    system_text_items(body).chain(message_text_items(body))
+}
+
+fn system_text_items<'a>(body: &'a serde_json::Value) -> impl Iterator<Item = &'a str> {
+    content_text_items(body.get("system"))
+}
+
+fn message_text_items<'a>(body: &'a serde_json::Value) -> impl Iterator<Item = &'a str> {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|message| content_text_items(message.get("content")))
+}
+
+fn first_text_from_content(content: Option<&serde_json::Value>) -> Option<&str> {
+    content_text_items(content).next()
+}
+
+fn content_text_items(content: Option<&serde_json::Value>) -> Box<dyn Iterator<Item = &str> + '_> {
+    match content {
+        Some(serde_json::Value::String(text)) => Box::new(std::iter::once(text.as_str())),
+        Some(serde_json::Value::Array(items)) => Box::new(items.iter().filter_map(text_from_block)),
+        Some(serde_json::Value::Object(_)) => {
+            Box::new(content.and_then(text_from_block).into_iter())
+        }
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+fn text_from_block(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(|text| text.as_str())
+            .or_else(|| map.get("content").and_then(|content| content.as_str())),
+        _ => None,
+    }
+}
+
+fn mock_warmup_intercept_response(
+    intercept_type: WarmupInterceptType,
+    request_body: &serde_json::Value,
+) -> Result<Response, AppError> {
+    if is_streaming_messages_request(request_body) {
+        mock_warmup_intercept_stream_response(intercept_type, request_body)
+    } else {
+        mock_warmup_intercept_json_response(intercept_type, request_body)
+    }
+}
+
+fn mock_warmup_intercept_json_response(
+    intercept_type: WarmupInterceptType,
+    request_body: &serde_json::Value,
+) -> Result<Response, AppError> {
+    let body = serde_json::json!({
+        "id": intercept_type.message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": request_body.get("model").and_then(|model| model.as_str()).unwrap_or("claude-mock"),
+        "content": [{
+            "type": "text",
+            "text": intercept_type.mock_text(),
+        }],
+        "stop_reason": intercept_type.stop_reason(),
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": mock_output_tokens(intercept_type.mock_text()),
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body)
+        .map_err(|e| AppError::Internal(format!("serialize warmup mock response: {}", e)))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body_bytes))
+        .map_err(|e| AppError::Internal(format!("build warmup mock response: {}", e)))
+}
+
+fn mock_warmup_intercept_stream_response(
+    intercept_type: WarmupInterceptType,
+    request_body: &serde_json::Value,
+) -> Result<Response, AppError> {
+    let body = build_warmup_intercept_sse(intercept_type, request_body)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from(body))
+        .map_err(|e| AppError::Internal(format!("build warmup mock stream response: {}", e)))
+}
+
+fn build_warmup_intercept_sse(
+    intercept_type: WarmupInterceptType,
+    request_body: &serde_json::Value,
+) -> Result<String, AppError> {
+    let message = serde_json::json!({
+        "id": intercept_type.message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": request_body.get("model").and_then(|model| model.as_str()).unwrap_or("claude-mock"),
+        "content": [],
+        "stop_reason": serde_json::Value::Null,
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        }
+    });
+    let events = [
+        serde_json::json!({"type": "message_start", "message": message}),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": intercept_type.mock_text()},
+        }),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": intercept_type.stop_reason(),
+                "stop_sequence": serde_json::Value::Null,
+            },
+            "usage": {"output_tokens": mock_output_tokens(intercept_type.mock_text())},
+        }),
+        serde_json::json!({"type": "message_stop"}),
+    ];
+
+    let mut out = String::new();
+    for event in events {
+        let event_type = event
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("message_delta");
+        out.push_str("event: ");
+        out.push_str(event_type);
+        out.push('\n');
+        out.push_str("data: ");
+        out.push_str(&serde_json::to_string(&event).map_err(|e| {
+            AppError::Internal(format!("serialize warmup mock stream event: {}", e))
+        })?);
+        out.push_str("\n\n");
+    }
+    Ok(out)
+}
+
+fn mock_output_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        0
+    } else {
+        text.split_whitespace().count().max(1) as u64
+    }
+}
+
 fn headers_without_content_length(
     headers: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -1428,8 +1785,13 @@ fn parse_system_role_model_list(raw: &str) -> Vec<String> {
 }
 
 /// 将设置项字符串解析为开关布尔值,仅 "true" 视为开启。
-fn parse_passthrough_flag(raw: &str) -> bool {
+fn parse_setting_flag(raw: &str) -> bool {
     raw == "true"
+}
+
+/// 将系统提示词环境透传设置解析为布尔值。
+fn parse_passthrough_flag(raw: &str) -> bool {
+    parse_setting_flag(raw)
 }
 
 /// 构造系统提示词环境透传开关的内存初始值(reload 之前的兜底,与设置默认值保持一致)。
@@ -1451,6 +1813,15 @@ fn default_cache_control_ttl_rewrite() -> CacheControlTtlRewrite {
 fn default_message_cache_control_rewrite() -> MessageCacheControlRewrite {
     MessageCacheControlRewrite::parse(DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE)
         .expect("默认 message cache_control 改写模式必须合法")
+}
+
+/// 构造预热请求拦截配置初始值(reload 之前的兜底,与设置默认值保持一致)。
+fn default_warmup_intercept_config() -> WarmupInterceptConfig {
+    WarmupInterceptConfig {
+        title_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED),
+        suggestion_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED),
+        haiku_probe_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED),
+    }
 }
 
 fn is_system_role_model_allowed(model: &str, allowed_models: &[String]) -> bool {
@@ -2175,18 +2546,29 @@ impl Drop for SlotGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage, build_message_telemetry_context,
-        extract_message_session_id, flush_stateful_cache_usage_buffer, has_system_role_message,
-        is_signature_related_error_body, is_signature_related_error_response_body,
-        is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
+        STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage, WarmupInterceptConfig,
+        WarmupInterceptType, build_message_telemetry_context, build_warmup_intercept_sse,
+        detect_warmup_intercept, extract_message_session_id, flush_stateful_cache_usage_buffer,
+        has_system_role_message, is_signature_related_error_body,
+        is_signature_related_error_response_body, is_system_role_model_allowed,
+        mock_warmup_intercept_json_response, parse_system_role_model_list, safe_body_summary,
         signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body,
         update_stateful_cache_usage_from_bytes,
     };
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
-    use axum::http::header::CONTENT_ENCODING;
+    use axum::body;
+    use axum::http::{StatusCode, header::CONTENT_ENCODING};
     use serde_json::json;
     use std::io::Write;
+
+    fn all_warmup_intercepts_enabled() -> WarmupInterceptConfig {
+        WarmupInterceptConfig {
+            title_enabled: true,
+            suggestion_enabled: true,
+            haiku_probe_enabled: true,
+        }
+    }
 
     #[test]
     fn safe_body_summary_hides_raw_body() {
@@ -2196,6 +2578,177 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn warmup_intercept_detects_haiku_probe_from_flow_shape() {
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "quota"}]
+        });
+
+        assert_eq!(
+            detect_warmup_intercept(
+                &body,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::HaikuProbe)
+        );
+        assert_eq!(
+            detect_warmup_intercept(&body, ClientType::API, all_warmup_intercepts_enabled()),
+            None
+        );
+    }
+
+    #[test]
+    fn warmup_intercept_detects_suggestion_mode_last_user_message() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "messages": [
+                {"role": "assistant", "content": "ok"},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"}]
+                }
+            ]
+        });
+
+        assert_eq!(
+            detect_warmup_intercept(
+                &body,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::Suggestion)
+        );
+    }
+
+    #[test]
+    fn warmup_intercept_detects_json_title_prompt_from_flow_shape() {
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 32000,
+            "stream": true,
+            "system": "You are Claude Code.\nGenerate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. Return JSON with a single \"title\" field.",
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"]
+                    }
+                }
+            },
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "<session>实现 MVP</session>"}]}]
+        });
+
+        assert_eq!(
+            detect_warmup_intercept(
+                &body,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::JsonTitle)
+        );
+    }
+
+    #[test]
+    fn warmup_intercept_detects_legacy_title_and_warmup_prompts() {
+        let legacy_title = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{
+                "role": "user",
+                "content": "Please write a 5-10 word title for the following conversation: hello"
+            }]
+        });
+        let warmup = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "Warmup"}]
+        });
+
+        assert_eq!(
+            detect_warmup_intercept(
+                &legacy_title,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::TextTitle)
+        );
+        assert_eq!(
+            detect_warmup_intercept(
+                &warmup,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::TextTitle)
+        );
+    }
+
+    #[test]
+    fn warmup_intercept_does_not_match_generic_title_words() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": "请给 HTML 页面增加 <title> 和 meta description"
+            }]
+        });
+
+        assert_eq!(
+            detect_warmup_intercept(
+                &body,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_json_title_mock_uses_json_text_content() {
+        let request = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "stream": false
+        });
+
+        let response =
+            mock_warmup_intercept_json_response(WarmupInterceptType::JsonTitle, &request)
+                .expect("mock response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+
+        assert_eq!(body_json["id"], "msg_mock_title");
+        assert_eq!(
+            body_json["content"][0]["text"],
+            "{\"title\":\"New Conversation\"}"
+        );
+        assert_eq!(body_json["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn warmup_stream_mock_contains_anthropic_sse_events() {
+        let request = json!({
+            "model": "claude-opus-4-8",
+            "stream": true
+        });
+
+        let body = build_warmup_intercept_sse(WarmupInterceptType::Suggestion, &request)
+            .expect("sse body");
+
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: content_block_delta"));
+        assert!(body.contains(r#""text":"""#));
+        assert!(body.contains(r#""stop_reason":"end_turn""#));
+        assert!(body.contains("event: message_stop"));
     }
 
     #[test]

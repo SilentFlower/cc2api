@@ -188,6 +188,19 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "proxy_client_pool_enabled",
             crate::store::settings_store::DEFAULT_PROXY_CLIENT_POOL_ENABLED,
         ),
+        // 预热/辅助请求本地拦截默认关闭,避免升级后改变转发行为。
+        (
+            "intercept_warmup_title_enabled",
+            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
+        ),
+        (
+            "intercept_warmup_suggestion_enabled",
+            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+        ),
+        (
+            "intercept_warmup_haiku_probe_enabled",
+            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

@@ -51,6 +51,11 @@ const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' |
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
 
+/** 预热/辅助请求本地拦截开关 */
+const interceptWarmupTitleEnabled = ref(false);
+const interceptWarmupSuggestionEnabled = ref(false);
+const interceptWarmupHaikuProbeEnabled = ref(false);
+
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
 const logsLoading = ref(false);
@@ -156,6 +161,9 @@ async function loadSettings() {
       messageCacheControlRewrite.value = 'off';
     }
     proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
+    interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
+    interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
+    interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -218,6 +226,9 @@ async function saveSettings() {
       cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
       message_cache_control_rewrite: messageCacheControlRewrite.value,
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
+      intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
+      intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
+      intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
     });
     toast('保存成功');
   } catch (e) {
@@ -357,6 +368,57 @@ onMounted(async () => {
               :class="isValidModel ? '' : 'border-red-400'"
             />
             <p class="text-[11px] text-[#b5b0a6]">建议保留为 Haiku,成本最低</p>
+          </div>
+        </div>
+      </div>
+    </Card>
+
+    <!-- 预热请求拦截 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">预热请求拦截</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            命中后在本地返回 mock 响应,不转发上游,用于减少 Claude Code 标题生成、Suggestion 和 Haiku 探测等辅助请求消耗。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">标题 / Warmup</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptWarmupTitleEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ interceptWarmupTitleEnabled ? '本地拦截' : '转发上游' }}</span>
+            </label>
+            <p class="text-[11px] text-[#b5b0a6]">覆盖旧标题提示和新版 JSON 标题提示。</p>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">Suggestion Mode</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptWarmupSuggestionEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ interceptWarmupSuggestionEnabled ? '本地拦截' : '转发上游' }}</span>
+            </label>
+            <p class="text-[11px] text-[#b5b0a6]">最后一条 user 消息以 [SUGGESTION MODE: 开头时命中。</p>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">Haiku 探测</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptWarmupHaikuProbeEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ interceptWarmupHaikuProbeEnabled ? '本地拦截' : '转发上游' }}</span>
+            </label>
+            <p class="text-[11px] text-[#b5b0a6]">Claude Code 非流式 Haiku max_tokens=1 探测返回 #。</p>
           </div>
         </div>
       </div>

@@ -128,6 +128,10 @@ async fn main() {
         .reload_message_cache_control_rewrite()
         .await
         .expect("load message cache control rewrite failed");
+    gateway_svc
+        .reload_warmup_intercept_config()
+        .await
+        .expect("load warmup intercept config failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 

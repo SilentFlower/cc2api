@@ -26,8 +26,9 @@ use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrit
 use crate::service::telemetry::TelemetryService;
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
-    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_PROXY_CLIENT_POOL_ENABLED, SettingsStore,
+    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PROXY_CLIENT_POOL_ENABLED, SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -699,6 +700,15 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("proxy_client_pool_enabled".into())
         .or_insert_with(|| DEFAULT_PROXY_CLIENT_POOL_ENABLED.to_string());
+    settings
+        .entry("intercept_warmup_title_enabled".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED.to_string());
+    settings
+        .entry("intercept_warmup_suggestion_enabled".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED.to_string());
+    settings
+        .entry("intercept_warmup_haiku_probe_enabled".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -788,6 +798,20 @@ async fn update_settings(
             ));
         }
     }
+    for key in &[
+        "intercept_warmup_title_enabled",
+        "intercept_warmup_suggestion_enabled",
+        "intercept_warmup_haiku_probe_enabled",
+    ] {
+        if let Some(val) = body.get(*key) {
+            if val != "true" && val != "false" {
+                return Err(AppError::BadRequest(format!(
+                    "'{}' 必须是 true 或 false",
+                    key
+                )));
+            }
+        }
+    }
     state.settings_store.upsert_many(&body).await?;
     if let Some(val) = body.get("proxy_client_pool_enabled") {
         crate::tlsfp::set_request_client_pool_enabled(val == "true");
@@ -813,6 +837,12 @@ async fn update_settings(
             .gateway_svc
             .reload_message_cache_control_rewrite()
             .await?;
+    }
+    if body.contains_key("intercept_warmup_title_enabled")
+        || body.contains_key("intercept_warmup_suggestion_enabled")
+        || body.contains_key("intercept_warmup_haiku_probe_enabled")
+    {
+        state.gateway_svc.reload_warmup_intercept_config().await?;
     }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;
