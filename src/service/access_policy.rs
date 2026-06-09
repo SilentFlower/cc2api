@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::error::AppError;
 
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
-pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str = "2.1.89-2.1.156";
+pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str = "2.1.89-2.1.169";
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS: &str = "AI-Hub-Monitor*\npython-httpx*";
 
@@ -150,10 +150,7 @@ fn parse_list(raw: &str) -> Vec<String> {
 fn parse_ua_patterns(raw: &str) -> Result<Vec<String>, AppError> {
     let patterns = parse_list(raw);
     for pattern in &patterns {
-        if !pattern
-            .chars()
-            .all(|c| c.is_ascii_graphic() || c == ' ')
-        {
+        if !pattern.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
             return Err(AppError::BadRequest(format!(
                 "'allowed_user_agents' 包含非法字符: {}",
                 pattern
@@ -221,10 +218,12 @@ fn extract_claude_code_version(user_agent: &str) -> Option<Option<&str>> {
     } else {
         return None;
     };
-    Some(user_agent[prefix.len()..]
-        .split_whitespace()
-        .next()
-        .filter(|s| !s.is_empty()))
+    Some(
+        user_agent[prefix.len()..]
+            .split_whitespace()
+            .next()
+            .filter(|s| !s.is_empty()),
+    )
 }
 
 fn version_rules_match(rules: &[VersionRule], version: &str) -> bool {
@@ -297,23 +296,30 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        access_policy_error_response, validate_claude_code_versions, AccessPolicy,
-        AccessPolicyRejection, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+        AccessPolicy, AccessPolicyRejection, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+        DEFAULT_ALLOWED_USER_AGENTS, access_policy_error_response, validate_claude_code_versions,
     };
     use axum::http::StatusCode;
     use serde_json::Value;
 
     #[test]
     fn default_policy_allows_configured_claude_code_range() {
-        let policy =
-            AccessPolicy::parse(DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS)
-                .unwrap();
+        let policy = AccessPolicy::parse(
+            DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+            DEFAULT_ALLOWED_USER_AGENTS,
+        )
+        .unwrap();
 
         assert!(policy.check_user_agent("claude-code/2.1.89").is_ok());
         assert!(policy.check_user_agent("claude-code/2.1.156").is_ok());
-        assert!(policy.check_user_agent("claude-cli/2.1.120 (external, cli)").is_ok());
+        assert!(policy.check_user_agent("claude-code/2.1.169").is_ok());
+        assert!(
+            policy
+                .check_user_agent("claude-cli/2.1.120 (external, cli)")
+                .is_ok()
+        );
         assert!(policy.check_user_agent("claude-code/2.1.88").is_err());
-        assert!(policy.check_user_agent("claude-code/2.1.157").is_err());
+        assert!(policy.check_user_agent("claude-code/2.1.170").is_err());
         assert!(policy.check_user_agent("claude-code/").is_err());
         assert!(policy.check_user_agent("AI-Hub-Monitor/1.0.0").is_ok());
         assert!(policy.check_user_agent("python-httpx/0.28.1").is_ok());
@@ -321,9 +327,11 @@ mod tests {
 
     #[test]
     fn ua_patterns_only_apply_to_non_claude_code_clients() {
-        let policy =
-            AccessPolicy::parse("2.1.89-2.1.156", "AI-Hub-Monitor*,python-httpx*,MyClient/1.*")
-                .unwrap();
+        let policy = AccessPolicy::parse(
+            "2.1.89-2.1.156",
+            "AI-Hub-Monitor*,python-httpx*,MyClient/1.*",
+        )
+        .unwrap();
 
         assert!(policy.check_user_agent("AI-Hub-Monitor").is_ok());
         assert!(policy.check_user_agent("AI-Hub-Monitor/1.0.0").is_ok());

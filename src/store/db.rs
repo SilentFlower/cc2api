@@ -1,14 +1,22 @@
 use sqlx::AnyPool;
 use std::path::Path;
 
+const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = "2.1.89-2.1.156";
+
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
         if let Some(parent) = Path::new(dsn).parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let pool = AnyPool::connect(&format!("sqlite:{}?mode=rwc", dsn)).await?;
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await.ok();
-        sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await.ok();
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&pool)
+            .await
+            .ok();
         Ok(pool)
     } else {
         let pool = AnyPool::connect(dsn).await?;
@@ -17,7 +25,11 @@ pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
 }
 
 pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
-    let schema = if driver == "sqlite" { SQLITE_SCHEMA } else { PG_SCHEMA };
+    let schema = if driver == "sqlite" {
+        SQLITE_SCHEMA
+    } else {
+        PG_SCHEMA
+    };
     for stmt in schema.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -100,7 +112,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .ok();
 
     // api_tokens 表
-    let token_schema = if driver == "sqlite" { SQLITE_TOKENS_SCHEMA } else { PG_TOKENS_SCHEMA };
+    let token_schema = if driver == "sqlite" {
+        SQLITE_TOKENS_SCHEMA
+    } else {
+        PG_TOKENS_SCHEMA
+    };
     for stmt in token_schema.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -110,7 +126,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     }
 
     // settings 表（全局配置项）
-    let settings_schema = if driver == "sqlite" { SQLITE_SETTINGS_SCHEMA } else { PG_SETTINGS_SCHEMA };
+    let settings_schema = if driver == "sqlite" {
+        SQLITE_SETTINGS_SCHEMA
+    } else {
+        PG_SETTINGS_SCHEMA
+    };
     for stmt in settings_schema.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -169,11 +189,22 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         } else {
             "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING"
         };
-        sqlx::query(insert_sql).bind(key).bind(val).execute(pool).await.ok();
+        sqlx::query(insert_sql)
+            .bind(key)
+            .bind(val)
+            .execute(pool)
+            .await
+            .ok();
     }
+    upgrade_default_settings(pool).await?;
+    upgrade_account_claude_code_profile(pool, driver).await?;
 
     // prime_logs 表（峰值预热调用日志）
-    let prime_logs_schema = if driver == "sqlite" { SQLITE_PRIME_LOGS_SCHEMA } else { PG_PRIME_LOGS_SCHEMA };
+    let prime_logs_schema = if driver == "sqlite" {
+        SQLITE_PRIME_LOGS_SCHEMA
+    } else {
+        PG_PRIME_LOGS_SCHEMA
+    };
     for stmt in prime_logs_schema.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -182,6 +213,57 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         sqlx::query(stmt).execute(pool).await?;
     }
 
+    Ok(())
+}
+
+async fn upgrade_default_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
+        .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
+        .bind("allowed_claude_code_versions")
+        .bind(PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn upgrade_account_claude_code_profile(
+    pool: &AnyPool,
+    driver: &str,
+) -> Result<(), sqlx::Error> {
+    let version = crate::service::version_profile::DEFAULT_CLAUDE_CODE_VERSION;
+    let version_base = crate::service::version_profile::DEFAULT_CLAUDE_CODE_VERSION_BASE;
+    let build_time = crate::service::version_profile::DEFAULT_CLAUDE_CODE_BUILD_TIME;
+    let sql = if driver == "sqlite" {
+        r#"
+        UPDATE accounts
+        SET canonical_env = json_set(
+            CASE
+                WHEN json_valid(canonical_env) THEN canonical_env
+                ELSE '{}'
+            END,
+            '$.version', $1,
+            '$.version_base', $2,
+            '$.build_time', $3
+        )
+        "#
+    } else {
+        r#"
+        UPDATE accounts
+        SET canonical_env = jsonb_set(
+            jsonb_set(
+                jsonb_set(canonical_env, '{version}', to_jsonb($1::text), true),
+                '{version_base}', to_jsonb($2::text), true
+            ),
+            '{build_time}', to_jsonb($3::text), true
+        )
+        "#
+    };
+    sqlx::query(sql)
+        .bind(version)
+        .bind(version_base)
+        .bind(build_time)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -301,6 +383,100 @@ CREATE TABLE IF NOT EXISTS prime_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_prime_logs_triggered_at ON prime_logs(triggered_at DESC);
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn make_sqlite_pool() -> AnyPool {
+        sqlx::any::install_default_drivers();
+        let tmp = std::env::temp_dir().join(format!("ccgw_db_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        AnyPool::connect(&dsn).await.expect("pool")
+    }
+
+    #[tokio::test]
+    async fn migrate_upgrades_existing_account_claude_code_profile() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        sqlx::query(
+            r#"INSERT INTO accounts (
+                email, token, device_id, canonical_env, canonical_prompt_env, canonical_process
+            ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind("user@example.com")
+        .bind("token")
+        .bind("device-1")
+        .bind(
+            r#"{"version":"2.1.156","version_base":"2.1.156","build_time":"2026-05-28T18:30:33Z","platform":"linux","custom":"keep"}"#,
+        )
+        .bind("{}")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .expect("insert account");
+
+        migrate(&pool, "sqlite").await.expect("second migrate");
+
+        let raw: String = sqlx::query_scalar("SELECT canonical_env FROM accounts WHERE email=$1")
+            .bind("user@example.com")
+            .fetch_one(&pool)
+            .await
+            .expect("canonical_env");
+        let env: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(
+            env["version"],
+            crate::service::version_profile::DEFAULT_CLAUDE_CODE_VERSION
+        );
+        assert_eq!(
+            env["version_base"],
+            crate::service::version_profile::DEFAULT_CLAUDE_CODE_VERSION_BASE
+        );
+        assert_eq!(
+            env["build_time"],
+            crate::service::version_profile::DEFAULT_CLAUDE_CODE_BUILD_TIME
+        );
+        assert_eq!(env["platform"], "linux");
+        assert_eq!(env["custom"], "keep");
+    }
+
+    #[tokio::test]
+    async fn migrate_upgrades_only_old_default_allowed_versions_setting() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind(PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
+            .bind("allowed_claude_code_versions")
+            .execute(&pool)
+            .await
+            .expect("set old default");
+
+        migrate(&pool, "sqlite").await.expect("second migrate");
+        let upgraded: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("allowed_claude_code_versions")
+            .fetch_one(&pool)
+            .await
+            .expect("upgraded setting");
+        assert_eq!(
+            upgraded,
+            crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING
+        );
+
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("2.1.*")
+            .bind("allowed_claude_code_versions")
+            .execute(&pool)
+            .await
+            .expect("set custom");
+        migrate(&pool, "sqlite").await.expect("third migrate");
+        let custom: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("allowed_claude_code_versions")
+            .fetch_one(&pool)
+            .await
+            .expect("custom setting");
+        assert_eq!(custom, "2.1.*");
+    }
+}
 
 /// 峰值预热日志表（PostgreSQL）。
 const PG_PRIME_LOGS_SCHEMA: &str = r#"

@@ -13,10 +13,9 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    CODE_TRIGGERS_BETA_TOKEN, DEFAULT_CLAUDE_CODE_VERSION, MCP_SERVERS_BETA_TOKEN,
-    MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
-    claude_cli_user_agent, claude_code_user_agent, growthbook_user_agent, is_event_logging_path,
-    normalize_version,
+    CODE_TRIGGERS_BETA_TOKEN, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN,
+    STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
+    claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
 };
 
 /// header wire 大小写映射。
@@ -1356,7 +1355,7 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
-        DEFAULT_CLAUDE_CODE_VERSION => CCH_ATTESTATION_SEED_2156,
+        "2.1.156" | "2.1.169" => CCH_ATTESTATION_SEED_2156,
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -7219,7 +7218,7 @@ mod tests {
             system[0]["text"]
                 .as_str()
                 .unwrap()
-                .starts_with("x-anthropic-billing-header: cc_version=2.1.156.")
+                .starts_with("x-anthropic-billing-header: cc_version=2.1.169.")
         );
         assert!(system[0]["text"].as_str().unwrap().contains("cch="));
         assert_eq!(system[1]["text"], json!(super::CLAUDE_CODE_SYSTEM_PROMPT));
@@ -7360,7 +7359,7 @@ mod tests {
     }
 
     #[test]
-    fn api_messages_headers_use_2156_profile() {
+    fn api_messages_headers_use_2169_profile() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -7382,7 +7381,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("User-Agent").unwrap(),
-            "claude-cli/2.1.156 (external, cli)"
+            "claude-cli/2.1.169 (external, cli)"
         );
         assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
         assert_eq!(
@@ -7693,7 +7692,7 @@ mod tests {
         );
         assert_eq!(
             event_headers.get("User-Agent").unwrap(),
-            "claude-code/2.1.156"
+            "claude-code/2.1.169"
         );
         assert_eq!(event_headers.get("x-service-name").unwrap(), "claude-code");
         assert_eq!(
@@ -7783,7 +7782,7 @@ mod tests {
         );
         assert_eq!(
             oauth_headers.get("User-Agent").unwrap(),
-            "claude-cli/2.1.156 (external, cli)"
+            "claude-cli/2.1.169 (external, cli)"
         );
 
         let penguin_headers = rewriter.rewrite_headers(
@@ -7802,7 +7801,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_wire_order_matches_2156_capture() {
+    fn endpoint_wire_order_matches_2169_capture() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let empty = std::collections::HashMap::new();
@@ -7984,7 +7983,7 @@ mod tests {
     }
 
     #[test]
-    fn growthbook_rewrite_adds_2156_attributes() {
+    fn growthbook_rewrite_adds_2169_attributes() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -8109,16 +8108,18 @@ mod tests {
             cch_attestation_seed(DEFAULT_CLAUDE_CODE_VERSION),
             0x4D659218E32A3268
         );
+        assert_eq!(cch_attestation_seed("2.1.156"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.169"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
 
     #[test]
-    fn cch_rewrite_uses_2156_seed() {
-        let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.156.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+    fn cch_rewrite_uses_2169_seed() {
+        let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.169.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
         let out = compute_cch_attestation(body.to_vec(), DEFAULT_CLAUDE_CODE_VERSION);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("cch=40943"));
+        assert!(text.contains("cch=27300"));
     }
 
     #[test]

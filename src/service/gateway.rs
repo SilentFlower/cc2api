@@ -2016,7 +2016,7 @@ fn update_stateful_cache_usage_from_bytes(
 
     buffer.push_str(&String::from_utf8_lossy(bytes));
     if buffer.len() > STATEFUL_USAGE_BUFFER_LIMIT {
-        let keep_from = buffer.len() - STATEFUL_USAGE_BUFFER_LIMIT;
+        let keep_from = next_char_boundary(buffer, buffer.len() - STATEFUL_USAGE_BUFFER_LIMIT);
         buffer.drain(..keep_from);
         if let Some(newline_idx) = buffer.find('\n') {
             buffer.drain(..=newline_idx);
@@ -2030,6 +2030,13 @@ fn update_stateful_cache_usage_from_bytes(
     buffer.drain(..complete_len);
 
     merge_stateful_cache_usage_from_lines(usage, complete.lines());
+}
+
+fn next_char_boundary(value: &str, mut index: usize) -> usize {
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 /// 在流结束时解析最后一个没有换行结尾的 SSE data 行。
@@ -2127,8 +2134,8 @@ impl Drop for SlotGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        SignatureRetryStage, build_message_telemetry_context, extract_message_session_id,
-        flush_stateful_cache_usage_buffer, has_system_role_message,
+        STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage, build_message_telemetry_context,
+        extract_message_session_id, flush_stateful_cache_usage_buffer, has_system_role_message,
         is_signature_related_error_body, is_signature_related_error_response_body,
         is_system_role_model_allowed, parse_system_role_model_list, safe_body_summary,
         signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
@@ -2252,6 +2259,23 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
         assert_eq!(usage.cache_read_input_tokens, 55);
         assert_eq!(usage.cache_creation_input_tokens, 89);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn stateful_cache_usage_buffer_trims_on_utf8_boundary() {
+        let mut usage = StatefulCacheUsage::default();
+        let prefix_len = 1;
+        let mut buffer = "a".repeat(prefix_len);
+        buffer.push('你');
+        buffer.push_str(&"b".repeat(STATEFUL_USAGE_BUFFER_LIMIT - 3));
+
+        let raw_keep_from = buffer.len() + 1 - STATEFUL_USAGE_BUFFER_LIMIT;
+        assert!(!buffer.is_char_boundary(raw_keep_from));
+
+        update_stateful_cache_usage_from_bytes(&mut usage, &mut buffer, b"b");
+
+        assert!(buffer.is_char_boundary(0));
+        assert!(buffer.len() <= STATEFUL_USAGE_BUFFER_LIMIT);
     }
 
     #[test]

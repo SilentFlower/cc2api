@@ -10,14 +10,14 @@ use tracing::{debug, info, warn};
 
 use crate::model::account::Account;
 use crate::model::identity::{
-    build_full_env_json, device_profile, process_snapshot, process_snapshot_json, run_profile,
-    RunProfile,
+    RunProfile, build_full_env_json, device_profile, process_snapshot, process_snapshot_json,
+    run_profile,
 };
 use crate::service::account::AccountService;
 use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
-    claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
-    EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN,
+    EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN, claude_code_user_agent, growthbook_user_agent,
+    is_event_logging_path, normalize_version,
 };
 use crate::store::account_store::AccountStore;
 
@@ -544,10 +544,12 @@ fn build_event_json(
             event_data.insert("auth".into(), auth.clone());
             event_data.insert(
                 "session_id".into(),
-                json!(event
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| run_profile.growthbook_session_id.clone())),
+                json!(
+                    event
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| run_profile.growthbook_session_id.clone())
+                ),
             );
             for (key, value) in &event.fields {
                 event_data.insert(key.clone(), value.clone());
@@ -577,10 +579,12 @@ fn base_internal_event_data(
     event_data.insert("email".into(), json!(profile.email));
     event_data.insert(
         "session_id".into(),
-        json!(event
-            .session_id
-            .clone()
-            .unwrap_or_else(|| run_profile.session_id.clone())),
+        json!(
+            event
+                .session_id
+                .clone()
+                .unwrap_or_else(|| run_profile.session_id.clone())
+        ),
     );
     event_data.insert("model".into(), json!(event.model));
     event_data.insert("user_type".into(), json!("external"));
@@ -974,9 +978,9 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_event_batch, build_growthbook_eval, build_metrics, enqueue_events, internal_event,
-        is_telemetry_path, message_request_events, message_result_events, MessageTelemetryContext,
-        MessageTelemetryResult, TelemetryEvent,
+        MessageTelemetryContext, MessageTelemetryResult, TelemetryEvent, build_event_batch,
+        build_growthbook_eval, build_metrics, enqueue_events, internal_event, is_telemetry_path,
+        message_request_events, message_result_events,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1055,11 +1059,11 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_headers_match_2156_wire_profile() {
+    fn telemetry_headers_match_2169_wire_profile() {
         let event_headers = super::telemetry_request_headers(
             "/api/event_logging/v2/batch",
             "redacted",
-            "claude-code/2.1.156",
+            "claude-code/2.1.169",
             true,
         );
         assert_eq!(
@@ -1112,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn growthbook_eval_contains_2156_attributes() {
+    fn growthbook_eval_contains_2169_attributes() {
         let account = test_account();
         let run = run_profile(
             &account,
