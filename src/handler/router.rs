@@ -187,6 +187,8 @@ async fn list_accounts(
         });
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
         obj["queued_requests"] = serde_json::json!(si.queued);
+        obj["transient_backoff_waiting"] = serde_json::json!(si.transient_backoff_waiting);
+        obj["transient_backoff_remaining_ms"] = serde_json::json!(si.transient_backoff_remaining_ms);
         if let Ok(rpm) = state.account_svc.get_account_rpm_status(a).await {
             obj["rpm_current"] = serde_json::json!(rpm.current);
             obj["rpm_remaining"] = serde_json::json!(rpm.remaining);

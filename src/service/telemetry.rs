@@ -273,7 +273,7 @@ async fn telemetry_loop(
     account_id: i64,
     proxy_url: String,
 ) {
-    let client = crate::tlsfp::make_request_client(&proxy_url);
+    let client = crate::tlsfp::get_request_client(&proxy_url);
 
     loop {
         tokio::time::sleep(TICK_INTERVAL).await;

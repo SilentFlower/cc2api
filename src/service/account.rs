@@ -27,9 +27,9 @@ const RPM_WAIT_STEP: Duration = Duration::from_millis(250);
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
-/// 撞墙之外的纯速率限制的短冷却时间。瞬时 429(每分钟级突发限流)很快即过,
-/// 没必要把账号晾整分钟;若上游给了 retry-after 则走更精确的分支,不受此值影响。
-const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(15);
+/// 撞墙之外的纯速率限制请求级等待时间。瞬时 429 很快即过，只让当前请求等一小段时间再重试，
+/// 不写入账号级冷却,避免把仍可服务其他请求的账号从调度池里摘掉。
+const PURE_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// retry-after 冷却时长上限（秒）,防御上游给出异常大的值把账号长期下线。
 const MAX_RETRY_AFTER_SECS: i64 = 5 * 60 * 60;
 
@@ -63,6 +63,10 @@ pub struct AccountScoreInfo {
     pub current_concurrency: i64,
     /// 当前等待队列中的请求数。
     pub queued: i64,
+    /// 正在等待瞬时 429 软退避的请求数。
+    pub transient_backoff_waiting: i64,
+    /// 瞬时 429 软退避剩余毫秒数。
+    pub transient_backoff_remaining_ms: u64,
 }
 
 /// 账号当前分钟 RPM 状态，用于调度判断和管理端展示。
@@ -87,6 +91,28 @@ enum RpmAdmissionAction {
     Wait,
     Skip,
     Reject,
+}
+
+/// 上游 429 的处理结果。
+pub enum RateLimitDecision {
+    /// 已写入账号级冷却窗口。
+    Quarantined,
+    /// 使用进程内账号级软退避等待指定时间,账号仍保持可调度。
+    RequestBackoff(Duration),
+    /// 单请求级拒绝,不应隔离账号或自动重试。
+    PassThrough,
+}
+
+#[derive(Clone)]
+struct TransientRateLimitBackoff {
+    until: Instant,
+    waiting: Arc<AtomicI64>,
+}
+
+enum RateLimitWindowDecision {
+    Quarantine(&'static str, chrono::DateTime<Utc>),
+    RequestBackoff(Duration),
+    PassThrough,
 }
 
 /// 评分权重默认值。
@@ -324,6 +350,10 @@ pub struct AccountService {
     /// 由 `get_or_create_queue` → `AccountQueue::adjust_capacity` 原地调整信号量容量,
     /// 不替换 queue 实例,保证已占用的 permit 不丢失。
     queues: RwLock<HashMap<i64, Arc<AccountQueue>>>,
+    /// 纯瞬时 429 的进程内软退避:account_id → 退避状态。
+    ///
+    /// 这里不写数据库、不改变账号状态。它只阻止当前进程在上游临时锁定窗口内继续打同一账号。
+    transient_rate_limit_backoffs: RwLock<HashMap<i64, TransientRateLimitBackoff>>,
 }
 
 impl AccountService {
@@ -338,6 +368,7 @@ impl AccountService {
             score_weights: RwLock::new((DEFAULT_W7D, DEFAULT_W5H, DEFAULT_WCONC)),
             settings_store,
             queues: RwLock::new(HashMap::new()),
+            transient_rate_limit_backoffs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -413,6 +444,113 @@ impl AccountService {
         let total = self.store.count().await?;
         let accounts = self.store.list_paged(page, page_size).await?;
         Ok((accounts, total))
+    }
+
+    /// 设置纯瞬时 429 的进程内软退避窗口。
+    ///
+    /// @param account_id 账号 ID。
+    /// @param delay 退避时长。
+    /// @return 无返回值。
+    pub async fn set_transient_rate_limit_backoff(&self, account_id: i64, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+
+        let until = Instant::now() + delay;
+        let mut map = self.transient_rate_limit_backoffs.write().await;
+        if let Some(entry) = map.get_mut(&account_id) {
+            if until > entry.until {
+                entry.until = until;
+            }
+            return;
+        }
+
+        map.insert(account_id, TransientRateLimitBackoff {
+            until,
+            waiting: Arc::new(AtomicI64::new(0)),
+        });
+    }
+
+    /// 等待账号当前的纯瞬时 429 软退避窗口结束。
+    ///
+    /// 这个等待必须发生在 RPM 预占和并发槽位获取之前,否则会把上游临时锁定时间计入本地限流。
+    ///
+    /// @param account 被选中的账号。
+    /// @return 无返回值。
+    pub async fn wait_transient_rate_limit_backoff(&self, account: &Account) {
+        loop {
+            let entry = {
+                let now = Instant::now();
+                let map = self.transient_rate_limit_backoffs.read().await;
+                match map.get(&account.id).cloned() {
+                    Some(entry) if entry.until > now => Some(entry),
+                    _ => None,
+                }
+            };
+
+            let Some(entry) = entry else {
+                self.clear_expired_transient_rate_limit_backoff(account.id).await;
+                return;
+            };
+
+            let remaining = entry.until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.clear_expired_transient_rate_limit_backoff(account.id).await;
+                continue;
+            }
+
+            entry.waiting.fetch_add(1, Ordering::Relaxed);
+            let waiting = entry.waiting.clone();
+            let _waiting_guard = scopeguard::guard((), move |_| {
+                waiting.fetch_sub(1, Ordering::Relaxed);
+            });
+
+            info!(
+                "account {} waits {}ms for transient 429 soft backoff",
+                account.id,
+                remaining.as_millis()
+            );
+            sleep(remaining).await;
+        }
+    }
+
+    /// 读取账号当前纯瞬时 429 软退避状态。
+    ///
+    /// @param account_id 账号 ID。
+    /// @return 返回 `(等待请求数, 剩余毫秒数)`。
+    pub async fn transient_rate_limit_backoff_status(&self, account_id: i64) -> (i64, u64) {
+        let now = Instant::now();
+        let entry = {
+            let map = self.transient_rate_limit_backoffs.read().await;
+            map.get(&account_id).cloned()
+        };
+
+        let Some(entry) = entry else {
+            return (0, 0);
+        };
+
+        let waiting = entry.waiting.load(Ordering::Relaxed).max(0);
+        if entry.until > now {
+            let remaining = entry.until.saturating_duration_since(now);
+            let millis = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+            return (waiting, millis);
+        }
+        if waiting > 0 {
+            return (waiting, 0);
+        }
+
+        self.clear_expired_transient_rate_limit_backoff(account_id).await;
+        (0, 0)
+    }
+
+    async fn clear_expired_transient_rate_limit_backoff(&self, account_id: i64) {
+        let now = Instant::now();
+        let mut map = self.transient_rate_limit_backoffs.write().await;
+        if map.get(&account_id).is_some_and(|entry| {
+            entry.until <= now && entry.waiting.load(Ordering::Relaxed) <= 0
+        }) {
+            map.remove(&account_id);
+        }
     }
 
     /// 使用粘性会话为请求选择账号。
@@ -881,7 +1019,7 @@ impl AccountService {
     ///   按量付费）：属这条请求自身的问题,**不隔离账号**,直接放行(由上层把 429 透传回客户端)。
     /// - **有 `retry-after`**：按上游指定时长冷却(封顶 [`MAX_RETRY_AFTER_SECS`]),最稳。
     /// - **OAuth 撞墙（5h/7d）**：隔离到对应窗口重置时间。
-    /// - **其余**（未撞墙 / 无法查 usage / SetupToken）：仅短冷却,避免一次抖动长时间下线账号。
+    /// - **其余**（未撞墙 / 无法查 usage / SetupToken）：返回请求级等待,由当前请求释放槽位后重试。
     ///
     /// Sonnet 7 天墙暂不纳入判断（上游可能只对 Sonnet 请求返回 429,不影响其他模型）。
     pub async fn handle_rate_limit(
@@ -890,9 +1028,9 @@ impl AccountService {
         retry_after_secs: Option<i64>,
         body: &str,
         usage: Option<serde_json::Value>,
-    ) -> Result<(), AppError> {
-        match self.determine_rate_limit_window(account, retry_after_secs, body, usage) {
-            Some((reason, reset_at)) => {
+    ) -> Result<RateLimitDecision, AppError> {
+        match Self::determine_rate_limit_window(account, retry_after_secs, body, usage) {
+            RateLimitWindowDecision::Quarantine(reason, reset_at) => {
                 warn!(
                     "account {} rate limited ({}) until {}",
                     account.id,
@@ -906,34 +1044,41 @@ impl AccountService {
                         reason,
                         Some(reset_at),
                     )
-                    .await
+                    .await?;
+                Ok(RateLimitDecision::Quarantined)
             }
-            None => {
+            RateLimitWindowDecision::RequestBackoff(delay) => {
+                warn!(
+                    "account {} got transient 429, retrying request after {}s without account quarantine",
+                    account.id,
+                    delay.as_secs()
+                );
+                Ok(RateLimitDecision::RequestBackoff(delay))
+            }
+            RateLimitWindowDecision::PassThrough => {
                 // 单请求级拒绝(如长上下文需 credits):不是账号限流,不隔离账号。
                 warn!(
                     "account {} got non-capacity 429, passing through without quarantine: {}",
                     account.id,
                     body.chars().take(160).collect::<String>()
                 );
-                Ok(())
+                Ok(RateLimitDecision::PassThrough)
             }
         }
     }
 
     /// 判断这条 429 该如何限流。
     ///
-    /// 返回 `Some((原因, 解除时间))` 表示隔离账号;返回 `None` 表示这是单请求级拒绝
-    /// (计费/权限类),不隔离账号。
+    /// 返回账号级冷却、请求级等待或单请求透传三类结果。
     ///
     /// 撞墙判断**完全不主动查 usage 接口**,改用被动用量:`usage` 入参为这条 429
     /// 响应自带的 ratelimit 头(最新),取不到再退回账号已存的 `usage_data`。
     fn determine_rate_limit_window(
-        &self,
         account: &Account,
         retry_after_secs: Option<i64>,
         body: &str,
         usage: Option<serde_json::Value>,
-    ) -> Option<(&'static str, chrono::DateTime<Utc>)> {
+    ) -> RateLimitWindowDecision {
         let now = Utc::now();
 
         // 1) 上游明确给了 retry-after → 这是最权威的退避信号,优先按它精确冷却
@@ -941,10 +1086,10 @@ impl AccountService {
         //    会落到下面第 2 步。先判它,避免真限流文案里偶含 "credit" 被误当成不隔离。
         if let Some(secs) = retry_after_secs {
             let capped = secs.min(MAX_RETRY_AFTER_SECS);
-            return Some((
+            return RateLimitWindowDecision::Quarantine(
                 "429 速率限制（retry-after）",
                 now + chrono::Duration::seconds(capped),
-            ));
+            );
         }
 
         // 2) 计费/权限类拒绝（无 retry-after）:长上下文需 usage credits、额度不足等。
@@ -952,15 +1097,8 @@ impl AccountService {
         //    与账号容量无关,绝不隔离账号。
         let body_lc = body.to_lowercase();
         if body_lc.contains("long context") || body_lc.contains("credit") {
-            return None;
+            return RateLimitWindowDecision::PassThrough;
         }
-
-        let short = || {
-            (
-                "速率限制（短冷却）",
-                now + chrono::Duration::from_std(PURE_RATE_LIMIT_COOLDOWN).unwrap(),
-            )
-        };
 
         // 3) 撞墙判断:完全不主动查 usage 接口,改用被动用量数据。
         //    优先用这条 429 响应自带的 ratelimit 头(usage 入参,最新),
@@ -968,9 +1106,13 @@ impl AccountService {
         //    用 429 自带头还能在风暴中正确识别真撞墙(此时 usage_data 因无 200 响应而不更新)。
         let usage = usage.unwrap_or_else(|| account.usage_data.clone());
         match classify_rate_limit(&usage, USAGE_HIT_THRESHOLD) {
-            Some(RateLimitWindow::SevenDay(reset_at)) => Some(("周限额已满", reset_at)),
-            Some(RateLimitWindow::FiveHour(reset_at)) => Some(("5 小时限额已满", reset_at)),
-            None => Some(short()),
+            Some(RateLimitWindow::SevenDay(reset_at)) => {
+                RateLimitWindowDecision::Quarantine("周限额已满", reset_at)
+            }
+            Some(RateLimitWindow::FiveHour(reset_at)) => {
+                RateLimitWindowDecision::Quarantine("5 小时限额已满", reset_at)
+            }
+            None => RateLimitWindowDecision::RequestBackoff(PURE_RATE_LIMIT_RETRY_DELAY),
         }
     }
 
@@ -1058,6 +1200,8 @@ impl AccountService {
         let queue = self.get_or_create_queue(account.id, account.concurrency).await;
         let current_concurrency = queue.active_count();
         let queued = queue.waiting_count();
+        let (transient_backoff_waiting, transient_backoff_remaining_ms) =
+            self.transient_rate_limit_backoff_status(account.id).await;
         // 负载 % = (活跃 + 排队) / concurrency × 100,与 select_by_score 保持一致
         let concurrency_pct = if account.concurrency > 0 {
             ((current_concurrency + queued) as f64) / (account.concurrency as f64) * 100.0
@@ -1077,6 +1221,8 @@ impl AccountService {
             weights: (w7d, w5h, wconc),
             current_concurrency,
             queued,
+            transient_backoff_waiting,
+            transient_backoff_remaining_ms,
         }
     }
 }
@@ -1307,8 +1453,27 @@ pub fn generate_session_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::account::{AccountStatus, BillingMode};
+    use crate::store::account_store::AccountStore;
+    use crate::store::memory::MemoryStore;
+    use crate::store::settings_store::SettingsStore;
     use chrono::Duration as ChronoDuration;
     use serde_json::json;
+    use sqlx::AnyPool;
+
+    async fn setup_account_service() -> (Arc<AccountStore>, Arc<AccountService>) {
+        sqlx::any::install_default_drivers();
+        let tmp = std::env::temp_dir().join(format!("ccgw_account_service_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        crate::store::db::migrate(&pool, "sqlite").await.expect("migrate");
+
+        let store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let cache = Arc::new(MemoryStore::new());
+        let settings_store = Arc::new(SettingsStore::new(pool));
+        let svc = Arc::new(AccountService::new(store.clone(), cache, settings_store));
+        (store, svc)
+    }
 
     /// 生成一个相对当前时间指定偏移的 RFC3339 字符串。
     fn rfc3339_at(offset: ChronoDuration) -> String {
@@ -1317,6 +1482,45 @@ mod tests {
 
     fn make_window(util: serde_json::Value, resets_at: &str) -> serde_json::Value {
         json!({ "utilization": util, "resets_at": resets_at })
+    }
+
+    fn test_account_with_usage(usage_data: serde_json::Value) -> Account {
+        Account {
+            id: 1,
+            name: "测试账号".into(),
+            email: "user@example.com".into(),
+            status: AccountStatus::Active,
+            auth_type: AccountAuthType::Oauth,
+            setup_token: String::new(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+            oauth_refreshed_at: None,
+            auth_error: String::new(),
+            proxy_url: String::new(),
+            device_id: "device-1".into(),
+            canonical_env: json!({}),
+            canonical_prompt: json!({}),
+            canonical_process: json!({}),
+            billing_mode: BillingMode::Strip,
+            account_uuid: None,
+            organization_uuid: None,
+            subscription_type: None,
+            concurrency: 3,
+            priority: 50,
+            rpm_limit: 0,
+            rate_limited_at: None,
+            rate_limit_reset_at: None,
+            disable_reason: String::new(),
+            auto_telemetry: false,
+            auto_poll_usage: false,
+            allow_1m_models: "opus".into(),
+            telemetry_count: 0,
+            usage_data,
+            usage_fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
     }
 
     // ---- check_usage_window ----
@@ -1529,6 +1733,75 @@ mod tests {
         });
         assert!(classify_rate_limit(&usage, 97.0).is_none());
         assert!(classify_rate_limit(&usage, 90.0).is_some());
+    }
+
+    #[test]
+    fn transient_429_uses_request_backoff_without_account_quarantine() {
+        let account = test_account_with_usage(json!({}));
+
+        match AccountService::determine_rate_limit_window(&account, None, "rate limited", None) {
+            RateLimitWindowDecision::RequestBackoff(delay) => {
+                assert_eq!(delay, PURE_RATE_LIMIT_RETRY_DELAY);
+            }
+            _ => panic!("expected request-level backoff"),
+        }
+    }
+
+    #[test]
+    fn credit_429_passes_through_without_backoff_or_quarantine() {
+        let account = test_account_with_usage(json!({}));
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "This request requires long context usage credits",
+            None,
+        ) {
+            RateLimitWindowDecision::PassThrough => {}
+            _ => panic!("expected pass-through decision"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_backoff_wait_count_is_in_memory_only() {
+        let (_store, svc) = setup_account_service().await;
+        let mut account = test_account_with_usage(json!({}));
+        account.id = 0;
+        svc.create_account(&mut account).await.unwrap();
+
+        svc.set_transient_rate_limit_backoff(account.id, Duration::from_millis(80)).await;
+        let waiter_svc = svc.clone();
+        let waiter_account = account.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_svc
+                .wait_transient_rate_limit_backoff(&waiter_account)
+                .await;
+        });
+
+        let mut saw_waiter = false;
+        for _ in 0..10 {
+            let (waiting, remaining_ms) = svc
+                .transient_rate_limit_backoff_status(account.id)
+                .await;
+            if waiting > 0 {
+                saw_waiter = true;
+                assert!(remaining_ms > 0);
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(saw_waiter);
+
+        waiter.await.unwrap();
+        let stored = svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, crate::model::account::AccountStatus::Active);
+        assert!(stored.rate_limit_reset_at.is_none());
+
+        let (waiting, remaining_ms) = svc
+            .transient_rate_limit_backoff_status(account.id)
+            .await;
+        assert_eq!(waiting, 0);
+        assert_eq!(remaining_ms, 0);
     }
 
     // ---- tiered_decay ----

@@ -19,7 +19,8 @@ const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
-const SCOPE_FULL: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const SCOPE_FULL: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const SCOPE_INFERENCE: &str = "user:inference";
 
 /// 会话 TTL（30 分钟）。
@@ -293,7 +294,7 @@ impl OAuthFlowService {
         debug!("exchanging code for session {}", session_id);
 
         // 发送 token exchange 请求
-        let client = crate::tlsfp::make_request_client(&session.proxy_url);
+        let client = crate::tlsfp::get_request_client(&session.proxy_url);
         let resp = client
             .post(TOKEN_URL)
             .header("Content-Type", "application/json")
@@ -363,4 +364,3 @@ fn percent_encode(input: &str) -> String {
     }
     result
 }
-

@@ -71,6 +71,8 @@ export interface Account {
   }
   current_concurrency?: number
   queued_requests?: number
+  transient_backoff_waiting?: number
+  transient_backoff_remaining_ms?: number
   rate_limited_at?: string
   rate_limit_reset_at?: string
   disable_reason?: string

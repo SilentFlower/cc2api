@@ -17,7 +17,7 @@ use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     access_policy_error_response,
 };
-use crate::service::account::{AccountService, QueueWaitError};
+use crate::service::account::{AccountService, QueueWaitError, RateLimitDecision};
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
     StatefulCacheCompletion, StatefulCacheUsage, detect_client_type, ordered_anthropic_headers,
@@ -52,6 +52,11 @@ const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 /// 正常 Anthropic SSE 的 usage 会在尾部出现；这里仅在压缩响应上保留一份内部副本用于解压解析,
 /// 不改变转发给 Claude Code 的原始响应字节。
 const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct RateLimitResponseDecision {
+    delay: std::time::Duration,
+}
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -261,6 +266,7 @@ impl GatewayService {
 
         // 429 自动换号 / 并发降级重试循环
         let mut exclude_ids = blocked_ids.clone();
+        let mut backoff_retry_ids: Vec<i64> = Vec::new();
         let mut last_resp: Option<Response> = None;
 
         loop {
@@ -321,6 +327,12 @@ impl GatewayService {
                     return Ok(axum::Json(body).into_response());
                 }
             }
+
+            // 瞬时 429 软退避是账号级、进程内状态。等待放在 RPM/并发前,
+            // 避免把上游临时锁定窗口算进本地 RPM 或占住账号并发槽。
+            self.account_svc
+                .wait_transient_rate_limit_backoff(&account)
+                .await;
 
             // RPM admission 放在并发槽位之前：粘性会话超限时等待/拒绝,非粘性请求超限时换号。
             // 这样不会因为 RPM 等待长期占用账号并发槽位,也不会把已有粘性会话随意切到其他账号。
@@ -574,6 +586,25 @@ impl GatewayService {
                 return Ok(Response::from_parts(parts, guarded_body));
             }
 
+            if let Some(decision) = resp.extensions().get::<RateLimitResponseDecision>() {
+                self.account_svc
+                    .set_transient_rate_limit_backoff(account.id, decision.delay)
+                    .await;
+                if !backoff_retry_ids.contains(&account.id) {
+                    warn!(
+                        "account {} returned transient 429, applying {}s soft backoff before retrying request",
+                        account.id,
+                        decision.delay.as_secs()
+                    );
+                    backoff_retry_ids.push(account.id);
+                    drop(slot_guard); // 等待期间不占用账号并发槽位
+                    self.account_svc
+                        .wait_transient_rate_limit_backoff(&account)
+                        .await;
+                    continue;
+                }
+            }
+
             // 429：guard drop 会归还槽位 permit，排除该账号，尝试下一个
             warn!(
                 "account {} returned 429, excluding and retrying (attempt {})",
@@ -704,7 +735,7 @@ impl GatewayService {
 
         debug!("upstream URL: {}", target_url);
 
-        let client = crate::tlsfp::make_request_client(&account.proxy_url);
+        let client = crate::tlsfp::get_request_client(&account.proxy_url);
 
         let mut req_builder = match method {
             "GET" => client.get(&target_url),
@@ -758,16 +789,20 @@ impl GatewayService {
                 safe_upstream_error_log_body(&body_bytes, &headers_429)
             );
 
-            if let Err(e) = self
+            let rate_limit_decision = match self
                 .account_svc
                 .handle_rate_limit(account, retry_after, &body_snippet, usage_from_headers)
                 .await
             {
-                warn!(
-                    "failed to handle rate limit for account {}: {}",
-                    account.id, e
-                );
-            }
+                Ok(decision) => Some(decision),
+                Err(e) => {
+                    warn!(
+                        "failed to handle rate limit for account {}: {}",
+                        account.id, e
+                    );
+                    None
+                }
+            };
 
             // 用缓冲的 body 重建 429 响应（无需流式）,过滤掉网关指纹响应头后返回。
             let mut rb = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
@@ -777,9 +812,15 @@ impl GatewayService {
                 }
                 rb = rb.header(k.clone(), v.clone());
             }
-            return rb
+            let mut response = rb
                 .body(Body::from(body_bytes))
-                .map_err(|e| AppError::Internal(format!("build 429 response: {}", e)));
+                .map_err(|e| AppError::Internal(format!("build 429 response: {}", e)))?;
+            if let Some(RateLimitDecision::RequestBackoff(delay)) = rate_limit_decision {
+                response
+                    .extensions_mut()
+                    .insert(RateLimitResponseDecision { delay });
+            }
+            return Ok(response);
         }
 
         // 处理认证失败：403 永久停用（但如果账号已处于 429 限流中则跳过，避免误判）

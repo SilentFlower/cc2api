@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::model::account::{Account, AccountStatus};
-use crate::service::account::AccountService;
+use crate::service::account::{AccountService, RateLimitDecision};
 use crate::service::gateway::extract_passive_usage;
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
@@ -284,15 +284,23 @@ impl PrimePollerService {
         if status == 429 {
             // 预热请求体极小,不会触发长上下文计费类 429;此处无 retry-after/响应体/被动用量,
             // 走「用已存 usage_data 判断撞墙 + 短冷却」的常规逻辑即可。
-            if let Err(e) = self
+            match self
                 .account_svc
                 .handle_rate_limit(account, None, "", None)
                 .await
             {
-                warn!(
+                Ok(RateLimitDecision::RequestBackoff(delay)) => {
+                    info!(
+                        "prime poller: transient 429 for account {}, no account quarantine, suggested delay {}s",
+                        account.id,
+                        delay.as_secs()
+                    );
+                }
+                Ok(RateLimitDecision::Quarantined | RateLimitDecision::PassThrough) => {}
+                Err(e) => warn!(
                     "prime poller: handle_rate_limit failed for account {}: {}",
                     account.id, e
-                );
+                ),
             }
             return;
         }
@@ -402,7 +410,7 @@ impl PrimePollerService {
         headers.insert("authorization".into(), format!("Bearer {}", token));
 
         // 走定制 tlsfp 客户端,复用账号的 proxy_url。
-        let client = crate::tlsfp::make_request_client(&account.proxy_url);
+        let client = crate::tlsfp::get_request_client(&account.proxy_url);
         let mut req = client.post(UPSTREAM_URL).body(rewritten_bytes);
         for (k, v) in ordered_anthropic_headers("/v1/messages", &headers) {
             req = req.header(k, v);

@@ -1,14 +1,17 @@
+use once_cell::sync::Lazy;
 use rustls::craft::{
     CraftExtension, ExtensionSpec, Fingerprint, GreaseOrCipher, GreaseOrCurve, GreaseOrVersion,
     KeepExtension,
 };
+use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
 use rustls::internal::msgs::handshake::ClientExtension;
-use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::{CipherSuite, Error, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme};
 use static_init::dynamic;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -25,7 +28,7 @@ struct X25519Mlkem768KxGroup;
 
 impl SupportedKxGroup for X25519Mlkem768KxGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        use ml_kem::{MlKem768, KemCore, EncodedSizeUser};
+        use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 
         let mut rng = rand::thread_rng();
 
@@ -81,13 +84,17 @@ impl ActiveKeyExchange for X25519Mlkem768ActiveKx {
         let (ct_bytes, x25519_peer) = peer_pub_key.split_at(1088);
 
         // ML-KEM decapsulation
-        let ct: ml_kem::Ciphertext<ml_kem::MlKem768> = ct_bytes.try_into()
+        let ct: ml_kem::Ciphertext<ml_kem::MlKem768> = ct_bytes
+            .try_into()
             .map_err(|_| Error::General("ML-KEM: invalid ciphertext".into()))?;
-        let mlkem_ss = self.dk.decapsulate(&ct)
+        let mlkem_ss = self
+            .dk
+            .decapsulate(&ct)
             .map_err(|_| Error::General("ML-KEM decapsulation failed".into()))?;
 
         // X25519 DH
-        let x25519_peer_key: [u8; 32] = x25519_peer.try_into()
+        let x25519_peer_key: [u8; 32] = x25519_peer
+            .try_into()
             .map_err(|_| Error::General("X25519: invalid peer key".into()))?;
         let x25519_peer_pub = x25519_dalek::PublicKey::from(x25519_peer_key);
         let x25519_ss = self.x25519_secret.diffie_hellman(&x25519_peer_pub);
@@ -127,6 +134,8 @@ impl SupportedKxGroup for FakeKxGroup {
 
 static X25519MLKEM768_KX: X25519Mlkem768KxGroup = X25519Mlkem768KxGroup;
 static FAKE_X448: FakeKxGroup = FakeKxGroup(NamedGroup::Unknown(0x001E));
+static REQUEST_CLIENT_CACHE: Lazy<RwLock<HashMap<String, reqwest::Client>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 macro_rules! static_ref {
     ($val:expr, $type:ty) => {{
@@ -317,8 +326,46 @@ fn build_tls_config() -> rustls::ClientConfig {
     config
 }
 
+/// 获取带 TLS 指纹伪装的缓存 reqwest 客户端。
+///
+/// 相同代理地址返回同一个内部连接池的 clone；不同代理地址使用独立客户端，避免代理配置串用。
+///
+/// # 参数
+/// - `proxy_url`: 代理地址。空字符串表示直连，非空时沿用 reqwest 支持的 HTTP/SOCKS 代理格式。
+///
+/// # 返回
+/// 返回可直接发起请求的 `reqwest::Client` clone。
+pub fn get_request_client(proxy_url: &str) -> reqwest::Client {
+    let cache_key = proxy_url.to_string();
+    {
+        let cache = REQUEST_CLIENT_CACHE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(client) = cache.get(&cache_key) {
+            return client.clone();
+        }
+    }
+
+    let client = make_request_client(proxy_url);
+    let mut cache = REQUEST_CLIENT_CACHE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.get(&cache_key) {
+        return existing.clone();
+    }
+    cache.insert(cache_key, client.clone());
+    client
+}
+
 /// 创建带 TLS 指纹伪装的 reqwest 客户端。
+///
 /// 支持直连和代理（HTTP/SOCKS5）。
+///
+/// # 参数
+/// - `proxy_url`: 代理地址。空字符串表示直连，非空时沿用 reqwest 支持的 HTTP/SOCKS 代理格式。
+///
+/// # 返回
+/// 返回新建的 `reqwest::Client`。
 pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     let tls_config = build_tls_config();
 
@@ -341,4 +388,51 @@ pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_request_client_cache_for_test() {
+        REQUEST_CLIENT_CACHE
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn request_client_cache_len_for_test() -> usize {
+        REQUEST_CLIENT_CACHE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[test]
+    fn same_proxy_reuses_cached_client_entry() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear_request_client_cache_for_test();
+
+        let proxy_url = "socks5h://127.0.0.1:65530";
+
+        let _first = get_request_client(proxy_url);
+        assert_eq!(request_client_cache_len_for_test(), 1);
+
+        let _second = get_request_client(proxy_url);
+        assert_eq!(request_client_cache_len_for_test(), 1);
+    }
+
+    #[test]
+    fn different_proxy_uses_different_cached_client_entry() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear_request_client_cache_for_test();
+
+        let _first = get_request_client("socks5h://127.0.0.1:65530");
+        let _second = get_request_client("socks5h://127.0.0.1:65531");
+
+        assert_eq!(request_client_cache_len_for_test(), 2);
+    }
 }

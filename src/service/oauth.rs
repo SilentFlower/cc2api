@@ -4,7 +4,7 @@ use crate::service::version_profile::{
     MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
     claude_cli_user_agent, claude_code_user_agent, normalize_version,
 };
-use crate::tlsfp::make_request_client;
+use crate::tlsfp::get_request_client;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -65,7 +65,7 @@ impl TokenTester {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let client = make_request_client(proxy_url);
+        let client = get_request_client(proxy_url);
 
         let resp = client
             .post("https://api.anthropic.com/v1/messages?beta=true")
@@ -108,7 +108,7 @@ pub async fn refresh_oauth_token(
     refresh_token: &str,
     proxy_url: &str,
 ) -> Result<RefreshedOAuthTokens, AppError> {
-    let client = make_request_client(proxy_url);
+    let client = get_request_client(proxy_url);
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -158,7 +158,7 @@ pub async fn refresh_oauth_token(
 
 /// 从 Anthropic OAuth API 获取账号用量数据。
 pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError> {
-    let client = make_request_client(proxy_url);
+    let client = get_request_client(proxy_url);
 
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")

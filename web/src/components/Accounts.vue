@@ -113,10 +113,10 @@ let autoReloadTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(() => {
   load();
-  // 每 60 秒静默重拉账户列表（usage_data 会带新值过来）
+  // 每 5 秒静默重拉账户列表，保证秒级 soft backoff 状态能被看到。
   autoReloadTimer = setInterval(() => {
     load();
-  }, 60 * 1000);
+  }, 5 * 1000);
 });
 
 onUnmounted(() => {
@@ -437,6 +437,28 @@ function rpmClass(account: Account): string {
 }
 
 /**
+ * 格式化瞬时 429 软退避剩余时间。
+ * @param account 账号对象
+ */
+function transientBackoffLabel(account: Account): string {
+  const waiting = account.transient_backoff_waiting ?? 0;
+  const remainingMs = account.transient_backoff_remaining_ms ?? 0;
+  if (waiting <= 0 && remainingMs <= 0) return '0';
+  const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
+  return `${waiting} · ${seconds}s`;
+}
+
+/**
+ * 获取瞬时 429 软退避文本颜色。
+ * @param account 账号对象
+ */
+function transientBackoffClass(account: Account): string {
+  return ((account.transient_backoff_waiting ?? 0) > 0 || (account.transient_backoff_remaining_ms ?? 0) > 0)
+    ? 'text-amber-600'
+    : 'text-[#29261e]';
+}
+
+/**
  * 获取当前账号显示的凭证摘要
  * @param account 账号对象
  */
@@ -650,7 +672,7 @@ async function copyText(text: string) {
 
           <!-- 信息 -->
           <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
-            <div class="grid grid-cols-4 gap-3">
+            <div class="grid grid-cols-5 gap-2">
               <div class="text-center relative"
                    @mouseenter="showScoreTooltip($event, a)"
                    @mouseleave="hideScoreTooltip">
@@ -669,6 +691,12 @@ async function copyText(text: string) {
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">排队</p>
                 <p class="text-sm font-medium" :class="(a.queued_requests ?? 0) > 0 ? 'text-amber-600' : 'text-[#29261e]'">
                   {{ a.queued_requests ?? 0 }}
+                </p>
+              </div>
+              <div class="text-center">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">429 等待</p>
+                <p class="text-sm font-medium" :class="transientBackoffClass(a)">
+                  {{ transientBackoffLabel(a) }}
                 </p>
               </div>
               <div class="text-center">
