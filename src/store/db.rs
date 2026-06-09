@@ -183,6 +183,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "message_cache_control_rewrite",
             crate::store::settings_store::DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
         ),
+        // 代理 reqwest Client 连接池默认开启,可通过设置页关闭用于排查连接复用问题。
+        (
+            "proxy_client_pool_enabled",
+            crate::store::settings_store::DEFAULT_PROXY_CLIENT_POOL_ENABLED,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

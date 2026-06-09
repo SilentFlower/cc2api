@@ -2,11 +2,11 @@ use chrono::Utc;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -255,17 +255,13 @@ impl AccountQueue {
                     Err(_) => return, // semaphore 被 close
                 };
                 // 原子决定：若 cap 仍 > target 则吞掉，否则归还 permit 并退出
-                let decision = cap_c.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |c| {
-                        if c > target_c.load(Ordering::Acquire) {
-                            Some(c - 1)
-                        } else {
-                            None
-                        }
-                    },
-                );
+                let decision = cap_c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                    if c > target_c.load(Ordering::Acquire) {
+                        Some(c - 1)
+                    } else {
+                        None
+                    }
+                });
                 match decision {
                     Ok(_) => permit.forget(), // cap 已 -1,permit 不归还
                     Err(_) => {
@@ -293,10 +289,7 @@ impl AccountQueue {
     /// （官方源码：直接对底层计数 CAS，不走 waker 队列）。一旦走快速路径，新请求就可能
     /// 插队到已在等的老请求前面，破坏 FIFO。故此处统一走 `acquire_owned`——无人等待时
     /// 它自己就会立即 ready，不会有额外开销。
-    pub async fn acquire(
-        &self,
-        timeout: Duration,
-    ) -> Result<OwnedSemaphorePermit, QueueWaitError> {
+    pub async fn acquire(&self, timeout: Duration) -> Result<OwnedSemaphorePermit, QueueWaitError> {
         // 1. 进等待区：拿不到等待位说明队列满，降级。
         //    queue_cap 用 try_acquire 是 OK 的：它仅作上限计数，无用户 waiter 排队。
         let queue_permit = self
@@ -375,13 +368,16 @@ impl AccountService {
     /// 从数据库加载评分权重到内存缓存，启动时和更新设置后调用。
     pub async fn reload_score_weights(&self) {
         if let Ok(settings) = self.settings_store.get_all().await {
-            let w7d = settings.get("score_weight_7d")
+            let w7d = settings
+                .get("score_weight_7d")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(DEFAULT_W7D);
-            let w5h = settings.get("score_weight_5h")
+            let w5h = settings
+                .get("score_weight_5h")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(DEFAULT_W5H);
-            let wconc = settings.get("score_weight_concurrency")
+            let wconc = settings
+                .get("score_weight_concurrency")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(DEFAULT_WCONC);
             *self.score_weights.write().await = (w7d, w5h, wconc);
@@ -402,7 +398,9 @@ impl AccountService {
         a.canonical_prompt = prompt;
         a.canonical_process = process;
 
-        if a.status == crate::model::account::AccountStatus::Active && a.status.to_string() == "active" {
+        if a.status == crate::model::account::AccountStatus::Active
+            && a.status.to_string() == "active"
+        {
             // default already active
         }
         if a.concurrency == 0 {
@@ -440,7 +438,11 @@ impl AccountService {
         self.store.list().await
     }
 
-    pub async fn list_accounts_paged(&self, page: i64, page_size: i64) -> Result<(Vec<Account>, i64), AppError> {
+    pub async fn list_accounts_paged(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<Account>, i64), AppError> {
         let total = self.store.count().await?;
         let accounts = self.store.list_paged(page, page_size).await?;
         Ok((accounts, total))
@@ -465,10 +467,13 @@ impl AccountService {
             return;
         }
 
-        map.insert(account_id, TransientRateLimitBackoff {
-            until,
-            waiting: Arc::new(AtomicI64::new(0)),
-        });
+        map.insert(
+            account_id,
+            TransientRateLimitBackoff {
+                until,
+                waiting: Arc::new(AtomicI64::new(0)),
+            },
+        );
     }
 
     /// 等待账号当前的纯瞬时 429 软退避窗口结束。
@@ -489,13 +494,15 @@ impl AccountService {
             };
 
             let Some(entry) = entry else {
-                self.clear_expired_transient_rate_limit_backoff(account.id).await;
+                self.clear_expired_transient_rate_limit_backoff(account.id)
+                    .await;
                 return;
             };
 
             let remaining = entry.until.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.clear_expired_transient_rate_limit_backoff(account.id).await;
+                self.clear_expired_transient_rate_limit_backoff(account.id)
+                    .await;
                 continue;
             }
 
@@ -539,16 +546,18 @@ impl AccountService {
             return (waiting, 0);
         }
 
-        self.clear_expired_transient_rate_limit_backoff(account_id).await;
+        self.clear_expired_transient_rate_limit_backoff(account_id)
+            .await;
         (0, 0)
     }
 
     async fn clear_expired_transient_rate_limit_backoff(&self, account_id: i64) {
         let now = Instant::now();
         let mut map = self.transient_rate_limit_backoffs.write().await;
-        if map.get(&account_id).is_some_and(|entry| {
-            entry.until <= now && entry.waiting.load(Ordering::Relaxed) <= 0
-        }) {
+        if map
+            .get(&account_id)
+            .is_some_and(|entry| entry.until <= now && entry.waiting.load(Ordering::Relaxed) <= 0)
+        {
             map.remove(&account_id);
         }
     }
@@ -585,15 +594,21 @@ impl AccountService {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
                 if account_id > 0 {
                     if let Ok(account) = self.store.get_by_id(account_id).await {
-                        let id_allowed = allowed_ids.is_empty() || allowed_ids.contains(&account_id);
+                        let id_allowed =
+                            allowed_ids.is_empty() || allowed_ids.contains(&account_id);
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
                         {
                             // 粘性命中：刷新 TTL，保持活跃会话不过期
-                            let _ = self.cache.set_session_account_id(
-                                session_hash, account_id, STICKY_SESSION_TTL,
-                            ).await;
+                            let _ = self
+                                .cache
+                                .set_session_account_id(
+                                    session_hash,
+                                    account_id,
+                                    STICKY_SESSION_TTL,
+                                )
+                                .await;
                             return Ok(SelectedAccount {
                                 account,
                                 sticky: true,
@@ -626,9 +641,7 @@ impl AccountService {
         }
 
         if candidates.is_empty() {
-            return Err(AppError::ServiceUnavailable(
-                "no available accounts".into(),
-            ));
+            return Err(AppError::ServiceUnavailable("no available accounts".into()));
         }
 
         // 按优先级分组，同优先级内按综合评分选择（5h 用量 + 并发负载）
@@ -686,7 +699,10 @@ impl AccountService {
     }
 
     /// 返回账号当前分钟 RPM 状态。读取失败由调用方决定是否失败开放。
-    pub async fn get_account_rpm_status(&self, account: &Account) -> Result<AccountRpmStatus, AppError> {
+    pub async fn get_account_rpm_status(
+        &self,
+        account: &Account,
+    ) -> Result<AccountRpmStatus, AppError> {
         let (minute_ts, reset_at) = current_rpm_window();
         let limit = account.rpm_limit.max(0);
         let current = self.cache.get_account_rpm(account.id, minute_ts).await?;
@@ -743,7 +759,9 @@ impl AccountService {
                         None,
                         session_hash,
                     );
-                    return Err(AppError::ServiceUnavailable("account rpm limit reached".into()));
+                    return Err(AppError::ServiceUnavailable(
+                        "account rpm limit reached".into(),
+                    ));
                 }
                 Ok(result) => {
                     let now = Utc::now();
@@ -805,7 +823,14 @@ impl AccountService {
         match detail {
             Some(detail) => info!(
                 "[RPM] 账号={} id={} 当前={} 限制={} 粘性={} 动作={} 详情={} session={}",
-                account.name, account.id, current, account.rpm_limit, sticky, action_label, detail, session
+                account.name,
+                account.id,
+                current,
+                account.rpm_limit,
+                sticky,
+                action_label,
+                detail,
+                session
             ),
             None => info!(
                 "[RPM] 账号={} id={} 当前={} 限制={} 粘性={} 动作={} session={}",
@@ -865,7 +890,11 @@ impl AccountService {
 
     /// 从上游响应头被动采集的用量数据合并到数据库。
     /// 不发起任何 API 请求。与已有 usage_data 做 merge，不会丢失响应头中未包含的窗口（如 seven_day_sonnet）。
-    pub async fn update_passive_usage(&self, id: i64, partial: serde_json::Value) -> Result<(), AppError> {
+    pub async fn update_passive_usage(
+        &self,
+        id: i64,
+        partial: serde_json::Value,
+    ) -> Result<(), AppError> {
         let account = self.store.get_by_id(id).await?;
         let mut existing = if account.usage_data.is_object() {
             account.usage_data
@@ -887,9 +916,7 @@ impl AccountService {
         match account.auth_type {
             AccountAuthType::SetupToken => {
                 if account.setup_token.is_empty() {
-                    return Err(AppError::ServiceUnavailable(
-                        "setup token is empty".into(),
-                    ));
+                    return Err(AppError::ServiceUnavailable("setup token is empty".into()));
                 }
                 Ok(account.setup_token)
             }
@@ -958,7 +985,9 @@ impl AccountService {
             .map(|expires_at| expires_at > Utc::now())
             .unwrap_or(false);
 
-        match crate::service::oauth::refresh_oauth_token(&latest.refresh_token, &latest.proxy_url).await {
+        match crate::service::oauth::refresh_oauth_token(&latest.refresh_token, &latest.proxy_url)
+            .await
+        {
             Ok(tokens) => {
                 self.store
                     .update_oauth_tokens(
@@ -1146,8 +1175,10 @@ impl AccountService {
         // 计算每个候选的综合得分，同时记录并发是否已满
         let mut scored: Vec<(&Account, f64, bool)> = Vec::with_capacity(best.len());
         for acc in &best {
-            let eff_5h = effective_utilization_detail(acc, "five_hour", 5.0 * 3600.0, now).effective;
-            let eff_7d = effective_utilization_detail(acc, "seven_day", 7.0 * 24.0 * 3600.0, now).effective;
+            let eff_5h =
+                effective_utilization_detail(acc, "five_hour", 5.0 * 3600.0, now).effective;
+            let eff_7d =
+                effective_utilization_detail(acc, "seven_day", 7.0 * 24.0 * 3600.0, now).effective;
             // 从 FIFO 排队器读取实时活跃/等待数
             let queue = self.get_or_create_queue(acc.id, acc.concurrency).await;
             let current = queue.active_count();
@@ -1166,7 +1197,11 @@ impl AccountService {
 
         // 优先从未满的账号中选择；全都满了才回退到全部候选
         let pool: Vec<(&Account, f64)> = {
-            let not_full: Vec<_> = scored.iter().filter(|(_, _, full)| !full).map(|(a, s, _)| (*a, *s)).collect();
+            let not_full: Vec<_> = scored
+                .iter()
+                .filter(|(_, _, full)| !full)
+                .map(|(a, s, _)| (*a, *s))
+                .collect();
             if not_full.is_empty() {
                 scored.iter().map(|(a, s, _)| (*a, *s)).collect()
             } else {
@@ -1197,7 +1232,9 @@ impl AccountService {
         let d7d = effective_utilization_detail(account, "seven_day", 7.0 * 24.0 * 3600.0, now);
 
         // 从 FIFO 排队器读取实时活跃/等待数(替代原 cache.get_slot_count 查询)
-        let queue = self.get_or_create_queue(account.id, account.concurrency).await;
+        let queue = self
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
         let current_concurrency = queue.active_count();
         let queued = queue.waiting_count();
         let (transient_backoff_waiting, transient_backoff_remaining_ms) =
@@ -1264,7 +1301,11 @@ fn effective_utilization_detail(
         .unwrap_or(0.0);
 
     if util == 0.0 {
-        return WindowDetail { utilization: 0.0, decay: 1.0, effective: 0.0 };
+        return WindowDetail {
+            utilization: 0.0,
+            decay: 1.0,
+            effective: 0.0,
+        };
     }
 
     // 解析 resets_at，计算剩余时间占窗口总时长的比例，再映射到阶梯档位
@@ -1288,10 +1329,18 @@ fn effective_utilization_detail(
 
     // resets_at 已过期 → 窗口已重置，用量归零
     if decay == 0.0 {
-        return WindowDetail { utilization: 0.0, decay: 1.0, effective: 0.0 };
+        return WindowDetail {
+            utilization: 0.0,
+            decay: 1.0,
+            effective: 0.0,
+        };
     }
 
-    WindowDetail { utilization: util, decay, effective: util * decay }
+    WindowDetail {
+        utilization: util,
+        decay,
+        effective: util * decay,
+    }
 }
 
 /// 将剩余时间比例映射为阶梯衰减系数。
@@ -1314,10 +1363,7 @@ enum RateLimitWindow {
 /// 根据 usage_data JSON 判断哪个窗口撞墙。
 /// 优先检查 7 天窗口（同时命中时 7 天 reset 更晚，限流更久）。
 /// Sonnet 7 天窗口暂不纳入判断。
-fn classify_rate_limit(
-    usage: &serde_json::Value,
-    threshold: f64,
-) -> Option<RateLimitWindow> {
+fn classify_rate_limit(usage: &serde_json::Value, threshold: f64) -> Option<RateLimitWindow> {
     if let Some(reset_at) = check_usage_window(usage, "seven_day", threshold) {
         return Some(RateLimitWindow::SevenDay(reset_at));
     }
@@ -1449,7 +1495,6 @@ pub fn generate_session_hash(
     hex::encode(&hash[..16])
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,10 +1508,13 @@ mod tests {
 
     async fn setup_account_service() -> (Arc<AccountStore>, Arc<AccountService>) {
         sqlx::any::install_default_drivers();
-        let tmp = std::env::temp_dir().join(format!("ccgw_account_service_{}.db", rand::random::<u64>()));
+        let tmp =
+            std::env::temp_dir().join(format!("ccgw_account_service_{}.db", rand::random::<u64>()));
         let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
         let pool = AnyPool::connect(&dsn).await.expect("pool");
-        crate::store::db::migrate(&pool, "sqlite").await.expect("migrate");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("migrate");
 
         let store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let cache = Arc::new(MemoryStore::new());
@@ -1634,11 +1682,14 @@ mod tests {
         });
         match classify_rate_limit(&usage, 97.0) {
             Some(RateLimitWindow::FiveHour(_)) => {}
-            other => panic!("expected FiveHour, got {:?}", match other {
-                Some(RateLimitWindow::SevenDay(_)) => "SevenDay",
-                Some(RateLimitWindow::FiveHour(_)) => "FiveHour",
-                None => "None",
-            }),
+            other => panic!(
+                "expected FiveHour, got {:?}",
+                match other {
+                    Some(RateLimitWindow::SevenDay(_)) => "SevenDay",
+                    Some(RateLimitWindow::FiveHour(_)) => "FiveHour",
+                    None => "None",
+                }
+            ),
         }
     }
 
@@ -1769,7 +1820,8 @@ mod tests {
         account.id = 0;
         svc.create_account(&mut account).await.unwrap();
 
-        svc.set_transient_rate_limit_backoff(account.id, Duration::from_millis(80)).await;
+        svc.set_transient_rate_limit_backoff(account.id, Duration::from_millis(80))
+            .await;
         let waiter_svc = svc.clone();
         let waiter_account = account.clone();
         let waiter = tokio::spawn(async move {
@@ -1780,9 +1832,7 @@ mod tests {
 
         let mut saw_waiter = false;
         for _ in 0..10 {
-            let (waiting, remaining_ms) = svc
-                .transient_rate_limit_backoff_status(account.id)
-                .await;
+            let (waiting, remaining_ms) = svc.transient_rate_limit_backoff_status(account.id).await;
             if waiting > 0 {
                 saw_waiter = true;
                 assert!(remaining_ms > 0);
@@ -1797,9 +1847,7 @@ mod tests {
         assert_eq!(stored.status, crate::model::account::AccountStatus::Active);
         assert!(stored.rate_limit_reset_at.is_none());
 
-        let (waiting, remaining_ms) = svc
-            .transient_rate_limit_backoff_status(account.id)
-            .await;
+        let (waiting, remaining_ms) = svc.transient_rate_limit_backoff_status(account.id).await;
         assert_eq!(waiting, 0);
         assert_eq!(remaining_ms, 0);
     }
@@ -1814,8 +1862,8 @@ mod tests {
 
     #[test]
     fn tiered_decay_boundary_values() {
-        assert_eq!(tiered_decay(0.5), 0.8);  // 不满足 >0.5，落入中档
-        assert_eq!(tiered_decay(0.2), 0.6);  // 不满足 >0.2，落入最低档
+        assert_eq!(tiered_decay(0.5), 0.8); // 不满足 >0.5，落入中档
+        assert_eq!(tiered_decay(0.2), 0.6); // 不满足 >0.2，落入最低档
     }
 
     #[test]

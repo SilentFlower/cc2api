@@ -1,12 +1,12 @@
 use axum::extract::{Path, Query, Request, State};
-use chrono::TimeZone;
-use serde::Deserialize;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::TimeZone;
 use rust_embed::Embed;
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -15,8 +15,8 @@ use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
-    validate_claude_code_versions, validate_user_agent_patterns,
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+    validate_claude_code_versions, validate_user_agent_patterns,
 };
 use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
@@ -26,7 +26,8 @@ use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrit
 use crate::service::telemetry::TelemetryService;
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
-    SettingsStore, DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_PROXY_CLIENT_POOL_ENABLED, SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -95,10 +96,19 @@ pub fn build_router(
             put(update_token).delete(delete_token_handler),
         )
         .route("/admin/dashboard", get(get_dashboard))
-        .route("/admin/oauth/generate-auth-url", post(oauth_generate_auth_url))
-        .route("/admin/oauth/generate-setup-token-url", post(oauth_generate_setup_token_url))
+        .route(
+            "/admin/oauth/generate-auth-url",
+            post(oauth_generate_auth_url),
+        )
+        .route(
+            "/admin/oauth/generate-setup-token-url",
+            post(oauth_generate_setup_token_url),
+        )
         .route("/admin/oauth/exchange-code", post(oauth_exchange_code))
-        .route("/admin/oauth/exchange-setup-token-code", post(oauth_exchange_setup_token_code))
+        .route(
+            "/admin/oauth/exchange-setup-token-code",
+            post(oauth_exchange_setup_token_code),
+        )
         .route("/admin/settings", get(get_settings).put(update_settings))
         .route("/admin/prime-logs", get(get_prime_logs))
         .layer(middleware::from_fn(move |req, next: Next| {
@@ -119,10 +129,7 @@ pub fn build_router(
 // --- Handlers ---
 
 /// 网关透传 fallback：鉴权 + 代理上游
-async fn gateway_fallback(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
+async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Response {
     let key = extract_key(&req);
     if key.is_empty() {
         return err_json(StatusCode::UNAUTHORIZED, "missing api key");
@@ -132,7 +139,10 @@ async fn gateway_fallback(
         Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
     };
-    state.gateway_svc.handle_request(req, Some(&api_token)).await
+    state
+        .gateway_svc
+        .handle_request(req, Some(&api_token))
+        .await
 }
 
 /// 统一 JSON 错误响应
@@ -154,7 +164,10 @@ async fn list_accounts(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(12).clamp(1, 100);
-    let (accounts, total) = state.account_svc.list_accounts_paged(page, page_size).await?;
+    let (accounts, total) = state
+        .account_svc
+        .list_accounts_paged(page, page_size)
+        .await?;
     let total_pages = (total + page_size - 1) / page_size;
 
     // 为每个账号附加遥测会话过期时间 + 调度评分信息
@@ -188,7 +201,8 @@ async fn list_accounts(
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
         obj["queued_requests"] = serde_json::json!(si.queued);
         obj["transient_backoff_waiting"] = serde_json::json!(si.transient_backoff_waiting);
-        obj["transient_backoff_remaining_ms"] = serde_json::json!(si.transient_backoff_remaining_ms);
+        obj["transient_backoff_remaining_ms"] =
+            serde_json::json!(si.transient_backoff_remaining_ms);
         if let Ok(rpm) = state.account_svc.get_account_rpm_status(a).await {
             obj["rpm_current"] = serde_json::json!(rpm.current);
             obj["rpm_remaining"] = serde_json::json!(rpm.remaining);
@@ -237,14 +251,8 @@ async fn create_account(
     if req.email.is_empty() {
         return Err(AppError::BadRequest("email is required".into()));
     }
-    let auth_type = req
-        .auth_type
-        .unwrap_or_else(|| "setup_token".into())
-        .into();
-    let setup_token = req
-        .setup_token
-        .or(req.token)
-        .unwrap_or_default();
+    let auth_type = req.auth_type.unwrap_or_else(|| "setup_token".into()).into();
+    let setup_token = req.setup_token.or(req.token).unwrap_or_default();
     let mut account = Account {
         id: 0,
         name: req.name.unwrap_or_default(),
@@ -360,12 +368,7 @@ async fn update_account(
             } else if status == "disabled" {
                 state
                     .account_svc
-                    .disable_account(
-                        id,
-                        AccountStatus::Disabled,
-                        "手动停用",
-                        None,
-                    )
+                    .disable_account(id, AccountStatus::Disabled, "手动停用", None)
                     .await?;
                 existing = state.account_svc.get_account(id).await?;
                 return Ok(Json(existing));
@@ -429,7 +432,7 @@ async fn test_account(
         Err(e) => {
             return Ok(Json(
                 serde_json::json!({"status": "error", "message": e.to_string()}),
-            ))
+            ));
         }
     };
     match state
@@ -543,9 +546,7 @@ async fn delete_token_handler(
 
 // --- Dashboard ---
 
-async fn get_dashboard(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
+async fn get_dashboard(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let accounts = state.account_svc.list_accounts().await?;
     let token_count = state.token_store.count().await.unwrap_or(0);
 
@@ -663,9 +664,7 @@ fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 // --- Settings Handlers ---
 
 /// 获取所有设置项。
-async fn get_settings(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
+async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let mut settings = state.settings_store.get_all().await?;
     settings
         .entry("allow_system_role_models".into())
@@ -680,9 +679,7 @@ async fn get_settings(
         .or_insert_with(|| DEFAULT_ALLOWED_USER_AGENTS.to_string());
     settings
         .entry("passthrough_shell".into())
-        .or_insert_with(|| {
-            crate::store::settings_store::DEFAULT_PASSTHROUGH_SHELL.to_string()
-        });
+        .or_insert_with(|| crate::store::settings_store::DEFAULT_PASSTHROUGH_SHELL.to_string());
     settings
         .entry("passthrough_os_version".into())
         .or_insert_with(|| {
@@ -699,6 +696,9 @@ async fn get_settings(
     settings
         .entry("message_cache_control_rewrite".into())
         .or_insert_with(|| DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE.to_string());
+    settings
+        .entry("proxy_client_pool_enabled".into())
+        .or_insert_with(|| DEFAULT_PROXY_CLIENT_POOL_ENABLED.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -708,14 +708,16 @@ async fn update_settings(
     Json(body): Json<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 校验权重值必须是合法的非负数
-    for key in &["score_weight_7d", "score_weight_5h", "score_weight_concurrency"] {
+    for key in &[
+        "score_weight_7d",
+        "score_weight_5h",
+        "score_weight_concurrency",
+    ] {
         if let Some(val) = body.get(*key) {
             match val.parse::<f64>() {
                 Ok(v) if v.is_finite() && v >= 0.0 => {}
                 _ => {
-                    return Err(AppError::BadRequest(
-                        format!("'{}' 必须是非负数", key),
-                    ));
+                    return Err(AppError::BadRequest(format!("'{}' 必须是非负数", key)));
                 }
             }
         }
@@ -734,9 +736,10 @@ async fn update_settings(
             match seg.parse::<u32>() {
                 Ok(h) if h < 24 => {}
                 _ => {
-                    return Err(AppError::BadRequest(
-                        format!("'peak_prime_hours' 包含非法小时: {}", seg),
-                    ));
+                    return Err(AppError::BadRequest(format!(
+                        "'peak_prime_hours' 包含非法小时: {}",
+                        seg
+                    )));
                 }
             }
         }
@@ -744,9 +747,7 @@ async fn update_settings(
     // 峰值预热模型:非空字符串,具体模型名由 Anthropic 侧校验
     if let Some(val) = body.get("peak_prime_model") {
         if val.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "'peak_prime_model' 不能为空".into(),
-            ));
+            return Err(AppError::BadRequest("'peak_prime_model' 不能为空".into()));
         }
     }
     // 允许 messages[].role=system 的模型列表:逗号分隔,允许为空;非空项必须是模型 ID 安全集。
@@ -767,9 +768,10 @@ async fn update_settings(
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
-                return Err(AppError::BadRequest(
-                    format!("'{}' 必须是 true 或 false", key),
-                ));
+                return Err(AppError::BadRequest(format!(
+                    "'{}' 必须是 true 或 false",
+                    key
+                )));
             }
         }
     }
@@ -779,12 +781,21 @@ async fn update_settings(
     if let Some(val) = body.get("message_cache_control_rewrite") {
         MessageCacheControlRewrite::parse(val)?;
     }
+    if let Some(val) = body.get("proxy_client_pool_enabled") {
+        if val != "true" && val != "false" {
+            return Err(AppError::BadRequest(
+                "'proxy_client_pool_enabled' 必须是 true 或 false".into(),
+            ));
+        }
+    }
     state.settings_store.upsert_many(&body).await?;
+    if let Some(val) = body.get("proxy_client_pool_enabled") {
+        crate::tlsfp::set_request_client_pool_enabled(val == "true");
+    }
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
     }
-    if body.contains_key("allowed_claude_code_versions")
-        || body.contains_key("allowed_user_agents")
+    if body.contains_key("allowed_claude_code_versions") || body.contains_key("allowed_user_agents")
     {
         state.gateway_svc.reload_access_policy().await?;
     }
@@ -843,20 +854,19 @@ mod tests {
     #[test]
     fn model_id_list_allows_empty_and_valid_ids() {
         assert!(validate_model_id_list("allow_system_role_models", "").is_ok());
-        assert!(validate_model_id_list(
-            "allow_system_role_models",
-            "claude-opus-4-8, claude.test:model_1"
-        )
-        .is_ok());
+        assert!(
+            validate_model_id_list(
+                "allow_system_role_models",
+                "claude-opus-4-8, claude.test:model_1"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn model_id_list_rejects_unsafe_chars() {
-        let err = validate_model_id_list(
-            "allow_system_role_models",
-            "claude-opus-4-8, bad/model",
-        )
-        .unwrap_err();
+        let err = validate_model_id_list("allow_system_role_models", "claude-opus-4-8, bad/model")
+            .unwrap_err();
 
         assert!(err.to_string().contains("bad/model"));
     }

@@ -10,8 +10,7 @@ use crate::service::access_policy::{
 /// 允许 `messages[].role=system` 的默认模型列表。
 pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
-pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str =
-    DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
+pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS_SETTING: &str = DEFAULT_ALLOWED_USER_AGENTS;
 
@@ -26,6 +25,8 @@ pub const DEFAULT_PASSTHROUGH_WORKING_DIR: &str = "true";
 pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
 /// Claude Code messages 缓存断点稳定化默认关闭,保持旧请求体行为。
 pub const DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE: &str = "off";
+/// 代理 HTTP 客户端连接池默认开启,用于复用同一代理下的底层连接。
+pub const DEFAULT_PROXY_CLIENT_POOL_ENABLED: &str = "true";
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {
@@ -97,7 +98,9 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("ccgw_settings_{}.db", rand::random::<u64>()));
         let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
         let pool = AnyPool::connect(&dsn).await.expect("pool");
-        crate::store::db::migrate(&pool, "sqlite").await.expect("migrate");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("migrate");
         SettingsStore::new(pool)
     }
 

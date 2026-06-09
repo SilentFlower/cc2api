@@ -99,7 +99,8 @@ impl Config {
                     .unwrap_or(5432),
                 user: env::var("DATABASE_USER").unwrap_or_else(|_| "postgres".into()),
                 password: env::var("DATABASE_PASSWORD").unwrap_or_default(),
-                dbname: env::var("DATABASE_DBNAME").unwrap_or_else(|_| "claude_code_gateway".into()),
+                dbname: env::var("DATABASE_DBNAME")
+                    .unwrap_or_else(|_| "claude_code_gateway".into()),
             },
             redis,
             admin: AdminConfig {

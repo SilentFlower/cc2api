@@ -12,6 +12,7 @@ use static_init::dynamic;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -134,6 +135,7 @@ impl SupportedKxGroup for FakeKxGroup {
 
 static X25519MLKEM768_KX: X25519Mlkem768KxGroup = X25519Mlkem768KxGroup;
 static FAKE_X448: FakeKxGroup = FakeKxGroup(NamedGroup::Unknown(0x001E));
+static REQUEST_CLIENT_POOL_ENABLED: AtomicBool = AtomicBool::new(true);
 static REQUEST_CLIENT_CACHE: Lazy<RwLock<HashMap<String, reqwest::Client>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -326,6 +328,28 @@ fn build_tls_config() -> rustls::ClientConfig {
     config
 }
 
+/// 设置带代理的 reqwest 客户端连接池是否启用。
+///
+/// # 参数
+/// - `enabled`: `true` 表示复用同一代理的缓存客户端,`false` 表示每次请求新建客户端。
+pub fn set_request_client_pool_enabled(enabled: bool) {
+    REQUEST_CLIENT_POOL_ENABLED.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        REQUEST_CLIENT_CACHE
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+/// 读取当前 reqwest 客户端连接池开关状态。
+///
+/// # 返回
+/// 返回 `true` 表示当前会复用缓存客户端,返回 `false` 表示每次请求新建客户端。
+pub fn request_client_pool_enabled() -> bool {
+    REQUEST_CLIENT_POOL_ENABLED.load(Ordering::Relaxed)
+}
+
 /// 获取带 TLS 指纹伪装的缓存 reqwest 客户端。
 ///
 /// 相同代理地址返回同一个内部连接池的 clone；不同代理地址使用独立客户端，避免代理配置串用。
@@ -336,6 +360,10 @@ fn build_tls_config() -> rustls::ClientConfig {
 /// # 返回
 /// 返回可直接发起请求的 `reqwest::Client` clone。
 pub fn get_request_client(proxy_url: &str) -> reqwest::Client {
+    if !request_client_pool_enabled() {
+        return make_request_client(proxy_url);
+    }
+
     let cache_key = proxy_url.to_string();
     {
         let cache = REQUEST_CLIENT_CACHE
@@ -411,10 +439,27 @@ mod tests {
             .len()
     }
 
+    struct RequestClientPoolStateGuard;
+
+    impl RequestClientPoolStateGuard {
+        fn new() -> Self {
+            set_request_client_pool_enabled(true);
+            clear_request_client_cache_for_test();
+            Self
+        }
+    }
+
+    impl Drop for RequestClientPoolStateGuard {
+        fn drop(&mut self) {
+            set_request_client_pool_enabled(true);
+            clear_request_client_cache_for_test();
+        }
+    }
+
     #[test]
     fn same_proxy_reuses_cached_client_entry() {
         let _guard = TEST_LOCK.lock().unwrap();
-        clear_request_client_cache_for_test();
+        let _state_guard = RequestClientPoolStateGuard::new();
 
         let proxy_url = "socks5h://127.0.0.1:65530";
 
@@ -428,11 +473,28 @@ mod tests {
     #[test]
     fn different_proxy_uses_different_cached_client_entry() {
         let _guard = TEST_LOCK.lock().unwrap();
-        clear_request_client_cache_for_test();
+        let _state_guard = RequestClientPoolStateGuard::new();
 
         let _first = get_request_client("socks5h://127.0.0.1:65530");
         let _second = get_request_client("socks5h://127.0.0.1:65531");
 
         assert_eq!(request_client_cache_len_for_test(), 2);
+    }
+
+    #[test]
+    fn disabled_pool_bypasses_cached_client_entry() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _state_guard = RequestClientPoolStateGuard::new();
+
+        set_request_client_pool_enabled(false);
+        assert!(!request_client_pool_enabled());
+
+        let proxy_url = "socks5h://127.0.0.1:65530";
+
+        let _first = get_request_client(proxy_url);
+        assert_eq!(request_client_cache_len_for_test(), 0);
+
+        let _second = get_request_client(proxy_url);
+        assert_eq!(request_client_cache_len_for_test(), 0);
     }
 }

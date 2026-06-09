@@ -126,7 +126,10 @@ impl CacheStore for MemoryStore {
         ttl: Duration,
     ) -> Result<RpmAcquire, AppError> {
         if limit <= 0 {
-            return Ok(RpmAcquire { acquired: true, current: 0 });
+            return Ok(RpmAcquire {
+                acquired: true,
+                current: 0,
+            });
         }
         let mut rpm = self.rpm.lock().await;
         let now = tokio::time::Instant::now();
@@ -152,12 +155,7 @@ impl CacheStore for MemoryStore {
         })
     }
 
-    async fn acquire_lock(
-        &self,
-        key: &str,
-        owner: &str,
-        ttl: Duration,
-    ) -> Result<bool, AppError> {
+    async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut locks = self.locks.lock().await;
         let now = tokio::time::Instant::now();
         if let Some(existing) = locks.get(key) {

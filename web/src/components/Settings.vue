@@ -48,6 +48,9 @@ const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 /** Claude Code messages 缓存断点改写模式 */
 const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' | 'sub2api'>('off');
 
+/** 代理 HTTP 客户端连接池复用开关 */
+const proxyClientPoolEnabled = ref(true);
+
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
 const logsLoading = ref(false);
@@ -152,6 +155,7 @@ async function loadSettings() {
     } else {
       messageCacheControlRewrite.value = 'off';
     }
+    proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -213,6 +217,7 @@ async function saveSettings() {
       passthrough_working_dir: passthroughWorkingDir.value ? 'true' : 'false',
       cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
       message_cache_control_rewrite: messageCacheControlRewrite.value,
+      proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
     });
     toast('保存成功');
   } catch (e) {
@@ -352,6 +357,32 @@ onMounted(async () => {
               :class="isValidModel ? '' : 'border-red-400'"
             />
             <p class="text-[11px] text-[#b5b0a6]">建议保留为 Haiku,成本最低</p>
+          </div>
+        </div>
+      </div>
+    </Card>
+
+    <!-- 代理连接池 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">代理连接池</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            开启后同一代理地址复用 reqwest Client 和底层连接;关闭后每次上游请求新建客户端,用于排查代理连接复用问题。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">总开关</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="proxyClientPoolEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ proxyClientPoolEnabled ? '已启用' : '已关闭' }}</span>
+            </label>
           </div>
         </div>
       </div>

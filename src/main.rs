@@ -2,6 +2,7 @@ use claude_code_gateway::config;
 use claude_code_gateway::handler;
 use claude_code_gateway::service;
 use claude_code_gateway::store;
+use claude_code_gateway::tlsfp;
 
 use std::sync::Arc;
 use tracing::info;
@@ -42,7 +43,7 @@ async fn main() {
                 &redis_cfg.password,
                 redis_cfg.db,
             )
-                .await
+            .await
             {
                 Ok(r) => {
                     info!("using redis cache");
@@ -60,10 +61,34 @@ async fn main() {
         }
     };
 
-    let account_store = Arc::new(store::account_store::AccountStore::new(pool.clone(), driver.clone()));
-    let token_store = Arc::new(store::token_store::TokenStore::new(pool.clone(), driver.clone()));
+    let account_store = Arc::new(store::account_store::AccountStore::new(
+        pool.clone(),
+        driver.clone(),
+    ));
+    let token_store = Arc::new(store::token_store::TokenStore::new(
+        pool.clone(),
+        driver.clone(),
+    ));
     let settings_store = Arc::new(store::settings_store::SettingsStore::new(pool.clone()));
     let prime_log_store = Arc::new(store::prime_log_store::PrimeLogStore::new(pool.clone()));
+
+    let proxy_client_pool_enabled = settings_store
+        .get_value(
+            "proxy_client_pool_enabled",
+            store::settings_store::DEFAULT_PROXY_CLIENT_POOL_ENABLED,
+        )
+        .await
+        .expect("load proxy client pool setting failed")
+        != "false";
+    tlsfp::set_request_client_pool_enabled(proxy_client_pool_enabled);
+    info!(
+        "proxy client pool: {}",
+        if proxy_client_pool_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),

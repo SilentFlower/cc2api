@@ -31,11 +31,6 @@ pub trait CacheStore: Send + Sync {
         limit: i32,
         ttl: Duration,
     ) -> Result<RpmAcquire, AppError>;
-    async fn acquire_lock(
-        &self,
-        key: &str,
-        owner: &str,
-        ttl: Duration,
-    ) -> Result<bool, AppError>;
+    async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError>;
     async fn release_lock(&self, key: &str, owner: &str);
 }

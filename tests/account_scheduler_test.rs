@@ -82,11 +82,19 @@ async fn test_429_disables_account_for_5h() {
 
     // 模拟 429：停用 5 小时，状态保持 Active（靠 rate_limit_reset_at 拦截调度）
     let reset_at = Utc::now() + Duration::hours(5);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset_at))
-        .await
-        .expect("disable_account failed");
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset_at),
+    )
+    .await
+    .expect("disable_account failed");
 
-    let updated = svc.get_account(account.id).await.expect("get_account failed");
+    let updated = svc
+        .get_account(account.id)
+        .await
+        .expect("get_account failed");
     assert_eq!(updated.status, AccountStatus::Active);
     assert_eq!(updated.disable_reason, "429 速率限制");
     assert!(updated.rate_limit_reset_at.is_some());
@@ -102,11 +110,19 @@ async fn test_429_account_recovers_after_expiry() {
 
     // 设置一个已经过期的 rate_limit_reset_at
     let reset_at = Utc::now() - Duration::seconds(10);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset_at))
-        .await
-        .expect("disable_account failed");
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset_at),
+    )
+    .await
+    .expect("disable_account failed");
 
-    let updated = svc.get_account(account.id).await.expect("get_account failed");
+    let updated = svc
+        .get_account(account.id)
+        .await
+        .expect("get_account failed");
     // rate_limit_reset_at 已过期，应该可以调度
     assert!(updated.is_schedulable());
 }
@@ -140,7 +156,10 @@ async fn test_403_permanently_disables_account() {
         .await
         .expect("disable_account failed");
 
-    let updated = svc.get_account(account.id).await.expect("get_account failed");
+    let updated = svc
+        .get_account(account.id)
+        .await
+        .expect("get_account failed");
     assert_eq!(updated.status, AccountStatus::Disabled);
     assert_eq!(updated.disable_reason, "403 认证失败");
     assert!(updated.rate_limit_reset_at.is_none());
@@ -187,9 +206,14 @@ async fn test_enable_clears_everything() {
 
     // 先禁用（模拟 429）
     let reset_at = Utc::now() + Duration::hours(5);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset_at))
-        .await
-        .unwrap();
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset_at),
+    )
+    .await
+    .unwrap();
 
     // 手动启用
     svc.enable_account(account.id).await.unwrap();
@@ -413,15 +437,25 @@ async fn test_disable_reason_updates_on_repeated_429() {
 
     // 第一次 429
     let reset1 = Utc::now() + Duration::hours(5);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset1))
-        .await
-        .unwrap();
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset1),
+    )
+    .await
+    .unwrap();
 
     // 第二次 429（重新计时）
     let reset2 = Utc::now() + Duration::hours(5);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset2))
-        .await
-        .unwrap();
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset2),
+    )
+    .await
+    .unwrap();
 
     let updated = svc.get_account(account.id).await.unwrap();
     assert_eq!(updated.disable_reason, "429 速率限制");
@@ -435,9 +469,14 @@ async fn test_403_during_429_does_not_escalate() {
 
     // 先 429 限流
     let reset_at = Utc::now() + Duration::hours(5);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset_at))
-        .await
-        .unwrap();
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset_at),
+    )
+    .await
+    .unwrap();
 
     // 模拟网关逻辑：403 到达时检测到已在限流中，不执行永久停用
     let updated = svc.get_account(account.id).await.unwrap();
@@ -461,9 +500,14 @@ async fn test_403_after_429_expired_does_disable() {
 
     // 429 已过期
     let reset_at = Utc::now() - Duration::seconds(10);
-    svc.disable_account(account.id, AccountStatus::Active, "429 速率限制", Some(reset_at))
-        .await
-        .unwrap();
+    svc.disable_account(
+        account.id,
+        AccountStatus::Active,
+        "429 速率限制",
+        Some(reset_at),
+    )
+    .await
+    .unwrap();
 
     // 限流已过期，403 应该正常永久停用
     let updated = svc.get_account(account.id).await.unwrap();
