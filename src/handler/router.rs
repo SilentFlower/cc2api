@@ -26,8 +26,10 @@ use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrit
 use crate::service::telemetry::TelemetryService;
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
-    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
+    DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
     DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     SettingsStore,
@@ -717,6 +719,18 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("rewrite_disabled_thinking_models".into())
         .or_insert_with(|| DEFAULT_REWRITE_DISABLED_THINKING_MODELS.to_string());
+    settings
+        .entry("intercept_assistant_prefill_enabled".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED.to_string());
+    settings
+        .entry("intercept_assistant_prefill_models".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS.to_string());
+    settings
+        .entry("log_429_request_enabled".into())
+        .or_insert_with(|| DEFAULT_LOG_429_REQUEST_ENABLED.to_string());
+    settings
+        .entry("log_429_request_body_limit".into())
+        .or_insert_with(|| DEFAULT_LOG_429_REQUEST_BODY_LIMIT.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -811,6 +825,8 @@ async fn update_settings(
         "intercept_warmup_suggestion_enabled",
         "intercept_warmup_haiku_probe_enabled",
         "rewrite_disabled_thinking_enabled",
+        "intercept_assistant_prefill_enabled",
+        "log_429_request_enabled",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -823,6 +839,12 @@ async fn update_settings(
     }
     if let Some(val) = body.get("rewrite_disabled_thinking_models") {
         validate_model_id_list("rewrite_disabled_thinking_models", val)?;
+    }
+    if let Some(val) = body.get("intercept_assistant_prefill_models") {
+        validate_model_id_list("intercept_assistant_prefill_models", val)?;
+    }
+    if let Some(val) = body.get("log_429_request_body_limit") {
+        validate_usize_range("log_429_request_body_limit", val, 0, 1_048_576)?;
     }
     state.settings_store.upsert_many(&body).await?;
     if let Some(val) = body.get("proxy_client_pool_enabled") {
@@ -861,6 +883,22 @@ async fn update_settings(
     {
         state.gateway_svc.reload_disabled_thinking_rewrite().await?;
     }
+    if body.contains_key("intercept_assistant_prefill_enabled")
+        || body.contains_key("intercept_assistant_prefill_models")
+    {
+        state
+            .gateway_svc
+            .reload_assistant_prefill_intercept_config()
+            .await?;
+    }
+    if body.contains_key("log_429_request_enabled")
+        || body.contains_key("log_429_request_body_limit")
+    {
+        state
+            .gateway_svc
+            .reload_rate_limit_request_log_config()
+            .await?;
+    }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;
     Ok(Json(serde_json::json!({"ok": true})))
@@ -884,6 +922,23 @@ fn validate_model_id_list(key: &str, raw: &str) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+/// 校验 usize 数字范围。
+///
+/// @param key 设置项 key,用于错误提示。
+/// @param raw 原始字符串。
+/// @param min 允许的最小值。
+/// @param max 允许的最大值。
+/// @return 校验通过返回 `Ok(())`,否则返回业务错误。
+fn validate_usize_range(key: &str, raw: &str, min: usize, max: usize) -> Result<(), AppError> {
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value >= min && value <= max => Ok(()),
+        _ => Err(AppError::BadRequest(format!(
+            "'{}' 必须是 {} 到 {} 之间的整数",
+            key, min, max
+        ))),
+    }
 }
 
 /// 获取最近 50 条峰值预热调用记录,按时间倒序。

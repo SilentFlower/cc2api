@@ -28,8 +28,10 @@ use crate::service::telemetry::{
 };
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
-    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
+    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
     DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     SettingsStore,
@@ -67,6 +69,18 @@ struct WarmupInterceptConfig {
     title_enabled: bool,
     suggestion_enabled: bool,
     haiku_probe_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantPrefillInterceptConfig {
+    enabled: bool,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateLimitRequestLogConfig {
+    enabled: bool,
+    body_limit: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +139,8 @@ pub struct GatewayService {
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
+    assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
+    rate_limit_request_log_config: RwLock<RateLimitRequestLogConfig>,
 }
 
 impl GatewayService {
@@ -154,6 +170,10 @@ impl GatewayService {
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
             disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
+            assistant_prefill_intercept_config: RwLock::new(
+                default_assistant_prefill_intercept_config(),
+            ),
+            rate_limit_request_log_config: RwLock::new(default_rate_limit_request_log_config()),
         }
     }
 
@@ -294,6 +314,57 @@ impl GatewayService {
         Ok(())
     }
 
+    /// 从全局设置刷新 assistant prefill 本地拦截配置。
+    ///
+    /// 配置缓存到内存,用于在账号选择/RPM/并发槽之前拦截已知不被上游支持的请求形态。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_assistant_prefill_intercept_config(&self) -> Result<(), AppError> {
+        let enabled = self
+            .settings_store
+            .get_value(
+                "intercept_assistant_prefill_enabled",
+                DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+            )
+            .await?;
+        let models = self
+            .settings_store
+            .get_value(
+                "intercept_assistant_prefill_models",
+                DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+            )
+            .await?;
+        *self.assistant_prefill_intercept_config.write().await = AssistantPrefillInterceptConfig {
+            enabled: parse_setting_flag(&enabled),
+            models: parse_system_role_model_list(&models),
+        };
+        Ok(())
+    }
+
+    /// 从全局设置刷新 429 请求观测日志配置。
+    ///
+    /// 配置缓存到内存,只在上游返回 429 时读取,默认关闭以避免记录用户请求内容。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_rate_limit_request_log_config(&self) -> Result<(), AppError> {
+        let enabled = self
+            .settings_store
+            .get_value("log_429_request_enabled", DEFAULT_LOG_429_REQUEST_ENABLED)
+            .await?;
+        let body_limit = self
+            .settings_store
+            .get_value(
+                "log_429_request_body_limit",
+                DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
+            )
+            .await?;
+        *self.rate_limit_request_log_config.write().await = RateLimitRequestLogConfig {
+            enabled: parse_setting_flag(&enabled),
+            body_limit: parse_rate_limit_request_body_limit(&body_limit),
+        };
+        Ok(())
+    }
+
     /// 从全局设置刷新客户端访问策略。
     ///
     /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析配置失败时返回业务错误。
@@ -373,6 +444,21 @@ impl GatewayService {
 
         // 检测客户端类型
         let client_type = detect_client_type(&ua, &path, &body_map);
+
+        if path.starts_with("/v1/messages") {
+            let assistant_prefill_config = self.assistant_prefill_intercept_config.read().await;
+            if should_intercept_assistant_prefill(&body_map, &assistant_prefill_config) {
+                let model = body_map
+                    .get("model")
+                    .and_then(|model| model.as_str())
+                    .unwrap_or_default();
+                warn!(
+                    "assistant prefill intercepted before upstream: model={} path={} client_type={:?}",
+                    model, path, client_type
+                );
+                return Ok(assistant_prefill_intercept_response(model));
+            }
+        }
 
         // 生成会话哈希
         let session_hash =
@@ -926,6 +1012,19 @@ impl GatewayService {
             // 用这条 429 响应自带的 ratelimit 头做撞墙判断(被动,不再主动查 usage 接口)
             let usage_from_headers = extract_passive_usage(&headers_429);
             let body_bytes = resp.bytes().await.unwrap_or_default();
+            let request_log_config = *self.rate_limit_request_log_config.read().await;
+            if request_log_config.enabled {
+                warn!(
+                    "429_request_capture {}",
+                    format_rate_limit_request_capture(
+                        path,
+                        account,
+                        headers,
+                        body,
+                        request_log_config
+                    )
+                );
+            }
             // 业务判断使用解压后的文本；返回给客户端仍使用原始 body，避免改变透传语义。
             let decoded_body = decode_upstream_error_body(&body_bytes, &headers_429);
             let body_snippet = String::from_utf8_lossy(&decoded_body).into_owned();
@@ -1178,6 +1277,180 @@ fn safe_upstream_error_log_body(body: &[u8], headers: &HeaderMap) -> String {
     out
 }
 
+fn format_rate_limit_request_capture(
+    path: &str,
+    account: &Account,
+    headers: &std::collections::HashMap<String, String>,
+    body: &[u8],
+    config: RateLimitRequestLogConfig,
+) -> String {
+    let body_json = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let model = body_json
+        .as_ref()
+        .and_then(|value| value.get("model"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let stream = body_json
+        .as_ref()
+        .and_then(|value| value.get("stream"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let capture = serde_json::json!({
+        "account_id": account.id,
+        "path": path,
+        "model": model,
+        "stream": stream,
+        "body_summary": safe_body_summary(body),
+        "request_headers": redact_request_headers(headers),
+        "request_body": redacted_request_body_for_log(body, config.body_limit),
+    });
+    serde_json::to_string(&capture).unwrap_or_else(|_| "{}".into())
+}
+
+fn redact_request_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let mut redacted = serde_json::Map::new();
+    for (key, value) in headers {
+        let safe_value = if is_sensitive_log_key(key) {
+            "***REDACTED***".to_string()
+        } else {
+            redact_sensitive_text(value)
+        };
+        redacted.insert(key.clone(), serde_json::Value::String(safe_value));
+    }
+    serde_json::Value::Object(redacted)
+}
+
+fn redacted_request_body_for_log(body: &[u8], limit: usize) -> String {
+    let raw = if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) {
+        redact_sensitive_json_value(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(body).into_owned())
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    };
+    truncate_log_text(&redact_sensitive_text(&raw), limit)
+}
+
+fn redact_sensitive_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_log_key(key) {
+                    *child = serde_json::Value::String("***REDACTED***".into());
+                } else {
+                    redact_sensitive_json_value(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_sensitive_json_value(item);
+            }
+        }
+        serde_json::Value::String(text) => {
+            *text = redact_sensitive_text(text);
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_log_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .flat_map(|ch| ch.to_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "cookie"
+            | "setcookie"
+            | "xapikey"
+            | "anthropicapikey"
+            | "apikey"
+            | "key"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "setuptoken"
+            | "password"
+            | "secret"
+            | "clientsecret"
+    )
+}
+
+fn redact_sensitive_text(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let mut redact_next = false;
+    for part in input.split_whitespace() {
+        if redact_next || looks_like_sensitive_token_part(part) {
+            out.push("***REDACTED***");
+            redact_next = token_prefix_requires_next_redaction(part);
+        } else {
+            out.push(part);
+            redact_next = false;
+        }
+    }
+    out.join(" ")
+}
+
+fn looks_like_sensitive_token_part(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    lower.starts_with("bearer")
+        || lower.starts_with("basic")
+        || lower.starts_with("sk-")
+        || lower.contains("access_token=")
+        || lower.contains("refresh_token=")
+        || lower.contains("authorization=")
+        || lower.contains("api_key=")
+        || lower.contains("token=")
+        || lower.contains("password=")
+        || lower.contains("secret=")
+        || lower.contains("authorization:")
+        || lower.contains("api_key:")
+        || lower.contains("token:")
+        || lower.contains("password:")
+        || lower.contains("secret:")
+}
+
+fn token_prefix_requires_next_redaction(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    lower == "bearer"
+        || lower == "basic"
+        || lower.ends_with("=bearer")
+        || lower.ends_with(":bearer")
+        || lower.ends_with("token:")
+        || lower.ends_with("password:")
+        || lower.ends_with("secret:")
+        || lower.ends_with("authorization:")
+        || lower.ends_with("api_key:")
+}
+
+fn truncate_log_text(raw: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut truncated = false;
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx >= limit {
+            truncated = true;
+            break;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    if truncated {
+        out.push_str("...<truncated>");
+    }
+    out
+}
+
 fn decode_upstream_error_body(body: &[u8], headers: &HeaderMap) -> Vec<u8> {
     let codings = response_content_codings(headers);
     decode_response_body_with_codings(body, &codings)
@@ -1374,6 +1647,55 @@ fn is_streaming_messages_request(body: &serde_json::Value) -> bool {
     body.get("stream")
         .and_then(|stream| stream.as_bool())
         .unwrap_or(false)
+}
+
+fn should_intercept_assistant_prefill(
+    body: &serde_json::Value,
+    config: &AssistantPrefillInterceptConfig,
+) -> bool {
+    config.enabled
+        && assistant_prefill_model_matches(
+            body.get("model")
+                .and_then(|model| model.as_str())
+                .unwrap_or(""),
+            &config.models,
+        )
+        && messages_end_with_assistant(body)
+}
+
+fn assistant_prefill_model_matches(model: &str, configured_models: &[String]) -> bool {
+    configured_models
+        .iter()
+        .any(|configured| configured.as_str() == model)
+}
+
+fn messages_end_with_assistant(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("role"))
+        .and_then(|role| role.as_str())
+        == Some("assistant")
+}
+
+fn assistant_prefill_intercept_response(model: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(assistant_prefill_intercept_body(model)),
+    )
+        .into_response()
+}
+
+fn assistant_prefill_intercept_body(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "This model does not support assistant message prefill. The conversation must end with a user message.",
+            "code": "assistant_prefill_intercepted",
+        },
+        "model": model,
+    })
 }
 
 fn request_text_items<'a>(body: &'a serde_json::Value) -> impl Iterator<Item = &'a str> {
@@ -1863,6 +2185,31 @@ fn default_disabled_thinking_rewrite() -> DisabledThinkingRewrite {
         enabled: parse_setting_flag(DEFAULT_REWRITE_DISABLED_THINKING_ENABLED),
         models: parse_system_role_model_list(DEFAULT_REWRITE_DISABLED_THINKING_MODELS),
     }
+}
+
+/// 构造 assistant prefill 拦截配置初始值。
+fn default_assistant_prefill_intercept_config() -> AssistantPrefillInterceptConfig {
+    AssistantPrefillInterceptConfig {
+        enabled: parse_setting_flag(DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED),
+        models: parse_system_role_model_list(DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS),
+    }
+}
+
+/// 构造 429 请求观测日志配置初始值。
+fn default_rate_limit_request_log_config() -> RateLimitRequestLogConfig {
+    RateLimitRequestLogConfig {
+        enabled: parse_setting_flag(DEFAULT_LOG_429_REQUEST_ENABLED),
+        body_limit: parse_rate_limit_request_body_limit(DEFAULT_LOG_429_REQUEST_BODY_LIMIT),
+    }
+}
+
+/// 解析 429 请求体日志字符上限。非法值回落到默认值。
+fn parse_rate_limit_request_body_limit(raw: &str) -> usize {
+    raw.trim().parse::<usize>().ok().unwrap_or_else(|| {
+        DEFAULT_LOG_429_REQUEST_BODY_LIMIT
+            .parse::<usize>()
+            .expect("默认 429 请求体日志上限必须是合法 usize")
+    })
 }
 
 fn is_system_role_model_allowed(model: &str, allowed_models: &[String]) -> bool {
@@ -2587,20 +2934,27 @@ impl Drop for SlotGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage, WarmupInterceptConfig,
-        WarmupInterceptType, build_message_telemetry_context, build_warmup_intercept_sse,
-        detect_warmup_intercept, extract_message_session_id, flush_stateful_cache_usage_buffer,
+        AssistantPrefillInterceptConfig, RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT,
+        SignatureRetryStage, WarmupInterceptConfig, WarmupInterceptType,
+        assistant_prefill_intercept_body, build_message_telemetry_context,
+        build_warmup_intercept_sse, detect_warmup_intercept, extract_message_session_id,
+        flush_stateful_cache_usage_buffer, format_rate_limit_request_capture,
         has_system_role_message, is_signature_related_error_body,
         is_signature_related_error_response_body, is_system_role_model_allowed,
-        mock_warmup_intercept_json_response, parse_system_role_model_list, safe_body_summary,
+        mock_warmup_intercept_json_response, parse_rate_limit_request_body_limit,
+        parse_system_role_model_list, redact_request_headers, redact_sensitive_text,
+        redacted_request_body_for_log, safe_body_summary, should_intercept_assistant_prefill,
         signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
-        strip_thinking_from_messages_request, system_role_model_error_body,
+        strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_stateful_cache_usage_from_bytes,
     };
+    use crate::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use axum::body;
     use axum::http::{StatusCode, header::CONTENT_ENCODING};
+    use chrono::Utc;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::io::Write;
 
     fn all_warmup_intercepts_enabled() -> WarmupInterceptConfig {
@@ -2608,6 +2962,52 @@ mod tests {
             title_enabled: true,
             suggestion_enabled: true,
             haiku_probe_enabled: true,
+        }
+    }
+
+    fn assistant_prefill_config(enabled: bool) -> AssistantPrefillInterceptConfig {
+        AssistantPrefillInterceptConfig {
+            enabled,
+            models: parse_system_role_model_list("claude-fable-5,claude-opus-4-8,claude-opus-4-7"),
+        }
+    }
+
+    fn test_account() -> Account {
+        Account {
+            id: 42,
+            name: "测试账号".into(),
+            email: "user@example.com".into(),
+            status: AccountStatus::Active,
+            auth_type: AccountAuthType::SetupToken,
+            setup_token: String::new(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: None,
+            oauth_refreshed_at: None,
+            auth_error: String::new(),
+            proxy_url: String::new(),
+            device_id: String::new(),
+            canonical_env: json!({}),
+            canonical_prompt: json!({}),
+            canonical_process: json!({}),
+            billing_mode: BillingMode::Strip,
+            account_uuid: None,
+            organization_uuid: None,
+            subscription_type: None,
+            concurrency: 3,
+            priority: 50,
+            rpm_limit: 0,
+            rate_limited_at: None,
+            rate_limit_reset_at: None,
+            disable_reason: String::new(),
+            auto_telemetry: false,
+            auto_poll_usage: false,
+            allow_1m_models: "opus".into(),
+            telemetry_count: 0,
+            usage_data: json!({}),
+            usage_fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -2619,6 +3019,153 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn assistant_prefill_intercept_matches_enabled_model_and_last_assistant() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "{"}
+            ]
+        });
+
+        assert!(should_intercept_assistant_prefill(
+            &body,
+            &assistant_prefill_config(true)
+        ));
+    }
+
+    #[test]
+    fn assistant_prefill_intercept_ignores_disabled_unmatched_or_last_user() {
+        let last_assistant = json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "assistant", "content": "prefill"}]
+        });
+        let unmatched_model = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "assistant", "content": "prefill"}]
+        });
+        let last_user = json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "go"}]
+        });
+
+        assert!(!should_intercept_assistant_prefill(
+            &last_assistant,
+            &assistant_prefill_config(false)
+        ));
+        assert!(!should_intercept_assistant_prefill(
+            &unmatched_model,
+            &assistant_prefill_config(true)
+        ));
+        assert!(!should_intercept_assistant_prefill(
+            &last_user,
+            &assistant_prefill_config(true)
+        ));
+    }
+
+    #[test]
+    fn assistant_prefill_intercept_body_uses_stable_error_code() {
+        let body = assistant_prefill_intercept_body("claude-opus-4-8");
+
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "assistant_prefill_intercepted");
+        assert_eq!(body["model"], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn rate_limit_request_log_redacts_sensitive_headers() {
+        let headers = HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            ),
+            ("x-api-key".to_string(), "sk-ant-oat-secret".to_string()),
+            ("user-agent".to_string(), "claude-code/2.1.169".to_string()),
+        ]);
+
+        let redacted = redact_request_headers(&headers);
+        let serialized = serde_json::to_string(&redacted).expect("json");
+
+        assert!(serialized.contains("***REDACTED***"));
+        assert!(serialized.contains("claude-code/2.1.169"));
+        assert!(!serialized.contains("secret-token"));
+        assert!(!serialized.contains("sk-ant-oat-secret"));
+    }
+
+    #[test]
+    fn rate_limit_request_log_redacts_sensitive_body_fields_and_truncates() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "stream":false,
+            "access_token":"raw-access-token",
+            "messages":[{"role":"user","content":"hello"}],
+            "metadata":{"refresh_token":"raw-refresh-token","password":"raw-password"}
+        }"#;
+
+        let redacted = redacted_request_body_for_log(body, 120);
+
+        assert!(redacted.contains("***REDACTED***"));
+        assert!(redacted.contains("...<truncated>"));
+        assert!(!redacted.contains("raw-access-token"));
+        assert!(!redacted.contains("raw-refresh-token"));
+        assert!(!redacted.contains("raw-password"));
+    }
+
+    #[test]
+    fn rate_limit_request_log_redacts_free_text_token_values() {
+        let redacted = redact_sensitive_text(
+            "authorization: Bearer raw-token token: raw-token-2 password=raw-password",
+        );
+
+        assert!(redacted.contains("***REDACTED***"));
+        assert!(!redacted.contains("raw-token"));
+        assert!(!redacted.contains("raw-token-2"));
+        assert!(!redacted.contains("raw-password"));
+    }
+
+    #[test]
+    fn rate_limit_request_capture_uses_actual_request_shape() {
+        let headers = HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            ),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ]);
+        let body = br#"{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"hello"}]}"#;
+
+        let captured = format_rate_limit_request_capture(
+            "/v1/messages",
+            &test_account(),
+            &headers,
+            body,
+            RateLimitRequestLogConfig {
+                enabled: true,
+                body_limit: 4096,
+            },
+        );
+
+        assert!(captured.contains(r#""account_id":42"#));
+        assert!(captured.contains(r#""model":"claude-opus-4-8""#));
+        assert!(captured.contains(r#""stream":false"#));
+        assert!(captured.contains("sha256:"));
+        assert!(!captured.contains("secret-token"));
+    }
+
+    #[test]
+    fn rate_limit_request_body_limit_parser_falls_back_for_invalid_values() {
+        assert_eq!(parse_rate_limit_request_body_limit("32"), 32);
+        assert_eq!(parse_rate_limit_request_body_limit("invalid"), 8192);
+    }
+
+    #[test]
+    fn truncate_log_text_handles_zero_limit() {
+        assert_eq!(truncate_log_text("hello", 0), "");
+        assert_eq!(truncate_log_text("hello", 3), "hel...<truncated>");
     }
 
     #[test]

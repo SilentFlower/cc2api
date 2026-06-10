@@ -37,6 +37,15 @@ pub const DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED: &str = "false";
 pub const DEFAULT_REWRITE_DISABLED_THINKING_ENABLED: &str = "false";
 /// 默认只匹配线上已确认报错的 Fable 5,避免影响 Opus 4.8 / 4.7 的正常请求。
 pub const DEFAULT_REWRITE_DISABLED_THINKING_MODELS: &str = "claude-fable-5";
+/// assistant prefill 本地拦截默认关闭,避免升级后改变请求行为。
+pub const DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED: &str = "false";
+/// 默认只覆盖当前事故相关模型,管理员可在设置页追加。
+pub const DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
+    "claude-fable-5,claude-opus-4-8,claude-opus-4-7";
+/// 429 请求观测日志默认关闭,避免默认记录用户请求内容。
+pub const DEFAULT_LOG_429_REQUEST_ENABLED: &str = "false";
+/// 429 请求观测日志默认请求体字符上限。
+pub const DEFAULT_LOG_429_REQUEST_BODY_LIMIT: &str = "8192";
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

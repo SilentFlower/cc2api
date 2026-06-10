@@ -136,6 +136,14 @@ async fn main() {
         .reload_disabled_thinking_rewrite()
         .await
         .expect("load disabled thinking rewrite config failed");
+    gateway_svc
+        .reload_assistant_prefill_intercept_config()
+        .await
+        .expect("load assistant prefill intercept config failed");
+    gateway_svc
+        .reload_rate_limit_request_log_config()
+        .await
+        .expect("load 429 request log config failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 

@@ -210,6 +210,24 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "rewrite_disabled_thinking_models",
             crate::store::settings_store::DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
         ),
+        // assistant prefill 本地拦截默认关闭,避免升级后改变转发行为。
+        (
+            "intercept_assistant_prefill_enabled",
+            crate::store::settings_store::DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+        ),
+        (
+            "intercept_assistant_prefill_models",
+            crate::store::settings_store::DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+        ),
+        // 429 请求观测默认关闭,开启后只输出脱敏和截断后的请求信息。
+        (
+            "log_429_request_enabled",
+            crate::store::settings_store::DEFAULT_LOG_429_REQUEST_ENABLED,
+        ),
+        (
+            "log_429_request_body_limit",
+            crate::store::settings_store::DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

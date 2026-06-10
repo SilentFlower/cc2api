@@ -52,6 +52,14 @@ const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' |
 const rewriteDisabledThinkingEnabled = ref(false);
 const rewriteDisabledThinkingModels = ref('claude-fable-5');
 
+/** assistant prefill 本地拦截配置 */
+const interceptAssistantPrefillEnabled = ref(false);
+const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-4-8,claude-opus-4-7');
+
+/** 429 请求观测日志配置 */
+const log429RequestEnabled = ref(false);
+const log429RequestBodyLimit = ref('8192');
+
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
 
@@ -148,6 +156,24 @@ const isValidRewriteDisabledThinkingModels = computed(() => {
   });
 });
 
+/** assistant prefill 拦截模型列表是否合法 */
+const isValidInterceptAssistantPrefillModels = computed(() => {
+  const raw = interceptAssistantPrefillModels.value.trim();
+  if (!raw) return true;
+  return raw.split(',').every((s) => {
+    const model = s.trim();
+    return !model || /^[A-Za-z0-9._:-]+$/.test(model);
+  });
+});
+
+/** 429 请求体日志字符上限是否合法 */
+const isValidLog429RequestBodyLimit = computed(() => {
+  const raw = log429RequestBodyLimit.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 0 && n <= 1048576;
+});
+
 /** 加载设置 */
 async function loadSettings() {
   try {
@@ -177,6 +203,10 @@ async function loadSettings() {
     proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
     rewriteDisabledThinkingEnabled.value = (data.rewrite_disabled_thinking_enabled ?? 'false') === 'true';
     rewriteDisabledThinkingModels.value = data.rewrite_disabled_thinking_models ?? 'claude-fable-5';
+    interceptAssistantPrefillEnabled.value = (data.intercept_assistant_prefill_enabled ?? 'false') === 'true';
+    interceptAssistantPrefillModels.value = data.intercept_assistant_prefill_models ?? 'claude-fable-5,claude-opus-4-8,claude-opus-4-7';
+    log429RequestEnabled.value = (data.log_429_request_enabled ?? 'false') === 'true';
+    log429RequestBodyLimit.value = data.log_429_request_body_limit ?? '8192';
     interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
     interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
@@ -228,6 +258,14 @@ async function saveSettings() {
     toast('thinking 改写模型列表包含非法字符');
     return;
   }
+  if (!isValidInterceptAssistantPrefillModels.value) {
+    toast('assistant prefill 拦截模型列表包含非法字符');
+    return;
+  }
+  if (!isValidLog429RequestBodyLimit.value) {
+    toast('429 请求体日志上限必须是 0 到 1048576 的整数');
+    return;
+  }
   saving.value = true;
   try {
     await api.updateSettings({
@@ -248,6 +286,10 @@ async function saveSettings() {
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
       rewrite_disabled_thinking_enabled: rewriteDisabledThinkingEnabled.value ? 'true' : 'false',
       rewrite_disabled_thinking_models: rewriteDisabledThinkingModels.value.trim(),
+      intercept_assistant_prefill_enabled: interceptAssistantPrefillEnabled.value ? 'true' : 'false',
+      intercept_assistant_prefill_models: interceptAssistantPrefillModels.value.trim(),
+      log_429_request_enabled: log429RequestEnabled.value ? 'true' : 'false',
+      log_429_request_body_limit: log429RequestBodyLimit.value.trim(),
       intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
       intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
@@ -441,6 +483,81 @@ onMounted(async () => {
               <span class="text-sm text-[#29261e]">{{ interceptWarmupHaikuProbeEnabled ? '本地拦截' : '转发上游' }}</span>
             </label>
             <p class="text-[11px] text-[#b5b0a6]">Claude Code 非流式 Haiku max_tokens=1 探测返回 #。</p>
+          </div>
+        </div>
+      </div>
+    </Card>
+
+    <!-- assistant prefill 拦截 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">assistant prefill 拦截</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            开启后,命中模型且最后一条消息为 assistant 的 /v1/messages 请求会在本地返回 400,不进入账号选择、RPM、并发槽或上游转发。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">总开关</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptAssistantPrefillEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ interceptAssistantPrefillEnabled ? '本地拦截' : '转发上游' }}</span>
+            </label>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">拦截模型 (逗号分隔)</Label>
+            <Input
+              v-model="interceptAssistantPrefillModels"
+              placeholder="claude-fable-5,claude-opus-4-8,claude-opus-4-7"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+              :class="isValidInterceptAssistantPrefillModels ? '' : 'border-red-400'"
+            />
+            <p class="text-[11px] text-[#b5b0a6]">默认只覆盖当前事故相关模型；空列表等价于开启但不拦截任何模型。</p>
+          </div>
+        </div>
+      </div>
+    </Card>
+
+    <!-- 429 请求观测 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">429 请求观测</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            开启后,上游返回 429 时记录实际发往上游的请求头和请求体;日志会脱敏 Authorization、Cookie、token、password、secret 等字段并按长度截断。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">总开关</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="log429RequestEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ log429RequestEnabled ? '记录 429 请求' : '关闭记录' }}</span>
+            </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">请求体字符上限</Label>
+            <Input
+              v-model="log429RequestBodyLimit"
+              type="number"
+              min="0"
+              max="1048576"
+              step="1024"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+              :class="isValidLog429RequestBodyLimit ? '' : 'border-red-400'"
+            />
+            <p class="text-[11px] text-[#b5b0a6]">0 表示不输出请求体内容；默认 8192。</p>
           </div>
         </div>
       </div>
@@ -760,7 +877,7 @@ onMounted(async () => {
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}
