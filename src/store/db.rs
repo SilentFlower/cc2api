@@ -201,6 +201,15 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "intercept_warmup_haiku_probe_enabled",
             crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
         ),
+        // thinking.type=disabled 兼容改写默认关闭,管理员确认模型后再开启。
+        (
+            "rewrite_disabled_thinking_enabled",
+            crate::store::settings_store::DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+        ),
+        (
+            "rewrite_disabled_thinking_models",
+            crate::store::settings_store::DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

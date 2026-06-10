@@ -19,8 +19,9 @@ use crate::service::access_policy::{
 };
 use crate::service::account::{AccountService, QueueWaitError, RateLimitDecision};
 use crate::service::rewriter::{
-    CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
-    StatefulCacheCompletion, StatefulCacheUsage, detect_client_type, ordered_anthropic_headers,
+    CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
+    MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion, StatefulCacheUsage,
+    detect_client_type, ordered_anthropic_headers,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
@@ -30,6 +31,7 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
     DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     SettingsStore,
 };
 
@@ -122,6 +124,7 @@ pub struct GatewayService {
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
+    disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
 }
 
 impl GatewayService {
@@ -150,6 +153,7 @@ impl GatewayService {
             cache_control_ttl_rewrite: RwLock::new(default_cache_control_ttl_rewrite()),
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
+            disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
         }
     }
 
@@ -259,6 +263,33 @@ impl GatewayService {
             title_enabled: parse_setting_flag(&title),
             suggestion_enabled: parse_setting_flag(&suggestion),
             haiku_probe_enabled: parse_setting_flag(&haiku_probe),
+        };
+        Ok(())
+    }
+
+    /// 从全局设置刷新 `thinking.type=disabled` 兼容改写配置。
+    ///
+    /// 配置缓存到内存,并在 body 序列化和 CCH attestation 之前参与改写。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_disabled_thinking_rewrite(&self) -> Result<(), AppError> {
+        let enabled = self
+            .settings_store
+            .get_value(
+                "rewrite_disabled_thinking_enabled",
+                DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+            )
+            .await?;
+        let models = self
+            .settings_store
+            .get_value(
+                "rewrite_disabled_thinking_models",
+                DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
+            )
+            .await?;
+        *self.disabled_thinking_rewrite.write().await = DisabledThinkingRewrite {
+            enabled: parse_setting_flag(&enabled),
+            models: parse_system_role_model_list(&models),
         };
         Ok(())
     }
@@ -514,6 +545,7 @@ impl GatewayService {
             let env_pt = *self.env_passthrough.read().await;
             let cache_ttl = *self.cache_control_ttl_rewrite.read().await;
             let message_cache = *self.message_cache_control_rewrite.read().await;
+            let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
             let (rewritten_body, stateful_cache_completion) =
                 self.rewriter.rewrite_body_with_stateful_completion(
                     &body_bytes,
@@ -523,6 +555,7 @@ impl GatewayService {
                     env_pt,
                     cache_ttl,
                     message_cache,
+                    &disabled_thinking,
                 );
             debug!(
                 "request body summary AFTER rewrite: {}",
@@ -1821,6 +1854,14 @@ fn default_warmup_intercept_config() -> WarmupInterceptConfig {
         title_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED),
         suggestion_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED),
         haiku_probe_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED),
+    }
+}
+
+/// 构造 `thinking.type=disabled` 兼容改写的内存初始值。
+fn default_disabled_thinking_rewrite() -> DisabledThinkingRewrite {
+    DisabledThinkingRewrite {
+        enabled: parse_setting_flag(DEFAULT_REWRITE_DISABLED_THINKING_ENABLED),
+        models: parse_system_role_model_list(DEFAULT_REWRITE_DISABLED_THINKING_MODELS),
     }
 }
 

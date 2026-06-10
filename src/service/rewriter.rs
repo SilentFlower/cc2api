@@ -361,6 +361,27 @@ pub struct EnvPassthrough {
     pub working_dir: bool,
 }
 
+/// `thinking.type=disabled` 的兼容改写配置。
+///
+/// 该配置只处理请求体顶层 `thinking` 参数,不处理历史 assistant thinking block。
+/// 历史 block 带 Anthropic 签名,修改内容会造成另一类签名错误,仍交给网关的签名降级重试。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DisabledThinkingRewrite {
+    /// 是否启用 `disabled` 到 `adaptive` 的自动改写。
+    pub enabled: bool,
+    /// 需要改写的精确模型 ID 列表。
+    pub models: Vec<String>,
+}
+
+impl DisabledThinkingRewrite {
+    /// 构造关闭状态的配置。
+    ///
+    /// @return 不改写任何请求的配置。
+    pub fn off() -> Self {
+        Self::default()
+    }
+}
+
 /// Anthropic ephemeral cache_control TTL 改写模式。
 ///
 /// 该设置只决定是否覆盖已有 `cache_control.type == "ephemeral"` 的 `ttl`;
@@ -774,6 +795,7 @@ impl Rewriter {
             env_pt,
             cache_ttl_rewrite,
             message_cache_rewrite,
+            &DisabledThinkingRewrite::off(),
         );
         self.complete_stateful_cache(completion);
         output
@@ -788,6 +810,7 @@ impl Rewriter {
     /// @param env_pt 环境透传配置。
     /// @param cache_ttl_rewrite cache_control TTL 改写配置。
     /// @param message_cache_rewrite message cache_control 断点改写配置。
+    /// @param disabled_thinking_rewrite `thinking.type=disabled` 兼容改写配置。
     /// @return 改写后的 body 与可选 stateful 延迟提交句柄。
     pub fn rewrite_body_with_stateful_completion(
         &self,
@@ -798,6 +821,7 @@ impl Rewriter {
         env_pt: EnvPassthrough,
         cache_ttl_rewrite: CacheControlTtlRewrite,
         message_cache_rewrite: MessageCacheControlRewrite,
+        disabled_thinking_rewrite: &DisabledThinkingRewrite,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         self.rewrite_body_inner(
             body,
@@ -807,6 +831,7 @@ impl Rewriter {
             env_pt,
             cache_ttl_rewrite,
             message_cache_rewrite,
+            disabled_thinking_rewrite,
         )
     }
 
@@ -870,6 +895,7 @@ impl Rewriter {
         env_pt: EnvPassthrough,
         cache_ttl_rewrite: CacheControlTtlRewrite,
         message_cache_rewrite: MessageCacheControlRewrite,
+        disabled_thinking_rewrite: &DisabledThinkingRewrite,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         if body.is_empty() {
             return (body.to_vec(), None);
@@ -891,6 +917,7 @@ impl Rewriter {
                 message_cache_rewrite,
             );
             rewrite_existing_ephemeral_cache_control_ttl(&mut parsed, cache_ttl_rewrite);
+            rewrite_disabled_thinking_to_adaptive(&mut parsed, disabled_thinking_rewrite);
         } else if is_event_logging_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
@@ -3990,6 +4017,43 @@ fn rewrite_block_cache_control_ttl(
     cache_control.insert("ttl".into(), serde_json::Value::String(ttl.to_string()));
 }
 
+/// 将匹配模型上的顶层 `thinking.type=disabled` 改写为 `adaptive`。
+///
+/// 这个改写只碰顶层请求参数,用于兼容上游已不接受 disabled thinking 的模型。
+/// 历史消息里的 signed thinking block 不在这里处理,避免破坏 Anthropic 签名校验。
+fn rewrite_disabled_thinking_to_adaptive(
+    body: &mut serde_json::Value,
+    config: &DisabledThinkingRewrite,
+) {
+    if !config.enabled {
+        return;
+    }
+    let model = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !disabled_thinking_model_matches(model, &config.models) {
+        return;
+    }
+    let Some(thinking) = body
+        .get_mut("thinking")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    if thinking.get("type").and_then(|value| value.as_str()) != Some("disabled") {
+        return;
+    }
+    thinking.insert("type".into(), serde_json::Value::String("adaptive".into()));
+}
+
+/// 判断模型是否命中 `thinking.type=disabled` 兼容改写列表。
+fn disabled_thinking_model_matches(model: &str, configured_models: &[String]) -> bool {
+    configured_models
+        .iter()
+        .any(|configured| configured.as_str() == model)
+}
+
 /// 按 Claude Code 2.1.156 抓包约束 API 模式的 `max_tokens`。
 fn normalize_api_max_tokens(body: &mut serde_json::Value) {
     match body.get("max_tokens").and_then(|v| v.as_f64()) {
@@ -4440,9 +4504,9 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
-        cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
-        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
+        CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
+        MessageCacheControlRewrite, Rewriter, cch_attestation_seed, compute_cc_version_suffix,
+        compute_cch_attestation, matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -4573,6 +4637,25 @@ mod tests {
         serde_json::from_slice(&out).unwrap()
     }
 
+    fn rewrite_messages_body_with_disabled_thinking(
+        body: serde_json::Value,
+        disabled_thinking_rewrite: DisabledThinkingRewrite,
+    ) -> serde_json::Value {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            &disabled_thinking_rewrite,
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
     fn rewrite_messages_body_with_rewriter(
         rewriter: &Rewriter,
         body: serde_json::Value,
@@ -4606,6 +4689,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Stateful,
+            &DisabledThinkingRewrite::off(),
         );
         (serde_json::from_slice(&out).unwrap(), completion)
     }
@@ -4754,6 +4838,105 @@ mod tests {
         let err = CacheControlTtlRewrite::parse("30m").unwrap_err();
 
         assert!(err.to_string().contains("cache_control_ttl_rewrite"));
+    }
+
+    #[test]
+    fn disabled_thinking_rewrite_updates_matched_model_before_output_body() {
+        let out = rewrite_messages_body_with_disabled_thinking(
+            json!({
+                "model": "claude-fable-5",
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+            }),
+            DisabledThinkingRewrite {
+                enabled: true,
+                models: vec!["claude-fable-5".into()],
+            },
+        );
+
+        assert_eq!(out["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn disabled_thinking_rewrite_keeps_unmatched_model() {
+        let out = rewrite_messages_body_with_disabled_thinking(
+            json!({
+                "model": "claude-opus-4-8",
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+            }),
+            DisabledThinkingRewrite {
+                enabled: true,
+                models: vec!["claude-fable-5".into()],
+            },
+        );
+
+        assert_eq!(out["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn disabled_thinking_rewrite_runs_before_cch_and_keeps_cache_breakpoints() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let messages: Vec<serde_json::Value> = (0..60)
+            .map(|idx| {
+                json!({
+                    "role": if idx % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{
+                        "type": "text",
+                        "text": format!("block-{}", idx)
+                    }]
+                })
+            })
+            .collect();
+        let body = json!({
+            "model": "claude-fable-5",
+            "thinking": {"type": "disabled"},
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
+            }],
+            "messages": messages
+        });
+
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::FiveMinutes,
+            MessageCacheControlRewrite::Auto,
+            &DisabledThinkingRewrite {
+                enabled: true,
+                models: vec!["claude-fable-5".into()],
+            },
+        );
+        let text = String::from_utf8(out.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed["thinking"]["type"], "adaptive");
+        assert_eq!(message_cache_control_positions(&parsed).len(), 4);
+        assert!(!text.contains("cch=12345"));
+        assert!(!text.contains("cch=00000"));
+
+        let actual = super::CCH_VALUE_REGEX
+            .find(&text)
+            .map(|m| m.as_str().to_string())
+            .expect("cch value exists");
+        let mut placeholder_body = out;
+        let cch_pos = placeholder_body
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        let expected = String::from_utf8(compute_cch_attestation(
+            placeholder_body,
+            DEFAULT_CLAUDE_CODE_VERSION,
+        ))
+        .unwrap();
+
+        assert!(expected.contains(&actual));
     }
 
     #[test]

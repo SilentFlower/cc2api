@@ -48,6 +48,10 @@ const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 /** Claude Code messages 缓存断点改写模式 */
 const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' | 'sub2api'>('off');
 
+/** thinking.type=disabled 兼容改写配置 */
+const rewriteDisabledThinkingEnabled = ref(false);
+const rewriteDisabledThinkingModels = ref('claude-fable-5');
+
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
 
@@ -134,6 +138,16 @@ const isValidAllowedUserAgents = computed(() => {
   });
 });
 
+/** thinking.type=disabled 改写模型列表是否合法 */
+const isValidRewriteDisabledThinkingModels = computed(() => {
+  const raw = rewriteDisabledThinkingModels.value.trim();
+  if (!raw) return true;
+  return raw.split(',').every((s) => {
+    const model = s.trim();
+    return !model || /^[A-Za-z0-9._:-]+$/.test(model);
+  });
+});
+
 /** 加载设置 */
 async function loadSettings() {
   try {
@@ -161,6 +175,8 @@ async function loadSettings() {
       messageCacheControlRewrite.value = 'off';
     }
     proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
+    rewriteDisabledThinkingEnabled.value = (data.rewrite_disabled_thinking_enabled ?? 'false') === 'true';
+    rewriteDisabledThinkingModels.value = data.rewrite_disabled_thinking_models ?? 'claude-fable-5';
     interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
     interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
@@ -208,6 +224,10 @@ async function saveSettings() {
     toast('UA 白名单包含非法字符');
     return;
   }
+  if (!isValidRewriteDisabledThinkingModels.value) {
+    toast('thinking 改写模型列表包含非法字符');
+    return;
+  }
   saving.value = true;
   try {
     await api.updateSettings({
@@ -226,6 +246,8 @@ async function saveSettings() {
       cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
       message_cache_control_rewrite: messageCacheControlRewrite.value,
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
+      rewrite_disabled_thinking_enabled: rewriteDisabledThinkingEnabled.value ? 'true' : 'false',
+      rewrite_disabled_thinking_models: rewriteDisabledThinkingModels.value.trim(),
       intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
       intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
@@ -639,6 +661,34 @@ onMounted(async () => {
         <p class="text-[11px] text-[#b5b0a6]">
           这些设置只影响 Anthropic /v1/messages 转发,发生在 CCH attestation 重新计算之前。off 可作为回滚开关。
         </p>
+
+        <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">thinking.type=disabled 兼容改写</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              命中模型时,将顶层 thinking.type 从 disabled 改为 adaptive；改写发生在 CCH attestation 计算和 cache 前缀诊断之前。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-4">
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="rewriteDisabledThinkingEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ rewriteDisabledThinkingEnabled ? '已启用' : '保持原样' }}</span>
+            </label>
+            <div class="space-y-2">
+              <Input
+                v-model="rewriteDisabledThinkingModels"
+                placeholder="claude-fable-5"
+                class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+                :class="isValidRewriteDisabledThinkingModels ? '' : 'border-red-400'"
+              />
+              <p class="text-[11px] text-[#b5b0a6]">逗号分隔精确模型 ID；默认只匹配 claude-fable-5</p>
+            </div>
+          </div>
+        </div>
       </div>
     </Card>
 
@@ -710,7 +760,7 @@ onMounted(async () => {
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}

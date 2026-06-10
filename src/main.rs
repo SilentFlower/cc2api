@@ -132,6 +132,10 @@ async fn main() {
         .reload_warmup_intercept_config()
         .await
         .expect("load warmup intercept config failed");
+    gateway_svc
+        .reload_disabled_thinking_rewrite()
+        .await
+        .expect("load disabled thinking rewrite config failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 
