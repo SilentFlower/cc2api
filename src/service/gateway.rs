@@ -36,8 +36,9 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
-    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PASSTHROUGH_OS_VERSION,
+    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     SettingsStore,
 };
@@ -85,6 +86,7 @@ struct AssistantPrefillInterceptConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RateLimitRequestLogConfig {
     enabled: bool,
+    non_stream_enabled: bool,
     body_limit: usize,
 }
 
@@ -398,6 +400,13 @@ impl GatewayService {
             .settings_store
             .get_value("log_429_request_enabled", DEFAULT_LOG_429_REQUEST_ENABLED)
             .await?;
+        let non_stream_enabled = self
+            .settings_store
+            .get_value(
+                "log_non_stream_request_enabled",
+                DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
+            )
+            .await?;
         let body_limit = self
             .settings_store
             .get_value(
@@ -407,6 +416,7 @@ impl GatewayService {
             .await?;
         *self.rate_limit_request_log_config.write().await = RateLimitRequestLogConfig {
             enabled: parse_setting_flag(&enabled),
+            non_stream_enabled: parse_setting_flag(&non_stream_enabled),
             body_limit: parse_rate_limit_request_body_limit(&body_limit),
         };
         Ok(())
@@ -786,6 +796,24 @@ impl GatewayService {
             let mut final_headers = rewritten_headers;
             final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
 
+            if path.starts_with("/v1/messages")
+                && !is_streaming_messages_request(&rewritten_body_map)
+            {
+                let request_log_config = *self.rate_limit_request_log_config.read().await;
+                if request_log_config.non_stream_enabled {
+                    warn!(
+                        "non_stream_request_capture {}",
+                        format_request_capture(
+                            &path,
+                            &account,
+                            &final_headers,
+                            &final_body,
+                            request_log_config
+                        )
+                    );
+                }
+            }
+
             if account.auto_telemetry && path.starts_with("/v1/messages") {
                 // 遥测会话会启动后台上游请求，必须等 RPM/槽位/改写/Token 全部成功后再激活，
                 // 避免被 RPM 跳过的账号产生额外上游副作用。
@@ -1098,13 +1126,7 @@ impl GatewayService {
             if request_log_config.enabled {
                 warn!(
                     "429_request_capture {}",
-                    format_rate_limit_request_capture(
-                        path,
-                        account,
-                        headers,
-                        body,
-                        request_log_config
-                    )
+                    format_request_capture(path, account, headers, body, request_log_config)
                 );
             }
             // 业务判断使用解压后的文本；返回给客户端仍使用原始 body，避免改变透传语义。
@@ -1385,7 +1407,7 @@ fn safe_upstream_error_log_body(body: &[u8], headers: &HeaderMap) -> String {
     out
 }
 
-fn format_rate_limit_request_capture(
+fn format_request_capture(
     path: &str,
     account: &Account,
     headers: &std::collections::HashMap<String, String>,
@@ -2560,6 +2582,7 @@ fn default_assistant_prefill_intercept_config() -> AssistantPrefillInterceptConf
 fn default_rate_limit_request_log_config() -> RateLimitRequestLogConfig {
     RateLimitRequestLogConfig {
         enabled: parse_setting_flag(DEFAULT_LOG_429_REQUEST_ENABLED),
+        non_stream_enabled: parse_setting_flag(DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED),
         body_limit: parse_rate_limit_request_body_limit(DEFAULT_LOG_429_REQUEST_BODY_LIMIT),
     }
 }
@@ -3321,15 +3344,14 @@ mod tests {
         RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage,
         WarmupInterceptConfig, WarmupInterceptType, assistant_prefill_intercept_body,
         build_message_telemetry_context, build_warmup_intercept_sse, detect_warmup_intercept,
-        extract_message_session_id, flush_stateful_cache_usage_buffer,
-        format_rate_limit_request_capture, has_system_role_message,
-        is_signature_related_error_body, is_signature_related_error_response_body,
-        is_system_role_model_allowed, mock_warmup_intercept_json_response,
-        parse_bootstrap_additional_model_options, parse_rate_limit_request_body_limit,
-        parse_system_role_model_list, patch_bootstrap_json, redact_request_headers,
-        redact_sensitive_text, redacted_request_body_for_log, rewrite_bootstrap_response,
-        safe_body_summary, should_intercept_assistant_prefill, signature_retry_body_for_stage,
-        strip_signature_sensitive_blocks_from_messages_request,
+        extract_message_session_id, flush_stateful_cache_usage_buffer, format_request_capture,
+        has_system_role_message, is_signature_related_error_body,
+        is_signature_related_error_response_body, is_system_role_model_allowed,
+        mock_warmup_intercept_json_response, parse_bootstrap_additional_model_options,
+        parse_rate_limit_request_body_limit, parse_system_role_model_list, patch_bootstrap_json,
+        redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
+        rewrite_bootstrap_response, safe_body_summary, should_intercept_assistant_prefill,
+        signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_stateful_cache_usage_from_bytes,
     };
@@ -3664,13 +3686,14 @@ mod tests {
         ]);
         let body = br#"{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"hello"}]}"#;
 
-        let captured = format_rate_limit_request_capture(
+        let captured = format_request_capture(
             "/v1/messages",
             &test_account(),
             &headers,
             body,
             RateLimitRequestLogConfig {
                 enabled: true,
+                non_stream_enabled: false,
                 body_limit: 4096,
             },
         );
@@ -3680,6 +3703,37 @@ mod tests {
         assert!(captured.contains(r#""stream":false"#));
         assert!(captured.contains("sha256:"));
         assert!(!captured.contains("secret-token"));
+    }
+
+    #[test]
+    fn non_stream_request_capture_includes_redacted_headers_and_body() {
+        let headers = HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer upstream-secret".to_string(),
+            ),
+            ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
+        ]);
+        let body = br#"{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"token: raw-token"}]}"#;
+
+        let captured = format_request_capture(
+            "/v1/messages",
+            &test_account(),
+            &headers,
+            body,
+            RateLimitRequestLogConfig {
+                enabled: false,
+                non_stream_enabled: true,
+                body_limit: 4096,
+            },
+        );
+
+        assert!(captured.contains(r#""request_headers":{"#));
+        assert!(captured.contains(r#""request_body":"#));
+        assert!(captured.contains("***REDACTED***"));
+        assert!(captured.contains("oauth-2025-04-20"));
+        assert!(!captured.contains("upstream-secret"));
+        assert!(!captured.contains("raw-token"));
     }
 
     #[test]

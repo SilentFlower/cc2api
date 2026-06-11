@@ -58,6 +58,7 @@ const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-4-8,clau
 
 /** 429 请求观测日志配置 */
 const log429RequestEnabled = ref(false);
+const logNonStreamRequestEnabled = ref(false);
 const log429RequestBodyLimit = ref('8192');
 
 /** Claude Code bootstrap 模型选项配置 */
@@ -227,6 +228,7 @@ async function loadSettings() {
     interceptAssistantPrefillEnabled.value = (data.intercept_assistant_prefill_enabled ?? 'false') === 'true';
     interceptAssistantPrefillModels.value = data.intercept_assistant_prefill_models ?? 'claude-fable-5,claude-opus-4-8,claude-opus-4-7';
     log429RequestEnabled.value = (data.log_429_request_enabled ?? 'false') === 'true';
+    logNonStreamRequestEnabled.value = (data.log_non_stream_request_enabled ?? 'false') === 'true';
     log429RequestBodyLimit.value = data.log_429_request_body_limit ?? '8192';
     const bootstrapMode = data.bootstrap_model_options_mode ?? 'passthrough';
     bootstrapModelOptionsMode.value = bootstrapMode === 'configured' || bootstrapMode === 'hide_fable' ? bootstrapMode : 'passthrough';
@@ -317,6 +319,7 @@ async function saveSettings() {
       intercept_assistant_prefill_enabled: interceptAssistantPrefillEnabled.value ? 'true' : 'false',
       intercept_assistant_prefill_models: interceptAssistantPrefillModels.value.trim(),
       log_429_request_enabled: log429RequestEnabled.value ? 'true' : 'false',
+      log_non_stream_request_enabled: logNonStreamRequestEnabled.value ? 'true' : 'false',
       log_429_request_body_limit: log429RequestBodyLimit.value.trim(),
       bootstrap_model_options_mode: bootstrapModelOptionsMode.value,
       bootstrap_additional_model_options: bootstrapAdditionalModelOptions.value.trim(),
@@ -560,13 +563,13 @@ onMounted(async () => {
         <div>
           <h3 class="text-sm font-semibold text-[#29261e]">429 请求观测</h3>
           <p class="text-xs text-[#8c8475] mt-1">
-            开启后,上游返回 429 时记录实际发往上游的请求头和请求体;日志会脱敏 Authorization、Cookie、token、password、secret 等字段并按长度截断。
+            可记录 429 请求和异常非流式轮询请求的最终上游请求头与请求体;日志会脱敏 Authorization、Cookie、token、password、secret 等字段并按长度截断。
           </p>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="space-y-1.5">
-            <Label class="text-[#5c5647] text-sm">总开关</Label>
+            <Label class="text-[#5c5647] text-sm">429 捕获</Label>
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
               <input
                 v-model="log429RequestEnabled"
@@ -574,6 +577,17 @@ onMounted(async () => {
                 class="accent-[#c4704f] w-4 h-4"
               />
               <span class="text-sm text-[#29261e]">{{ log429RequestEnabled ? '记录 429 请求' : '关闭记录' }}</span>
+            </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">非流请求</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="logNonStreamRequestEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ logNonStreamRequestEnabled ? '记录非流请求' : '关闭记录' }}</span>
             </label>
           </div>
           <div class="space-y-1.5">

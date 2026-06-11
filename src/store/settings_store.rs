@@ -44,6 +44,8 @@ pub const DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
     "claude-fable-5,claude-opus-4-8,claude-opus-4-7";
 /// 429 请求观测日志默认关闭,避免默认记录用户请求内容。
 pub const DEFAULT_LOG_429_REQUEST_ENABLED: &str = "false";
+/// 非流式 `/v1/messages` 请求观测日志默认关闭,避免默认记录用户请求内容。
+pub const DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED: &str = "false";
 /// 429 请求观测日志默认请求体字符上限。
 pub const DEFAULT_LOG_429_REQUEST_BODY_LIMIT: &str = "8192";
 /// bootstrap 模型选项默认透传上游响应,避免未配置时改变上游能力列表。

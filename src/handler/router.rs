@@ -33,9 +33,9 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
     DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    SettingsStore,
+    DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -732,6 +732,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("log_429_request_enabled".into())
         .or_insert_with(|| DEFAULT_LOG_429_REQUEST_ENABLED.to_string());
     settings
+        .entry("log_non_stream_request_enabled".into())
+        .or_insert_with(|| DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED.to_string());
+    settings
         .entry("log_429_request_body_limit".into())
         .or_insert_with(|| DEFAULT_LOG_429_REQUEST_BODY_LIMIT.to_string());
     settings
@@ -836,6 +839,7 @@ async fn update_settings(
         "rewrite_disabled_thinking_enabled",
         "intercept_assistant_prefill_enabled",
         "log_429_request_enabled",
+        "log_non_stream_request_enabled",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -907,6 +911,7 @@ async fn update_settings(
             .await?;
     }
     if body.contains_key("log_429_request_enabled")
+        || body.contains_key("log_non_stream_request_enabled")
         || body.contains_key("log_429_request_body_limit")
     {
         state
