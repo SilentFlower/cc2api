@@ -16,6 +16,7 @@ http-body-util = "0.1"
 # Async
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["time"] }
+futures-util = "0.3"
 
 # TLS
 rustls = { path = "craftls/rustls", default-features = false, features = ["ring", "logging", "tls12"] }

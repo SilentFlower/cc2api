@@ -60,20 +60,25 @@ const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-4-8,clau
 const log429RequestEnabled = ref(false);
 const logNonStreamRequestEnabled = ref(false);
 const log429RequestBodyLimit = ref('8192');
+const streamKeepaliveEnabled = ref(false);
+const streamKeepaliveIntervalSecs = ref('45');
+const streamUpstreamIdleTimeoutSecs = ref('120');
 
 /** Claude Code bootstrap 模型选项配置 */
 const bootstrapModelOptionsMode = ref<'passthrough' | 'configured' | 'hide_fable'>('passthrough');
 const bootstrapAdditionalModelOptions = ref('[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]');
 
+type AutoModeClassifierMode = 'passthrough' | 'mock_allow' | 'mock_block' | 'error';
+
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
 
-/** 预热/辅助请求本地拦截开关 */
+/** 预热与 Auto Mode classifier 本地处理开关 */
 const interceptWarmupTitleEnabled = ref(false);
 const interceptWarmupSuggestionEnabled = ref(false);
 const interceptWarmupHaikuProbeEnabled = ref(false);
-const interceptWarmupNonStreamAuxEnabled = ref(false);
-const interceptWarmupNonStreamAuxMode = ref<'mock_text' | 'error'>('mock_text');
+const interceptAutoModeClassifierStage1Mode = ref<AutoModeClassifierMode>('passthrough');
+const interceptAutoModeClassifierStage2Mode = ref<AutoModeClassifierMode>('passthrough');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -102,6 +107,14 @@ const allValid = computed(() => {
 const isValidTotal = computed(() => {
   return Math.abs(totalWeight.value - 1.0) < 0.001;
 });
+
+/** 解析 Auto Mode classifier 本地处理模式 */
+function parseAutoModeClassifierMode(raw: string | undefined): AutoModeClassifierMode {
+  if (raw === 'mock_allow' || raw === 'mock_block' || raw === 'error') {
+    return raw;
+  }
+  return 'passthrough';
+}
 
 /** 预热小时输入是否合法(逗号分隔的 0-23,允许空) */
 const isValidHours = computed(() => {
@@ -181,6 +194,22 @@ const isValidLog429RequestBodyLimit = computed(() => {
   return Number.isSafeInteger(n) && n >= 0 && n <= 1048576;
 });
 
+/** 流式 keep-alive 间隔是否合法 */
+const isValidStreamKeepaliveIntervalSecs = computed(() => {
+  const raw = streamKeepaliveIntervalSecs.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 5 && n <= 240;
+});
+
+/** 上游流静默超时是否合法 */
+const isValidStreamUpstreamIdleTimeoutSecs = computed(() => {
+  const raw = streamUpstreamIdleTimeoutSecs.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 30 && n <= 1800;
+});
+
 /** bootstrap 模型选项 JSON 是否合法 */
 const isValidBootstrapAdditionalModelOptions = computed(() => {
   const raw = bootstrapAdditionalModelOptions.value.trim();
@@ -232,15 +261,17 @@ async function loadSettings() {
     log429RequestEnabled.value = (data.log_429_request_enabled ?? 'false') === 'true';
     logNonStreamRequestEnabled.value = (data.log_non_stream_request_enabled ?? 'false') === 'true';
     log429RequestBodyLimit.value = data.log_429_request_body_limit ?? '8192';
+    streamKeepaliveEnabled.value = (data.stream_keepalive_enabled ?? 'false') === 'true';
+    streamKeepaliveIntervalSecs.value = data.stream_keepalive_interval_secs ?? '45';
+    streamUpstreamIdleTimeoutSecs.value = data.stream_upstream_idle_timeout_secs ?? '120';
     const bootstrapMode = data.bootstrap_model_options_mode ?? 'passthrough';
     bootstrapModelOptionsMode.value = bootstrapMode === 'configured' || bootstrapMode === 'hide_fable' ? bootstrapMode : 'passthrough';
     bootstrapAdditionalModelOptions.value = data.bootstrap_additional_model_options ?? '[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]';
     interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
     interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
-    interceptWarmupNonStreamAuxEnabled.value = (data.intercept_warmup_non_stream_aux_enabled ?? 'false') === 'true';
-    const nonStreamAuxMode = data.intercept_warmup_non_stream_aux_mode ?? 'mock_text';
-    interceptWarmupNonStreamAuxMode.value = nonStreamAuxMode === 'error' ? 'error' : 'mock_text';
+    interceptAutoModeClassifierStage1Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage1_mode);
+    interceptAutoModeClassifierStage2Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage2_mode);
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -297,6 +328,14 @@ async function saveSettings() {
     toast('429 请求体日志上限必须是 0 到 1048576 的整数');
     return;
   }
+  if (!isValidStreamKeepaliveIntervalSecs.value) {
+    toast('流式 keep-alive 间隔必须是 5 到 240 秒的整数');
+    return;
+  }
+  if (!isValidStreamUpstreamIdleTimeoutSecs.value) {
+    toast('上游流静默超时必须是 30 到 1800 秒的整数');
+    return;
+  }
   if (!isValidBootstrapAdditionalModelOptions.value) {
     toast('bootstrap 模型选项必须是 JSON 数组,且每项包含合法 model');
     return;
@@ -326,13 +365,16 @@ async function saveSettings() {
       log_429_request_enabled: log429RequestEnabled.value ? 'true' : 'false',
       log_non_stream_request_enabled: logNonStreamRequestEnabled.value ? 'true' : 'false',
       log_429_request_body_limit: log429RequestBodyLimit.value.trim(),
+      stream_keepalive_enabled: streamKeepaliveEnabled.value ? 'true' : 'false',
+      stream_keepalive_interval_secs: streamKeepaliveIntervalSecs.value.trim(),
+      stream_upstream_idle_timeout_secs: streamUpstreamIdleTimeoutSecs.value.trim(),
       bootstrap_model_options_mode: bootstrapModelOptionsMode.value,
       bootstrap_additional_model_options: bootstrapAdditionalModelOptions.value.trim(),
       intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
       intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
-      intercept_warmup_non_stream_aux_enabled: interceptWarmupNonStreamAuxEnabled.value ? 'true' : 'false',
-      intercept_warmup_non_stream_aux_mode: interceptWarmupNonStreamAuxMode.value,
+      intercept_auto_mode_classifier_stage1_mode: interceptAutoModeClassifierStage1Mode.value,
+      intercept_auto_mode_classifier_stage2_mode: interceptAutoModeClassifierStage2Mode.value,
     });
     toast('保存成功');
   } catch (e) {
@@ -483,7 +525,7 @@ onMounted(async () => {
         <div>
           <h3 class="text-sm font-semibold text-[#29261e]">预热请求拦截</h3>
           <p class="text-xs text-[#8c8475] mt-1">
-            命中后在本地返回 mock 响应,不转发上游,用于减少 Claude Code 标题生成、Suggestion 和 Haiku 探测等辅助请求消耗。
+            预热类命中后本地返回 mock 响应；Auto Mode classifier 可单独选择转发或本地处理。
           </p>
         </div>
 
@@ -528,39 +570,37 @@ onMounted(async () => {
 
         <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
           <div>
-            <Label class="text-[#5c5647] text-sm">非流辅助请求</Label>
+            <Label class="text-[#5c5647] text-sm">Auto Mode classifier</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              命中 Claude Code 非流式 max_tokens=64 辅助轮询请求；默认关闭，不按模型名硬编码。
+              仅命中带 XML suffix 和 transcript 的 Claude Code Auto Mode side-query。mock allow 返回 &lt;block&gt;no&lt;/block&gt;。
             </p>
           </div>
-          <div class="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-4">
-            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-              <input
-                v-model="interceptWarmupNonStreamAuxEnabled"
-                type="checkbox"
-                class="accent-[#c4704f] w-4 h-4"
-              />
-              <span class="text-sm text-[#29261e]">{{ interceptWarmupNonStreamAuxEnabled ? '本地拦截' : '转发上游' }}</span>
-            </label>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-                <input
-                  v-model="interceptWarmupNonStreamAuxMode"
-                  type="radio"
-                  value="mock_text"
-                  class="accent-[#c4704f] w-4 h-4"
-                />
-                <span class="text-sm text-[#29261e]">固定文本</span>
-              </label>
-              <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-                <input
-                  v-model="interceptWarmupNonStreamAuxMode"
-                  type="radio"
-                  value="error"
-                  class="accent-[#c4704f] w-4 h-4"
-                />
-                <span class="text-sm text-[#29261e]">返回错误</span>
-              </label>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="space-y-1.5">
+              <Label class="text-[#5c5647] text-sm">Stage 1</Label>
+              <select
+                v-model="interceptAutoModeClassifierStage1Mode"
+                class="h-9 w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 text-sm text-[#29261e] focus:outline-none focus:ring-2 focus:ring-[#c4704f]"
+              >
+                <option value="passthrough">转发上游</option>
+                <option value="mock_allow">Mock allow</option>
+                <option value="mock_block">Mock block</option>
+                <option value="error">返回错误</option>
+              </select>
+              <p class="text-[11px] text-[#b5b0a6]">匹配 max_tokens=64/256 与 Stage 1 suffix。</p>
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-[#5c5647] text-sm">Stage 2</Label>
+              <select
+                v-model="interceptAutoModeClassifierStage2Mode"
+                class="h-9 w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 text-sm text-[#29261e] focus:outline-none focus:ring-2 focus:ring-[#c4704f]"
+              >
+                <option value="passthrough">转发上游</option>
+                <option value="mock_allow">Mock allow</option>
+                <option value="mock_block">Mock block</option>
+                <option value="error">返回错误</option>
+              </select>
+              <p class="text-[11px] text-[#b5b0a6]">匹配 4096-8192 token 与 Stage 2 suffix，不处理 64000 fallback。</p>
             </div>
           </div>
         </div>
@@ -648,6 +688,54 @@ onMounted(async () => {
               :class="isValidLog429RequestBodyLimit ? '' : 'border-red-400'"
             />
             <p class="text-[11px] text-[#b5b0a6]">0 表示不输出请求体内容；可填 0 到 1048576 的任意整数，默认 8192。</p>
+          </div>
+        </div>
+
+        <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">流式稳定性</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              开启后仅在上游首个 SSE chunk 到达后插入 comment keep-alive，不影响首字时间，用于减少 Claude Code non-stream fallback。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="space-y-1.5">
+              <Label class="text-[#5c5647] text-sm">Keep-alive</Label>
+              <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+                <input
+                  v-model="streamKeepaliveEnabled"
+                  type="checkbox"
+                  class="accent-[#c4704f] w-4 h-4"
+                />
+                <span class="text-sm text-[#29261e]">{{ streamKeepaliveEnabled ? '插入 comment' : '关闭' }}</span>
+              </label>
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-[#5c5647] text-sm">间隔秒数</Label>
+              <Input
+                v-model="streamKeepaliveIntervalSecs"
+                type="number"
+                min="5"
+                max="240"
+                step="1"
+                class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+                :class="isValidStreamKeepaliveIntervalSecs ? '' : 'border-red-400'"
+              />
+              <p class="text-[11px] text-[#b5b0a6]">建议 30-60 秒，默认 45。</p>
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-[#5c5647] text-sm">上游静默超时</Label>
+              <Input
+                v-model="streamUpstreamIdleTimeoutSecs"
+                type="number"
+                min="30"
+                max="1800"
+                step="1"
+                class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+                :class="isValidStreamUpstreamIdleTimeoutSecs ? '' : 'border-red-400'"
+              />
+              <p class="text-[11px] text-[#b5b0a6]">默认 120；调大可避免 cc2api 先于客户端 fallback 断流。</p>
+            </div>
           </div>
         </div>
       </div>
@@ -1026,7 +1114,7 @@ onMounted(async () => {
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidBootstrapAdditionalModelOptions"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidStreamKeepaliveIntervalSecs || !isValidStreamUpstreamIdleTimeoutSecs || !isValidBootstrapAdditionalModelOptions"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}

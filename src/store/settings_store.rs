@@ -33,10 +33,10 @@ pub const DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED: &str = "false";
 pub const DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED: &str = "false";
 /// Claude Code Haiku `max_tokens=1` 探测请求本地拦截默认关闭,由管理员显式开启。
 pub const DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED: &str = "false";
-/// Claude Code 非流辅助轮询请求本地拦截默认关闭,避免升级后改变转发行为。
-pub const DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED: &str = "false";
-/// Claude Code 非流辅助轮询请求命中后的默认响应模式。
-pub const DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE: &str = "mock_text";
+/// Auto Mode classifier Stage 1 默认转发上游,避免升级后改变安全判定行为。
+pub const DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE: &str = "passthrough";
+/// Auto Mode classifier Stage 2 默认转发上游,避免升级后改变安全判定行为。
+pub const DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE: &str = "passthrough";
 /// `thinking.type=disabled` 自动改写默认关闭,避免升级后改变请求体语义。
 pub const DEFAULT_REWRITE_DISABLED_THINKING_ENABLED: &str = "false";
 /// 默认只匹配线上已确认报错的 Fable 5,避免影响 Opus 4.8 / 4.7 的正常请求。
@@ -52,6 +52,12 @@ pub const DEFAULT_LOG_429_REQUEST_ENABLED: &str = "false";
 pub const DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED: &str = "false";
 /// 429 请求观测日志默认请求体字符上限。
 pub const DEFAULT_LOG_429_REQUEST_BODY_LIMIT: &str = "8192";
+/// 流式 SSE keep-alive 默认关闭,避免升级后改变下游流字节。
+pub const DEFAULT_STREAM_KEEPALIVE_ENABLED: &str = "false";
+/// 流式 SSE keep-alive 默认间隔秒数,需小于 Claude Code watchdog。
+pub const DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS: &str = "45";
+/// 上游流静默超时默认保持历史 120 秒行为。
+pub const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS: &str = "120";
 /// bootstrap 模型选项默认透传上游响应,避免未配置时改变上游能力列表。
 pub const DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE: &str = "passthrough";
 /// bootstrap 自定义模型选项默认保留 2.1.172 抓包中出现的 Fable 入口。

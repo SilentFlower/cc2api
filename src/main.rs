@@ -145,6 +145,10 @@ async fn main() {
         .await
         .expect("load 429 request log config failed");
     gateway_svc
+        .reload_stream_stability_config()
+        .await
+        .expect("load stream stability config failed");
+    gateway_svc
         .reload_bootstrap_profile_config()
         .await
         .expect("load bootstrap profile config failed");

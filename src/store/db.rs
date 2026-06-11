@@ -3,6 +3,10 @@ use std::path::Path;
 
 const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] =
     &["2.1.89-2.1.156", "2.1.89-2.1.169"];
+const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
+    "intercept_warmup_non_stream_aux_enabled",
+    "intercept_warmup_non_stream_aux_mode",
+];
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -189,7 +193,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "proxy_client_pool_enabled",
             crate::store::settings_store::DEFAULT_PROXY_CLIENT_POOL_ENABLED,
         ),
-        // 预热/辅助请求本地拦截默认关闭,避免升级后改变转发行为。
+        // 预热与 Auto Mode classifier 本地处理默认不改变转发行为。
         (
             "intercept_warmup_title_enabled",
             crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
@@ -203,12 +207,12 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
         ),
         (
-            "intercept_warmup_non_stream_aux_enabled",
-            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED,
+            "intercept_auto_mode_classifier_stage1_mode",
+            crate::store::settings_store::DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
         ),
         (
-            "intercept_warmup_non_stream_aux_mode",
-            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE,
+            "intercept_auto_mode_classifier_stage2_mode",
+            crate::store::settings_store::DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
         ),
         // thinking.type=disabled 兼容改写默认关闭,管理员确认模型后再开启。
         (
@@ -241,6 +245,19 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "log_429_request_body_limit",
             crate::store::settings_store::DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
         ),
+        // 流式稳定性默认关闭,管理员确认 watchdog fallback 后再开启。
+        (
+            "stream_keepalive_enabled",
+            crate::store::settings_store::DEFAULT_STREAM_KEEPALIVE_ENABLED,
+        ),
+        (
+            "stream_keepalive_interval_secs",
+            crate::store::settings_store::DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+        ),
+        (
+            "stream_upstream_idle_timeout_secs",
+            crate::store::settings_store::DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
+        ),
         // Claude Code bootstrap 模型选项默认透传上游;管理员可切换为配置列表或隐藏 Fable。
         (
             "bootstrap_model_options_mode",
@@ -264,6 +281,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             .ok();
     }
     upgrade_default_settings(pool).await?;
+    remove_obsolete_settings(pool).await?;
     upgrade_account_claude_code_profile(pool, driver).await?;
 
     // prime_logs 表（峰值预热调用日志）
@@ -289,6 +307,16 @@ async fn upgrade_default_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
             .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
             .bind("allowed_claude_code_versions")
             .bind(previous)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn remove_obsolete_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    for key in OBSOLETE_SETTINGS_KEYS {
+        sqlx::query("DELETE FROM settings WHERE key=$1")
+            .bind(key)
             .execute(pool)
             .await?;
     }
@@ -546,6 +574,31 @@ mod tests {
             .await
             .expect("custom setting");
         assert_eq!(custom, "2.1.*");
+    }
+
+    #[tokio::test]
+    async fn migrate_removes_obsolete_non_stream_aux_settings() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        for key in OBSOLETE_SETTINGS_KEYS {
+            sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES ($1, $2)")
+                .bind(key)
+                .bind("legacy")
+                .execute(&pool)
+                .await
+                .expect("insert obsolete setting");
+        }
+
+        migrate(&pool, "sqlite").await.expect("second migrate");
+
+        for key in OBSOLETE_SETTINGS_KEYS {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .expect("count obsolete setting");
+            assert_eq!(count, 0, "{} should be removed", key);
+        }
     }
 }
 

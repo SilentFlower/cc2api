@@ -20,7 +20,7 @@ use crate::service::access_policy::{
 };
 use crate::service::account::AccountService;
 use crate::service::gateway::{
-    BootstrapModelOptionsMode, GatewayService, NonStreamAuxMode,
+    AutoModeClassifierMode, BootstrapModelOptionsMode, GatewayService,
     parse_bootstrap_additional_model_options,
 };
 use crate::service::oauth::TokenTester;
@@ -31,15 +31,22 @@ use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
-    DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED, DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE,
-    DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
-    DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
-    DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, SettingsStore,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
+    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
+    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
+    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
 };
 use crate::store::token_store::TokenStore;
+
+const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
+    "intercept_warmup_non_stream_aux_enabled",
+    "intercept_warmup_non_stream_aux_mode",
+];
 
 #[derive(Clone)]
 pub struct AppState {
@@ -676,6 +683,9 @@ fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 /// 获取所有设置项。
 async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let mut settings = state.settings_store.get_all().await?;
+    for key in OBSOLETE_SETTINGS_KEYS {
+        settings.remove(*key);
+    }
     settings
         .entry("allow_system_role_models".into())
         .or_insert_with(|| {
@@ -719,11 +729,11 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("intercept_warmup_haiku_probe_enabled".into())
         .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED.to_string());
     settings
-        .entry("intercept_warmup_non_stream_aux_enabled".into())
-        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED.to_string());
+        .entry("intercept_auto_mode_classifier_stage1_mode".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE.to_string());
     settings
-        .entry("intercept_warmup_non_stream_aux_mode".into())
-        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE.to_string());
+        .entry("intercept_auto_mode_classifier_stage2_mode".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE.to_string());
     settings
         .entry("rewrite_disabled_thinking_enabled".into())
         .or_insert_with(|| DEFAULT_REWRITE_DISABLED_THINKING_ENABLED.to_string());
@@ -746,6 +756,15 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("log_429_request_body_limit".into())
         .or_insert_with(|| DEFAULT_LOG_429_REQUEST_BODY_LIMIT.to_string());
     settings
+        .entry("stream_keepalive_enabled".into())
+        .or_insert_with(|| DEFAULT_STREAM_KEEPALIVE_ENABLED.to_string());
+    settings
+        .entry("stream_keepalive_interval_secs".into())
+        .or_insert_with(|| DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS.to_string());
+    settings
+        .entry("stream_upstream_idle_timeout_secs".into())
+        .or_insert_with(|| DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS.to_string());
+    settings
         .entry("bootstrap_model_options_mode".into())
         .or_insert_with(|| DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE.to_string());
     settings
@@ -757,8 +776,11 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
 /// 批量更新设置项。
 async fn update_settings(
     State(state): State<AppState>,
-    Json(body): Json<std::collections::HashMap<String, String>>,
+    Json(mut body): Json<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    for key in OBSOLETE_SETTINGS_KEYS {
+        body.remove(*key);
+    }
     // 校验权重值必须是合法的非负数
     for key in &[
         "score_weight_7d",
@@ -844,11 +866,11 @@ async fn update_settings(
         "intercept_warmup_title_enabled",
         "intercept_warmup_suggestion_enabled",
         "intercept_warmup_haiku_probe_enabled",
-        "intercept_warmup_non_stream_aux_enabled",
         "rewrite_disabled_thinking_enabled",
         "intercept_assistant_prefill_enabled",
         "log_429_request_enabled",
         "log_non_stream_request_enabled",
+        "stream_keepalive_enabled",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -868,8 +890,17 @@ async fn update_settings(
     if let Some(val) = body.get("log_429_request_body_limit") {
         validate_usize_range("log_429_request_body_limit", val, 0, 1_048_576)?;
     }
-    if let Some(val) = body.get("intercept_warmup_non_stream_aux_mode") {
-        NonStreamAuxMode::parse(val)?;
+    if let Some(val) = body.get("stream_keepalive_interval_secs") {
+        validate_usize_range("stream_keepalive_interval_secs", val, 5, 240)?;
+    }
+    if let Some(val) = body.get("stream_upstream_idle_timeout_secs") {
+        validate_usize_range("stream_upstream_idle_timeout_secs", val, 30, 1800)?;
+    }
+    if let Some(val) = body.get("intercept_auto_mode_classifier_stage1_mode") {
+        AutoModeClassifierMode::parse(val)?;
+    }
+    if let Some(val) = body.get("intercept_auto_mode_classifier_stage2_mode") {
+        AutoModeClassifierMode::parse(val)?;
     }
     if let Some(val) = body.get("bootstrap_model_options_mode") {
         BootstrapModelOptionsMode::parse(val)?;
@@ -906,8 +937,8 @@ async fn update_settings(
     if body.contains_key("intercept_warmup_title_enabled")
         || body.contains_key("intercept_warmup_suggestion_enabled")
         || body.contains_key("intercept_warmup_haiku_probe_enabled")
-        || body.contains_key("intercept_warmup_non_stream_aux_enabled")
-        || body.contains_key("intercept_warmup_non_stream_aux_mode")
+        || body.contains_key("intercept_auto_mode_classifier_stage1_mode")
+        || body.contains_key("intercept_auto_mode_classifier_stage2_mode")
     {
         state.gateway_svc.reload_warmup_intercept_config().await?;
     }
@@ -932,6 +963,12 @@ async fn update_settings(
             .gateway_svc
             .reload_rate_limit_request_log_config()
             .await?;
+    }
+    if body.contains_key("stream_keepalive_enabled")
+        || body.contains_key("stream_keepalive_interval_secs")
+        || body.contains_key("stream_upstream_idle_timeout_secs")
+    {
+        state.gateway_svc.reload_stream_stability_config().await?;
     }
     if body.contains_key("bootstrap_model_options_mode")
         || body.contains_key("bootstrap_additional_model_options")
