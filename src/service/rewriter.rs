@@ -13,10 +13,10 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    CODE_TRIGGERS_BETA_TOKEN, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
-    MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION,
-    STAINLESS_RUNTIME_VERSION, claude_cli_user_agent, claude_code_user_agent,
-    growthbook_user_agent, is_event_logging_path, normalize_version,
+    CODE_TRIGGERS_BETA_TOKEN, FABLE_MESSAGE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
+    MCP_PROTOCOL_VERSION, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN,
+    STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
+    claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
 };
 
 /// header wire 大小写映射。
@@ -89,6 +89,9 @@ impl ClientType {
 
 const API_MAX_TOKENS_LIMIT: u64 = 64000;
 const API_DEFAULT_MAX_TOKENS: u64 = 32000;
+const CONTEXT_1M_BETA_TOKEN: &str = "context-1m-2025-08-07";
+const FABLE_MODEL_ID: &str = "claude-fable-5";
+const FABLE_FALLBACK_MODEL_ID: &str = "claude-opus-4-8";
 
 /// 从逗号分隔的 anthropic-beta header 中剥离指定 token，保留其它 token 和相对顺序。
 ///
@@ -135,13 +138,16 @@ fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
 }
 
 /// 根据模型返回正确的 anthropic-beta 值。
-fn beta_header_for_model(model_id: &str) -> &'static str {
-    let _ = model_id;
-    MESSAGE_BETA_TOKENS
+fn beta_header_for_model(model_id: &str) -> String {
+    if is_fable_model(model_id) {
+        FABLE_MESSAGE_BETA_TOKENS.to_string()
+    } else {
+        MESSAGE_BETA_TOKENS.to_string()
+    }
 }
 
-/// 根据 endpoint 返回 Claude Code 2.1.169 的必需 beta token。
-fn beta_header_for_path(path: &str, model_id: &str) -> &'static str {
+/// 根据 endpoint 返回 Claude Code 2.1.172 的必需 beta token。
+fn beta_header_for_path(path: &str, model_id: &str) -> String {
     if is_event_logging_path(path)
         || path.starts_with("/api/eval/")
         || path.starts_with("/api/oauth/")
@@ -149,14 +155,19 @@ fn beta_header_for_path(path: &str, model_id: &str) -> &'static str {
         || path.starts_with("/api/claude_code_grove")
         || path.starts_with("/api/claude_code_penguin_mode")
     {
-        OAUTH_BETA_TOKEN
+        OAUTH_BETA_TOKEN.to_string()
     } else if path.starts_with("/v1/code/triggers") {
-        CODE_TRIGGERS_BETA_TOKEN
+        CODE_TRIGGERS_BETA_TOKEN.to_string()
     } else if path.starts_with("/v1/mcp_servers") {
-        MCP_SERVERS_BETA_TOKEN
+        MCP_SERVERS_BETA_TOKEN.to_string()
     } else {
         beta_header_for_model(model_id)
     }
+}
+
+fn is_fable_model(model_id: &str) -> bool {
+    // Fable `[1m]` 的 beta 顺序还没有抓包确认，不能用后缀裁剪去推断主请求画像。
+    model_id == FABLE_MODEL_ID
 }
 
 /// 判断该 endpoint 是否应该发送 anthropic-beta。
@@ -166,7 +177,7 @@ fn requires_anthropic_beta(path: &str) -> bool {
 
 /// 判断该 endpoint 是否应该主动发送 JSON content-type。
 ///
-/// 2.1.169 抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
+/// 2.1.172 抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
 /// “值正确但 header 集合不像真实客户端”的 wire 指纹偏差。
 fn requires_json_content_type(path: &str) -> bool {
     !(path == "/"
@@ -176,7 +187,7 @@ fn requires_json_content_type(path: &str) -> bool {
         || path.starts_with("/api/claude_code_penguin_mode"))
 }
 
-/// 按 Claude Code 2.1.169 抓包中的 endpoint wire 顺序组织上游 header。
+/// 按 Claude Code 2.1.172 抓包中的 endpoint wire 顺序组织上游 header。
 ///
 /// reqwest/hyper 是否保留大小写仍取决于底层 HTTP 实现；这里至少保证应用层
 /// profile 的集合和插入顺序稳定，避免继续依赖 HashMap 的随机遍历顺序。
@@ -545,12 +556,12 @@ impl Rewriter {
         let mut out = HashMap::new();
 
         if client_type == ClientType::API {
-            // API 模式：使用按 endpoint 拆分的 Claude Code 2.1.169 header profile。
+            // API 模式：使用按 endpoint 拆分的 Claude Code 2.1.172 header profile。
             out.insert("Accept".into(), "application/json".into());
             if requires_anthropic_beta(path) {
                 out.insert(
                     "anthropic-beta".into(),
-                    beta_header_for_path(path, model_id).into(),
+                    beta_header_for_path(path, model_id),
                 );
             }
             if requires_json_content_type(path) {
@@ -742,12 +753,15 @@ impl Rewriter {
             let filtered_existing = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
                 existing_beta
             } else {
-                strip_beta_token(&existing_beta, "context-1m-2025-08-07")
+                strip_beta_token(&existing_beta, CONTEXT_1M_BETA_TOKEN)
             };
             if requires_anthropic_beta(path) {
                 out.insert(
                     "anthropic-beta".into(),
-                    merge_anthropic_beta(beta_header_for_path(path, model_id), &filtered_existing),
+                    merge_anthropic_beta(
+                        beta_header_for_path(path, model_id).as_str(),
+                        &filtered_existing,
+                    ),
                 );
             }
             if is_event_logging_path(path) {
@@ -1006,6 +1020,7 @@ impl Rewriter {
             strip_message_cache_control(body);
 
             normalize_api_max_tokens(body);
+            ensure_fable_fallbacks(body);
 
             // 注入 Claude Code-like system 画像，并把原始 system 迁移到 messages。
             self.rewrite_api_system_prompt(body, &profile.env.version);
@@ -1349,7 +1364,8 @@ fn compute_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
         .windows(CCH_PLACEHOLDER.len())
         .position(|w| w == CCH_PLACEHOLDER)
     {
-        let hash = xxhash_rust::xxh64::xxh64(&body, cch_attestation_seed(version));
+        let hash_input = cch_attestation_input(&body, version);
+        let hash = xxhash_rust::xxh64::xxh64(&hash_input, cch_attestation_seed(version));
         let cch = format!("{:05x}", hash & 0xFFFFF);
         // "cch=" 占 4 字节，后续 5 字节是 "00000"。
         body[pos + 4..pos + 9].copy_from_slice(cch.as_bytes());
@@ -1364,6 +1380,16 @@ fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
     } else {
         body
     }
+}
+
+fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
+    if normalize_version(version) != "2.1.172" {
+        return body.to_vec();
+    }
+
+    let mut normalized = replace_top_level_string_value(body, "model", b"\"\"");
+    normalized = remove_top_level_field(&normalized, "max_tokens");
+    remove_top_level_field(&normalized, "fallbacks")
 }
 
 fn find_cch_value(body: &[u8]) -> Option<usize> {
@@ -1404,9 +1430,175 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
-        "2.1.156" | "2.1.169" => CCH_ATTESTATION_SEED_2156,
+        "2.1.156" | "2.1.169" | "2.1.172" => CCH_ATTESTATION_SEED_2156,
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
+}
+
+fn replace_top_level_string_value(body: &[u8], field: &str, replacement: &[u8]) -> Vec<u8> {
+    if let Some(range) = find_top_level_field_value_range(body, field) {
+        let mut out = Vec::with_capacity(body.len() - range.len() + replacement.len());
+        out.extend_from_slice(&body[..range.start]);
+        out.extend_from_slice(replacement);
+        out.extend_from_slice(&body[range.end..]);
+        out
+    } else {
+        body.to_vec()
+    }
+}
+
+fn remove_top_level_field(body: &[u8], field: &str) -> Vec<u8> {
+    if let Some(range) = find_top_level_field_range(body, field) {
+        let mut out = Vec::with_capacity(body.len() - range.len());
+        out.extend_from_slice(&body[..range.start]);
+        out.extend_from_slice(&body[range.end..]);
+        out
+    } else {
+        body.to_vec()
+    }
+}
+
+fn find_top_level_field_range(body: &[u8], field: &str) -> Option<std::ops::Range<usize>> {
+    let found = find_top_level_field_ranges(body, field)?;
+    let mut start = found.key_start;
+    let mut end = found.value_end;
+    let next = skip_json_ws(body, end);
+    if next < body.len() && body[next] == b',' {
+        end = next + 1;
+    } else {
+        let mut prev = start;
+        while prev > 0 && is_json_ws(body[prev - 1]) {
+            prev -= 1;
+        }
+        if prev > 0 && body[prev - 1] == b',' {
+            start = prev - 1;
+        }
+    }
+    Some(start..end)
+}
+
+fn find_top_level_field_value_range(body: &[u8], field: &str) -> Option<std::ops::Range<usize>> {
+    let found = find_top_level_field_ranges(body, field)?;
+    Some(found.value_start..found.value_end)
+}
+
+struct TopLevelFieldRanges {
+    key_start: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
+fn find_top_level_field_ranges(body: &[u8], field: &str) -> Option<TopLevelFieldRanges> {
+    let mut idx = skip_json_ws(body, 0);
+    if body.get(idx) != Some(&b'{') {
+        return None;
+    }
+    idx += 1;
+
+    loop {
+        idx = skip_json_ws(body, idx);
+        match body.get(idx) {
+            Some(b'}') | None => return None,
+            Some(b',') => {
+                idx += 1;
+                continue;
+            }
+            Some(b'"') => {}
+            _ => return None,
+        }
+
+        let key_start = idx;
+        let key_end = scan_json_string_end(body, key_start)?;
+        let key = parse_json_string_bytes(&body[key_start..key_end])?;
+        idx = skip_json_ws(body, key_end);
+        if body.get(idx) != Some(&b':') {
+            return None;
+        }
+        idx = skip_json_ws(body, idx + 1);
+        let value_start = idx;
+        let value_end = scan_json_value_end(body, value_start)?;
+        if key == field {
+            return Some(TopLevelFieldRanges {
+                key_start,
+                value_start,
+                value_end,
+            });
+        }
+        idx = skip_json_ws(body, value_end);
+        if body.get(idx) == Some(&b',') {
+            idx += 1;
+        }
+    }
+}
+
+fn scan_json_string_end(body: &[u8], start: usize) -> Option<usize> {
+    if body.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut idx = start + 1;
+    let mut escaped = false;
+    while idx < body.len() {
+        let byte = body[idx];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Some(idx + 1);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn scan_json_value_end(body: &[u8], start: usize) -> Option<usize> {
+    let mut idx = start;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while idx < body.len() {
+        let byte = body[idx];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                if depth == 0 {
+                    return Some(idx);
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+    Some(idx)
+}
+
+fn parse_json_string_bytes(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice(bytes).ok()
+}
+
+fn skip_json_ws(body: &[u8], mut idx: usize) -> usize {
+    while idx < body.len() && is_json_ws(body[idx]) {
+        idx += 1;
+    }
+    idx
+}
+
+fn is_json_ws(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t')
 }
 
 /// 从 messages 数组中提取首条用户消息文本。
@@ -4081,11 +4273,27 @@ fn api_default_max_tokens(body: &serde_json::Value) -> u64 {
         .unwrap_or_default()
         .to_lowercase();
 
-    if model == "claude-opus-4-8" {
+    if model == "claude-opus-4-8" || is_fable_model(&model) {
         API_MAX_TOKENS_LIMIT
     } else {
         API_DEFAULT_MAX_TOKENS
     }
+}
+
+/// 为 Fable 主请求补齐 Claude Code 2.1.172 抓包中的服务端 fallback 列表。
+fn ensure_fable_fallbacks(body: &mut serde_json::Value) {
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    if !is_fable_model(model) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    obj.entry("fallbacks")
+        .or_insert_with(|| serde_json::json!([{ "model": FABLE_FALLBACK_MODEL_ID }]));
 }
 
 /// 移除消息和 system 中的空文本内容块。
@@ -4505,8 +4713,9 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 mod tests {
     use super::{
         CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
-        MessageCacheControlRewrite, Rewriter, cch_attestation_seed, compute_cc_version_suffix,
-        compute_cch_attestation, matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
+        MessageCacheControlRewrite, Rewriter, cch_attestation_input, cch_attestation_seed,
+        compute_cc_version_suffix, compute_cch_attestation, matches_1m_whitelist,
+        ordered_anthropic_headers, strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -4514,8 +4723,9 @@ mod tests {
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
-        MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_FALLBACK_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
+        MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS,
+        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
     };
     use base64::Engine;
     use chrono::Utc;
@@ -7423,7 +7633,7 @@ mod tests {
             system[0]["text"]
                 .as_str()
                 .unwrap()
-                .starts_with("x-anthropic-billing-header: cc_version=2.1.169.")
+                .starts_with("x-anthropic-billing-header: cc_version=2.1.172.")
         );
         assert!(system[0]["text"].as_str().unwrap().contains("cch="));
         assert_eq!(system[1]["text"], json!(super::CLAUDE_CODE_SYSTEM_PROMPT));
@@ -7476,6 +7686,34 @@ mod tests {
         );
 
         assert_eq!(parsed["max_tokens"], json!(64000));
+    }
+
+    #[test]
+    fn api_messages_defaults_fable_to_capture_max_tokens_and_fallbacks() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-fable-5",
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(64000));
+        assert_eq!(parsed["fallbacks"], json!([{ "model": "claude-opus-4-8" }]));
+    }
+
+    #[test]
+    fn api_messages_keeps_existing_fable_fallbacks() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-fable-5",
+                "messages": [],
+                "fallbacks": [{"model": "custom-fallback"}]
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["fallbacks"], json!([{ "model": "custom-fallback" }]));
     }
 
     #[test]
@@ -7564,7 +7802,7 @@ mod tests {
     }
 
     #[test]
-    fn api_messages_headers_use_2169_profile() {
+    fn api_messages_headers_use_2172_profile() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -7586,7 +7824,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("User-Agent").unwrap(),
-            "claude-cli/2.1.169 (external, cli)"
+            "claude-cli/2.1.172 (external, cli)"
         );
         assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
         assert_eq!(
@@ -7601,6 +7839,49 @@ mod tests {
             headers.get("X-Claude-Code-Session-Id").unwrap(),
             "session-1"
         );
+    }
+
+    #[test]
+    fn fable_messages_headers_use_fallback_beta_without_context_1m() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-fable-5",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(beta, FABLE_MESSAGE_BETA_TOKENS);
+        assert!(beta.contains(FABLE_FALLBACK_BETA_TOKENS));
+        assert!(!beta.contains(CTX_1M));
+        assert!(beta.contains("effort-2025-11-24,server-side-fallback-2026-06-01"));
+        assert!(beta.contains("fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11"));
+    }
+
+    #[test]
+    fn opus_claude_code_headers_preserve_context_1m_when_allowed() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), CTX_1M.to_string());
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-4-8[1m]",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert!(beta.contains(CTX_1M));
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(!beta.contains("server-side-fallback-2026-06-01"));
     }
 
     #[test]
@@ -7897,7 +8178,7 @@ mod tests {
         );
         assert_eq!(
             event_headers.get("User-Agent").unwrap(),
-            "claude-code/2.1.169"
+            "claude-code/2.1.172"
         );
         assert_eq!(event_headers.get("x-service-name").unwrap(), "claude-code");
         assert_eq!(
@@ -7974,7 +8255,7 @@ mod tests {
         );
 
         let mut incoming_mcp_headers = std::collections::HashMap::new();
-        incoming_mcp_headers.insert("User-Agent".to_string(), "claude-cli/2.1.169".to_string());
+        incoming_mcp_headers.insert("User-Agent".to_string(), "claude-cli/2.1.172".to_string());
         incoming_mcp_headers.insert("anthropic-beta".to_string(), "client-token".to_string());
         let cc_mcp_headers = rewriter.rewrite_headers(
             &incoming_mcp_headers,
@@ -8019,7 +8300,7 @@ mod tests {
         );
         assert_eq!(
             oauth_headers.get("User-Agent").unwrap(),
-            "claude-cli/2.1.169 (external, cli)"
+            "claude-cli/2.1.172 (external, cli)"
         );
 
         let penguin_headers = rewriter.rewrite_headers(
@@ -8038,7 +8319,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_wire_order_matches_2169_capture() {
+    fn endpoint_wire_order_matches_2172_capture() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let empty = std::collections::HashMap::new();
@@ -8222,7 +8503,7 @@ mod tests {
     }
 
     #[test]
-    fn growthbook_rewrite_adds_2169_attributes() {
+    fn growthbook_rewrite_adds_2172_attributes() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -8349,6 +8630,7 @@ mod tests {
         );
         assert_eq!(cch_attestation_seed("2.1.156"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.169"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.172"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
@@ -8356,9 +8638,45 @@ mod tests {
     #[test]
     fn cch_rewrite_uses_2169_seed() {
         let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.169.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
-        let out = compute_cch_attestation(body.to_vec(), DEFAULT_CLAUDE_CODE_VERSION);
+        let out = compute_cch_attestation(body.to_vec(), "2.1.169");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("cch=27300"));
+    }
+
+    #[test]
+    fn cch_2172_opus_normalizes_top_level_model_and_max_tokens() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":64000,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.172.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+        let normalized = cch_attestation_input(body, "2.1.172");
+
+        assert_eq!(
+            normalized,
+            br#"{"model":"","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.172.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#
+        );
+
+        let out = compute_cch_attestation(body.to_vec(), "2.1.172");
+        let expected_hash = xxhash_rust::xxh64::xxh64(&normalized, cch_attestation_seed("2.1.172"));
+        let expected_cch = format!("cch={:05x}", expected_hash & 0xFFFFF);
+        assert!(String::from_utf8(out).unwrap().contains(&expected_cch));
+    }
+
+    #[test]
+    fn cch_2172_fable_normalizes_top_level_fallbacks_only() {
+        let body = br#"{"model":"claude-fable-5","max_tokens":64000,"tools":[{"name":"Nested","input_schema":{"type":"object","properties":{"fallbacks":{"model":"keep-nested"},"max_tokens":{"type":"integer"}}}}],"fallbacks":[{"model":"claude-opus-4-8"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.172.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"nested model and fallbacks stay"}]}]}"#;
+        let normalized = String::from_utf8(cch_attestation_input(body, "2.1.172")).unwrap();
+
+        assert!(normalized.contains(r#""model":"""#));
+        assert!(!normalized.contains(r#","max_tokens":64000"#));
+        assert!(!normalized.contains(r#","fallbacks":[{"model":"claude-opus-4-8"}]"#));
+        assert!(normalized.contains(r#""fallbacks":{"model":"keep-nested"}"#));
+        assert!(normalized.contains(r#""max_tokens":{"type":"integer"}"#));
+        assert!(normalized.contains("nested model and fallbacks stay"));
+    }
+
+    #[test]
+    fn cch_2169_keeps_full_body_profile() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":64000,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.169.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+
+        assert_eq!(cch_attestation_input(body, "2.1.169"), body);
     }
 
     #[test]

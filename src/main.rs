@@ -144,6 +144,10 @@ async fn main() {
         .reload_rate_limit_request_log_config()
         .await
         .expect("load 429 request log config failed");
+    gateway_svc
+        .reload_bootstrap_profile_config()
+        .await
+        .expect("load bootstrap profile config failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 

@@ -19,13 +19,16 @@ use crate::service::access_policy::{
     validate_claude_code_versions, validate_user_agent_patterns,
 };
 use crate::service::account::AccountService;
-use crate::service::gateway::GatewayService;
+use crate::service::gateway::{
+    BootstrapModelOptionsMode, GatewayService, parse_bootstrap_additional_model_options,
+};
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrite};
 use crate::service::telemetry::TelemetryService;
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
+    DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
@@ -731,6 +734,12 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("log_429_request_body_limit".into())
         .or_insert_with(|| DEFAULT_LOG_429_REQUEST_BODY_LIMIT.to_string());
+    settings
+        .entry("bootstrap_model_options_mode".into())
+        .or_insert_with(|| DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE.to_string());
+    settings
+        .entry("bootstrap_additional_model_options".into())
+        .or_insert_with(|| DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -846,6 +855,12 @@ async fn update_settings(
     if let Some(val) = body.get("log_429_request_body_limit") {
         validate_usize_range("log_429_request_body_limit", val, 0, 1_048_576)?;
     }
+    if let Some(val) = body.get("bootstrap_model_options_mode") {
+        BootstrapModelOptionsMode::parse(val)?;
+    }
+    if let Some(val) = body.get("bootstrap_additional_model_options") {
+        parse_bootstrap_additional_model_options(val)?;
+    }
     state.settings_store.upsert_many(&body).await?;
     if let Some(val) = body.get("proxy_client_pool_enabled") {
         crate::tlsfp::set_request_client_pool_enabled(val == "true");
@@ -898,6 +913,11 @@ async fn update_settings(
             .gateway_svc
             .reload_rate_limit_request_log_config()
             .await?;
+    }
+    if body.contains_key("bootstrap_model_options_mode")
+        || body.contains_key("bootstrap_additional_model_options")
+    {
+        state.gateway_svc.reload_bootstrap_profile_config().await?;
     }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;

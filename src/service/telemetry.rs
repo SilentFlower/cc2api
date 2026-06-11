@@ -103,6 +103,8 @@ pub struct MessageTelemetryContext {
     pub client_type: String,
     /// 当前网关重试序号。
     pub attempt: usize,
+    /// 最终发送到 `/v1/messages` 的 `anthropic-beta` header。
+    pub betas: String,
 }
 
 /// 表示 `/v1/messages` 上游响应阶段的安全遥测摘要。
@@ -863,6 +865,7 @@ fn common_message_fields(
     context: &MessageTelemetryContext,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut fields = serde_json::Map::new();
+    fields.insert("betas".into(), json!(context.betas));
     fields.insert("api_endpoint".into(), json!("/v1/messages"));
     fields.insert(
         "request_body_bytes".into(),
@@ -1059,11 +1062,11 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_headers_match_2169_wire_profile() {
+    fn telemetry_headers_match_2172_wire_profile() {
         let event_headers = super::telemetry_request_headers(
             "/api/event_logging/v2/batch",
             "redacted",
-            "claude-code/2.1.169",
+            "claude-code/2.1.172",
             true,
         );
         assert_eq!(
@@ -1116,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn growthbook_eval_contains_2169_attributes() {
+    fn growthbook_eval_contains_2172_attributes() {
         let account = test_account();
         let run = run_profile(
             &account,
@@ -1187,6 +1190,7 @@ mod tests {
             system_prompt_block_count: 3,
             client_type: "api".into(),
             attempt: 1,
+            betas: "claude-code-20250219".into(),
         };
 
         let request_events = message_request_events(&context);
@@ -1218,6 +1222,22 @@ mod tests {
         assert!(result_names.contains(&"tengu_api_success"));
         assert!(result_names.contains(&"tengu_api_slow_first_byte"));
         assert!(result_names.contains(&"tengu_tool_use_success"));
+        let query_event = request_events
+            .iter()
+            .find(|event| event.name.as_deref() == Some("tengu_api_query"))
+            .expect("api query event");
+        assert_eq!(
+            query_event.fields.get("betas"),
+            Some(&json!("claude-code-20250219"))
+        );
+        let success_event = result_events
+            .iter()
+            .find(|event| event.name.as_deref() == Some("tengu_api_success"))
+            .expect("api success event");
+        assert_eq!(
+            success_event.fields.get("betas"),
+            Some(&json!("claude-code-20250219"))
+        );
     }
 
     #[test]
@@ -1238,6 +1258,7 @@ mod tests {
             system_prompt_block_count: 1,
             client_type: "api".into(),
             attempt: 0,
+            betas: "server-side-fallback-2026-06-01,fallback-credit-2026-06-01".into(),
         };
         let events = message_request_events(&context);
         let payload = build_event_batch(&account, &run, 3.0, &events);
@@ -1248,6 +1269,40 @@ mod tests {
         assert!(!serialized.contains("raw-tool-input-marker"));
         assert!(serialized.contains("redacted_summary"));
         assert!(serialized.contains("request_body_bytes"));
+    }
+
+    #[test]
+    fn fable_message_telemetry_uses_request_model_and_betas_without_cli_flag() {
+        let account = test_account();
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 10, 16, 30, 37).unwrap(),
+        );
+        let context = MessageTelemetryContext {
+            model: "claude-fable-5".into(),
+            session_id: Some("session-1".into()),
+            request_body_bytes: 111,
+            rewritten_body_bytes: 222,
+            stream: true,
+            tool_count: 0,
+            attachment_count: 0,
+            system_prompt_block_count: 2,
+            client_type: "api".into(),
+            attempt: 0,
+            betas: "server-side-fallback-2026-06-01,fallback-credit-2026-06-01".into(),
+        };
+        let events = message_request_events(&context);
+        let payload = build_event_batch(&account, &run, 3.0, &events);
+        let event = &payload["events"][0]["event_data"];
+        let serialized = serde_json::to_string(&payload).unwrap();
+
+        assert_eq!(event["model"], json!("claude-fable-5"));
+        assert_eq!(
+            event["betas"],
+            json!("server-side-fallback-2026-06-01,fallback-credit-2026-06-01")
+        );
+        assert!(!serialized.contains(r#""flags":"model""#));
+        assert!(!serialized.contains(r#""flag_count":1"#));
     }
 
     #[test]

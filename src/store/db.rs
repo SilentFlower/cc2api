@@ -1,7 +1,8 @@
 use sqlx::AnyPool;
 use std::path::Path;
 
-const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = "2.1.89-2.1.156";
+const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] =
+    &["2.1.89-2.1.156", "2.1.89-2.1.169"];
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -228,6 +229,15 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "log_429_request_body_limit",
             crate::store::settings_store::DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
         ),
+        // Claude Code bootstrap 模型选项默认透传上游;管理员可切换为配置列表或隐藏 Fable。
+        (
+            "bootstrap_model_options_mode",
+            crate::store::settings_store::DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
+        ),
+        (
+            "bootstrap_additional_model_options",
+            crate::store::settings_store::DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"
@@ -262,12 +272,14 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
 }
 
 async fn upgrade_default_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
-        .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
-        .bind("allowed_claude_code_versions")
-        .bind(PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
-        .execute(pool)
-        .await?;
+    for previous in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
+            .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
+            .bind("allowed_claude_code_versions")
+            .bind(previous)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -489,23 +501,25 @@ mod tests {
     async fn migrate_upgrades_only_old_default_allowed_versions_setting() {
         let pool = make_sqlite_pool().await;
         migrate(&pool, "sqlite").await.expect("initial migrate");
-        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
-            .bind(PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
-            .bind("allowed_claude_code_versions")
-            .execute(&pool)
-            .await
-            .expect("set old default");
+        for previous in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind(previous)
+                .bind("allowed_claude_code_versions")
+                .execute(&pool)
+                .await
+                .expect("set old default");
 
-        migrate(&pool, "sqlite").await.expect("second migrate");
-        let upgraded: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
-            .bind("allowed_claude_code_versions")
-            .fetch_one(&pool)
-            .await
-            .expect("upgraded setting");
-        assert_eq!(
-            upgraded,
-            crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING
-        );
+            migrate(&pool, "sqlite").await.expect("second migrate");
+            let upgraded: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind("allowed_claude_code_versions")
+                .fetch_one(&pool)
+                .await
+                .expect("upgraded setting");
+            assert_eq!(
+                upgraded,
+                crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING
+            );
+        }
 
         sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
             .bind("2.1.*")

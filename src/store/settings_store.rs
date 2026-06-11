@@ -46,6 +46,10 @@ pub const DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
 pub const DEFAULT_LOG_429_REQUEST_ENABLED: &str = "false";
 /// 429 请求观测日志默认请求体字符上限。
 pub const DEFAULT_LOG_429_REQUEST_BODY_LIMIT: &str = "8192";
+/// bootstrap 模型选项默认透传上游响应,避免未配置时改变上游能力列表。
+pub const DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE: &str = "passthrough";
+/// bootstrap 自定义模型选项默认保留 2.1.172 抓包中出现的 Fable 入口。
+pub const DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

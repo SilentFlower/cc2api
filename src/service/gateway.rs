@@ -1,6 +1,10 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderMap, StatusCode, header::CONTENT_ENCODING, response::Parts};
+use axum::http::{
+    HeaderMap, StatusCode,
+    header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
+    response::Parts,
+};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
@@ -27,7 +31,8 @@ use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
 };
 use crate::store::settings_store::{
-    DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
+    DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
+    DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -81,6 +86,46 @@ struct AssistantPrefillInterceptConfig {
 struct RateLimitRequestLogConfig {
     enabled: bool,
     body_limit: usize,
+}
+
+/// Claude Code bootstrap response 的模型选项改写模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapModelOptionsMode {
+    Passthrough,
+    Configured,
+    HideFable,
+}
+
+impl BootstrapModelOptionsMode {
+    /// 从 settings 字符串解析 bootstrap 模型选项改写模式。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回模式,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "passthrough" => Ok(Self::Passthrough),
+            "configured" => Ok(Self::Configured),
+            "hide_fable" => Ok(Self::HideFable),
+            other => Err(AppError::BadRequest(format!(
+                "'bootstrap_model_options_mode' 不支持的值: {}",
+                other
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::Configured => "configured",
+            Self::HideFable => "hide_fable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BootstrapProfileConfig {
+    mode: BootstrapModelOptionsMode,
+    additional_model_options: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +186,7 @@ pub struct GatewayService {
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
     rate_limit_request_log_config: RwLock<RateLimitRequestLogConfig>,
+    bootstrap_profile_config: RwLock<BootstrapProfileConfig>,
 }
 
 impl GatewayService {
@@ -174,6 +220,7 @@ impl GatewayService {
                 default_assistant_prefill_intercept_config(),
             ),
             rate_limit_request_log_config: RwLock::new(default_rate_limit_request_log_config()),
+            bootstrap_profile_config: RwLock::new(default_bootstrap_profile_config()),
         }
     }
 
@@ -361,6 +408,33 @@ impl GatewayService {
         *self.rate_limit_request_log_config.write().await = RateLimitRequestLogConfig {
             enabled: parse_setting_flag(&enabled),
             body_limit: parse_rate_limit_request_body_limit(&body_limit),
+        };
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Claude Code bootstrap response 模型选项改写配置。
+    ///
+    /// 配置缓存到内存,只在 `/api/claude_cli/bootstrap` 成功 JSON 响应上使用。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析 JSON 失败时返回业务错误。
+    pub async fn reload_bootstrap_profile_config(&self) -> Result<(), AppError> {
+        let mode = self
+            .settings_store
+            .get_value(
+                "bootstrap_model_options_mode",
+                DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
+            )
+            .await?;
+        let options = self
+            .settings_store
+            .get_value(
+                "bootstrap_additional_model_options",
+                DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
+            )
+            .await?;
+        *self.bootstrap_profile_config.write().await = BootstrapProfileConfig {
+            mode: BootstrapModelOptionsMode::parse(&mode)?,
+            additional_model_options: parse_bootstrap_additional_model_options(&options)?,
         };
         Ok(())
     }
@@ -683,6 +757,7 @@ impl GatewayService {
                     rewritten_body.len(),
                     client_type,
                     attempt,
+                    final_beta_header(&rewritten_headers),
                 ))
             } else {
                 None
@@ -1131,6 +1206,21 @@ impl GatewayService {
                 .map_err(|e| AppError::Internal(format!("build error response: {}", e)));
         }
 
+        if path.starts_with("/api/claude_cli/bootstrap") {
+            let config = self.bootstrap_profile_config.read().await.clone();
+            if config.mode != BootstrapModelOptionsMode::Passthrough {
+                let headers = resp.headers().clone();
+                let body_bytes = resp.bytes().await.unwrap_or_default();
+                return rewrite_bootstrap_response(
+                    status_code,
+                    &headers,
+                    body_bytes,
+                    query,
+                    &config,
+                );
+            }
+        }
+
         // 构建响应
         let mut response_builder = Response::builder()
             .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
@@ -1521,6 +1611,217 @@ fn decode_deflate_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
             Ok(out)
         }
     }
+}
+
+fn rewrite_bootstrap_response(
+    status_code: u16,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+    query: &str,
+    config: &BootstrapProfileConfig,
+) -> Result<Response, AppError> {
+    let codings = response_content_codings(headers);
+    let decoded = decode_response_body_with_codings(&body_bytes, &codings);
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return rebuild_upstream_response(status_code, headers, body_bytes);
+    };
+    if !patch_bootstrap_json(&mut value, query, config) {
+        return rebuild_upstream_response(status_code, headers, body_bytes);
+    }
+
+    let body = serde_json::to_vec(&value)
+        .map_err(|e| AppError::Internal(format!("serialize bootstrap response: {}", e)))?;
+    let mut rb = Response::builder()
+        .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    for (k, v) in headers.iter() {
+        if should_skip_rewritten_bootstrap_response_header(k.as_str()) {
+            continue;
+        }
+        rb = rb.header(k.clone(), v.clone());
+    }
+    rb = rb.header(CONTENT_TYPE, "application/json");
+    rb.body(Body::from(body))
+        .map_err(|e| AppError::Internal(format!("build bootstrap response: {}", e)))
+}
+
+fn rebuild_upstream_response(
+    status_code: u16,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, AppError> {
+    let mut rb = Response::builder()
+        .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    for (k, v) in headers.iter() {
+        if is_gateway_fingerprint_header(k.as_str()) {
+            continue;
+        }
+        rb = rb.header(k.clone(), v.clone());
+    }
+    rb.body(Body::from(body_bytes))
+        .map_err(|e| AppError::Internal(format!("build upstream response: {}", e)))
+}
+
+fn should_skip_rewritten_bootstrap_response_header(name: &str) -> bool {
+    is_gateway_fingerprint_header(name)
+        || name.eq_ignore_ascii_case(CONTENT_ENCODING.as_str())
+        || name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
+        || name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str())
+        || name.eq_ignore_ascii_case(CONTENT_TYPE.as_str())
+}
+
+fn patch_bootstrap_json(
+    value: &mut serde_json::Value,
+    query: &str,
+    config: &BootstrapProfileConfig,
+) -> bool {
+    match config.mode {
+        BootstrapModelOptionsMode::Passthrough => false,
+        BootstrapModelOptionsMode::Configured => {
+            inject_bootstrap_fable_profile(value, query, config);
+            true
+        }
+        BootstrapModelOptionsMode::HideFable => {
+            hide_bootstrap_fable_profile(value);
+            true
+        }
+    }
+}
+
+fn inject_bootstrap_fable_profile(
+    value: &mut serde_json::Value,
+    query: &str,
+    config: &BootstrapProfileConfig,
+) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let client_data = obj
+        .entry("client_data")
+        .or_insert_with(|| serde_json::json!({}));
+    if !client_data.is_object() {
+        *client_data = serde_json::json!({});
+    }
+    if let Some(client_data_obj) = client_data.as_object_mut() {
+        let cedar_lagoon = client_data_obj
+            .entry("cedar_lagoon")
+            .or_insert_with(|| serde_json::json!({}));
+        if !cedar_lagoon.is_object() {
+            *cedar_lagoon = serde_json::json!({});
+        }
+        if let Some(cedar_obj) = cedar_lagoon.as_object_mut() {
+            cedar_obj.insert("claude-fable".into(), serde_json::Value::Bool(true));
+            cedar_obj.insert("claude-mythos".into(), serde_json::Value::Bool(true));
+        }
+    }
+    obj.insert(
+        "additional_model_options".into(),
+        serde_json::Value::Array(config.additional_model_options.clone()),
+    );
+    if query_model_is_fable(query) {
+        obj.insert("cwk_cfg_key".into(), serde_json::json!("marigold"));
+    }
+}
+
+fn hide_bootstrap_fable_profile(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let client_data = obj
+        .entry("client_data")
+        .or_insert_with(|| serde_json::json!({}));
+    if !client_data.is_object() {
+        *client_data = serde_json::json!({});
+    }
+    if let Some(client_data_obj) = client_data.as_object_mut() {
+        let cedar_lagoon = client_data_obj
+            .entry("cedar_lagoon")
+            .or_insert_with(|| serde_json::json!({}));
+        if !cedar_lagoon.is_object() {
+            *cedar_lagoon = serde_json::json!({});
+        }
+        if let Some(cedar_obj) = cedar_lagoon.as_object_mut() {
+            cedar_obj.insert("claude-fable".into(), serde_json::Value::Bool(false));
+        }
+    }
+    if let Some(options) = obj
+        .get_mut("additional_model_options")
+        .and_then(|options| options.as_array_mut())
+    {
+        options.retain(|item| {
+            !item
+                .get("model")
+                .and_then(|model| model.as_str())
+                .map(is_bootstrap_fable_model_option)
+                .unwrap_or(false)
+        });
+    }
+    if obj.get("cwk_cfg_key").and_then(|value| value.as_str()) == Some("marigold") {
+        obj.insert("cwk_cfg_key".into(), serde_json::Value::Null);
+    }
+}
+
+fn query_model_is_fable(query: &str) -> bool {
+    query.split('&').any(|part| {
+        part.strip_prefix("model=")
+            .map(|model| model.starts_with("claude-fable-5"))
+            .unwrap_or(false)
+    })
+}
+
+fn is_bootstrap_fable_model_option(model: &str) -> bool {
+    model.starts_with("claude-fable-")
+}
+
+/// 解析 bootstrap response 中要暴露的额外模型选项 JSON。
+///
+/// @param raw settings 中保存的 JSON 数组字符串。
+/// @return 解析后的模型选项数组。
+pub(crate) fn parse_bootstrap_additional_model_options(
+    raw: &str,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        AppError::BadRequest(format!(
+            "'bootstrap_additional_model_options' 必须是 JSON 数组: {}",
+            e
+        ))
+    })?;
+    let Some(items) = parsed.as_array() else {
+        return Err(AppError::BadRequest(
+            "'bootstrap_additional_model_options' 必须是 JSON 数组".into(),
+        ));
+    };
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err(AppError::BadRequest(
+                "'bootstrap_additional_model_options' 每一项必须是对象".into(),
+            ));
+        };
+        let Some(model) = obj.get("model").and_then(|model| model.as_str()) else {
+            return Err(AppError::BadRequest(
+                "'bootstrap_additional_model_options' 每一项必须包含 model 字符串".into(),
+            ));
+        };
+        validate_bootstrap_model_option_id(model)?;
+    }
+    Ok(items.clone())
+}
+
+fn validate_bootstrap_model_option_id(model: &str) -> Result<(), AppError> {
+    if model.trim().is_empty()
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '[' | ']'))
+    {
+        return Err(AppError::BadRequest(format!(
+            "'bootstrap_additional_model_options' 包含非法模型 ID: {}",
+            model
+        )));
+    }
+    Ok(())
 }
 
 fn is_signature_related_error_response_body(body: &[u8], headers: &HeaderMap) -> bool {
@@ -2203,6 +2504,18 @@ fn default_rate_limit_request_log_config() -> RateLimitRequestLogConfig {
     }
 }
 
+/// 构造 bootstrap response 模型选项改写配置初始值。
+fn default_bootstrap_profile_config() -> BootstrapProfileConfig {
+    BootstrapProfileConfig {
+        mode: BootstrapModelOptionsMode::parse(DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE)
+            .expect("默认 bootstrap 模型选项模式必须合法"),
+        additional_model_options: parse_bootstrap_additional_model_options(
+            DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
+        )
+        .expect("默认 bootstrap 额外模型选项必须合法"),
+    }
+}
+
 /// 解析 429 请求体日志字符上限。非法值回落到默认值。
 fn parse_rate_limit_request_body_limit(raw: &str) -> usize {
     raw.trim().parse::<usize>().ok().unwrap_or_else(|| {
@@ -2245,6 +2558,7 @@ fn build_message_telemetry_context(
     rewritten_body_bytes: usize,
     client_type: ClientType,
     attempt: usize,
+    betas: String,
 ) -> MessageTelemetryContext {
     MessageTelemetryContext {
         model: original_body
@@ -2273,7 +2587,16 @@ fn build_message_telemetry_context(
         }
         .into(),
         attempt,
+        betas,
     }
+}
+
+fn final_beta_header(headers: &std::collections::HashMap<String, String>) -> String {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("anthropic-beta"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
 }
 
 fn extract_message_session_id(body: &serde_json::Value) -> Option<String> {
@@ -2934,24 +3257,26 @@ impl Drop for SlotGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistantPrefillInterceptConfig, RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT,
-        SignatureRetryStage, WarmupInterceptConfig, WarmupInterceptType,
-        assistant_prefill_intercept_body, build_message_telemetry_context,
-        build_warmup_intercept_sse, detect_warmup_intercept, extract_message_session_id,
-        flush_stateful_cache_usage_buffer, format_rate_limit_request_capture,
-        has_system_role_message, is_signature_related_error_body,
-        is_signature_related_error_response_body, is_system_role_model_allowed,
-        mock_warmup_intercept_json_response, parse_rate_limit_request_body_limit,
-        parse_system_role_model_list, redact_request_headers, redact_sensitive_text,
-        redacted_request_body_for_log, safe_body_summary, should_intercept_assistant_prefill,
-        signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
+        AssistantPrefillInterceptConfig, BootstrapModelOptionsMode, BootstrapProfileConfig,
+        RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage,
+        WarmupInterceptConfig, WarmupInterceptType, assistant_prefill_intercept_body,
+        build_message_telemetry_context, build_warmup_intercept_sse, detect_warmup_intercept,
+        extract_message_session_id, flush_stateful_cache_usage_buffer,
+        format_rate_limit_request_capture, has_system_role_message,
+        is_signature_related_error_body, is_signature_related_error_response_body,
+        is_system_role_model_allowed, mock_warmup_intercept_json_response,
+        parse_bootstrap_additional_model_options, parse_rate_limit_request_body_limit,
+        parse_system_role_model_list, patch_bootstrap_json, redact_request_headers,
+        redact_sensitive_text, redacted_request_body_for_log, rewrite_bootstrap_response,
+        safe_body_summary, should_intercept_assistant_prefill, signature_retry_body_for_stage,
+        strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_stateful_cache_usage_from_bytes,
     };
     use crate::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use axum::body;
-    use axum::http::{StatusCode, header::CONTENT_ENCODING};
+    use axum::http::{HeaderMap, StatusCode, header::CONTENT_ENCODING};
     use chrono::Utc;
     use serde_json::json;
     use std::collections::HashMap;
@@ -2970,6 +3295,30 @@ mod tests {
             enabled,
             models: parse_system_role_model_list("claude-fable-5,claude-opus-4-8,claude-opus-4-7"),
         }
+    }
+
+    fn bootstrap_config(mode: BootstrapModelOptionsMode) -> BootstrapProfileConfig {
+        BootstrapProfileConfig {
+            mode,
+            additional_model_options: parse_bootstrap_additional_model_options(
+                r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#,
+            )
+            .expect("bootstrap options"),
+        }
+    }
+
+    fn bootstrap_body() -> serde_json::Value {
+        json!({
+            "client_data": null,
+            "additional_model_options": null,
+            "additional_model_costs": null,
+            "oauth_account": {
+                "account_uuid": "account-redacted",
+                "account_email": "user@example.com",
+                "organization_uuid": "org-redacted"
+            },
+            "cwk_cfg_key": null
+        })
     }
 
     fn test_account() -> Account {
@@ -3074,6 +3423,123 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "assistant_prefill_intercepted");
         assert_eq!(body["model"], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn bootstrap_patch_passthrough_keeps_response_unchanged() {
+        let mut body = bootstrap_body();
+
+        let changed = patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-fable-5",
+            &bootstrap_config(BootstrapModelOptionsMode::Passthrough),
+        );
+
+        assert!(!changed);
+        assert!(body["client_data"].is_null());
+        assert!(body["additional_model_options"].is_null());
+        assert!(body["cwk_cfg_key"].is_null());
+    }
+
+    #[test]
+    fn bootstrap_patch_configured_injects_fable_capture_shape() {
+        let mut body = bootstrap_body();
+
+        let changed = patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-fable-5",
+            &bootstrap_config(BootstrapModelOptionsMode::Configured),
+        );
+
+        assert!(changed);
+        assert_eq!(body["client_data"]["cedar_lagoon"]["claude-fable"], true);
+        assert_eq!(body["client_data"]["cedar_lagoon"]["claude-mythos"], true);
+        assert_eq!(
+            body["additional_model_options"][0]["model"],
+            "claude-fable-5[1m]"
+        );
+        assert_eq!(body["additional_model_options"][0]["name"], "Fable");
+        assert_eq!(body["cwk_cfg_key"], "marigold");
+        assert_eq!(body["oauth_account"]["account_uuid"], "account-redacted");
+    }
+
+    #[test]
+    fn bootstrap_patch_configured_does_not_force_marigold_for_opus() {
+        let mut body = bootstrap_body();
+
+        patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-opus-4-8",
+            &bootstrap_config(BootstrapModelOptionsMode::Configured),
+        );
+
+        assert!(body["cwk_cfg_key"].is_null());
+        assert_eq!(body["client_data"]["cedar_lagoon"]["claude-fable"], true);
+    }
+
+    #[test]
+    fn bootstrap_patch_hide_fable_removes_model_option_and_marigold() {
+        let mut body = json!({
+            "client_data": {"cedar_lagoon": {"claude-fable": true, "claude-mythos": true}},
+            "additional_model_options": [
+                {"model": "claude-fable-5[1m]", "name": "Fable"},
+                {"model": "claude-opus-4-8", "name": "Opus"}
+            ],
+            "cwk_cfg_key": "marigold"
+        });
+
+        let changed = patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-fable-5",
+            &bootstrap_config(BootstrapModelOptionsMode::HideFable),
+        );
+
+        assert!(changed);
+        assert_eq!(body["client_data"]["cedar_lagoon"]["claude-fable"], false);
+        assert_eq!(body["client_data"]["cedar_lagoon"]["claude-mythos"], true);
+        assert_eq!(
+            body["additional_model_options"],
+            json!([{"model": "claude-opus-4-8", "name": "Opus"}])
+        );
+        assert!(body["cwk_cfg_key"].is_null());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rewrite_decodes_gzip_and_returns_plain_json() {
+        let body = serde_json::to_vec(&bootstrap_body()).expect("json");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).expect("write gzip");
+        let compressed = encoder.finish().expect("finish gzip");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let response = rewrite_bootstrap_response(
+            200,
+            &headers,
+            bytes::Bytes::from(compressed),
+            "entrypoint=cli&model=claude-fable-5",
+            &bootstrap_config(BootstrapModelOptionsMode::Configured),
+        )
+        .expect("rewrite");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        assert!(response.headers().get("transfer-encoding").is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+        assert_eq!(parsed["client_data"]["cedar_lagoon"]["claude-fable"], true);
+        assert_eq!(parsed["cwk_cfg_key"], "marigold");
     }
 
     #[test]
@@ -3703,6 +4169,7 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
             222,
             ClientType::ClaudeCode,
             1,
+            "claude-code-20250219".into(),
         );
 
         assert_eq!(context.model, "claude-sonnet-4-20250514");
@@ -3715,6 +4182,7 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
         assert_eq!(context.system_prompt_block_count, 1);
         assert_eq!(context.client_type, "claude_code");
         assert_eq!(context.attempt, 1);
+        assert_eq!(context.betas, "claude-code-20250219");
     }
 
     #[test]
@@ -3735,6 +4203,7 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
             20,
             ClientType::API,
             0,
+            String::new(),
         );
 
         assert_eq!(context.session_id, None);

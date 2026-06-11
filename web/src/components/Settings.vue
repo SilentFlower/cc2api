@@ -34,7 +34,7 @@ const primeModel = ref('claude-haiku-4-5-20251001');
 const allowSystemRoleModels = ref('claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.169');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.172');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
 /** 系统提示词环境字段「真值透传」开关(工作目录默认透传) */
@@ -59,6 +59,10 @@ const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-4-8,clau
 /** 429 请求观测日志配置 */
 const log429RequestEnabled = ref(false);
 const log429RequestBodyLimit = ref('8192');
+
+/** Claude Code bootstrap 模型选项配置 */
+const bootstrapModelOptionsMode = ref<'passthrough' | 'configured' | 'hide_fable'>('passthrough');
+const bootstrapAdditionalModelOptions = ref('[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]');
 
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
@@ -174,6 +178,23 @@ const isValidLog429RequestBodyLimit = computed(() => {
   return Number.isSafeInteger(n) && n >= 0 && n <= 1048576;
 });
 
+/** bootstrap 模型选项 JSON 是否合法 */
+const isValidBootstrapAdditionalModelOptions = computed(() => {
+  const raw = bootstrapAdditionalModelOptions.value.trim();
+  if (!raw) return true;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return false;
+    return parsed.every((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+      const model = (item as Record<string, unknown>).model;
+      return typeof model === 'string' && model.length > 0 && /^[A-Za-z0-9._:\-[\]]+$/.test(model);
+    });
+  } catch {
+    return false;
+  }
+});
+
 /** 加载设置 */
 async function loadSettings() {
   try {
@@ -185,7 +206,7 @@ async function loadSettings() {
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.169';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.172';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
     passthroughOsVersion.value = (data.passthrough_os_version ?? 'false') === 'true';
@@ -207,6 +228,9 @@ async function loadSettings() {
     interceptAssistantPrefillModels.value = data.intercept_assistant_prefill_models ?? 'claude-fable-5,claude-opus-4-8,claude-opus-4-7';
     log429RequestEnabled.value = (data.log_429_request_enabled ?? 'false') === 'true';
     log429RequestBodyLimit.value = data.log_429_request_body_limit ?? '8192';
+    const bootstrapMode = data.bootstrap_model_options_mode ?? 'passthrough';
+    bootstrapModelOptionsMode.value = bootstrapMode === 'configured' || bootstrapMode === 'hide_fable' ? bootstrapMode : 'passthrough';
+    bootstrapAdditionalModelOptions.value = data.bootstrap_additional_model_options ?? '[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]';
     interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
     interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
@@ -266,6 +290,10 @@ async function saveSettings() {
     toast('429 请求体日志上限必须是 0 到 1048576 的整数');
     return;
   }
+  if (!isValidBootstrapAdditionalModelOptions.value) {
+    toast('bootstrap 模型选项必须是 JSON 数组,且每项包含合法 model');
+    return;
+  }
   saving.value = true;
   try {
     await api.updateSettings({
@@ -290,6 +318,8 @@ async function saveSettings() {
       intercept_assistant_prefill_models: interceptAssistantPrefillModels.value.trim(),
       log_429_request_enabled: log429RequestEnabled.value ? 'true' : 'false',
       log_429_request_body_limit: log429RequestBodyLimit.value.trim(),
+      bootstrap_model_options_mode: bootstrapModelOptionsMode.value,
+      bootstrap_additional_model_options: bootstrapAdditionalModelOptions.value.trim(),
       intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
       intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
@@ -809,6 +839,65 @@ onMounted(async () => {
       </div>
     </Card>
 
+    <!-- Claude Code bootstrap -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">Claude Code bootstrap</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            控制 /api/claude_cli/bootstrap 返回给客户端的额外模型选项。透传模式完全使用上游响应；配置模式按下方 JSON 覆盖 additional_model_options 并开启 cedar_lagoon；隐藏模式会移除 Fable 入口。
+          </p>
+        </div>
+
+        <div class="space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">模型选项模式</Label>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="bootstrapModelOptionsMode"
+                type="radio"
+                value="passthrough"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">透传上游</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="bootstrapModelOptionsMode"
+                type="radio"
+                value="configured"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">使用配置列表</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="bootstrapModelOptionsMode"
+                type="radio"
+                value="hide_fable"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">隐藏 Fable</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <Label class="text-[#5c5647] text-sm">additional_model_options JSON</Label>
+          <Textarea
+            v-model="bootstrapAdditionalModelOptions"
+            rows="5"
+            placeholder='[{"model":"claude-fable-5[1m]","name":"Fable"}]'
+            class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-xs"
+            :class="isValidBootstrapAdditionalModelOptions ? '' : 'border-red-400'"
+          />
+          <p class="text-[11px] text-[#b5b0a6]">必须是 JSON 数组；每项至少包含 model 字符串。空数组表示不额外暴露模型。</p>
+        </div>
+      </div>
+    </Card>
+
     <!-- 客户端访问策略 -->
     <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
       <div class="p-6 space-y-4">
@@ -825,18 +914,18 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.169"
+              placeholder="2.1.89-2.1.172"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
             />
-            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、2.1.*、2.1.89-2.1.169；逗号或换行分隔</p>
+            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、2.1.*、2.1.89-2.1.172；逗号或换行分隔</p>
             <div class="flex flex-wrap gap-1.5">
               <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
               <button
                 type="button"
-                @click="allowedClaudeCodeVersions = '2.1.89-2.1.169'"
+                @click="allowedClaudeCodeVersions = '2.1.89-2.1.172'"
                 class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-              >2.1.89-2.1.169</button>
+              >2.1.89-2.1.172</button>
               <button
                 type="button"
                 @click="allowedClaudeCodeVersions = ''"
@@ -877,7 +966,7 @@ onMounted(async () => {
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidBootstrapAdditionalModelOptions"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}
