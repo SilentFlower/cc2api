@@ -33,6 +33,10 @@ pub const DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED: &str = "false";
 pub const DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED: &str = "false";
 /// Claude Code Haiku `max_tokens=1` 探测请求本地拦截默认关闭,由管理员显式开启。
 pub const DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED: &str = "false";
+/// Claude Code 非流辅助轮询请求本地拦截默认关闭,避免升级后改变转发行为。
+pub const DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED: &str = "false";
+/// Claude Code 非流辅助轮询请求命中后的默认响应模式。
+pub const DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE: &str = "mock_text";
 /// `thinking.type=disabled` 自动改写默认关闭,避免升级后改变请求体语义。
 pub const DEFAULT_REWRITE_DISABLED_THINKING_ENABLED: &str = "false";
 /// 默认只匹配线上已确认报错的 Fable 5,避免影响 Opus 4.8 / 4.7 的正常请求。

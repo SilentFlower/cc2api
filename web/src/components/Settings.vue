@@ -72,6 +72,8 @@ const proxyClientPoolEnabled = ref(true);
 const interceptWarmupTitleEnabled = ref(false);
 const interceptWarmupSuggestionEnabled = ref(false);
 const interceptWarmupHaikuProbeEnabled = ref(false);
+const interceptWarmupNonStreamAuxEnabled = ref(false);
+const interceptWarmupNonStreamAuxMode = ref<'mock_text' | 'error'>('mock_text');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -236,6 +238,9 @@ async function loadSettings() {
     interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
     interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
+    interceptWarmupNonStreamAuxEnabled.value = (data.intercept_warmup_non_stream_aux_enabled ?? 'false') === 'true';
+    const nonStreamAuxMode = data.intercept_warmup_non_stream_aux_mode ?? 'mock_text';
+    interceptWarmupNonStreamAuxMode.value = nonStreamAuxMode === 'error' ? 'error' : 'mock_text';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -326,6 +331,8 @@ async function saveSettings() {
       intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
       intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
+      intercept_warmup_non_stream_aux_enabled: interceptWarmupNonStreamAuxEnabled.value ? 'true' : 'false',
+      intercept_warmup_non_stream_aux_mode: interceptWarmupNonStreamAuxMode.value,
     });
     toast('保存成功');
   } catch (e) {
@@ -518,6 +525,45 @@ onMounted(async () => {
             <p class="text-[11px] text-[#b5b0a6]">Claude Code 非流式 Haiku max_tokens=1 探测返回 #。</p>
           </div>
         </div>
+
+        <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">非流辅助请求</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              命中 Claude Code 非流式 max_tokens=64 辅助轮询请求；默认关闭，不按模型名硬编码。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-4">
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptWarmupNonStreamAuxEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ interceptWarmupNonStreamAuxEnabled ? '本地拦截' : '转发上游' }}</span>
+            </label>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+                <input
+                  v-model="interceptWarmupNonStreamAuxMode"
+                  type="radio"
+                  value="mock_text"
+                  class="accent-[#c4704f] w-4 h-4"
+                />
+                <span class="text-sm text-[#29261e]">固定文本</span>
+              </label>
+              <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+                <input
+                  v-model="interceptWarmupNonStreamAuxMode"
+                  type="radio"
+                  value="error"
+                  class="accent-[#c4704f] w-4 h-4"
+                />
+                <span class="text-sm text-[#29261e]">返回错误</span>
+              </label>
+            </div>
+          </div>
+        </div>
       </div>
     </Card>
 
@@ -597,11 +643,11 @@ onMounted(async () => {
               type="number"
               min="0"
               max="1048576"
-              step="1024"
+              step="1"
               class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
               :class="isValidLog429RequestBodyLimit ? '' : 'border-red-400'"
             />
-            <p class="text-[11px] text-[#b5b0a6]">0 表示不输出请求体内容；默认 8192。</p>
+            <p class="text-[11px] text-[#b5b0a6]">0 表示不输出请求体内容；可填 0 到 1048576 的任意整数，默认 8192。</p>
           </div>
         </div>
       </div>

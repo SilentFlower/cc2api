@@ -202,6 +202,14 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "intercept_warmup_haiku_probe_enabled",
             crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
         ),
+        (
+            "intercept_warmup_non_stream_aux_enabled",
+            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED,
+        ),
+        (
+            "intercept_warmup_non_stream_aux_mode",
+            crate::store::settings_store::DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE,
+        ),
         // thinking.type=disabled 兼容改写默认关闭,管理员确认模型后再开启。
         (
             "rewrite_disabled_thinking_enabled",

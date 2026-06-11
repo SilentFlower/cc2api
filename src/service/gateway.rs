@@ -34,7 +34,8 @@ use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
-    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
     DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PASSTHROUGH_OS_VERSION,
@@ -64,6 +65,10 @@ const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 /// 正常 Anthropic SSE 的 usage 会在尾部出现；这里仅在压缩响应上保留一份内部副本用于解压解析,
 /// 不改变转发给 Claude Code 的原始响应字节。
 const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
+/// 非流辅助轮询请求当前抓包最小约 57KiB,这里留出波动但避开普通短非流请求。
+const NON_STREAM_AUX_MIN_BODY_BYTES: usize = 32 * 1024;
+/// text 内容累计长度保护,用于覆盖 JSON 压缩/字段变化导致 body 字节波动的情况。
+const NON_STREAM_AUX_MIN_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy)]
 struct RateLimitResponseDecision {
@@ -75,6 +80,8 @@ struct WarmupInterceptConfig {
     title_enabled: bool,
     suggestion_enabled: bool,
     haiku_probe_enabled: bool,
+    non_stream_aux_enabled: bool,
+    non_stream_aux_mode: NonStreamAuxMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +131,37 @@ impl BootstrapModelOptionsMode {
     }
 }
 
+/// Claude Code 非流辅助请求本地拦截后的响应模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonStreamAuxMode {
+    MockText,
+    Error,
+}
+
+impl NonStreamAuxMode {
+    /// 从 settings 字符串解析非流辅助请求拦截响应模式。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回模式,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "mock_text" => Ok(Self::MockText),
+            "error" => Ok(Self::Error),
+            other => Err(AppError::BadRequest(format!(
+                "'intercept_warmup_non_stream_aux_mode' 不支持的值: {}",
+                other
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MockText => "mock_text",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct BootstrapProfileConfig {
     mode: BootstrapModelOptionsMode,
@@ -136,6 +174,7 @@ enum WarmupInterceptType {
     JsonTitle,
     Suggestion,
     HaikuProbe,
+    NonStreamAuxiliary,
 }
 
 impl WarmupInterceptType {
@@ -145,6 +184,7 @@ impl WarmupInterceptType {
             Self::JsonTitle => "json_title",
             Self::Suggestion => "suggestion",
             Self::HaikuProbe => "haiku_probe",
+            Self::NonStreamAuxiliary => "non_stream_auxiliary",
         }
     }
 
@@ -154,6 +194,7 @@ impl WarmupInterceptType {
             Self::JsonTitle => "msg_mock_title",
             Self::Suggestion => "msg_mock_suggestion",
             Self::HaikuProbe => "msg_mock_haiku_probe",
+            Self::NonStreamAuxiliary => "msg_mock_non_stream_auxiliary",
         }
     }
 
@@ -163,13 +204,16 @@ impl WarmupInterceptType {
             Self::JsonTitle => "{\"title\":\"New Conversation\"}",
             Self::Suggestion => "",
             Self::HaikuProbe => "#",
+            Self::NonStreamAuxiliary => "",
         }
     }
 
     fn stop_reason(self) -> &'static str {
         match self {
             Self::HaikuProbe => "max_tokens",
-            Self::TextTitle | Self::JsonTitle | Self::Suggestion => "end_turn",
+            Self::TextTitle | Self::JsonTitle | Self::Suggestion | Self::NonStreamAuxiliary => {
+                "end_turn"
+            }
         }
     }
 }
@@ -328,10 +372,26 @@ impl GatewayService {
                 DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
             )
             .await?;
+        let non_stream_aux = self
+            .settings_store
+            .get_value(
+                "intercept_warmup_non_stream_aux_enabled",
+                DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED,
+            )
+            .await?;
+        let non_stream_aux_mode = self
+            .settings_store
+            .get_value(
+                "intercept_warmup_non_stream_aux_mode",
+                DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE,
+            )
+            .await?;
         *self.warmup_intercept_config.write().await = WarmupInterceptConfig {
             title_enabled: parse_setting_flag(&title),
             suggestion_enabled: parse_setting_flag(&suggestion),
             haiku_probe_enabled: parse_setting_flag(&haiku_probe),
+            non_stream_aux_enabled: parse_setting_flag(&non_stream_aux),
+            non_stream_aux_mode: NonStreamAuxMode::parse(&non_stream_aux_mode)?,
         };
         Ok(())
     }
@@ -611,26 +671,32 @@ impl GatewayService {
 
             if path.starts_with("/v1/messages") {
                 let warmup_config = *self.warmup_intercept_config.read().await;
-                if let Some(intercept_type) =
-                    detect_warmup_intercept(&body_map, client_type, warmup_config)
-                {
+                if let Some(intercept_type) = detect_warmup_intercept(
+                    &path,
+                    &body_map,
+                    body_bytes.len(),
+                    client_type,
+                    warmup_config,
+                ) {
                     if should_bind_session {
                         let _ = self
                             .account_svc
                             .bind_selected_session(&session_hash, account.id)
                             .await;
                     }
-                    info!(
-                        "warmup intercept: type={} account={} model={} stream={}",
-                        intercept_type.as_str(),
-                        account.id,
-                        body_map
-                            .get("model")
-                            .and_then(|model| model.as_str())
-                            .unwrap_or_default(),
-                        is_streaming_messages_request(&body_map)
+                    log_warmup_intercept_hit(
+                        intercept_type,
+                        warmup_config,
+                        &account,
+                        &headers,
+                        &body_map,
+                        body_bytes.len(),
                     );
-                    return Ok(mock_warmup_intercept_response(intercept_type, &body_map)?);
+                    return Ok(warmup_intercept_response(
+                        intercept_type,
+                        warmup_config.non_stream_aux_mode,
+                        &body_map,
+                    )?);
                 }
             }
 
@@ -1210,29 +1276,46 @@ impl GatewayService {
             }
         }
 
+        let request_log_config = *self.rate_limit_request_log_config.read().await;
+        let should_log_non_stream_response = path.starts_with("/v1/messages")
+            && !is_streaming_messages_request(
+                &serde_json::from_slice::<serde_json::Value>(body)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            )
+            && request_log_config.non_stream_enabled;
+
         if status_code >= 400 {
             let response_headers = resp.headers().clone();
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let upstream_body_bytes = resp.bytes().await.unwrap_or_default();
             warn!(
                 "上游错误响应: account={} path={} status={} body={}",
                 account.id,
                 path,
                 status_code,
-                safe_upstream_error_log_body(&body_bytes, &response_headers)
+                safe_upstream_error_log_body(&upstream_body_bytes, &response_headers)
             );
-
-            let mut rb = Response::builder().status(
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            );
-            for (k, v) in response_headers.iter() {
-                if is_gateway_fingerprint_header(k.as_str()) {
-                    continue;
-                }
-                rb = rb.header(k.clone(), v.clone());
+            let (body_bytes, remove_transport_headers) =
+                buffered_error_body_for_downstream(upstream_body_bytes.clone(), &response_headers);
+            if should_log_non_stream_response {
+                warn!(
+                    "non_stream_response_capture {}",
+                    format_response_capture(
+                        path,
+                        account,
+                        status_code,
+                        &response_headers,
+                        &upstream_body_bytes,
+                        request_log_config,
+                        remove_transport_headers,
+                    )
+                );
             }
-            return rb
-                .body(Body::from(body_bytes))
-                .map_err(|e| AppError::Internal(format!("build error response: {}", e)));
+            return rebuild_buffered_upstream_response(
+                status_code,
+                &response_headers,
+                body_bytes,
+                remove_transport_headers,
+            );
         }
 
         if path.starts_with("/api/claude_cli/bootstrap") {
@@ -1259,6 +1342,29 @@ impl GatewayService {
                     &config,
                 );
             }
+        }
+
+        if should_log_non_stream_response {
+            let response_headers = resp.headers().clone();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            warn!(
+                "non_stream_response_capture {}",
+                format_response_capture(
+                    path,
+                    account,
+                    status_code,
+                    &response_headers,
+                    &body_bytes,
+                    request_log_config,
+                    false,
+                )
+            );
+            return rebuild_buffered_upstream_response(
+                status_code,
+                &response_headers,
+                body_bytes,
+                false,
+            );
         }
 
         // 构建响应
@@ -1425,14 +1531,54 @@ fn format_request_capture(
         .and_then(|value| value.get("stream"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let max_tokens = body_json
+        .as_ref()
+        .and_then(|value| value.get("max_tokens"))
+        .and_then(|value| value.as_u64());
+    let message_count = body_json
+        .as_ref()
+        .and_then(|value| value.get("messages"))
+        .and_then(|value| value.as_array())
+        .map(|messages| messages.len());
     let capture = serde_json::json!({
         "account_id": account.id,
         "path": path,
         "model": model,
         "stream": stream,
+        "max_tokens": max_tokens,
+        "message_count": message_count,
         "body_summary": safe_body_summary(body),
         "request_headers": redact_request_headers(headers),
         "request_body": redacted_request_body_for_log(body, config.body_limit),
+    });
+    serde_json::to_string(&capture).unwrap_or_else(|_| "{}".into())
+}
+
+fn format_response_capture(
+    path: &str,
+    account: &Account,
+    status_code: u16,
+    headers: &HeaderMap,
+    body: &[u8],
+    config: RateLimitRequestLogConfig,
+    transport_headers_removed: bool,
+) -> String {
+    let decoded_body = decode_upstream_error_body(body, headers);
+    let error_message = extract_upstream_error_message(&decoded_body);
+    let capture = serde_json::json!({
+        "account_id": account.id,
+        "path": path,
+        "status": status_code,
+        "content_type": response_header_text(headers, CONTENT_TYPE.as_str()),
+        "content_encoding": response_header_text(headers, CONTENT_ENCODING.as_str()),
+        "content_length": response_header_text(headers, CONTENT_LENGTH.as_str()),
+        "transfer_encoding": response_header_text(headers, TRANSFER_ENCODING.as_str()),
+        "transport_headers_removed": transport_headers_removed,
+        "body_summary": safe_body_summary(body),
+        "decoded_body_summary": safe_body_summary(&decoded_body),
+        "error_message": error_message,
+        "response_headers": redact_response_headers(headers),
+        "response_body": redacted_response_body_for_log(body, headers, config.body_limit),
     });
     serde_json::to_string(&capture).unwrap_or_else(|_| "{}".into())
 }
@@ -1452,12 +1598,53 @@ fn redact_request_headers(
     serde_json::Value::Object(redacted)
 }
 
+fn redact_response_headers(headers: &HeaderMap) -> serde_json::Value {
+    let mut redacted = serde_json::Map::new();
+    for (key, value) in headers {
+        let safe_value = value
+            .to_str()
+            .map(|value| {
+                if is_sensitive_log_key(key.as_str()) {
+                    "***REDACTED***".to_string()
+                } else {
+                    redact_sensitive_text(value)
+                }
+            })
+            .unwrap_or_else(|_| "<non-utf8>".to_string());
+        redacted.insert(
+            key.as_str().to_string(),
+            serde_json::Value::String(safe_value),
+        );
+    }
+    serde_json::Value::Object(redacted)
+}
+
+fn response_header_text(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn redacted_request_body_for_log(body: &[u8], limit: usize) -> String {
     let raw = if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) {
         redact_sensitive_json_value(&mut value);
         serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(body).into_owned())
     } else {
         String::from_utf8_lossy(body).into_owned()
+    };
+    truncate_log_text(&redact_sensitive_text(&raw), limit)
+}
+
+fn redacted_response_body_for_log(body: &[u8], headers: &HeaderMap, limit: usize) -> String {
+    let decoded = decode_upstream_error_body(body, headers);
+    let raw = if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+        redact_sensitive_json_value(&mut value);
+        serde_json::to_string(&value)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&decoded).into_owned())
+    } else {
+        String::from_utf8_lossy(&decoded).into_owned()
     };
     truncate_log_text(&redact_sensitive_text(&raw), limit)
 }
@@ -1587,22 +1774,27 @@ fn decode_upstream_error_body(body: &[u8], headers: &HeaderMap) -> Vec<u8> {
 }
 
 fn decode_response_body_with_codings(body: &[u8], codings: &[String]) -> Vec<u8> {
+    match try_decode_response_body_with_codings(body, codings) {
+        Ok(decoded) => decoded,
+        Err(e) => format!(
+            "<decode {} failed: {}; raw {}>",
+            codings.join(","),
+            e,
+            safe_body_summary(body)
+        )
+        .into_bytes(),
+    }
+}
+
+fn try_decode_response_body_with_codings(
+    body: &[u8],
+    codings: &[String],
+) -> std::io::Result<Vec<u8>> {
     let mut decoded = body.to_vec();
     for coding in codings.iter().rev() {
-        decoded = match decode_single_content_encoding(&coding, &decoded) {
-            Ok(next) => next,
-            Err(e) => {
-                return format!(
-                    "<decode {} failed: {}; raw {}>",
-                    coding,
-                    e,
-                    safe_body_summary(body)
-                )
-                .into_bytes();
-            }
-        };
+        decoded = decode_single_content_encoding(&coding, &decoded)?;
     }
-    decoded
+    Ok(decoded)
 }
 
 fn response_content_codings(headers: &HeaderMap) -> Vec<String> {
@@ -1715,21 +1907,78 @@ fn rewrite_bootstrap_response(
         .map_err(|e| AppError::Internal(format!("build bootstrap response: {}", e)))
 }
 
+fn buffered_error_body_for_downstream(body_bytes: Bytes, headers: &HeaderMap) -> (Bytes, bool) {
+    let codings = response_content_codings(headers);
+    if codings.is_empty() {
+        return (body_bytes, true);
+    }
+    match try_decode_response_body_for_downstream(&body_bytes, &codings) {
+        Ok(decoded) => (Bytes::from(decoded), true),
+        Err(e) => {
+            warn!(
+                "upstream error body decode failed before downstream rebuild: encoding={} error={} raw={}",
+                codings.join(","),
+                e,
+                safe_body_summary(&body_bytes)
+            );
+            (body_bytes, false)
+        }
+    }
+}
+
+fn try_decode_response_body_for_downstream(
+    body: &[u8],
+    codings: &[String],
+) -> std::io::Result<Vec<u8>> {
+    let mut decoded = body.to_vec();
+    for coding in codings.iter().rev() {
+        decoded = match coding.as_str() {
+            "gzip" | "x-gzip" | "deflate" | "br" | "zstd" => {
+                decode_single_content_encoding(coding, &decoded)?
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported content-encoding: {}", other),
+                ));
+            }
+        };
+    }
+    Ok(decoded)
+}
+
 fn rebuild_upstream_response(
     status_code: u16,
     headers: &HeaderMap,
     body_bytes: Bytes,
 ) -> Result<Response, AppError> {
+    rebuild_buffered_upstream_response(status_code, headers, body_bytes, false)
+}
+
+fn rebuild_buffered_upstream_response(
+    status_code: u16,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+    remove_transport_headers: bool,
+) -> Result<Response, AppError> {
     let mut rb = Response::builder()
         .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
     for (k, v) in headers.iter() {
-        if is_gateway_fingerprint_header(k.as_str()) {
+        if should_skip_buffered_response_header(k.as_str(), remove_transport_headers) {
             continue;
         }
         rb = rb.header(k.clone(), v.clone());
     }
     rb.body(Body::from(body_bytes))
         .map_err(|e| AppError::Internal(format!("build upstream response: {}", e)))
+}
+
+fn should_skip_buffered_response_header(name: &str, remove_transport_headers: bool) -> bool {
+    is_gateway_fingerprint_header(name)
+        || (remove_transport_headers
+            && (name.eq_ignore_ascii_case(CONTENT_ENCODING.as_str())
+                || name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
+                || name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str())))
 }
 
 fn should_skip_rewritten_bootstrap_response_header(name: &str) -> bool {
@@ -1957,7 +2206,9 @@ fn response_from_buffered(parts: Parts, body: Bytes) -> Response {
 }
 
 fn detect_warmup_intercept(
+    path: &str,
     body: &serde_json::Value,
+    body_bytes: usize,
     client_type: ClientType,
     config: WarmupInterceptConfig,
 ) -> Option<WarmupInterceptType> {
@@ -1975,7 +2226,88 @@ fn detect_warmup_intercept(
             return Some(WarmupInterceptType::TextTitle);
         }
     }
+    if is_haiku_probe_request(body, client_type)
+        || is_suggestion_mode_request(body)
+        || is_json_title_request(body)
+        || is_text_title_or_warmup_request(body)
+    {
+        return None;
+    }
+    if config.non_stream_aux_enabled
+        && is_non_stream_auxiliary_request(path, body, body_bytes, client_type)
+    {
+        return Some(WarmupInterceptType::NonStreamAuxiliary);
+    }
     None
+}
+
+fn is_non_stream_auxiliary_request(
+    path: &str,
+    body: &serde_json::Value,
+    body_bytes: usize,
+    client_type: ClientType,
+) -> bool {
+    if path != "/v1/messages"
+        || client_type != ClientType::ClaudeCode
+        || is_streaming_messages_request(body)
+        || body.get("max_tokens").and_then(|tokens| tokens.as_u64()) != Some(64)
+        || !messages_end_with_user(body)
+    {
+        return false;
+    }
+
+    body_bytes >= NON_STREAM_AUX_MIN_BODY_BYTES
+        || message_text_items(body).map(str::len).sum::<usize>() >= NON_STREAM_AUX_MIN_TEXT_BYTES
+}
+
+fn messages_end_with_user(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("role"))
+        .and_then(|role| role.as_str())
+        == Some("user")
+}
+
+fn log_warmup_intercept_hit(
+    intercept_type: WarmupInterceptType,
+    config: WarmupInterceptConfig,
+    account: &Account,
+    headers: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+    body_bytes: usize,
+) {
+    let text_bytes = message_text_items(body).map(str::len).sum::<usize>();
+    let message_count = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    let retry_count = headers
+        .get("X-Stainless-Retry-Count")
+        .or_else(|| headers.get("x-stainless-retry-count"))
+        .map(String::as_str)
+        .unwrap_or("-");
+    let body_summary = serde_json::json!({
+        "type": intercept_type.as_str(),
+        "account_id": account.id,
+        "model": body.get("model").and_then(|model| model.as_str()).unwrap_or_default(),
+        "stream": is_streaming_messages_request(body),
+        "max_tokens": body.get("max_tokens").and_then(|tokens| tokens.as_u64()),
+        "body_bytes": body_bytes,
+        "text_bytes": text_bytes,
+        "message_count": message_count,
+        "retry_count": retry_count,
+        "mode": if intercept_type == WarmupInterceptType::NonStreamAuxiliary {
+            config.non_stream_aux_mode.as_str()
+        } else {
+            "mock_text"
+        },
+    });
+    info!(
+        "warmup_intercept_hit {}",
+        serde_json::to_string(&body_summary).unwrap_or_else(|_| "{}".into())
+    );
 }
 
 fn is_haiku_probe_request(body: &serde_json::Value, client_type: ClientType) -> bool {
@@ -2123,15 +2455,42 @@ fn text_from_block(value: &serde_json::Value) -> Option<&str> {
     }
 }
 
-fn mock_warmup_intercept_response(
+fn warmup_intercept_response(
     intercept_type: WarmupInterceptType,
+    non_stream_aux_mode: NonStreamAuxMode,
     request_body: &serde_json::Value,
 ) -> Result<Response, AppError> {
+    if intercept_type == WarmupInterceptType::NonStreamAuxiliary
+        && non_stream_aux_mode == NonStreamAuxMode::Error
+    {
+        return non_stream_auxiliary_error_response(request_body);
+    }
     if is_streaming_messages_request(request_body) {
         mock_warmup_intercept_stream_response(intercept_type, request_body)
     } else {
         mock_warmup_intercept_json_response(intercept_type, request_body)
     }
+}
+
+fn non_stream_auxiliary_error_response(
+    request_body: &serde_json::Value,
+) -> Result<Response, AppError> {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "non-stream auxiliary request intercepted locally",
+            "code": "non_stream_auxiliary_intercepted",
+        },
+        "model": request_body.get("model").and_then(|model| model.as_str()).unwrap_or("claude-mock"),
+    });
+    let body_bytes = serde_json::to_vec(&body)
+        .map_err(|e| AppError::Internal(format!("serialize non-stream auxiliary error: {}", e)))?;
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(body_bytes))
+        .map_err(|e| AppError::Internal(format!("build non-stream auxiliary error: {}", e)))
 }
 
 fn mock_warmup_intercept_json_response(
@@ -2559,6 +2918,9 @@ fn default_warmup_intercept_config() -> WarmupInterceptConfig {
         title_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED),
         suggestion_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED),
         haiku_probe_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED),
+        non_stream_aux_enabled: parse_setting_flag(DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED),
+        non_stream_aux_mode: NonStreamAuxMode::parse(DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE)
+            .expect("默认非流辅助请求拦截模式必须合法"),
     }
 }
 
@@ -3341,17 +3703,19 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         AssistantPrefillInterceptConfig, BootstrapModelOptionsMode, BootstrapProfileConfig,
-        RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, SignatureRetryStage,
-        WarmupInterceptConfig, WarmupInterceptType, assistant_prefill_intercept_body,
+        NonStreamAuxMode, RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT,
+        SignatureRetryStage, WarmupInterceptConfig, WarmupInterceptType,
+        assistant_prefill_intercept_body, buffered_error_body_for_downstream,
         build_message_telemetry_context, build_warmup_intercept_sse, detect_warmup_intercept,
         extract_message_session_id, flush_stateful_cache_usage_buffer, format_request_capture,
-        has_system_role_message, is_signature_related_error_body,
+        format_response_capture, has_system_role_message, is_signature_related_error_body,
         is_signature_related_error_response_body, is_system_role_model_allowed,
-        mock_warmup_intercept_json_response, parse_bootstrap_additional_model_options,
-        parse_rate_limit_request_body_limit, parse_system_role_model_list, patch_bootstrap_json,
-        redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
-        rewrite_bootstrap_response, safe_body_summary, should_intercept_assistant_prefill,
-        signature_retry_body_for_stage, strip_signature_sensitive_blocks_from_messages_request,
+        mock_warmup_intercept_json_response, non_stream_auxiliary_error_response,
+        parse_bootstrap_additional_model_options, parse_rate_limit_request_body_limit,
+        parse_system_role_model_list, patch_bootstrap_json, redact_request_headers,
+        redact_sensitive_text, redacted_request_body_for_log, rewrite_bootstrap_response,
+        safe_body_summary, should_intercept_assistant_prefill, signature_retry_body_for_stage,
+        strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_stateful_cache_usage_from_bytes,
     };
@@ -3369,7 +3733,18 @@ mod tests {
             title_enabled: true,
             suggestion_enabled: true,
             haiku_probe_enabled: true,
+            non_stream_aux_enabled: true,
+            non_stream_aux_mode: NonStreamAuxMode::MockText,
         }
+    }
+
+    fn detect_test_warmup_intercept(
+        body: &serde_json::Value,
+        client_type: ClientType,
+        config: WarmupInterceptConfig,
+    ) -> Option<WarmupInterceptType> {
+        let body_bytes = serde_json::to_vec(body).expect("json").len();
+        detect_warmup_intercept("/v1/messages", body, body_bytes, client_type, config)
     }
 
     fn assistant_prefill_config(enabled: bool) -> AssistantPrefillInterceptConfig {
@@ -3625,6 +4000,39 @@ mod tests {
     }
 
     #[test]
+    fn buffered_error_body_decodes_gzip_before_removing_encoding_header() {
+        let body = br#"{"type":"error","error":{"message":"prompt is too long"}}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).expect("write gzip");
+        let compressed = encoder.finish().expect("finish gzip");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(
+            "content-length",
+            compressed.len().to_string().parse().unwrap(),
+        );
+
+        let (downstream_body, remove_transport_headers) =
+            buffered_error_body_for_downstream(bytes::Bytes::from(compressed), &headers);
+
+        assert!(remove_transport_headers);
+        assert_eq!(downstream_body.as_ref(), body);
+    }
+
+    #[test]
+    fn buffered_error_body_keeps_encoding_header_for_unknown_encoding() {
+        let body = bytes::Bytes::from_static(b"encoded-body");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "customzip".parse().unwrap());
+
+        let (downstream_body, remove_transport_headers) =
+            buffered_error_body_for_downstream(body.clone(), &headers);
+
+        assert!(!remove_transport_headers);
+        assert_eq!(downstream_body, body);
+    }
+
+    #[test]
     fn rate_limit_request_log_redacts_sensitive_headers() {
         let headers = HashMap::from([
             (
@@ -3737,6 +4145,36 @@ mod tests {
     }
 
     #[test]
+    fn response_capture_redacts_headers_body_and_extracts_error_message() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("set-cookie", "session=raw-cookie".parse().unwrap());
+        let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1001907 tokens > 1000000 maximum"},"token":"raw-token"}"#;
+
+        let captured = format_response_capture(
+            "/v1/messages",
+            &test_account(),
+            400,
+            &headers,
+            body,
+            RateLimitRequestLogConfig {
+                enabled: false,
+                non_stream_enabled: true,
+                body_limit: 96,
+            },
+            true,
+        );
+
+        assert!(captured.contains(r#""status":400"#));
+        assert!(captured.contains("prompt is too long"));
+        assert!(captured.contains(r#""transport_headers_removed":true"#));
+        assert!(captured.contains("***REDACTED***"));
+        assert!(captured.contains("...<truncated>"));
+        assert!(!captured.contains("raw-cookie"));
+        assert!(!captured.contains("raw-token"));
+    }
+
+    #[test]
     fn rate_limit_request_body_limit_parser_falls_back_for_invalid_values() {
         assert_eq!(parse_rate_limit_request_body_limit("32"), 32);
         assert_eq!(parse_rate_limit_request_body_limit("invalid"), 8192);
@@ -3749,6 +4187,76 @@ mod tests {
     }
 
     #[test]
+    fn non_stream_auxiliary_detects_high_confidence_polling_shape() {
+        let body = json!({
+            "model": "claude-fable-5",
+            "stream": false,
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "x".repeat(17 * 1024)}]
+            }]
+        });
+
+        assert_eq!(
+            detect_test_warmup_intercept(
+                &body,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::NonStreamAuxiliary)
+        );
+    }
+
+    #[test]
+    fn non_stream_auxiliary_ignores_disabled_or_non_target_shapes() {
+        let base = json!({
+            "model": "claude-opus-4-8",
+            "stream": false,
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "x".repeat(17 * 1024)}]
+            }]
+        });
+        let mut disabled_config = all_warmup_intercepts_enabled();
+        disabled_config.non_stream_aux_enabled = false;
+
+        assert_eq!(
+            detect_test_warmup_intercept(&base, ClientType::ClaudeCode, disabled_config),
+            None
+        );
+        assert_eq!(
+            detect_test_warmup_intercept(&base, ClientType::API, all_warmup_intercepts_enabled()),
+            None
+        );
+
+        for max_tokens in [64000_u64, 8192_u64] {
+            let mut body = base.clone();
+            body["max_tokens"] = json!(max_tokens);
+            assert_eq!(
+                detect_test_warmup_intercept(
+                    &body,
+                    ClientType::ClaudeCode,
+                    all_warmup_intercepts_enabled()
+                ),
+                None
+            );
+        }
+
+        let mut last_assistant = base.clone();
+        last_assistant["messages"] = json!([{"role": "assistant", "content": "prefill"}]);
+        assert_eq!(
+            detect_test_warmup_intercept(
+                &last_assistant,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn warmup_intercept_detects_haiku_probe_from_flow_shape() {
         let body = json!({
             "model": "claude-haiku-4-5-20251001",
@@ -3757,7 +4265,7 @@ mod tests {
         });
 
         assert_eq!(
-            detect_warmup_intercept(
+            detect_test_warmup_intercept(
                 &body,
                 ClientType::ClaudeCode,
                 all_warmup_intercepts_enabled()
@@ -3765,7 +4273,7 @@ mod tests {
             Some(WarmupInterceptType::HaikuProbe)
         );
         assert_eq!(
-            detect_warmup_intercept(&body, ClientType::API, all_warmup_intercepts_enabled()),
+            detect_test_warmup_intercept(&body, ClientType::API, all_warmup_intercepts_enabled()),
             None
         );
     }
@@ -3785,7 +4293,7 @@ mod tests {
         });
 
         assert_eq!(
-            detect_warmup_intercept(
+            detect_test_warmup_intercept(
                 &body,
                 ClientType::ClaudeCode,
                 all_warmup_intercepts_enabled()
@@ -3815,7 +4323,7 @@ mod tests {
         });
 
         assert_eq!(
-            detect_warmup_intercept(
+            detect_test_warmup_intercept(
                 &body,
                 ClientType::ClaudeCode,
                 all_warmup_intercepts_enabled()
@@ -3839,7 +4347,7 @@ mod tests {
         });
 
         assert_eq!(
-            detect_warmup_intercept(
+            detect_test_warmup_intercept(
                 &legacy_title,
                 ClientType::ClaudeCode,
                 all_warmup_intercepts_enabled()
@@ -3847,7 +4355,7 @@ mod tests {
             Some(WarmupInterceptType::TextTitle)
         );
         assert_eq!(
-            detect_warmup_intercept(
+            detect_test_warmup_intercept(
                 &warmup,
                 ClientType::ClaudeCode,
                 all_warmup_intercepts_enabled()
@@ -3868,7 +4376,7 @@ mod tests {
         });
 
         assert_eq!(
-            detect_warmup_intercept(
+            detect_test_warmup_intercept(
                 &body,
                 ClientType::ClaudeCode,
                 all_warmup_intercepts_enabled()
@@ -3900,6 +4408,52 @@ mod tests {
             "{\"title\":\"New Conversation\"}"
         );
         assert_eq!(body_json["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn non_stream_auxiliary_mock_text_returns_message_json() {
+        let request = json!({
+            "model": "claude-fable-5",
+            "stream": false,
+            "max_tokens": 64
+        });
+
+        let response =
+            mock_warmup_intercept_json_response(WarmupInterceptType::NonStreamAuxiliary, &request)
+                .expect("mock response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+
+        assert_eq!(body_json["id"], "msg_mock_non_stream_auxiliary");
+        assert_eq!(body_json["role"], "assistant");
+        assert_eq!(body_json["model"], "claude-fable-5");
+        assert_eq!(body_json["content"][0]["text"], "");
+        assert_eq!(body_json["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn non_stream_auxiliary_error_response_uses_standard_error_object() {
+        let request = json!({"model": "claude-fable-5"});
+
+        let response = non_stream_auxiliary_error_response(&request).expect("error response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+
+        assert_eq!(body_json["type"], "error");
+        assert_eq!(body_json["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body_json["error"]["code"],
+            "non_stream_auxiliary_intercepted"
+        );
+        assert_eq!(body_json["model"], "claude-fable-5");
     }
 
     #[test]

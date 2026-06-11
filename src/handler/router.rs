@@ -20,7 +20,8 @@ use crate::service::access_policy::{
 };
 use crate::service::account::AccountService;
 use crate::service::gateway::{
-    BootstrapModelOptionsMode, GatewayService, parse_bootstrap_additional_model_options,
+    BootstrapModelOptionsMode, GatewayService, NonStreamAuxMode,
+    parse_bootstrap_additional_model_options,
 };
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
@@ -31,6 +32,7 @@ use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED, DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE,
     DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
     DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
     DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
@@ -717,6 +719,12 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("intercept_warmup_haiku_probe_enabled".into())
         .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED.to_string());
     settings
+        .entry("intercept_warmup_non_stream_aux_enabled".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_ENABLED.to_string());
+    settings
+        .entry("intercept_warmup_non_stream_aux_mode".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_WARMUP_NON_STREAM_AUX_MODE.to_string());
+    settings
         .entry("rewrite_disabled_thinking_enabled".into())
         .or_insert_with(|| DEFAULT_REWRITE_DISABLED_THINKING_ENABLED.to_string());
     settings
@@ -836,6 +844,7 @@ async fn update_settings(
         "intercept_warmup_title_enabled",
         "intercept_warmup_suggestion_enabled",
         "intercept_warmup_haiku_probe_enabled",
+        "intercept_warmup_non_stream_aux_enabled",
         "rewrite_disabled_thinking_enabled",
         "intercept_assistant_prefill_enabled",
         "log_429_request_enabled",
@@ -858,6 +867,9 @@ async fn update_settings(
     }
     if let Some(val) = body.get("log_429_request_body_limit") {
         validate_usize_range("log_429_request_body_limit", val, 0, 1_048_576)?;
+    }
+    if let Some(val) = body.get("intercept_warmup_non_stream_aux_mode") {
+        NonStreamAuxMode::parse(val)?;
     }
     if let Some(val) = body.get("bootstrap_model_options_mode") {
         BootstrapModelOptionsMode::parse(val)?;
@@ -894,6 +906,8 @@ async fn update_settings(
     if body.contains_key("intercept_warmup_title_enabled")
         || body.contains_key("intercept_warmup_suggestion_enabled")
         || body.contains_key("intercept_warmup_haiku_probe_enabled")
+        || body.contains_key("intercept_warmup_non_stream_aux_enabled")
+        || body.contains_key("intercept_warmup_non_stream_aux_mode")
     {
         state.gateway_svc.reload_warmup_intercept_config().await?;
     }
