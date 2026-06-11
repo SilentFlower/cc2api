@@ -137,6 +137,36 @@ fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
     tokens.join(",")
 }
 
+/// 按抓包顺序把 `context-1m` 插入到 `oauth` 后面。
+fn order_context_1m_after_oauth(beta: String) -> String {
+    let tokens = beta
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>();
+    if !tokens.contains(&CONTEXT_1M_BETA_TOKEN) {
+        return tokens.join(",");
+    }
+
+    let mut ordered = Vec::with_capacity(tokens.len());
+    let mut inserted_context = false;
+    for token in tokens
+        .iter()
+        .copied()
+        .filter(|token| *token != CONTEXT_1M_BETA_TOKEN)
+    {
+        ordered.push(token);
+        if token == OAUTH_BETA_TOKEN {
+            ordered.push(CONTEXT_1M_BETA_TOKEN);
+            inserted_context = true;
+        }
+    }
+    if !inserted_context {
+        ordered.push(CONTEXT_1M_BETA_TOKEN);
+    }
+    ordered.join(",")
+}
+
 /// 根据模型返回正确的 anthropic-beta 值。
 fn beta_header_for_model(model_id: &str) -> String {
     if is_fable_model(model_id) {
@@ -758,10 +788,10 @@ impl Rewriter {
             if requires_anthropic_beta(path) {
                 out.insert(
                     "anthropic-beta".into(),
-                    merge_anthropic_beta(
+                    order_context_1m_after_oauth(merge_anthropic_beta(
                         beta_header_for_path(path, model_id).as_str(),
                         &filtered_existing,
-                    ),
+                    )),
                 );
             }
             if is_event_logging_path(path) {
@@ -1618,10 +1648,13 @@ fn extract_first_user_message(body: &serde_json::Value) -> String {
         match m.get("content") {
             Some(serde_json::Value::String(c)) => return c.clone(),
             Some(serde_json::Value::Array(arr)) => {
-                for item in arr {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        return text.to_string();
-                    }
+                // Claude Code 会把环境上下文作为首个 text block，cc_version 后缀实际取用户 prompt block。
+                if let Some(text) = arr
+                    .iter()
+                    .rev()
+                    .find_map(|item| item.get("text").and_then(|t| t.as_str()))
+                {
+                    return text.to_string();
                 }
             }
             _ => {}
@@ -4714,8 +4747,8 @@ mod tests {
     use super::{
         CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
         MessageCacheControlRewrite, Rewriter, cch_attestation_input, cch_attestation_seed,
-        compute_cc_version_suffix, compute_cch_attestation, matches_1m_whitelist,
-        ordered_anthropic_headers, strip_beta_token,
+        compute_cc_version_suffix, compute_cch_attestation, extract_first_user_message,
+        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -7863,6 +7896,30 @@ mod tests {
     }
 
     #[test]
+    fn fable_context_1m_beta_keeps_claude_code_order_when_allowed() {
+        let mut account = test_account();
+        account.allow_1m_models = "fable".into();
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), CTX_1M.to_string());
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-fable-5",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(
+            beta,
+            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-06-01,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
+        );
+    }
+
+    #[test]
     fn opus_claude_code_headers_preserve_context_1m_when_allowed() {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -8612,6 +8669,25 @@ mod tests {
         assert_eq!(
             compute_cc_version_suffix("abcd你fghijklmnopqrstuv", "2.1.156"),
             "45e"
+        );
+    }
+
+    #[test]
+    fn cc_version_suffix_source_uses_last_user_text_block() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "cwd: /tmp\nplatform: linux" },
+                    { "type": "text", "text": "abcd简fgohijklmnopqrse" }
+                ]
+            }]
+        });
+
+        assert_eq!(extract_first_user_message(&body), "abcd简fgohijklmnopqrse");
+        assert_eq!(
+            compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.172"),
+            "51f"
         );
     }
 
