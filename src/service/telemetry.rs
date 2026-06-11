@@ -993,7 +993,7 @@ mod tests {
     use crate::service::rewriter::ordered_anthropic_headers;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, claude_code_user_agent,
     };
     use base64::Engine;
     use chrono::{TimeZone, Utc};
@@ -1062,11 +1062,11 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_headers_match_2172_wire_profile() {
+    fn telemetry_headers_match_current_wire_profile() {
         let event_headers = super::telemetry_request_headers(
             "/api/event_logging/v2/batch",
             "redacted",
-            "claude-code/2.1.172",
+            claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str(),
             true,
         );
         assert_eq!(
@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn growthbook_eval_contains_2172_attributes() {
+    fn growthbook_eval_contains_current_attributes() {
         let account = test_account();
         let run = run_profile(
             &account,

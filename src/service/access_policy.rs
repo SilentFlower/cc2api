@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::error::AppError;
 
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
-pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str = "2.1.89-2.1.172";
+pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str = "2.1.89-2.1.173";
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS: &str = "AI-Hub-Monitor*\npython-httpx*";
 
@@ -314,13 +314,14 @@ mod tests {
         assert!(policy.check_user_agent("claude-code/2.1.156").is_ok());
         assert!(policy.check_user_agent("claude-code/2.1.169").is_ok());
         assert!(policy.check_user_agent("claude-code/2.1.172").is_ok());
+        assert!(policy.check_user_agent("claude-code/2.1.173").is_ok());
         assert!(
             policy
                 .check_user_agent("claude-cli/2.1.120 (external, cli)")
                 .is_ok()
         );
         assert!(policy.check_user_agent("claude-code/2.1.88").is_err());
-        assert!(policy.check_user_agent("claude-code/2.1.173").is_err());
+        assert!(policy.check_user_agent("claude-code/2.1.174").is_err());
         assert!(policy.check_user_agent("claude-code/").is_err());
         assert!(policy.check_user_agent("AI-Hub-Monitor/1.0.0").is_ok());
         assert!(policy.check_user_agent("python-httpx/0.28.1").is_ok());

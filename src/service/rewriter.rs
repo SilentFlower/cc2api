@@ -176,7 +176,7 @@ fn beta_header_for_model(model_id: &str) -> String {
     }
 }
 
-/// 根据 endpoint 返回 Claude Code 2.1.172 的必需 beta token。
+/// 根据 endpoint 返回当前 Claude Code 画像的必需 beta token。
 fn beta_header_for_path(path: &str, model_id: &str) -> String {
     if is_event_logging_path(path)
         || path.starts_with("/api/eval/")
@@ -196,7 +196,7 @@ fn beta_header_for_path(path: &str, model_id: &str) -> String {
 }
 
 fn is_fable_model(model_id: &str) -> bool {
-    // Fable `[1m]` 的 beta 顺序还没有抓包确认，不能用后缀裁剪去推断主请求画像。
+    // 2.1.173 抓包显示 Fable `[1m]` 不会改变主请求画像，不能用后缀裁剪推断 beta。
     model_id == FABLE_MODEL_ID
 }
 
@@ -207,7 +207,7 @@ fn requires_anthropic_beta(path: &str) -> bool {
 
 /// 判断该 endpoint 是否应该主动发送 JSON content-type。
 ///
-/// 2.1.172 抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
+/// 当前抓包中部分 GET 配置类端点不带 content-type；保留这些差异可以避免
 /// “值正确但 header 集合不像真实客户端”的 wire 指纹偏差。
 fn requires_json_content_type(path: &str) -> bool {
     !(path == "/"
@@ -217,7 +217,7 @@ fn requires_json_content_type(path: &str) -> bool {
         || path.starts_with("/api/claude_code_penguin_mode"))
 }
 
-/// 按 Claude Code 2.1.172 抓包中的 endpoint wire 顺序组织上游 header。
+/// 按当前 Claude Code 抓包中的 endpoint wire 顺序组织上游 header。
 ///
 /// reqwest/hyper 是否保留大小写仍取决于底层 HTTP 实现；这里至少保证应用层
 /// profile 的集合和插入顺序稳定，避免继续依赖 HashMap 的随机遍历顺序。
@@ -586,7 +586,7 @@ impl Rewriter {
         let mut out = HashMap::new();
 
         if client_type == ClientType::API {
-            // API 模式：使用按 endpoint 拆分的 Claude Code 2.1.172 header profile。
+            // API 模式：使用按 endpoint 拆分的当前 Claude Code header profile。
             out.insert("Accept".into(), "application/json".into());
             if requires_anthropic_beta(path) {
                 out.insert(
@@ -1413,7 +1413,7 @@ fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
 }
 
 fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
-    if normalize_version(version) != "2.1.172" {
+    if !matches!(normalize_version(version), "2.1.172" | "2.1.173") {
         return body.to_vec();
     }
 
@@ -1460,7 +1460,7 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
-        "2.1.156" | "2.1.169" | "2.1.172" => CCH_ATTESTATION_SEED_2156,
+        "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" => CCH_ATTESTATION_SEED_2156,
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -4313,7 +4313,7 @@ fn api_default_max_tokens(body: &serde_json::Value) -> u64 {
     }
 }
 
-/// 为 Fable 主请求补齐 Claude Code 2.1.172 抓包中的服务端 fallback 列表。
+/// 为 Fable 主请求补齐当前 Claude Code 抓包中的服务端 fallback 列表。
 fn ensure_fable_fallbacks(body: &mut serde_json::Value) {
     let model = body
         .get("model")
@@ -4758,7 +4758,8 @@ mod tests {
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_FALLBACK_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
         MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS,
-        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
+        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
+        claude_code_user_agent,
     };
     use base64::Engine;
     use chrono::Utc;
@@ -7663,10 +7664,10 @@ mod tests {
         let system = parsed["system"].as_array().expect("system array");
         assert_eq!(system.len(), 3);
         assert!(
-            system[0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("x-anthropic-billing-header: cc_version=2.1.172.")
+            system[0]["text"].as_str().unwrap().starts_with(
+                format!("x-anthropic-billing-header: cc_version={DEFAULT_CLAUDE_CODE_VERSION}.")
+                    .as_str()
+            )
         );
         assert!(system[0]["text"].as_str().unwrap().contains("cch="));
         assert_eq!(system[1]["text"], json!(super::CLAUDE_CODE_SYSTEM_PROMPT));
@@ -7835,7 +7836,7 @@ mod tests {
     }
 
     #[test]
-    fn api_messages_headers_use_2172_profile() {
+    fn api_messages_headers_use_current_profile() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -7857,7 +7858,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("User-Agent").unwrap(),
-            "claude-cli/2.1.172 (external, cli)"
+            claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
         );
         assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
         assert_eq!(
@@ -7917,6 +7918,26 @@ mod tests {
             beta,
             "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-06-01,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
         );
+    }
+
+    #[test]
+    fn fable_1m_model_without_incoming_context_1m_does_not_inject_beta() {
+        let mut account = test_account();
+        account.allow_1m_models = "fable".into();
+        let rewriter = Rewriter::new();
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-fable-5",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(beta, FABLE_MESSAGE_BETA_TOKENS);
+        assert!(!beta.contains(CTX_1M));
     }
 
     #[test]
@@ -8235,7 +8256,7 @@ mod tests {
         );
         assert_eq!(
             event_headers.get("User-Agent").unwrap(),
-            "claude-code/2.1.172"
+            claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
         );
         assert_eq!(event_headers.get("x-service-name").unwrap(), "claude-code");
         assert_eq!(
@@ -8357,7 +8378,7 @@ mod tests {
         );
         assert_eq!(
             oauth_headers.get("User-Agent").unwrap(),
-            "claude-cli/2.1.172 (external, cli)"
+            claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
         );
 
         let penguin_headers = rewriter.rewrite_headers(
@@ -8376,7 +8397,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_wire_order_matches_2172_capture() {
+    fn endpoint_wire_order_matches_current_capture() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let empty = std::collections::HashMap::new();
@@ -8560,7 +8581,7 @@ mod tests {
     }
 
     #[test]
-    fn growthbook_rewrite_adds_2172_attributes() {
+    fn growthbook_rewrite_adds_current_attributes() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -8689,6 +8710,10 @@ mod tests {
             compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.172"),
             "51f"
         );
+        assert_eq!(
+            compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.173"),
+            "262"
+        );
     }
 
     #[test]
@@ -8707,6 +8732,7 @@ mod tests {
         assert_eq!(cch_attestation_seed("2.1.156"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.169"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.172"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.173"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
@@ -8720,26 +8746,29 @@ mod tests {
     }
 
     #[test]
-    fn cch_2172_opus_normalizes_top_level_model_and_max_tokens() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":64000,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.172.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
-        let normalized = cch_attestation_input(body, "2.1.172");
+    fn cch_2172_and_2173_opus_normalize_top_level_model_and_max_tokens() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":64000,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.173.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+        let normalized = cch_attestation_input(body, "2.1.173");
 
         assert_eq!(
             normalized,
-            br#"{"model":"","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.172.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#
+            br#"{"model":"","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.173.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#
         );
+        assert_eq!(cch_attestation_input(body, "2.1.172"), normalized);
 
-        let out = compute_cch_attestation(body.to_vec(), "2.1.172");
-        let expected_hash = xxhash_rust::xxh64::xxh64(&normalized, cch_attestation_seed("2.1.172"));
+        let out = compute_cch_attestation(body.to_vec(), "2.1.173");
+        let expected_hash = xxhash_rust::xxh64::xxh64(&normalized, cch_attestation_seed("2.1.173"));
         let expected_cch = format!("cch={:05x}", expected_hash & 0xFFFFF);
         assert!(String::from_utf8(out).unwrap().contains(&expected_cch));
     }
 
     #[test]
-    fn cch_2172_fable_normalizes_top_level_fallbacks_only() {
-        let body = br#"{"model":"claude-fable-5","max_tokens":64000,"tools":[{"name":"Nested","input_schema":{"type":"object","properties":{"fallbacks":{"model":"keep-nested"},"max_tokens":{"type":"integer"}}}}],"fallbacks":[{"model":"claude-opus-4-8"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.172.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"nested model and fallbacks stay"}]}]}"#;
-        let normalized = String::from_utf8(cch_attestation_input(body, "2.1.172")).unwrap();
+    fn cch_2172_and_2173_fable_normalize_top_level_fallbacks_only() {
+        let body = br#"{"model":"claude-fable-5","max_tokens":64000,"tools":[{"name":"Nested","input_schema":{"type":"object","properties":{"fallbacks":{"model":"keep-nested"},"max_tokens":{"type":"integer"}}}}],"fallbacks":[{"model":"claude-opus-4-8"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.173.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"nested model and fallbacks stay"}]}]}"#;
+        let normalized = String::from_utf8(cch_attestation_input(body, "2.1.173")).unwrap();
+        let normalized_2172 = String::from_utf8(cch_attestation_input(body, "2.1.172")).unwrap();
 
+        assert_eq!(normalized_2172, normalized);
         assert!(normalized.contains(r#""model":"""#));
         assert!(!normalized.contains(r#","max_tokens":64000"#));
         assert!(!normalized.contains(r#","fallbacks":[{"model":"claude-opus-4-8"}]"#));
