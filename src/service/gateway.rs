@@ -68,11 +68,8 @@ const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 /// 正常 Anthropic SSE 的 usage 会在尾部出现；这里仅在压缩响应上保留一份内部副本用于解压解析,
 /// 不改变转发给 Claude Code 的原始响应字节。
 const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
-/// Auto Mode XML classifier Stage 1 追加的稳定 suffix。
+/// Auto Mode XML classifier Stage 1 追加的 suffix。仅作为兼容信号,不能作为唯一硬条件。
 const AUTO_MODE_XML_STAGE1_SUFFIX: &str = "Err on the side of blocking. <block> immediately.";
-/// Auto Mode XML classifier Stage 2 suffix 的稳定片段,用于避免仅按 max_tokens=8192 误拦。
-const AUTO_MODE_XML_STAGE2_SUFFIX_PART_A: &str = "Review the classification process";
-const AUTO_MODE_XML_STAGE2_SUFFIX_PART_B: &str = "follow it carefully";
 
 #[derive(Clone, Copy)]
 struct RateLimitResponseDecision {
@@ -2500,12 +2497,18 @@ fn is_auto_mode_classifier_stage1_request(
     body: &serde_json::Value,
     client_type: ClientType,
 ) -> bool {
-    auto_mode_classifier_common_matches(path, body, client_type)
-        && matches!(
-            body.get("max_tokens").and_then(|tokens| tokens.as_u64()),
-            Some(64 | 256)
-        )
-        && request_text_items(body).any(|text| text.contains(AUTO_MODE_XML_STAGE1_SUFFIX))
+    if !auto_mode_classifier_common_matches(path, body, client_type) {
+        return false;
+    }
+    let Some(max_tokens) = body.get("max_tokens").and_then(|tokens| tokens.as_u64()) else {
+        return false;
+    };
+    if max_tokens == 256 {
+        return true;
+    }
+    max_tokens == 64
+        && (has_stop_sequence(body, "</block>")
+            || request_text_items(body).any(|text| text.contains(AUTO_MODE_XML_STAGE1_SUFFIX)))
 }
 
 fn is_auto_mode_classifier_stage2_request(
@@ -2522,22 +2525,11 @@ fn is_auto_mode_classifier_stage2_request(
     if !(4096..=8192).contains(&max_tokens) {
         return false;
     }
-    if body
-        .get("stop_sequences")
-        .and_then(|value| value.as_array())
-        .map(|items| items.iter().any(|item| item.as_str() == Some("</block>")))
-        .unwrap_or(false)
-    {
+    if has_stop_sequence(body, "</block>") {
         return false;
     }
 
-    let mut has_part_a = false;
-    let mut has_part_b = false;
-    for text in request_text_items(body) {
-        has_part_a |= text.contains(AUTO_MODE_XML_STAGE2_SUFFIX_PART_A);
-        has_part_b |= text.contains(AUTO_MODE_XML_STAGE2_SUFFIX_PART_B);
-    }
-    has_part_a && has_part_b
+    true
 }
 
 fn auto_mode_classifier_common_matches(
@@ -2564,6 +2556,13 @@ fn auto_mode_classifier_common_matches(
         has_block_no |= text.contains("<block>no</block>");
     }
     has_transcript_open && has_transcript_close && has_block_yes && has_block_no
+}
+
+fn has_stop_sequence(body: &serde_json::Value, expected: &str) -> bool {
+    body.get("stop_sequences")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().any(|item| item.as_str() == Some(expected)))
+        .unwrap_or(false)
 }
 
 fn messages_end_with_user(body: &serde_json::Value) -> bool {
@@ -4172,6 +4171,14 @@ mod tests {
         })
     }
 
+    fn classifier_body_with_stop_sequence(max_tokens: u64, suffix: &str) -> serde_json::Value {
+        let mut body = classifier_body(max_tokens, suffix);
+        body.as_object_mut()
+            .expect("classifier body object")
+            .insert("stop_sequences".into(), json!(["</block>"]));
+        body
+    }
+
     fn assistant_prefill_config(enabled: bool) -> AssistantPrefillInterceptConfig {
         AssistantPrefillInterceptConfig {
             enabled,
@@ -4762,6 +4769,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_classifier_detects_stage1_by_stop_sequence_without_suffix() {
+        let body = classifier_body_with_stop_sequence(64, "\nUpdated classifier instruction.");
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            Some(WarmupInterceptType::AutoModeClassifierStage1)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_detects_stage1_fast_mode_without_stop_sequence() {
+        let body = classifier_body(256, "\nUpdated classifier instruction.");
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            Some(WarmupInterceptType::AutoModeClassifierStage1)
+        );
+    }
+
+    #[test]
     fn auto_mode_classifier_detects_stage2_by_xml_suffix() {
         let body = classifier_body(
             8192,
@@ -4771,6 +4798,26 @@ mod tests {
         assert_eq!(
             detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
             Some(WarmupInterceptType::AutoModeClassifierStage2)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_detects_stage2_without_exact_suffix() {
+        let body = classifier_body(4096, "\nUpdated classifier instruction.");
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            Some(WarmupInterceptType::AutoModeClassifierStage2)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_does_not_treat_stage1_stop_sequence_as_stage2() {
+        let body = classifier_body_with_stop_sequence(4096, "\nUpdated classifier instruction.");
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            None
         );
     }
 
