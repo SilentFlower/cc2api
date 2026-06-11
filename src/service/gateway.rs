@@ -1347,6 +1347,8 @@ impl GatewayService {
         if should_log_non_stream_response {
             let response_headers = resp.headers().clone();
             let body_bytes = resp.bytes().await.unwrap_or_default();
+            let (downstream_body, remove_transport_headers) =
+                buffered_response_body_for_downstream(body_bytes.clone(), &response_headers);
             warn!(
                 "non_stream_response_capture {}",
                 format_response_capture(
@@ -1356,14 +1358,14 @@ impl GatewayService {
                     &response_headers,
                     &body_bytes,
                     request_log_config,
-                    false,
+                    remove_transport_headers,
                 )
             );
             return rebuild_buffered_upstream_response(
                 status_code,
                 &response_headers,
-                body_bytes,
-                false,
+                downstream_body,
+                remove_transport_headers,
             );
         }
 
@@ -1907,7 +1909,7 @@ fn rewrite_bootstrap_response(
         .map_err(|e| AppError::Internal(format!("build bootstrap response: {}", e)))
 }
 
-fn buffered_error_body_for_downstream(body_bytes: Bytes, headers: &HeaderMap) -> (Bytes, bool) {
+fn buffered_response_body_for_downstream(body_bytes: Bytes, headers: &HeaderMap) -> (Bytes, bool) {
     let codings = response_content_codings(headers);
     if codings.is_empty() {
         return (body_bytes, true);
@@ -1916,7 +1918,7 @@ fn buffered_error_body_for_downstream(body_bytes: Bytes, headers: &HeaderMap) ->
         Ok(decoded) => (Bytes::from(decoded), true),
         Err(e) => {
             warn!(
-                "upstream error body decode failed before downstream rebuild: encoding={} error={} raw={}",
+                "upstream body decode failed before downstream rebuild: encoding={} error={} raw={}",
                 codings.join(","),
                 e,
                 safe_body_summary(&body_bytes)
@@ -1924,6 +1926,10 @@ fn buffered_error_body_for_downstream(body_bytes: Bytes, headers: &HeaderMap) ->
             (body_bytes, false)
         }
     }
+}
+
+fn buffered_error_body_for_downstream(body_bytes: Bytes, headers: &HeaderMap) -> (Bytes, bool) {
+    buffered_response_body_for_downstream(body_bytes, headers)
 }
 
 fn try_decode_response_body_for_downstream(
@@ -3706,9 +3712,10 @@ mod tests {
         NonStreamAuxMode, RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT,
         SignatureRetryStage, WarmupInterceptConfig, WarmupInterceptType,
         assistant_prefill_intercept_body, buffered_error_body_for_downstream,
-        build_message_telemetry_context, build_warmup_intercept_sse, detect_warmup_intercept,
-        extract_message_session_id, flush_stateful_cache_usage_buffer, format_request_capture,
-        format_response_capture, has_system_role_message, is_signature_related_error_body,
+        buffered_response_body_for_downstream, build_message_telemetry_context,
+        build_warmup_intercept_sse, detect_warmup_intercept, extract_message_session_id,
+        flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
+        has_system_role_message, is_signature_related_error_body,
         is_signature_related_error_response_body, is_system_role_model_allowed,
         mock_warmup_intercept_json_response, non_stream_auxiliary_error_response,
         parse_bootstrap_additional_model_options, parse_rate_limit_request_body_limit,
@@ -4014,6 +4021,23 @@ mod tests {
 
         let (downstream_body, remove_transport_headers) =
             buffered_error_body_for_downstream(bytes::Bytes::from(compressed), &headers);
+
+        assert!(remove_transport_headers);
+        assert_eq!(downstream_body.as_ref(), body);
+    }
+
+    #[test]
+    fn buffered_success_body_decodes_gzip_before_removing_encoding_header() {
+        let body = br#"{"type":"message","content":[{"type":"text","text":"ok"}]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).expect("write gzip");
+        let compressed = encoder.finish().expect("finish gzip");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let (downstream_body, remove_transport_headers) =
+            buffered_response_body_for_downstream(bytes::Bytes::from(compressed), &headers);
 
         assert!(remove_transport_headers);
         assert_eq!(downstream_body.as_ref(), body);
