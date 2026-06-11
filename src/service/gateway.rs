@@ -432,9 +432,16 @@ impl GatewayService {
                 DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
             )
             .await?;
+        let parsed_mode = BootstrapModelOptionsMode::parse(&mode)?;
+        let parsed_options = parse_bootstrap_additional_model_options(&options)?;
+        info!(
+            "[bootstrap] config_loaded | mode={} options={}",
+            parsed_mode.as_str(),
+            parsed_options.len()
+        );
         *self.bootstrap_profile_config.write().await = BootstrapProfileConfig {
-            mode: BootstrapModelOptionsMode::parse(&mode)?,
-            additional_model_options: parse_bootstrap_additional_model_options(&options)?,
+            mode: parsed_mode,
+            additional_model_options: parsed_options,
         };
         Ok(())
     }
@@ -1208,6 +1215,17 @@ impl GatewayService {
 
         if path.starts_with("/api/claude_cli/bootstrap") {
             let config = self.bootstrap_profile_config.read().await.clone();
+            let content_codings = response_content_codings(resp.headers());
+            info!(
+                "[bootstrap] upstream_response | account={} status={} mode={} model={} entrypoint={} encoding={} bytes={}",
+                account.id,
+                status_code,
+                config.mode.as_str(),
+                bootstrap_log_value(bootstrap_query_value(query, "model")),
+                bootstrap_log_value(bootstrap_query_value(query, "entrypoint")),
+                bootstrap_log_value(Some(&content_codings.join(","))),
+                resp.content_length().unwrap_or(0)
+            );
             if config.mode != BootstrapModelOptionsMode::Passthrough {
                 let headers = resp.headers().clone();
                 let body_bytes = resp.bytes().await.unwrap_or_default();
@@ -1623,14 +1641,45 @@ fn rewrite_bootstrap_response(
     let codings = response_content_codings(headers);
     let decoded = decode_response_body_with_codings(&body_bytes, &codings);
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        info!(
+            "[bootstrap] rewrite_skipped | reason=non_json mode={} status={} encoding={} raw_bytes={} decoded_bytes={}",
+            config.mode.as_str(),
+            status_code,
+            bootstrap_log_value(Some(&codings.join(","))),
+            body_bytes.len(),
+            decoded.len()
+        );
         return rebuild_upstream_response(status_code, headers, body_bytes);
     };
     if !patch_bootstrap_json(&mut value, query, config) {
+        info!(
+            "[bootstrap] rewrite_skipped | reason=unchanged mode={} model={} entrypoint={} status={} encoding={} raw_bytes={} decoded_bytes={}",
+            config.mode.as_str(),
+            bootstrap_log_value(bootstrap_query_value(query, "model")),
+            bootstrap_log_value(bootstrap_query_value(query, "entrypoint")),
+            status_code,
+            bootstrap_log_value(Some(&codings.join(","))),
+            body_bytes.len(),
+            decoded.len()
+        );
         return rebuild_upstream_response(status_code, headers, body_bytes);
     }
 
     let body = serde_json::to_vec(&value)
         .map_err(|e| AppError::Internal(format!("serialize bootstrap response: {}", e)))?;
+    info!(
+        "[bootstrap] rewrite_applied | mode={} model={} entrypoint={} fable_query={} options={} status={} encoding={} raw_bytes={} decoded_bytes={} rewritten_bytes={}",
+        config.mode.as_str(),
+        bootstrap_log_value(bootstrap_query_value(query, "model")),
+        bootstrap_log_value(bootstrap_query_value(query, "entrypoint")),
+        query_model_is_fable(query),
+        config.additional_model_options.len(),
+        status_code,
+        bootstrap_log_value(Some(&codings.join(","))),
+        body_bytes.len(),
+        decoded.len(),
+        body.len()
+    );
     let mut rb = Response::builder()
         .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
     for (k, v) in headers.iter() {
@@ -1766,6 +1815,17 @@ fn query_model_is_fable(query: &str) -> bool {
             .map(|model| model.starts_with("claude-fable-5"))
             .unwrap_or(false)
     })
+}
+
+fn bootstrap_query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if name == key { Some(value) } else { None }
+    })
+}
+
+fn bootstrap_log_value(value: Option<&str>) -> &str {
+    value.filter(|v| !v.is_empty()).unwrap_or("-")
 }
 
 fn is_bootstrap_fable_model_option(model: &str) -> bool {
