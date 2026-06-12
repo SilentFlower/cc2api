@@ -59,6 +59,7 @@ const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-4-8,clau
 /** 429 请求观测日志配置 */
 const log429RequestEnabled = ref(false);
 const logNonStreamRequestEnabled = ref(false);
+const nonStreamProbeCacheEnabled = ref(false);
 const log429RequestBodyLimit = ref('8192');
 const streamKeepaliveEnabled = ref(false);
 const streamKeepaliveIntervalSecs = ref('45');
@@ -260,6 +261,7 @@ async function loadSettings() {
     interceptAssistantPrefillModels.value = data.intercept_assistant_prefill_models ?? 'claude-fable-5,claude-opus-4-8,claude-opus-4-7';
     log429RequestEnabled.value = (data.log_429_request_enabled ?? 'false') === 'true';
     logNonStreamRequestEnabled.value = (data.log_non_stream_request_enabled ?? 'false') === 'true';
+    nonStreamProbeCacheEnabled.value = (data.non_stream_probe_cache_enabled ?? 'false') === 'true';
     log429RequestBodyLimit.value = data.log_429_request_body_limit ?? '8192';
     streamKeepaliveEnabled.value = (data.stream_keepalive_enabled ?? 'false') === 'true';
     streamKeepaliveIntervalSecs.value = data.stream_keepalive_interval_secs ?? '45';
@@ -364,6 +366,7 @@ async function saveSettings() {
       intercept_assistant_prefill_models: interceptAssistantPrefillModels.value.trim(),
       log_429_request_enabled: log429RequestEnabled.value ? 'true' : 'false',
       log_non_stream_request_enabled: logNonStreamRequestEnabled.value ? 'true' : 'false',
+      non_stream_probe_cache_enabled: nonStreamProbeCacheEnabled.value ? 'true' : 'false',
       log_429_request_body_limit: log429RequestBodyLimit.value.trim(),
       stream_keepalive_enabled: streamKeepaliveEnabled.value ? 'true' : 'false',
       stream_keepalive_interval_secs: streamKeepaliveIntervalSecs.value.trim(),
@@ -653,7 +656,7 @@ onMounted(async () => {
           </p>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div class="space-y-1.5">
             <Label class="text-[#5c5647] text-sm">429 捕获</Label>
             <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
@@ -675,6 +678,18 @@ onMounted(async () => {
               />
               <span class="text-sm text-[#29261e]">{{ logNonStreamRequestEnabled ? '记录非流请求' : '关闭记录' }}</span>
             </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">非流单消息探针缓存</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="nonStreamProbeCacheEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ nonStreamProbeCacheEnabled ? '30m 缓存' : '关闭' }}</span>
+            </label>
+            <p class="text-[11px] text-[#b5b0a6]">仅缓存 Claude Code 非流单消息探针。</p>
           </div>
           <div class="space-y-1.5">
             <Label class="text-[#5c5647] text-sm">请求体字符上限</Label>

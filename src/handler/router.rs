@@ -36,10 +36,11 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
-    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
+    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
+    SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -753,6 +754,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("log_non_stream_request_enabled".into())
         .or_insert_with(|| DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED.to_string());
     settings
+        .entry("non_stream_probe_cache_enabled".into())
+        .or_insert_with(|| DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED.to_string());
+    settings
         .entry("log_429_request_body_limit".into())
         .or_insert_with(|| DEFAULT_LOG_429_REQUEST_BODY_LIMIT.to_string());
     settings
@@ -870,6 +874,7 @@ async fn update_settings(
         "intercept_assistant_prefill_enabled",
         "log_429_request_enabled",
         "log_non_stream_request_enabled",
+        "non_stream_probe_cache_enabled",
         "stream_keepalive_enabled",
     ] {
         if let Some(val) = body.get(*key) {
@@ -962,6 +967,12 @@ async fn update_settings(
         state
             .gateway_svc
             .reload_rate_limit_request_log_config()
+            .await?;
+    }
+    if body.contains_key("non_stream_probe_cache_enabled") {
+        state
+            .gateway_svc
+            .reload_non_stream_probe_cache_config()
             .await?;
     }
     if body.contains_key("stream_keepalive_enabled")

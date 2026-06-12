@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
@@ -39,8 +40,8 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_PASSTHROUGH_OS_VERSION,
-    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
     DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
@@ -68,6 +69,8 @@ const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 /// 正常 Anthropic SSE 的 usage 会在尾部出现；这里仅在压缩响应上保留一份内部副本用于解压解析,
 /// 不改变转发给 Claude Code 的原始响应字节。
 const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
+/// 非流式单消息探针缓存固定 TTL。只缓存强特征探针,避免误缓存真实业务请求。
+const NON_STREAM_PROBE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 #[derive(Clone, Copy)]
 struct RateLimitResponseDecision {
     delay: std::time::Duration,
@@ -93,6 +96,11 @@ struct RateLimitRequestLogConfig {
     enabled: bool,
     non_stream_enabled: bool,
     body_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonStreamProbeCacheConfig {
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +192,62 @@ struct BootstrapProfileConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonStreamProbeType {
+    Count,
+    SessionGuidance,
+    ContextManagement,
+    Memory,
+    Environment,
+    GitStatus,
+    ActWhenReady,
+    TrellisSkill,
+    AgentSafety,
+    ConfirmRiskyAction,
+    AihubLanguage,
+    CodingStyle,
+}
+
+impl NonStreamProbeType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::SessionGuidance => "session_guidance",
+            Self::ContextManagement => "context_management",
+            Self::Memory => "memory",
+            Self::Environment => "environment",
+            Self::GitStatus => "git_status",
+            Self::ActWhenReady => "act_when_ready",
+            Self::TrellisSkill => "trellis_skill",
+            Self::AgentSafety => "agent_safety",
+            Self::ConfirmRiskyAction => "confirm_risky_action",
+            Self::AihubLanguage => "aihub_language",
+            Self::CodingStyle => "coding_style",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NonStreamProbeCacheLookup {
+    key: String,
+    key_hash: String,
+    probe_type: NonStreamProbeType,
+    model: String,
+    body_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedProbeResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+    probe_type: NonStreamProbeType,
+    model: String,
+    created_at: std::time::Instant,
+    expires_at: std::time::Instant,
+    expires_at_log: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WarmupInterceptType {
     TextTitle,
     JsonTitle,
@@ -259,6 +323,8 @@ pub struct GatewayService {
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
     rate_limit_request_log_config: RwLock<RateLimitRequestLogConfig>,
+    non_stream_probe_cache_config: RwLock<NonStreamProbeCacheConfig>,
+    non_stream_probe_cache: RwLock<HashMap<String, CachedProbeResponse>>,
     stream_stability_config: RwLock<StreamStabilityConfig>,
     bootstrap_profile_config: RwLock<BootstrapProfileConfig>,
 }
@@ -294,6 +360,8 @@ impl GatewayService {
                 default_assistant_prefill_intercept_config(),
             ),
             rate_limit_request_log_config: RwLock::new(default_rate_limit_request_log_config()),
+            non_stream_probe_cache_config: RwLock::new(default_non_stream_probe_cache_config()),
+            non_stream_probe_cache: RwLock::new(HashMap::new()),
             stream_stability_config: RwLock::new(default_stream_stability_config()),
             bootstrap_profile_config: RwLock::new(default_bootstrap_profile_config()),
         }
@@ -515,6 +583,26 @@ impl GatewayService {
         Ok(())
     }
 
+    /// 从全局设置刷新非流式单消息探针缓存配置。
+    ///
+    /// 配置缓存到内存,命中后直接返回上游成功响应副本,用于削减 Claude Code
+    /// 启动阶段重复发送的 `max_tokens=1` 探针请求。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_non_stream_probe_cache_config(&self) -> Result<(), AppError> {
+        let enabled = self
+            .settings_store
+            .get_value(
+                "non_stream_probe_cache_enabled",
+                DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+            )
+            .await?;
+        *self.non_stream_probe_cache_config.write().await = NonStreamProbeCacheConfig {
+            enabled: parse_setting_flag(&enabled),
+        };
+        Ok(())
+    }
+
     /// 从全局设置刷新流式稳定性配置。
     ///
     /// keep-alive 只会在上游首个流式 chunk 到达后向下游插入 SSE comment,
@@ -606,6 +694,107 @@ impl GatewayService {
         let policy = AccessPolicy::parse(&raw_versions, &raw_user_agents)?;
         *self.access_policy.write().await = policy;
         Ok(())
+    }
+
+    async fn non_stream_probe_cache_lookup(
+        &self,
+        path: &str,
+        client_type: ClientType,
+        body: &serde_json::Value,
+        headers: &HashMap<String, String>,
+        body_bytes: &[u8],
+    ) -> Result<Option<NonStreamProbeCacheLookup>, AppError> {
+        if !self.non_stream_probe_cache_config.read().await.enabled {
+            return Ok(None);
+        }
+        let Some(probe_type) = detect_non_stream_probe_type(path, body, client_type) else {
+            return Ok(None);
+        };
+        let model = body
+            .get("model")
+            .and_then(|model| model.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let key = non_stream_probe_cache_key(path, &model, headers, body_bytes)?;
+        let key_hash = short_hash_for_log(key.as_bytes());
+        Ok(Some(NonStreamProbeCacheLookup {
+            key,
+            key_hash,
+            probe_type,
+            model,
+            body_bytes: body_bytes.len(),
+        }))
+    }
+
+    async fn try_non_stream_probe_cache_hit(
+        &self,
+        lookup: &NonStreamProbeCacheLookup,
+        account: &Account,
+    ) -> Result<Option<Response>, AppError> {
+        let now = std::time::Instant::now();
+        let cached = {
+            let cache = self.non_stream_probe_cache.read().await;
+            cache.get(&lookup.key).cloned()
+        };
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        if now >= cached.expires_at {
+            self.non_stream_probe_cache
+                .write()
+                .await
+                .remove(&lookup.key);
+            return Ok(None);
+        }
+
+        log_non_stream_probe_cache_hit(lookup, account, &cached, now);
+        cached_non_stream_probe_response(lookup, &cached)
+    }
+
+    async fn store_non_stream_probe_cache_entry(
+        &self,
+        lookup: &NonStreamProbeCacheLookup,
+        account: &Account,
+        parts: &Parts,
+        body_bytes: Bytes,
+    ) -> Result<Response, AppError> {
+        let (downstream_body, _transport_headers_removed) =
+            buffered_response_body_for_downstream(body_bytes, &parts.headers);
+        if !is_cacheable_non_stream_probe_response(&downstream_body) {
+            return rebuild_buffered_upstream_response(
+                parts.status.as_u16(),
+                &parts.headers,
+                downstream_body,
+                true,
+            );
+        }
+
+        let now = std::time::Instant::now();
+        let expires_at = now + NON_STREAM_PROBE_CACHE_TTL;
+        let expires_at_log = (Utc::now()
+            + chrono::Duration::from_std(NON_STREAM_PROBE_CACHE_TTL).unwrap_or_default())
+        .to_rfc3339();
+        let cached = CachedProbeResponse {
+            status: parts.status,
+            headers: safe_non_stream_probe_response_headers(&parts.headers),
+            body: downstream_body.clone(),
+            probe_type: lookup.probe_type,
+            model: lookup.model.clone(),
+            created_at: now,
+            expires_at,
+            expires_at_log,
+        };
+        self.non_stream_probe_cache
+            .write()
+            .await
+            .insert(lookup.key.clone(), cached.clone());
+        log_non_stream_probe_cache_create(lookup, account, &cached);
+        rebuild_buffered_upstream_response(
+            parts.status.as_u16(),
+            &parts.headers,
+            downstream_body,
+            true,
+        )
     }
 
     /// 核心网关逻辑 -- axum handler。
@@ -974,6 +1163,30 @@ impl GatewayService {
                 }
             }
 
+            let non_stream_probe_cache_lookup = self
+                .non_stream_probe_cache_lookup(
+                    &path,
+                    client_type,
+                    &rewritten_body_map,
+                    &final_headers,
+                    &final_body,
+                )
+                .await?;
+            if let Some(lookup) = &non_stream_probe_cache_lookup {
+                if let Some(resp) = self
+                    .try_non_stream_probe_cache_hit(lookup, &account)
+                    .await?
+                {
+                    if should_bind_session {
+                        let _ = self
+                            .account_svc
+                            .bind_selected_session(&session_hash, account.id)
+                            .await;
+                    }
+                    return Ok(resp);
+                }
+            }
+
             if account.auto_telemetry && path.starts_with("/v1/messages") {
                 // 遥测会话会启动后台上游请求，必须等 RPM/槽位/改写/Token 全部成功后再激活，
                 // 避免被 RPM 跳过的账号产生额外上游副作用。
@@ -1065,6 +1278,17 @@ impl GatewayService {
 
             // 非 429：将响应体包装为 SlotGuardBody，流结束时归还槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                if let Some(lookup) = non_stream_probe_cache_lookup {
+                    if resp.status().is_success() && signature_retry_stage.is_none() {
+                        let (parts, body_bytes) = buffer_response_body(resp).await?;
+                        let cached_response = self
+                            .store_non_stream_probe_cache_entry(
+                                &lookup, &account, &parts, body_bytes,
+                            )
+                            .await?;
+                        return Ok(cached_response);
+                    }
+                }
                 let should_complete_stateful_cache =
                     resp.status().is_success() && signature_retry_stage.is_none();
                 // stateful 锚点描述的是本次发送给上游的 body。签名重试会换 body,非成功响应
@@ -2492,6 +2716,234 @@ fn auto_mode_classifier_mode_for_type(
     }
 }
 
+fn detect_non_stream_probe_type(
+    path: &str,
+    body: &serde_json::Value,
+    client_type: ClientType,
+) -> Option<NonStreamProbeType> {
+    if path != "/v1/messages"
+        || client_type != ClientType::ClaudeCode
+        || is_streaming_messages_request(body)
+        || body.get("max_tokens").and_then(|tokens| tokens.as_u64()) != Some(1)
+    {
+        return None;
+    }
+    let messages = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())?;
+    let [message] = messages.as_slice() else {
+        return None;
+    };
+    if message.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return None;
+    }
+    let text = single_text_from_content(message.get("content"))?;
+    classify_non_stream_probe_text(text)
+}
+
+fn classify_non_stream_probe_text(text: &str) -> Option<NonStreamProbeType> {
+    let trimmed = text.trim_start_matches('\u{feff}').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed == "count" {
+        return Some(NonStreamProbeType::Count);
+    }
+    if trimmed.starts_with("# Session-specific guidance") {
+        return Some(NonStreamProbeType::SessionGuidance);
+    }
+    if trimmed.starts_with("# Context management") {
+        return Some(NonStreamProbeType::ContextManagement);
+    }
+    if trimmed.starts_with("# Memory") {
+        return Some(NonStreamProbeType::Memory);
+    }
+    if trimmed.starts_with("# Environment") {
+        return Some(NonStreamProbeType::Environment);
+    }
+    if trimmed.starts_with("This is the git status at the start of the conversation") {
+        return Some(NonStreamProbeType::GitStatus);
+    }
+    if trimmed.starts_with("When you have enough information to act, act.") {
+        return Some(NonStreamProbeType::ActWhenReady);
+    }
+    if lower.contains("trellis-") && lower.contains("skill") {
+        return Some(NonStreamProbeType::TrellisSkill);
+    }
+    if trimmed.starts_with(
+        "You are an interactive agent that helps users with software engineering tasks",
+    ) {
+        return Some(NonStreamProbeType::AgentSafety);
+    }
+    if trimmed.starts_with("For actions that are hard to reverse or outward-facing") {
+        return Some(NonStreamProbeType::ConfirmRiskyAction);
+    }
+    if trimmed.contains("AI-HUB-GUIDE-LANGUAGE") || trimmed.contains("Always reply in Chinese") {
+        return Some(NonStreamProbeType::AihubLanguage);
+    }
+    if trimmed.starts_with("Write code that reads like the surrounding code") {
+        return Some(NonStreamProbeType::CodingStyle);
+    }
+    None
+}
+
+fn non_stream_probe_cache_key(
+    path: &str,
+    model: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> Result<String, AppError> {
+    let mut selected_headers = BTreeMap::new();
+    for (key, value) in headers {
+        if is_non_stream_probe_cache_header(key) {
+            selected_headers.insert(key.to_ascii_lowercase(), value.clone());
+        }
+    }
+    let body_hash = full_hex_hash(body);
+    let key = serde_json::json!({
+        "path": path,
+        "model": model,
+        "body_sha256": body_hash,
+        "headers": selected_headers,
+    });
+    serde_json::to_string(&key)
+        .map_err(|e| AppError::Internal(format!("serialize non-stream probe cache key: {}", e)))
+}
+
+fn is_non_stream_probe_cache_header(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower == "anthropic-version"
+        || lower == "anthropic-beta"
+        || lower == "x-app"
+        || lower == "user-agent"
+        || lower == "x-anthropic-billing-header"
+        || lower.starts_with("x-stainless-")
+}
+
+fn full_hex_hash(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn safe_non_stream_probe_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (key, value) in headers {
+        if should_skip_buffered_response_header(key.as_str(), true) {
+            continue;
+        }
+        if key.as_str().eq_ignore_ascii_case(CONTENT_LENGTH.as_str()) {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
+    out
+}
+
+fn cached_non_stream_probe_response(
+    lookup: &NonStreamProbeCacheLookup,
+    cached: &CachedProbeResponse,
+) -> Result<Option<Response>, AppError> {
+    let body = cached_non_stream_probe_body(lookup, &cached.body)?;
+    let mut rb = Response::builder().status(cached.status);
+    for (key, value) in cached.headers.iter() {
+        if key.as_str().eq_ignore_ascii_case(CONTENT_TYPE.as_str()) {
+            continue;
+        }
+        rb = rb.header(key.clone(), value.clone());
+    }
+    rb = rb.header(CONTENT_TYPE, "application/json");
+    let response = rb
+        .body(Body::from(body))
+        .map_err(|e| AppError::Internal(format!("build non-stream probe cache response: {}", e)))?;
+    Ok(Some(response))
+}
+
+fn cached_non_stream_probe_body(
+    lookup: &NonStreamProbeCacheLookup,
+    body: &[u8],
+) -> Result<Bytes, AppError> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body).map_err(|e| {
+        AppError::Internal(format!("parse cached non-stream probe response: {}", e))
+    })?;
+    if let Some(obj) = value.as_object_mut() {
+        let millis = Utc::now().timestamp_millis();
+        obj.insert(
+            "id".into(),
+            serde_json::Value::String(format!("msg_cached_probe_{}_{}", lookup.key_hash, millis)),
+        );
+    }
+    let bytes = serde_json::to_vec(&value).map_err(|e| {
+        AppError::Internal(format!("serialize cached non-stream probe response: {}", e))
+    })?;
+    Ok(Bytes::from(bytes))
+}
+
+fn is_cacheable_non_stream_probe_response(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("type").and_then(|value| value.as_str()) == Some("message")
+        && value.get("role").and_then(|value| value.as_str()) == Some("assistant")
+        && value.get("content").is_some()
+}
+
+fn log_non_stream_probe_cache_create(
+    lookup: &NonStreamProbeCacheLookup,
+    account: &Account,
+    cached: &CachedProbeResponse,
+) {
+    let payload = non_stream_probe_cache_create_log_payload(lookup, account, cached);
+    info!(
+        "non_stream_probe_cache_create {}",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+fn non_stream_probe_cache_create_log_payload(
+    lookup: &NonStreamProbeCacheLookup,
+    account: &Account,
+    cached: &CachedProbeResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "cache_key_hash": lookup.key_hash,
+        "probe_type": lookup.probe_type.as_str(),
+        "model": lookup.model,
+        "account_id": account.id,
+        "ttl_secs": NON_STREAM_PROBE_CACHE_TTL.as_secs(),
+        "body_bytes": lookup.body_bytes,
+        "status": cached.status.as_u16(),
+        "expires_at": cached.expires_at_log,
+    })
+}
+
+fn log_non_stream_probe_cache_hit(
+    lookup: &NonStreamProbeCacheLookup,
+    account: &Account,
+    cached: &CachedProbeResponse,
+    now: std::time::Instant,
+) {
+    let payload = non_stream_probe_cache_hit_log_payload(lookup, account, cached, now);
+    info!(
+        "non_stream_probe_cache_hit {}",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+fn non_stream_probe_cache_hit_log_payload(
+    lookup: &NonStreamProbeCacheLookup,
+    account: &Account,
+    cached: &CachedProbeResponse,
+    now: std::time::Instant,
+) -> serde_json::Value {
+    let age_secs = now.saturating_duration_since(cached.created_at).as_secs();
+    let expires_in_secs = cached.expires_at.saturating_duration_since(now).as_secs();
+    serde_json::json!({
+        "cache_key_hash": lookup.key_hash,
+        "probe_type": cached.probe_type.as_str(),
+        "model": cached.model,
+        "account_id": account.id,
+        "age_secs": age_secs,
+        "expires_in_secs": expires_in_secs,
+    })
+}
+
 fn is_auto_mode_classifier_stage1_request(
     path: &str,
     body: &serde_json::Value,
@@ -2737,6 +3189,15 @@ fn message_text_items<'a>(body: &'a serde_json::Value) -> impl Iterator<Item = &
 
 fn first_text_from_content(content: Option<&serde_json::Value>) -> Option<&str> {
     content_text_items(content).next()
+}
+
+fn single_text_from_content(content: Option<&serde_json::Value>) -> Option<&str> {
+    match content {
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(serde_json::Value::Array(items)) if items.len() == 1 => text_from_block(&items[0]),
+        Some(serde_json::Value::Object(_)) => content.and_then(text_from_block),
+        _ => None,
+    }
 }
 
 fn content_text_items(content: Option<&serde_json::Value>) -> Box<dyn Iterator<Item = &str> + '_> {
@@ -3301,6 +3762,13 @@ fn default_rate_limit_request_log_config() -> RateLimitRequestLogConfig {
         enabled: parse_setting_flag(DEFAULT_LOG_429_REQUEST_ENABLED),
         non_stream_enabled: parse_setting_flag(DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED),
         body_limit: parse_rate_limit_request_body_limit(DEFAULT_LOG_429_REQUEST_BODY_LIMIT),
+    }
+}
+
+/// 构造非流式单消息探针缓存配置初始值。
+fn default_non_stream_probe_cache_config() -> NonStreamProbeCacheConfig {
+    NonStreamProbeCacheConfig {
+        enabled: parse_setting_flag(DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED),
     }
 }
 
@@ -4083,34 +4551,49 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, BootstrapModelOptionsMode,
-        BootstrapProfileConfig, RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT,
-        STREAM_KEEPALIVE_BYTES, SignatureRetryStage, StreamStabilityConfig, WarmupInterceptConfig,
-        WarmupInterceptType, assistant_prefill_intercept_body, auto_mode_classifier_response,
+        BootstrapProfileConfig, CachedProbeResponse, GatewayService, NON_STREAM_PROBE_CACHE_TTL,
+        NonStreamProbeCacheLookup, NonStreamProbeType, RateLimitRequestLogConfig,
+        STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES, SignatureRetryStage,
+        StreamStabilityConfig, WarmupInterceptConfig, WarmupInterceptType,
+        assistant_prefill_intercept_body, auto_mode_classifier_response,
         buffered_error_body_for_downstream, buffered_response_body_for_downstream,
-        build_message_telemetry_context, build_warmup_intercept_sse,
-        detect_auto_mode_classifier_request, detect_warmup_intercept, extract_message_session_id,
-        flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
-        has_system_role_message, is_signature_related_error_body,
-        is_signature_related_error_response_body, is_system_role_model_allowed,
-        mock_warmup_intercept_json_response, parse_bootstrap_additional_model_options,
+        build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
+        cached_non_stream_probe_response, classify_non_stream_probe_text,
+        detect_auto_mode_classifier_request, detect_non_stream_probe_type, detect_warmup_intercept,
+        extract_message_session_id, flush_stateful_cache_usage_buffer, format_request_capture,
+        format_response_capture, has_system_role_message, is_cacheable_non_stream_probe_response,
+        is_signature_related_error_body, is_signature_related_error_response_body,
+        is_system_role_model_allowed, mock_warmup_intercept_json_response,
+        non_stream_probe_cache_create_log_payload, non_stream_probe_cache_hit_log_payload,
+        non_stream_probe_cache_key, parse_bootstrap_additional_model_options,
         parse_rate_limit_request_body_limit, parse_system_role_model_list, patch_bootstrap_json,
         redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
-        rewrite_bootstrap_response, safe_body_summary, should_intercept_assistant_prefill,
-        signature_retry_body_for_stage, stable_upstream_stream,
+        rewrite_bootstrap_response, safe_body_summary, safe_non_stream_probe_response_headers,
+        should_intercept_assistant_prefill, signature_retry_body_for_stage, stable_upstream_stream,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_stateful_cache_usage_from_bytes,
     };
     use crate::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
+    use crate::service::account::AccountService;
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
+    use crate::service::telemetry::TelemetryService;
+    use crate::store::account_store::AccountStore;
+    use crate::store::memory::MemoryStore;
+    use crate::store::settings_store::SettingsStore;
     use axum::body;
-    use axum::http::{HeaderMap, StatusCode, header::CONTENT_ENCODING};
+    use axum::http::{
+        HeaderMap, StatusCode,
+        header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
+    };
     use bytes::Bytes;
     use chrono::Utc;
     use serde_json::json;
+    use sqlx::AnyPool;
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::io::Write;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
@@ -4234,6 +4717,73 @@ mod tests {
         }
     }
 
+    fn non_stream_probe_request(text: &str) -> serde_json::Value {
+        json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": text}]
+            }]
+        })
+    }
+
+    fn test_probe_lookup() -> NonStreamProbeCacheLookup {
+        NonStreamProbeCacheLookup {
+            key: "cache-key".into(),
+            key_hash: "abcdef123456".into(),
+            probe_type: NonStreamProbeType::Count,
+            model: "claude-opus-4-8".into(),
+            body_bytes: 128,
+        }
+    }
+
+    fn cached_probe_response_with_times(
+        created_at: std::time::Instant,
+        expires_at: std::time::Instant,
+    ) -> CachedProbeResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert("request-id", "req_123".parse().unwrap());
+        CachedProbeResponse {
+            status: StatusCode::OK,
+            headers,
+            body: Bytes::from_static(
+                br#"{"id":"msg_original","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#,
+            ),
+            probe_type: NonStreamProbeType::Count,
+            model: "claude-opus-4-8".into(),
+            created_at,
+            expires_at,
+            expires_at_log: Utc::now().to_rfc3339(),
+        }
+    }
+
+    async fn test_gateway_service() -> GatewayService {
+        sqlx::any::install_default_drivers();
+        let tmp =
+            std::env::temp_dir().join(format!("ccgw_gateway_unit_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("migrate");
+        let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let settings_store = Arc::new(SettingsStore::new(pool));
+        let account_svc = Arc::new(AccountService::new(
+            account_store.clone(),
+            Arc::new(MemoryStore::new()),
+            settings_store.clone(),
+        ));
+        let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
+        GatewayService::new(
+            account_svc,
+            Arc::new(crate::service::rewriter::Rewriter::new()),
+            telemetry_svc,
+            settings_store,
+        )
+    }
+
     #[test]
     fn safe_body_summary_hides_raw_body() {
         let body = br#"{"private_text":"raw-prompt-marker","private_token":"raw-token-marker"}"#;
@@ -4242,6 +4792,487 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn non_stream_probe_detects_known_single_message_prompts() {
+        let cases = [
+            ("count", NonStreamProbeType::Count),
+            (
+                "# Session-specific guidance\nUse repo rules.",
+                NonStreamProbeType::SessionGuidance,
+            ),
+            (
+                "# Context management\nKeep context concise.",
+                NonStreamProbeType::ContextManagement,
+            ),
+            ("# Memory\n- path", NonStreamProbeType::Memory),
+            ("# Environment\ncwd=/repo", NonStreamProbeType::Environment),
+            (
+                "This is the git status at the start of the conversation\nM file",
+                NonStreamProbeType::GitStatus,
+            ),
+            (
+                "When you have enough information to act, act.",
+                NonStreamProbeType::ActWhenReady,
+            ),
+            (
+                "trellis-implement skill description",
+                NonStreamProbeType::TrellisSkill,
+            ),
+            (
+                "You are an interactive agent that helps users with software engineering tasks.",
+                NonStreamProbeType::AgentSafety,
+            ),
+            (
+                "For actions that are hard to reverse or outward-facing, ask first.",
+                NonStreamProbeType::ConfirmRiskyAction,
+            ),
+            (
+                "AI-HUB-GUIDE-LANGUAGE: Always reply in Chinese",
+                NonStreamProbeType::AihubLanguage,
+            ),
+            (
+                "Write code that reads like the surrounding code.",
+                NonStreamProbeType::CodingStyle,
+            ),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(
+                detect_non_stream_probe_type(
+                    "/v1/messages",
+                    &non_stream_probe_request(text),
+                    ClientType::ClaudeCode
+                ),
+                Some(expected),
+                "text={}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn non_stream_probe_rejects_non_probe_shapes() {
+        let base = non_stream_probe_request("count");
+        assert_eq!(
+            detect_non_stream_probe_type("/v1/messages", &base, ClientType::API),
+            None
+        );
+        assert_eq!(
+            detect_non_stream_probe_type("/v1/complete", &base, ClientType::ClaudeCode),
+            None
+        );
+
+        let mut streamed = base.clone();
+        streamed
+            .as_object_mut()
+            .unwrap()
+            .insert("stream".into(), json!(true));
+        assert_eq!(
+            detect_non_stream_probe_type("/v1/messages", &streamed, ClientType::ClaudeCode),
+            None
+        );
+
+        let mut max_tokens_two = base.clone();
+        max_tokens_two
+            .as_object_mut()
+            .unwrap()
+            .insert("max_tokens".into(), json!(2));
+        assert_eq!(
+            detect_non_stream_probe_type("/v1/messages", &max_tokens_two, ClientType::ClaudeCode),
+            None
+        );
+
+        let two_messages = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1,
+            "messages": [
+                {"role": "user", "content": "count"},
+                {"role": "user", "content": "count"}
+            ]
+        });
+        assert_eq!(
+            detect_non_stream_probe_type("/v1/messages", &two_messages, ClientType::ClaudeCode),
+            None
+        );
+
+        let assistant_message = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1,
+            "messages": [{"role": "assistant", "content": "count"}]
+        });
+        assert_eq!(
+            detect_non_stream_probe_type(
+                "/v1/messages",
+                &assistant_message,
+                ClientType::ClaudeCode
+            ),
+            None
+        );
+
+        let ordinary_prompt = non_stream_probe_request("请总结这个仓库的业务逻辑");
+        assert_eq!(
+            detect_non_stream_probe_type("/v1/messages", &ordinary_prompt, ClientType::ClaudeCode),
+            None
+        );
+
+        let multiple_text_blocks = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "count"},
+                    {"type": "text", "text": "second block should force passthrough"}
+                ]
+            }]
+        });
+        assert_eq!(
+            detect_non_stream_probe_type(
+                "/v1/messages",
+                &multiple_text_blocks,
+                ClientType::ClaudeCode
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn non_stream_probe_text_classifier_handles_bom_and_whitespace() {
+        assert_eq!(
+            classify_non_stream_probe_text("\u{feff}\n count \n"),
+            Some(NonStreamProbeType::Count)
+        );
+    }
+
+    #[test]
+    fn non_stream_probe_cache_key_uses_body_hash_and_selected_headers_only() {
+        let body = br#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"raw-prompt-marker"}]}"#;
+        let headers = HashMap::from([
+            ("authorization".to_string(), "Bearer raw-token".to_string()),
+            ("cookie".to_string(), "session=raw-cookie".to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
+            ("User-Agent".to_string(), "claude-code/2.1.173".to_string()),
+            (
+                "X-Stainless-Package-Version".to_string(),
+                "2.1.173".to_string(),
+            ),
+        ]);
+
+        let key = non_stream_probe_cache_key("/v1/messages", "claude-opus-4-8", &headers, body)
+            .expect("cache key");
+        let parsed: serde_json::Value = serde_json::from_str(&key).expect("json key");
+
+        assert_eq!(parsed["path"], "/v1/messages");
+        assert_eq!(parsed["model"], "claude-opus-4-8");
+        assert_eq!(parsed["body_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(parsed["headers"]["anthropic-version"], json!("2023-06-01"));
+        assert_eq!(
+            parsed["headers"]["user-agent"],
+            json!("claude-code/2.1.173")
+        );
+        assert!(parsed["headers"].get("authorization").is_none());
+        assert!(parsed["headers"].get("cookie").is_none());
+
+        let serialized = parsed.to_string();
+        assert!(!serialized.contains("raw-prompt-marker"));
+        assert!(!serialized.contains("raw-token"));
+        assert!(!serialized.contains("raw-cookie"));
+
+        let mut changed_headers = headers.clone();
+        changed_headers.insert("anthropic-beta".into(), "different-beta".into());
+        let changed_key =
+            non_stream_probe_cache_key("/v1/messages", "claude-opus-4-8", &changed_headers, body)
+                .expect("changed key");
+        assert_ne!(key, changed_key);
+    }
+
+    #[test]
+    fn safe_non_stream_probe_response_headers_removes_transport_and_gateway_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_LENGTH, "123".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert("x-litellm-model-id", "gateway-fingerprint".parse().unwrap());
+        headers.insert("request-id", "req_123".parse().unwrap());
+
+        let safe = safe_non_stream_probe_response_headers(&headers);
+
+        assert!(safe.get(CONTENT_TYPE).is_some());
+        assert!(safe.get("request-id").is_some());
+        assert!(safe.get(CONTENT_LENGTH).is_none());
+        assert!(safe.get(CONTENT_ENCODING).is_none());
+        assert!(safe.get(TRANSFER_ENCODING).is_none());
+        assert!(safe.get("x-litellm-model-id").is_none());
+    }
+
+    #[test]
+    fn cached_non_stream_probe_body_rewrites_response_id() {
+        let body = br#"{"id":"msg_original","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#;
+        let rewritten = cached_non_stream_probe_body(&test_probe_lookup(), body).expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+
+        let id = parsed["id"].as_str().expect("id");
+        assert!(id.starts_with("msg_cached_probe_abcdef123456_"));
+        assert_ne!(id, "msg_original");
+        assert_eq!(parsed["type"], "message");
+        assert_eq!(parsed["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn cached_non_stream_probe_response_sets_single_json_content_type() {
+        let now = std::time::Instant::now();
+        let cached = cached_probe_response_with_times(now, now + NON_STREAM_PROBE_CACHE_TTL);
+        let response = cached_non_stream_probe_response(&test_probe_lookup(), &cached)
+            .expect("response")
+            .expect("some response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_types: Vec<_> = response.headers().get_all(CONTENT_TYPE).iter().collect();
+        assert_eq!(content_types.len(), 1);
+        assert_eq!(content_types[0], "application/json");
+        assert_eq!(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req_123")
+        );
+
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+        assert!(
+            parsed["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("msg_cached_probe_abcdef123456_")
+        );
+    }
+
+    #[test]
+    fn non_stream_probe_response_cacheability_requires_anthropic_message_json() {
+        assert!(is_cacheable_non_stream_probe_response(
+            br#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#
+        ));
+        assert!(!is_cacheable_non_stream_probe_response(
+            br#"{"type":"message","role":"user","content":[]}"#
+        ));
+        assert!(!is_cacheable_non_stream_probe_response(
+            br#"{"type":"error","error":{"message":"bad"}}"#
+        ));
+        assert!(!is_cacheable_non_stream_probe_response(b"not json"));
+    }
+
+    #[test]
+    fn non_stream_probe_cache_log_payloads_do_not_include_prompt_or_response_body() {
+        let lookup = NonStreamProbeCacheLookup {
+            key: "key-with-raw-prompt-marker".into(),
+            key_hash: "abcdef123456".into(),
+            probe_type: NonStreamProbeType::SessionGuidance,
+            model: "claude-opus-4-8".into(),
+            body_bytes: 4096,
+        };
+        let now = std::time::Instant::now();
+        let mut cached = cached_probe_response_with_times(now, now + NON_STREAM_PROBE_CACHE_TTL);
+        cached.body = Bytes::from_static(
+            br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"raw-response-marker"}]}"#,
+        );
+
+        let create_payload =
+            non_stream_probe_cache_create_log_payload(&lookup, &test_account(), &cached);
+        let hit_payload =
+            non_stream_probe_cache_hit_log_payload(&lookup, &test_account(), &cached, now);
+
+        assert_eq!(create_payload["cache_key_hash"], "abcdef123456");
+        assert_eq!(create_payload["probe_type"], "session_guidance");
+        assert_eq!(create_payload["ttl_secs"], json!(1800));
+        assert_eq!(create_payload["body_bytes"], json!(4096));
+        assert_eq!(hit_payload["cache_key_hash"], "abcdef123456");
+        assert_eq!(hit_payload["age_secs"], json!(0));
+        assert_eq!(hit_payload["expires_in_secs"], json!(1800));
+
+        let serialized = format!("{}{}", create_payload, hit_payload);
+        assert!(!serialized.contains("raw-prompt-marker"));
+        assert!(!serialized.contains("raw-response-marker"));
+        assert!(!serialized.contains("key-with"));
+    }
+
+    #[tokio::test]
+    async fn non_stream_probe_cache_lookup_respects_global_switch() {
+        let service = test_gateway_service().await;
+        let body = non_stream_probe_request("count");
+        let body_bytes = serde_json::to_vec(&body).expect("body");
+        let headers = HashMap::from([
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ("user-agent".to_string(), "claude-code/2.1.173".to_string()),
+        ]);
+
+        assert!(
+            service
+                .non_stream_probe_cache_lookup(
+                    "/v1/messages",
+                    ClientType::ClaudeCode,
+                    &body,
+                    &headers,
+                    &body_bytes,
+                )
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            "non_stream_probe_cache_enabled".to_string(),
+            "true".to_string(),
+        );
+        service
+            .settings_store
+            .upsert_many(&settings)
+            .await
+            .expect("upsert setting");
+        service
+            .reload_non_stream_probe_cache_config()
+            .await
+            .expect("reload");
+        let lookup = service
+            .non_stream_probe_cache_lookup(
+                "/v1/messages",
+                ClientType::ClaudeCode,
+                &body,
+                &headers,
+                &body_bytes,
+            )
+            .await
+            .expect("lookup")
+            .expect("enabled lookup");
+
+        assert_eq!(lookup.probe_type, NonStreamProbeType::Count);
+        assert_eq!(lookup.model, "claude-opus-4-8");
+        assert_eq!(lookup.body_bytes, body_bytes.len());
+        assert_eq!(lookup.key_hash.len(), 12);
+    }
+
+    #[tokio::test]
+    async fn non_stream_probe_cache_store_creates_entry_from_success_message() {
+        let service = test_gateway_service().await;
+        let lookup = test_probe_lookup();
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"id":"msg_upstream","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+            ))
+            .expect("response");
+        let (parts, body) = response.into_parts();
+        let body_bytes = body::to_bytes(body, 1024 * 1024).await.expect("body");
+
+        let downstream = service
+            .store_non_stream_probe_cache_entry(&lookup, &test_account(), &parts, body_bytes)
+            .await
+            .expect("store");
+
+        assert_eq!(downstream.status(), StatusCode::OK);
+        let cache = service.non_stream_probe_cache.read().await;
+        let cached = cache.get(&lookup.key).expect("cached entry");
+        assert_eq!(cached.probe_type, NonStreamProbeType::Count);
+        assert_eq!(cached.model, "claude-opus-4-8");
+        assert_eq!(cached.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_stream_probe_cache_store_skips_non_message_response() {
+        let service = test_gateway_service().await;
+        let lookup = test_probe_lookup();
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"type":"error","error":{"message":"bad"}}"#,
+            ))
+            .expect("response");
+        let (parts, body) = response.into_parts();
+        let body_bytes = body::to_bytes(body, 1024 * 1024).await.expect("body");
+
+        let downstream = service
+            .store_non_stream_probe_cache_entry(&lookup, &test_account(), &parts, body_bytes)
+            .await
+            .expect("store");
+
+        assert_eq!(downstream.status(), StatusCode::OK);
+        assert!(
+            !service
+                .non_stream_probe_cache
+                .read()
+                .await
+                .contains_key(&lookup.key)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_stream_probe_cache_hit_returns_cached_response_without_upstream() {
+        let service = test_gateway_service().await;
+        let lookup = test_probe_lookup();
+        let now = std::time::Instant::now();
+        service.non_stream_probe_cache.write().await.insert(
+            lookup.key.clone(),
+            cached_probe_response_with_times(
+                now - Duration::from_secs(60),
+                now + NON_STREAM_PROBE_CACHE_TTL,
+            ),
+        );
+
+        let response = service
+            .try_non_stream_probe_cache_hit(&lookup, &test_account())
+            .await
+            .expect("hit")
+            .expect("cached response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+        assert!(
+            parsed["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("msg_cached_probe_abcdef123456_")
+        );
+        assert_eq!(parsed["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn non_stream_probe_cache_hit_removes_expired_entry() {
+        let service = test_gateway_service().await;
+        let lookup = test_probe_lookup();
+        let now = std::time::Instant::now();
+        service.non_stream_probe_cache.write().await.insert(
+            lookup.key.clone(),
+            cached_probe_response_with_times(
+                now - NON_STREAM_PROBE_CACHE_TTL - Duration::from_secs(1),
+                now - Duration::from_secs(1),
+            ),
+        );
+
+        let response = service
+            .try_non_stream_probe_cache_hit(&lookup, &test_account())
+            .await
+            .expect("hit");
+
+        assert!(response.is_none());
+        assert!(
+            !service
+                .non_stream_probe_cache
+                .read()
+                .await
+                .contains_key(&lookup.key)
+        );
     }
 
     #[test]

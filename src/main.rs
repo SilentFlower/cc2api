@@ -145,6 +145,10 @@ async fn main() {
         .await
         .expect("load 429 request log config failed");
     gateway_svc
+        .reload_non_stream_probe_cache_config()
+        .await
+        .expect("load non-stream probe cache config failed");
+    gateway_svc
         .reload_stream_stability_config()
         .await
         .expect("load stream stability config failed");

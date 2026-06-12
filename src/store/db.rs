@@ -242,6 +242,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
         ),
         (
+            "non_stream_probe_cache_enabled",
+            crate::store::settings_store::DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+        ),
+        (
             "log_429_request_body_limit",
             crate::store::settings_store::DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
         ),

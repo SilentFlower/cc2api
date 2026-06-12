@@ -50,6 +50,8 @@ pub const DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
 pub const DEFAULT_LOG_429_REQUEST_ENABLED: &str = "false";
 /// 非流式 `/v1/messages` 请求观测日志默认关闭,避免默认记录用户请求内容。
 pub const DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED: &str = "false";
+/// 非流式单消息探针缓存默认关闭,避免升级后改变上游请求行为。
+pub const DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED: &str = "false";
 /// 429 请求观测日志默认请求体字符上限。
 pub const DEFAULT_LOG_429_REQUEST_BODY_LIMIT: &str = "8192";
 /// 流式 SSE keep-alive 默认关闭,避免升级后改变下游流字节。
