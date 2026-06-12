@@ -1289,7 +1289,7 @@ impl GatewayService {
                     format_request_capture(path, account, headers, body, request_log_config)
                 );
             }
-            // 业务判断使用解压后的文本；返回给客户端仍使用原始 body，避免改变透传语义。
+            // 业务判断使用解压后的文本；下游响应稍后用统一的 buffered error 逻辑保持 body 与传输头一致。
             let decoded_body = decode_upstream_error_body(&body_bytes, &headers_429);
             let body_snippet = String::from_utf8_lossy(&decoded_body).into_owned();
             warn!(
@@ -1315,16 +1315,19 @@ impl GatewayService {
                 }
             };
 
-            // 用缓冲的 body 重建 429 响应（无需流式）,过滤掉网关指纹响应头后返回。
+            let (downstream_body, remove_transport_headers) =
+                buffered_error_body_for_downstream(body_bytes.clone(), &headers_429);
+
+            // 用缓冲的 body 重建 429 响应（无需流式）。若 body 已为下游解压,同步移除编码/长度等传输头。
             let mut rb = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
             for (k, v) in headers_429.iter() {
-                if is_gateway_fingerprint_header(k.as_str()) {
+                if should_skip_buffered_response_header(k.as_str(), remove_transport_headers) {
                     continue;
                 }
                 rb = rb.header(k.clone(), v.clone());
             }
             let mut response = rb
-                .body(Body::from(body_bytes))
+                .body(Body::from(downstream_body))
                 .map_err(|e| AppError::Internal(format!("build 429 response: {}", e)))?;
             if let Some(RateLimitDecision::RequestBackoff(delay)) = rate_limit_decision {
                 response
