@@ -140,6 +140,7 @@ pub fn build_router(
         .merge(frontend_routes)
         .merge(asset_routes)
         .merge(admin_routes)
+        .route("/v1/messages/count_tokens", post(gateway_count_tokens))
         .fallback(gateway_fallback)
         .with_state(state)
 }
@@ -148,19 +149,41 @@ pub fn build_router(
 
 /// 网关透传 fallback：鉴权 + 代理上游
 async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Response {
-    let key = extract_key(&req);
-    if key.is_empty() {
-        return err_json(StatusCode::UNAUTHORIZED, "missing api key");
-    }
-    let api_token = match state.token_store.get_by_token(&key).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
-        Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
+    let api_token = match authenticate_gateway_token(&state, extract_key(&req)).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
     state
         .gateway_svc
         .handle_request(req, Some(&api_token))
         .await
+}
+
+/// count_tokens 专用入口：鉴权 + 代理 Anthropic token counting API。
+async fn gateway_count_tokens(State(state): State<AppState>, req: Request) -> Response {
+    let api_token = match authenticate_gateway_token(&state, extract_key(&req)).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    state
+        .gateway_svc
+        .handle_count_tokens_request(req, Some(&api_token))
+        .await
+}
+
+/// 校验网关 API token。
+async fn authenticate_gateway_token(state: &AppState, key: String) -> Result<ApiToken, Response> {
+    if key.is_empty() {
+        return Err(err_json(StatusCode::UNAUTHORIZED, "missing api key"));
+    }
+    match state.token_store.get_by_token(&key).await {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(err_json(StatusCode::UNAUTHORIZED, "invalid api key")),
+        Err(_) => Err(err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication failed",
+        )),
+    }
 }
 
 /// 统一 JSON 错误响应

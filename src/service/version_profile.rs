@@ -19,6 +19,10 @@ pub const FABLE_FALLBACK_BETA_TOKENS: &str =
 pub const FABLE_MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-06-01,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code OAuth 相关端点使用的 beta token。
 pub const OAUTH_BETA_TOKEN: &str = "oauth-2025-04-20";
+/// Claude 原生 count_tokens 端点需要的 beta token。
+pub const COUNT_TOKENS_BETA_TOKEN: &str = "token-counting-2024-11-01";
+/// Claude 原生 count_tokens 端点缺省使用的 beta token 集合。
+pub const COUNT_TOKENS_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01";
 /// Claude Code triggers 端点使用的 beta token。
 pub const CODE_TRIGGERS_BETA_TOKEN: &str = "ccr-triggers-2026-01-30";
 /// Claude Code MCP servers 端点使用的 beta token。

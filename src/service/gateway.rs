@@ -26,11 +26,13 @@ use crate::service::account::{AccountService, QueueWaitError, RateLimitDecision}
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
     MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion, StatefulCacheUsage,
-    detect_client_type, ordered_anthropic_headers,
+    detect_client_type, matches_1m_whitelist, merge_anthropic_beta, order_context_1m_after_oauth,
+    ordered_anthropic_headers, strip_beta_token, strip_empty_text_blocks,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
 };
+use crate::service::version_profile::{COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS};
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
@@ -48,6 +50,7 @@ use crate::store::settings_store::{
 };
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
+const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 /// 账号级 FIFO 排队的最长等待时长。超时后会降级到其他账号；队列上限仍由 concurrency 控制。
 const SLOT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// TTFB（Time To First Byte）超时：从 send() 到收到响应头的最长等待时间。
@@ -803,6 +806,180 @@ impl GatewayService {
             Ok(resp) => resp,
             Err(e) => e.into_response(),
         }
+    }
+
+    /// Claude 原生 count_tokens 专用链路。
+    ///
+    /// 该入口只转发 `POST /v1/messages/count_tokens?beta=true`，不进入普通
+    /// `/v1/messages` 的 RPM、并发槽、非流探针缓存、usage、telemetry 和 429 换号重试。
+    ///
+    /// @param req 下游 HTTP 请求。
+    /// @param api_token 已通过网关鉴权的 API token。
+    /// @return 返回上游透传响应或 Anthropic 风格本地错误。
+    pub async fn handle_count_tokens_request(
+        &self,
+        req: Request,
+        api_token: Option<&ApiToken>,
+    ) -> Response {
+        match self.handle_count_tokens_request_inner(req, api_token).await {
+            Ok(resp) => resp,
+            Err(e) => count_tokens_app_error_response(e),
+        }
+    }
+
+    async fn handle_count_tokens_request_inner(
+        &self,
+        req: Request,
+        api_token: Option<&ApiToken>,
+    ) -> Result<Response, AppError> {
+        let method = req.method().clone();
+        if method != axum::http::Method::POST {
+            return Ok(anthropic_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "invalid_request_error",
+                "count_tokens only supports POST",
+            ));
+        }
+
+        let headers = extract_headers(req.headers());
+        let ua = headers
+            .get("User-Agent")
+            .or_else(|| headers.get("user-agent"))
+            .cloned()
+            .unwrap_or_default();
+
+        if let Err(rejection) = self.access_policy.read().await.check_user_agent(&ua) {
+            warn!(
+                "access policy rejected count_tokens request: setting={} reason={}",
+                rejection.setting, rejection.reason
+            );
+            return Ok(access_policy_error_response(&rejection));
+        }
+
+        let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("count_tokens body read failed: {}", e);
+                return Ok(anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Failed to read request body",
+                ));
+            }
+        };
+        if body_bytes.is_empty() {
+            return Ok(anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Request body is empty",
+            ));
+        }
+
+        let mut body_map = match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                return Ok(anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Request body must be a JSON object",
+                ));
+            }
+            Err(_) => {
+                return Ok(anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Failed to parse request body",
+                ));
+            }
+        };
+
+        let mut model_id = match body_map.get("model").and_then(|model| model.as_str()) {
+            Some(model) if !model.trim().is_empty() => model.to_string(),
+            _ => {
+                return Ok(anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "model is required",
+                ));
+            }
+        };
+
+        let client_type = detect_client_type(&ua, COUNT_TOKENS_PATH, &body_map);
+        let session_hash =
+            crate::service::account::generate_session_hash(&ua, &body_map, client_type);
+        let (allowed_ids, blocked_ids) = if let Some(t) = api_token {
+            (t.allowed_account_ids(), t.blocked_account_ids())
+        } else {
+            (vec![], vec![])
+        };
+
+        let selected = match self
+            .account_svc
+            .select_account_with_context(&session_hash, &blocked_ids, &allowed_ids)
+            .await
+        {
+            Ok(selected) => selected,
+            Err(e) => {
+                warn!("count_tokens account selection failed: {}", e);
+                return Ok(anthropic_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "Service temporarily unavailable",
+                ));
+            }
+        };
+        let account = selected.account;
+
+        strip_empty_text_blocks(&mut body_map);
+        sanitize_count_tokens_body(&mut body_map);
+        if let Some(mapped_model) = normalize_count_tokens_model_id(&model_id) {
+            if let Some(obj) = body_map.as_object_mut() {
+                obj.insert(
+                    "model".into(),
+                    serde_json::Value::String(mapped_model.into()),
+                );
+            }
+            model_id = mapped_model.to_string();
+        }
+        let final_body = serde_json::to_vec(&body_map)
+            .map_err(|e| AppError::Internal(format!("serialize count_tokens body: {}", e)))?;
+
+        let mut final_headers = self.rewriter.rewrite_headers(
+            &headers,
+            COUNT_TOKENS_PATH,
+            &account,
+            client_type,
+            &model_id,
+            &body_map,
+        );
+        apply_count_tokens_beta_header(&mut final_headers, &headers, &account, &model_id);
+
+        let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
+            Ok(token) => token,
+            Err(e) => {
+                warn!(
+                    "count_tokens upstream token resolve failed: account={} error={}",
+                    account.id, e
+                );
+                return Ok(anthropic_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "Failed to get access token",
+                ));
+            }
+        };
+        final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+        final_headers = headers_without_content_length(&final_headers);
+
+        info!(
+            "count_tokens_forward account={} model={} body={}",
+            account.id,
+            model_id,
+            safe_body_summary(&final_body)
+        );
+
+        self.forward_count_tokens_request(&final_headers, &final_body, &account)
+            .await
     }
 
     async fn handle_request_inner(
@@ -1712,6 +1889,65 @@ impl GatewayService {
             .body(body)
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))
     }
+
+    async fn forward_count_tokens_request(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+        account: &Account,
+    ) -> Result<Response, AppError> {
+        let target_url = count_tokens_upstream_url();
+        debug!("count_tokens upstream URL: {}", target_url);
+
+        let client = crate::tlsfp::get_request_client(&account.proxy_url);
+        let mut req_builder = client.post(&target_url);
+        for (k, v) in ordered_anthropic_headers(COUNT_TOKENS_PATH, headers) {
+            debug!(
+                "count_tokens upstream header: {}: {}",
+                k,
+                safe_header_log_value(&k, &v)
+            );
+            req_builder = req_builder.header(k, v);
+        }
+        req_builder = req_builder.body(body.to_vec());
+
+        let resp = tokio::time::timeout(UPSTREAM_TTFB_TIMEOUT, req_builder.send())
+            .await
+            .map_err(|_| {
+                warn!(
+                    "count_tokens upstream TTFB timeout for account {}",
+                    account.id
+                );
+                AppError::BadGateway("upstream TTFB timeout".into())
+            })?
+            .map_err(|e| {
+                warn!(
+                    "count_tokens upstream request failed for account {}: {}",
+                    account.id, e
+                );
+                AppError::BadGateway("upstream request failed".into())
+            })?;
+
+        let status_code = resp.status().as_u16();
+        let response_headers = resp.headers().clone();
+        let upstream_body_bytes = resp.bytes().await.unwrap_or_default();
+        if status_code >= 400 {
+            warn!(
+                "count_tokens upstream error: account={} status={} body={}",
+                account.id,
+                status_code,
+                safe_upstream_error_log_body(&upstream_body_bytes, &response_headers)
+            );
+        }
+        let (downstream_body, remove_transport_headers) =
+            buffered_response_body_for_downstream(upstream_body_bytes, &response_headers);
+        rebuild_buffered_upstream_response(
+            status_code,
+            &response_headers,
+            downstream_body,
+            remove_transport_headers,
+        )
+    }
 }
 
 fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
@@ -1722,6 +1958,138 @@ fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, Str
         }
     }
     map
+}
+
+fn count_tokens_upstream_url() -> String {
+    format!("{}{}?beta=true", UPSTREAM_BASE, COUNT_TOKENS_PATH)
+}
+
+fn sanitize_count_tokens_body(body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "max_tokens",
+        "stream",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop_sequences",
+        "stop",
+    ] {
+        obj.remove(key);
+    }
+}
+
+fn normalize_count_tokens_model_id(model_id: &str) -> Option<&'static str> {
+    match model_id {
+        "claude-sonnet-4-5" => Some("claude-sonnet-4-5-20250929"),
+        "claude-opus-4-5" => Some("claude-opus-4-5-20251101"),
+        "claude-haiku-4-5" => Some("claude-haiku-4-5-20251001"),
+        _ => None,
+    }
+}
+
+fn apply_count_tokens_beta_header(
+    headers: &mut std::collections::HashMap<String, String>,
+    original_headers: &std::collections::HashMap<String, String>,
+    account: &Account,
+    model_id: &str,
+) {
+    let incoming_beta = original_headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("anthropic-beta"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    let existing_beta = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("anthropic-beta"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    let base_beta = if incoming_beta.is_empty() {
+        existing_beta
+    } else {
+        incoming_beta
+    };
+    let filtered_beta = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
+        base_beta.to_string()
+    } else {
+        strip_beta_token(base_beta, "context-1m-2025-08-07")
+    };
+    let beta = order_context_1m_after_oauth(merge_anthropic_beta(
+        COUNT_TOKENS_BETA_TOKENS,
+        &filtered_beta,
+    ));
+    let beta = ensure_beta_token(beta, COUNT_TOKENS_BETA_TOKEN);
+
+    headers.retain(|key, _| !key.eq_ignore_ascii_case("anthropic-beta"));
+    headers.insert("anthropic-beta".into(), beta);
+}
+
+fn ensure_beta_token(beta: String, token: &str) -> String {
+    if beta.split(',').map(str::trim).any(|item| item == token) {
+        return beta;
+    }
+    if beta.trim().is_empty() {
+        token.to_string()
+    } else {
+        format!("{},{}", beta, token)
+    }
+}
+
+fn anthropic_error_body(error_type: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        },
+    })
+}
+
+fn anthropic_error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+    (
+        status,
+        axum::Json(anthropic_error_body(error_type, message)),
+    )
+        .into_response()
+}
+
+fn count_tokens_app_error_response(err: AppError) -> Response {
+    match err {
+        AppError::BadRequest(message) => {
+            anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+        }
+        AppError::Unauthorized => anthropic_error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "unauthorized",
+        ),
+        AppError::TooManyRequests(message) => {
+            anthropic_error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &message)
+        }
+        AppError::BadGateway(_) => anthropic_error_response(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "Upstream request failed",
+        ),
+        AppError::ServiceUnavailable(_) => anthropic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "Service temporarily unavailable",
+        ),
+        AppError::NotFound => {
+            anthropic_error_response(StatusCode::NOT_FOUND, "not_found_error", "not found")
+        }
+        AppError::Internal(detail) => {
+            warn!("count_tokens internal error: {}", detail);
+            anthropic_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "internal error",
+            )
+        }
+    }
 }
 
 /// Claude Code 主动扫描响应头检测 AI Gateway/代理（src/services/api/logging.ts）。
@@ -4569,7 +4937,8 @@ mod tests {
         parse_rate_limit_request_body_limit, parse_system_role_model_list, patch_bootstrap_json,
         redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
         rewrite_bootstrap_response, safe_body_summary, safe_non_stream_probe_response_headers,
-        should_intercept_assistant_prefill, signature_retry_body_for_stage, stable_upstream_stream,
+        sanitize_count_tokens_body, should_intercept_assistant_prefill,
+        signature_retry_body_for_stage, stable_upstream_stream,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_stateful_cache_usage_from_bytes,
@@ -4792,6 +5161,140 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[test]
+    fn count_tokens_upstream_url_uses_native_endpoint_with_beta() {
+        assert_eq!(
+            super::count_tokens_upstream_url(),
+            "https://api.anthropic.com/v1/messages/count_tokens?beta=true"
+        );
+    }
+
+    #[test]
+    fn count_tokens_body_sanitizer_removes_generation_fields() {
+        let mut body = json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "max_tokens": 1,
+            "temperature": 0,
+            "top_p": 0.9,
+            "top_k": 5,
+            "stop_sequences": ["x"],
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": []
+        });
+
+        sanitize_count_tokens_body(&mut body);
+
+        for key in [
+            "stream",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stop_sequences",
+        ] {
+            assert!(body.get(key).is_none(), "{key} should be removed");
+        }
+        assert_eq!(body["model"], "claude-opus-4-8");
+        assert!(body.get("messages").is_some());
+        assert!(body.get("tools").is_some());
+    }
+
+    #[test]
+    fn count_tokens_model_normalizer_maps_anthropic_short_ids_only() {
+        assert_eq!(
+            super::normalize_count_tokens_model_id("claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(
+            super::normalize_count_tokens_model_id("claude-opus-4-8"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn count_tokens_success_response_preserves_input_tokens_schema() {
+        let headers = HeaderMap::new();
+        let response = super::rebuild_buffered_upstream_response(
+            200,
+            &headers,
+            Bytes::from_static(br#"{"input_tokens":123}"#),
+            false,
+        )
+        .expect("response");
+        let status = response.status();
+        let body = body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, json!({"input_tokens": 123}));
+    }
+
+    #[test]
+    fn count_tokens_beta_injects_token_counting_and_preserves_client_beta() {
+        let account = test_account();
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-beta".into(), "oauth-2025-04-20".into());
+        let mut original = HashMap::new();
+        original.insert(
+            "Anthropic-Beta".into(),
+            "oauth-2025-04-20,context-management-2025-06-27".into(),
+        );
+
+        super::apply_count_tokens_beta_header(&mut headers, &original, &account, "claude-opus-4-8");
+
+        let beta = headers.get("anthropic-beta").expect("beta header");
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta.contains("oauth-2025-04-20"));
+        assert!(beta.contains("interleaved-thinking-2025-05-14"));
+        assert!(beta.contains("context-management-2025-06-27"));
+        assert!(beta.contains("token-counting-2024-11-01"));
+    }
+
+    #[test]
+    fn count_tokens_beta_filters_context_1m_when_model_not_allowed() {
+        let mut account = test_account();
+        account.allow_1m_models = "opus".into();
+        let mut headers = HashMap::new();
+        let mut original = HashMap::new();
+        original.insert(
+            "anthropic-beta".into(),
+            "oauth-2025-04-20,context-1m-2025-08-07".into(),
+        );
+
+        super::apply_count_tokens_beta_header(
+            &mut headers,
+            &original,
+            &account,
+            "claude-sonnet-4-6",
+        );
+
+        let beta = headers.get("anthropic-beta").expect("beta header");
+        assert!(!beta.contains("context-1m-2025-08-07"));
+        assert!(beta.contains("token-counting-2024-11-01"));
+    }
+
+    #[test]
+    fn count_tokens_local_error_uses_anthropic_shape() {
+        let body = super::anthropic_error_body("invalid_request_error", "model is required");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "model is required");
+    }
+
+    #[test]
+    fn count_tokens_path_does_not_enter_non_stream_probe_detector() {
+        let body = non_stream_probe_request("count");
+
+        assert_eq!(
+            detect_non_stream_probe_type(super::COUNT_TOKENS_PATH, &body, ClientType::ClaudeCode),
+            None
+        );
     }
 
     #[test]

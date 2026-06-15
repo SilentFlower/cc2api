@@ -13,9 +13,9 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    CODE_TRIGGERS_BETA_TOKEN, FABLE_MESSAGE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
-    MCP_PROTOCOL_VERSION, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN,
-    STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
+    CODE_TRIGGERS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
+    MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS,
+    OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
     claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
 };
 
@@ -97,7 +97,7 @@ const FABLE_FALLBACK_MODEL_ID: &str = "claude-opus-4-8";
 ///
 /// 对应 sub2api 的 `stripBetaTokensWithSet`：对非白名单模型默认过滤掉
 /// `context-1m-2025-08-07` 这类受控 beta，防止 Sonnet/Haiku 误开 1M 档计费。
-fn strip_beta_token(beta: &str, token: &str) -> String {
+pub(crate) fn strip_beta_token(beta: &str, token: &str) -> String {
     beta.split(',')
         .map(|t| t.trim())
         .filter(|t| !t.is_empty() && *t != token)
@@ -109,7 +109,7 @@ fn strip_beta_token(beta: &str, token: &str) -> String {
 ///
 /// `allow_1m_models` 是逗号分隔的子串列表（大小写不敏感，空段被忽略）。
 /// 任一子串在 model_id 中出现即视为命中。全空白名单 → 全部 filter。
-fn matches_1m_whitelist(model_id: &str, allow_1m_models: &str) -> bool {
+pub(crate) fn matches_1m_whitelist(model_id: &str, allow_1m_models: &str) -> bool {
     let m = model_id.to_lowercase();
     allow_1m_models
         .split(',')
@@ -119,7 +119,7 @@ fn matches_1m_whitelist(model_id: &str, allow_1m_models: &str) -> bool {
 }
 
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
-fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
+pub(crate) fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut tokens = Vec::new();
     for t in required.split(',') {
@@ -138,7 +138,7 @@ fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
 }
 
 /// 按抓包顺序把 `context-1m` 插入到 `oauth` 后面。
-fn order_context_1m_after_oauth(beta: String) -> String {
+pub(crate) fn order_context_1m_after_oauth(beta: String) -> String {
     let tokens = beta
         .split(',')
         .map(|t| t.trim())
@@ -178,7 +178,9 @@ fn beta_header_for_model(model_id: &str) -> String {
 
 /// 根据 endpoint 返回当前 Claude Code 画像的必需 beta token。
 fn beta_header_for_path(path: &str, model_id: &str) -> String {
-    if is_event_logging_path(path)
+    if path == "/v1/messages/count_tokens" {
+        COUNT_TOKENS_BETA_TOKENS.to_string()
+    } else if is_event_logging_path(path)
         || path.starts_with("/api/eval/")
         || path.starts_with("/api/oauth/")
         || path.starts_with("/api/claude_cli/bootstrap")
@@ -4330,7 +4332,7 @@ fn ensure_fable_fallbacks(body: &mut serde_json::Value) {
 }
 
 /// 移除消息和 system 中的空文本内容块。
-fn strip_empty_text_blocks(body: &mut serde_json::Value) {
+pub(crate) fn strip_empty_text_blocks(body: &mut serde_json::Value) {
     fn filter_blocks(blocks: &mut Vec<serde_json::Value>) {
         blocks.retain(|item| {
             if let Some(block) = item.as_object() {
