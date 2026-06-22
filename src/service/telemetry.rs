@@ -10,14 +10,14 @@ use tracing::{debug, info, warn};
 
 use crate::model::account::Account;
 use crate::model::identity::{
-    RunProfile, build_full_env_json, device_profile, process_snapshot, process_snapshot_json,
-    run_profile,
+    DeviceProfile, RunProfile, build_full_env_json, device_profile, process_snapshot,
+    process_snapshot_json, run_profile,
 };
 use crate::service::account::AccountService;
 use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
-    EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN, claude_code_user_agent, growthbook_user_agent,
-    is_event_logging_path, normalize_version,
+    EVENT_LOGGING_V2_PATH, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, claude_code_user_agent,
+    growthbook_user_agent, is_event_logging_path, normalize_version,
 };
 use crate::store::account_store::AccountStore;
 
@@ -490,7 +490,7 @@ fn build_event_batch(
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     };
 
-    let env_obj = build_full_env_json(&profile.env);
+    let env_obj = telemetry_env_json(&profile);
 
     let mut auth = json!({});
     auth["account_uuid"] = json!(profile.account_uuid);
@@ -578,7 +578,6 @@ fn base_internal_event_data(
     event_data.insert("event_name".into(), json!(event_name));
     event_data.insert("client_timestamp".into(), json!(js_iso_timestamp()));
     event_data.insert("device_id".into(), json!(profile.device_id));
-    event_data.insert("email".into(), json!(profile.email));
     event_data.insert(
         "session_id".into(),
         json!(
@@ -593,7 +592,7 @@ fn base_internal_event_data(
     event_data.insert("is_interactive".into(), json!(true));
     event_data.insert("client_type".into(), json!("cli"));
     event_data.insert("entrypoint".into(), json!("cli"));
-    event_data.insert("betas".into(), json!(""));
+    event_data.insert("betas".into(), json!(MESSAGE_BETA_TOKENS));
     event_data.insert("agent_sdk_version".into(), json!(""));
     event_data.insert("swe_bench_run_id".into(), json!(""));
     event_data.insert("swe_bench_instance_id".into(), json!(""));
@@ -605,11 +604,43 @@ fn base_internal_event_data(
     event_data.insert("skill_name".into(), json!(""));
     event_data.insert("plugin_name".into(), json!(""));
     event_data.insert("marketplace_name".into(), json!(""));
-    event_data.insert("additional_metadata".into(), json!(""));
+    event_data.insert(
+        "additional_metadata".into(),
+        json!(encoded_additional_metadata(event, profile)),
+    );
     event_data.insert("auth".into(), auth.clone());
     event_data.insert("env".into(), env_obj.clone());
     event_data.insert("process".into(), json!(process_b64));
     event_data
+}
+
+fn telemetry_env_json(profile: &DeviceProfile) -> serde_json::Value {
+    let mut env_obj = build_full_env_json(&profile.env);
+    if let Some(map) = env_obj.as_object_mut() {
+        map.insert("shell".into(), json!(profile.prompt.shell));
+        map.insert(
+            "is_running_with_bun".into(),
+            json!(profile.env.is_running_with_bun),
+        );
+    }
+    env_obj
+}
+
+fn encoded_additional_metadata(event: &TelemetryEvent, profile: &DeviceProfile) -> String {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("renderer_mode".into(), json!("cli"));
+    metadata.insert("entrypoint".into(), json!("cli"));
+    metadata.insert("provider".into(), json!("anthropic"));
+    metadata.insert("model".into(), json!(event.model));
+    metadata.insert(
+        "subscription_type".into(),
+        json!(profile.subscription_type.clone().unwrap_or_default()),
+    );
+    if let Some(attempt) = event.fields.get("attempt") {
+        metadata.insert("attempt".into(), attempt.clone());
+    }
+    let bytes = serde_json::to_vec(&serde_json::Value::Object(metadata)).unwrap_or_default();
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
 }
 
 fn enqueue_events(queue: &mut VecDeque<TelemetryEvent>, events: Vec<TelemetryEvent>) {
@@ -920,7 +951,6 @@ fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_j
         "deviceID": profile.device_id,
         "platform": profile.env.platform,
         "appVersion": profile.env.version,
-        "email": profile.email,
         "accountUUID": profile.account_uuid,
         "userType": "external",
         "rateLimitTier": rate_limit_tier(&profile.subscription_type),
@@ -936,7 +966,9 @@ fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_j
 
     json!({
         "attributes": attrs,
-        "forcedFeatures": {},
+        "forcedVariations": {},
+        "forcedFeatures": [],
+        "url": "",
     })
 }
 
@@ -1008,12 +1040,17 @@ mod tests {
             terminal: "ssh-session".into(),
             package_managers: "npm".into(),
             runtimes: "node".into(),
+            is_running_with_bun: false,
             is_claude_ai_auth: true,
             version: DEFAULT_CLAUDE_CODE_VERSION.into(),
             version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
             build_time: DEFAULT_CLAUDE_CODE_BUILD_TIME.into(),
             deployment_environment: "unknown-linux".into(),
             vcs: "git".into(),
+            ..Default::default()
+        };
+        let prompt = CanonicalPromptEnvData {
+            shell: "bash".into(),
             ..Default::default()
         };
         Account {
@@ -1031,7 +1068,7 @@ mod tests {
             proxy_url: String::new(),
             device_id: "device-1".into(),
             canonical_env: serde_json::to_value(env).unwrap(),
-            canonical_prompt: serde_json::to_value(CanonicalPromptEnvData::default()).unwrap(),
+            canonical_prompt: serde_json::to_value(prompt).unwrap(),
             canonical_process: serde_json::to_value(CanonicalProcessData::default()).unwrap(),
             billing_mode: BillingMode::Strip,
             account_uuid: Some("account-uuid".into()),
@@ -1126,9 +1163,15 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0).unwrap(),
         );
         let payload = build_growthbook_eval(&account, &run);
+        assert!(payload.get("forcedVariations").unwrap().is_object());
+        assert!(payload.get("forcedFeatures").unwrap().as_array().is_some());
+        assert_eq!(payload.get("url").unwrap(), "");
         let attrs = payload.get("attributes").unwrap();
+        assert!(attrs.get("email").is_none());
         assert_eq!(attrs.get("id").unwrap(), "device-1");
         assert_eq!(attrs.get("deviceID").unwrap(), "device-1");
+        assert_eq!(attrs.get("platform").unwrap(), "linux");
+        assert_eq!(attrs.get("accountUUID").unwrap(), "account-uuid");
         assert_eq!(
             attrs.get("sessionId").unwrap(),
             &json!(run.growthbook_session_id)
@@ -1144,6 +1187,7 @@ mod tests {
         );
         assert_eq!(attrs.get("entrypoint").unwrap(), "cli");
         assert_eq!(attrs.get("organizationUUID").unwrap(), "org-uuid");
+        assert_eq!(attrs.get("subscriptionType").unwrap(), "max");
     }
 
     #[test]
@@ -1161,12 +1205,33 @@ mod tests {
         let payload = build_event_batch(&account, &run, 12.5, &events);
         let event = &payload["events"][0]["event_data"];
         assert_eq!(event["device_id"], "device-1");
-        assert_eq!(event["email"], "user@example.com");
+        assert!(event.get("email").is_none());
         assert_eq!(event["session_id"], "session-1");
         assert_eq!(event["auth"]["account_uuid"], "account-uuid");
         assert_eq!(event["auth"]["organization_uuid"], "org-uuid");
+        assert!(
+            event["betas"]
+                .as_str()
+                .is_some_and(|betas| !betas.is_empty())
+        );
         assert_eq!(event["env"]["version"], DEFAULT_CLAUDE_CODE_VERSION);
+        assert_eq!(
+            event["env"]["version_base"],
+            DEFAULT_CLAUDE_CODE_VERSION_BASE
+        );
+        assert_eq!(event["env"]["build_time"], DEFAULT_CLAUDE_CODE_BUILD_TIME);
+        assert_eq!(event["env"]["shell"], "bash");
+        assert_eq!(event["env"]["is_running_with_bun"], false);
         assert_eq!(event["env"]["linux_distro_id"], "ubuntu");
+
+        let metadata_b64 = event["additional_metadata"].as_str().unwrap();
+        let decoded_metadata = base64::engine::general_purpose::STANDARD
+            .decode(metadata_b64)
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&decoded_metadata).unwrap();
+        assert_eq!(metadata["renderer_mode"], "cli");
+        assert_eq!(metadata["subscription_type"], "max");
+        assert_eq!(metadata["provider"], "anthropic");
 
         let process_b64 = event["process"].as_str().unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
