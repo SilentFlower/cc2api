@@ -1059,7 +1059,7 @@ impl Rewriter {
         }
     }
 
-    /// 替换已有 metadata.user_id 中的 device_id（CC 客户端模式）。
+    /// 替换已有 metadata.user_id 中的设备与账号身份（CC 客户端模式）。
     fn rewrite_metadata_user_id(&self, body: &mut serde_json::Value, profile: &DeviceProfile) {
         let user_id_str = {
             let metadata = match body.get("metadata").and_then(|m| m.as_object()) {
@@ -1079,6 +1079,10 @@ impl Rewriter {
                     "device_id".into(),
                     serde_json::Value::String(profile.device_id.clone()),
                 );
+                obj.insert(
+                    "account_uuid".into(),
+                    serde_json::Value::String(profile.account_uuid.clone()),
+                );
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                     metadata.insert("user_id".into(), serde_json::Value::String(new_str));
@@ -1088,12 +1092,18 @@ impl Rewriter {
         }
 
         // 旧格式：user_{device}_account_{uuid}_session_{uuid}
-        if let Some(idx) = user_id_str.find("_account_") {
-            let new_val = format!(
-                "user_{}_account_{}",
-                profile.device_id,
-                &user_id_str[idx + 9..]
-            );
+        if let Some(account_idx) = user_id_str.find("_account_") {
+            let account_tail = &user_id_str[account_idx + 9..];
+            let new_val = if let Some(session_idx) = account_tail.find("_session_") {
+                format!(
+                    "user_{}_account_{}_session_{}",
+                    profile.device_id,
+                    profile.account_uuid,
+                    &account_tail[session_idx + 9..]
+                )
+            } else {
+                format!("user_{}_account_{}", profile.device_id, account_tail)
+            };
             if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                 metadata.insert("user_id".into(), serde_json::Value::String(new_val));
             }
@@ -7965,6 +7975,65 @@ mod tests {
         assert!(beta.contains(CTX_1M));
         assert!(beta.contains("claude-code-20250219"));
         assert!(!beta.contains("server-side-fallback-2026-06-01"));
+    }
+
+    #[test]
+    fn claude_code_json_metadata_user_id_rewrites_account_and_keeps_session() {
+        let account = test_account();
+        let body = json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-keep"
+                }).to_string(),
+                "trace_id": "keep-me"
+            },
+            "messages": []
+        });
+
+        let parsed = rewrite_messages_body(body, ClientType::ClaudeCode);
+        let user_id = parsed["metadata"]["user_id"].as_str().unwrap();
+        let user_id_json: serde_json::Value = serde_json::from_str(user_id).unwrap();
+
+        assert_eq!(parsed["metadata"]["trace_id"], json!("keep-me"));
+        assert_eq!(user_id_json["device_id"], json!(account.device_id));
+        assert_eq!(
+            user_id_json["account_uuid"],
+            json!(account.account_uuid.clone().unwrap())
+        );
+        assert_eq!(user_id_json["session_id"], json!("session-keep"));
+        assert_eq!(
+            super::extract_session_id_from_body(&parsed).as_deref(),
+            Some("session-keep")
+        );
+    }
+
+    #[test]
+    fn claude_code_legacy_metadata_user_id_rewrites_account_and_keeps_session() {
+        let account = test_account();
+        let body = json!({
+            "metadata": {
+                "user_id": "user_client-device_account_client-account_session_session-keep"
+            },
+            "messages": []
+        });
+
+        let parsed = rewrite_messages_body(body, ClientType::ClaudeCode);
+        let user_id = parsed["metadata"]["user_id"].as_str().unwrap();
+
+        assert_eq!(
+            user_id,
+            format!(
+                "user_{}_account_{}_session_session-keep",
+                account.device_id,
+                account.account_uuid.clone().unwrap()
+            )
+        );
+        assert_eq!(
+            super::extract_session_id_from_body(&parsed).as_deref(),
+            Some("session-keep")
+        );
     }
 
     #[test]
