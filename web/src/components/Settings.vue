@@ -34,7 +34,7 @@ const primeModel = ref('claude-haiku-4-5-20251001');
 const allowSystemRoleModels = ref('claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.173');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.185');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
 /** 系统提示词环境字段「真值透传」开关(工作目录默认透传) */
@@ -239,7 +239,7 @@ async function loadSettings() {
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.173';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.185';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
     passthroughOsVersion.value = (data.passthrough_os_version ?? 'false') === 'true';
@@ -1077,18 +1077,18 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.173"
+              placeholder="2.1.89-2.1.185"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
             />
-            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、2.1.*、2.1.89-2.1.173；逗号或换行分隔</p>
+            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、2.1.*、2.1.89-2.1.185；逗号或换行分隔</p>
             <div class="flex flex-wrap gap-1.5">
               <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
               <button
                 type="button"
-                @click="allowedClaudeCodeVersions = '2.1.89-2.1.173'"
+                @click="allowedClaudeCodeVersions = '2.1.89-2.1.185'"
                 class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-              >2.1.89-2.1.173</button>
+              >2.1.89-2.1.185</button>
               <button
                 type="button"
                 @click="allowedClaudeCodeVersions = ''"

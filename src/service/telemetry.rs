@@ -1095,7 +1095,7 @@ mod tests {
         let eval_headers = super::telemetry_request_headers(
             "/api/eval/sdk-zAZezfDKGoZuXXKe",
             "redacted",
-            "Bun/1.3.14",
+            "Bun/1.4.0",
             false,
         );
         assert_eq!(eval_headers.get("Accept").unwrap(), "*/*");

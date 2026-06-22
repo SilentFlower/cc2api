@@ -4947,6 +4947,9 @@ mod tests {
     use crate::service::account::AccountService;
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use crate::service::telemetry::TelemetryService;
+    use crate::service::version_profile::{
+        DEFAULT_CLAUDE_CODE_VERSION, STAINLESS_PACKAGE_VERSION, claude_code_user_agent,
+    };
     use crate::store::account_store::AccountStore;
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::SettingsStore;
@@ -5457,10 +5460,13 @@ mod tests {
             ("cookie".to_string(), "session=raw-cookie".to_string()),
             ("anthropic-version".to_string(), "2023-06-01".to_string()),
             ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
-            ("User-Agent".to_string(), "claude-code/2.1.173".to_string()),
+            (
+                "User-Agent".to_string(),
+                claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION),
+            ),
             (
                 "X-Stainless-Package-Version".to_string(),
-                "2.1.173".to_string(),
+                STAINLESS_PACKAGE_VERSION.to_string(),
             ),
         ]);
 
@@ -5474,7 +5480,7 @@ mod tests {
         assert_eq!(parsed["headers"]["anthropic-version"], json!("2023-06-01"));
         assert_eq!(
             parsed["headers"]["user-agent"],
-            json!("claude-code/2.1.173")
+            json!(claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION))
         );
         assert!(parsed["headers"].get("authorization").is_none());
         assert!(parsed["headers"].get("cookie").is_none());
@@ -5612,7 +5618,10 @@ mod tests {
         let body_bytes = serde_json::to_vec(&body).expect("body");
         let headers = HashMap::from([
             ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ("user-agent".to_string(), "claude-code/2.1.173".to_string()),
+            (
+                "user-agent".to_string(),
+                claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION),
+            ),
         ]);
 
         assert!(

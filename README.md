@@ -518,9 +518,9 @@ cc-bridge/
 
 网关通过全局 settings 控制客户端入口访问，校验发生在账号选择和上游请求之前：
 
-- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.173`
+- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.185`
 - `allowed_user_agents`：只作用于非 Claude Code / CLI UA，默认允许 `AI-Hub-Monitor*` 和 `python-httpx*`
-- 版本规则支持精确版本、通配和闭区间，例如 `2.1.173`、`2.1.*`、`2.1.89-2.1.173`
+- 版本规则支持精确版本、通配和闭区间，例如 `2.1.185`、`2.1.*`、`2.1.89-2.1.185`
 - UA 规则支持 `*` 通配，例如 `AI-Hub-Monitor*`、`python-httpx*`
 - 对应配置清空表示关闭该项限制
 - 未命中策略时本地返回 403，不请求上游
@@ -587,10 +587,10 @@ cc-bridge/
 
 ### 请求头改写
 
-- 默认 Claude Code 指纹为 `2.1.173`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移会把已有账号的这三个版本字段升级到当前默认值
+- 默认 Claude Code 指纹为 `2.1.185`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移会把已有账号的这三个版本字段升级到当前默认值
 - `/v1/messages` 使用 `claude-cli/<version> (external, cli)`、`X-Stainless-Package-Version=0.94.0`、`X-Stainless-Runtime-Version=v24.3.0`
 - `/api/event_logging/v2/batch` 使用 `claude-code/<version>`、`anthropic-beta=oauth-2025-04-20`、`x-service-name=claude-code`
-- `/api/eval/*` 使用抓包中的 `Bun/1.3.14` UA
+- `/api/eval/*` 使用抓包中的 `Bun/1.4.0` UA
 - `/v1/code/triggers` / `/v1/mcp_servers` 使用各自 endpoint beta token
 - 注入/合并 `anthropic-beta`、固定必要 `anthropic-version`
 - 强制使用账号真实 `Authorization`
@@ -667,7 +667,7 @@ CCH attestation 重新计算之前完成。
 
 ### Billing / CCH 策略
 
-`billing_mode=rewrite` 会按版本改写 `cc_version` / `cch`。Claude Code `2.1.173` 的 `cc_version` 后缀公式沿用 JS 字符串索引语义；`cch` 使用序列化后的 body（其中 `cch=00000` 保持占位）计算 `xxhash64` 低 20 bits。`2.1.156` / `2.1.169` 使用完整最终 body 与 seed `0x4D659218E32A3268`；`2.1.172` / `2.1.173` 继续使用同 seed，但计算前会把顶层 `model` 值替换为 `""`，并排除顶层 `max_tokens` / `fallbacks` 字段。旧版本继续使用旧 seed `0x6E52736AC806831E`。
+`billing_mode=rewrite` 会按版本改写 `cc_version` / `cch`。Claude Code `2.1.185` 的 `cc_version` 后缀公式沿用 JS 字符串索引语义；`cch` 使用序列化后的 body（其中 `cch=00000` 保持占位）计算 `xxhash64` 低 20 bits。`2.1.156` / `2.1.169` 使用完整最终 body 与 seed `0x4D659218E32A3268`；`2.1.172` / `2.1.173` / `2.1.185` 继续使用同 seed，但计算前会把顶层 `model` 值替换为 `""`，并排除顶层 `max_tokens` / `fallbacks` 字段。旧版本继续使用旧 seed `0x6E52736AC806831E`。
 
 ### TLS 指纹
 

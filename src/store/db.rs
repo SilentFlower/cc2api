@@ -1,8 +1,12 @@
 use sqlx::AnyPool;
 use std::path::Path;
 
-const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] =
-    &["2.1.89-2.1.156", "2.1.89-2.1.169", "2.1.89-2.1.172"];
+const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
+    "2.1.89-2.1.156",
+    "2.1.89-2.1.169",
+    "2.1.89-2.1.172",
+    "2.1.89-2.1.173",
+];
 const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
     "intercept_warmup_non_stream_aux_enabled",
     "intercept_warmup_non_stream_aux_mode",
