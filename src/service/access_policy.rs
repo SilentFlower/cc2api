@@ -15,7 +15,6 @@ pub struct AccessPolicy {
     version_rules: Vec<VersionRule>,
     ua_patterns: Vec<String>,
     raw_versions: String,
-    raw_user_agents: String,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +41,6 @@ impl AccessPolicy {
             version_rules: parse_version_rules(allowed_versions)?,
             ua_patterns: parse_ua_patterns(allowed_user_agents)?,
             raw_versions: allowed_versions.trim().to_string(),
-            raw_user_agents: allowed_user_agents.trim().to_string(),
         })
     }
 
@@ -95,10 +93,7 @@ impl AccessPolicy {
 
         Err(AccessPolicyRejection {
             setting: "allowed_user_agents",
-            reason: format!(
-                "User-Agent '{}' 不在允许列表内；允许规则：{}",
-                user_agent, self.raw_user_agents
-            ),
+            reason: format!("当前 User-Agent '{}' 不允许访问", user_agent),
         })
     }
 }
@@ -367,6 +362,18 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_version_rejection_keeps_allowed_range() {
+        let policy = AccessPolicy::parse("2.1.89-2.1.156", "").unwrap();
+        let rejection = policy.check_user_agent("claude-code/2.1.37").unwrap_err();
+
+        assert_eq!(rejection.setting, "allowed_claude_code_versions");
+        assert_eq!(
+            rejection.reason,
+            "Claude Code 版本 '2.1.37' 不在允许范围内；允许范围：2.1.89-2.1.156"
+        );
+    }
+
+    #[test]
     fn version_range_validation_rejects_reversed_range() {
         assert!(validate_claude_code_versions("2.1.156-2.1.89").is_err());
     }
@@ -394,5 +401,37 @@ mod tests {
         assert_eq!(value["error"]["code"], rejection.setting);
         assert_eq!(value["setting"], rejection.setting);
         assert_eq!(value["reason"], rejection.reason);
+    }
+
+    #[tokio::test]
+    async fn rejected_non_claude_user_agent_response_hides_allowed_patterns() {
+        let policy =
+            AccessPolicy::parse("", "AI-Hub-Monitor*,python-httpx*,PrivateClient/1.*").unwrap();
+        let rejection = policy.check_user_agent("curl/8.0").unwrap_err();
+
+        assert_eq!(rejection.setting, "allowed_user_agents");
+        assert_eq!(rejection.reason, "当前 User-Agent 'curl/8.0' 不允许访问");
+
+        let response = access_policy_error_response(&rejection);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        let value: Value = serde_json::from_str(&body_text).unwrap();
+
+        assert_eq!(
+            value["error"]["message"],
+            "当前 User-Agent 'curl/8.0' 不允许访问"
+        );
+        assert_eq!(value["error"]["code"], "allowed_user_agents");
+        assert_eq!(value["setting"], "allowed_user_agents");
+        assert_eq!(value["reason"], "当前 User-Agent 'curl/8.0' 不允许访问");
+        assert!(body_text.contains("curl/8.0"));
+        assert!(!body_text.contains("AI-Hub-Monitor"));
+        assert!(!body_text.contains("python-httpx"));
+        assert!(!body_text.contains("PrivateClient"));
+        assert!(!body_text.contains("允许规则"));
     }
 }
