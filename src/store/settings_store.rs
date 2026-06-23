@@ -6,11 +6,14 @@ use crate::error::AppError;
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
 };
+use crate::service::version_profile::{ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_VERSION_PROFILE};
 
 /// 允许 `messages[].role=system` 的默认模型列表。
 pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
+/// 默认 Claude Code 版本画像 key。
+pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING: &str = DEFAULT_CLAUDE_CODE_VERSION_PROFILE;
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS_SETTING: &str = DEFAULT_ALLOWED_USER_AGENTS;
 
@@ -68,11 +71,25 @@ pub const DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claud
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {
     pool: AnyPool,
+    driver: String,
 }
 
 impl SettingsStore {
+    /// 构造默认 SQLite 方言的设置存储。
+    ///
+    /// @param pool SQLx 连接池。
+    /// @return 设置存储实例。
     pub fn new(pool: AnyPool) -> Self {
-        Self { pool }
+        Self::new_with_driver(pool, "sqlite".into())
+    }
+
+    /// 构造指定数据库方言的设置存储。
+    ///
+    /// @param pool SQLx 连接池。
+    /// @param driver 数据库驱动名，支持 `sqlite` 和 `postgres`。
+    /// @return 设置存储实例。
+    pub fn new_with_driver(pool: AnyPool, driver: String) -> Self {
+        Self { pool, driver }
     }
 
     /// 读取所有设置项。
@@ -123,11 +140,93 @@ impl SettingsStore {
         }
         Ok(())
     }
+
+    /// 以事务方式应用 Claude Code 版本画像设置。
+    ///
+    /// 该操作会把所有账号的 canonical env 版本字段同步到目标画像，并强制覆盖
+    /// `allowed_claude_code_versions`。账号 env 与 settings 在同一事务中提交，避免热路径
+    /// 看到部分切换后的画像组合。
+    ///
+    /// @param profile 目标版本画像。
+    /// @return 应用成功返回 `Ok(())`，数据库失败时返回业务错误。
+    pub async fn apply_claude_code_profile(
+        &self,
+        profile: &'static ClaudeCodeProfile,
+    ) -> Result<(), AppError> {
+        let identity = &profile.identity;
+        let account_sql = if self.driver == "postgres" {
+            r#"
+            UPDATE accounts
+            SET canonical_env = jsonb_set(
+                jsonb_set(
+                    jsonb_set(canonical_env, '{version}', to_jsonb($1::text), true),
+                    '{version_base}', to_jsonb($2::text), true
+                ),
+                '{build_time}', to_jsonb($3::text), true
+            ),
+            updated_at=NOW()
+            "#
+        } else {
+            r#"
+            UPDATE accounts
+            SET canonical_env = json_set(
+                CASE
+                    WHEN json_valid(canonical_env) THEN canonical_env
+                    ELSE '{}'
+                END,
+                '$.version', $1,
+                '$.version_base', $2,
+                '$.build_time', $3
+            ),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            "#
+        };
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(format!("begin profile transaction: {}", e)))?;
+        sqlx::query(account_sql)
+            .bind(identity.version)
+            .bind(identity.version_base)
+            .bind(identity.build_time)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("update account profile: {}", e)))?;
+
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind("claude_code_version_profile")
+        .bind(profile.key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("upsert profile setting: {}", e)))?;
+
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind("allowed_claude_code_versions")
+        .bind(profile.access_policy.allowed_claude_code_versions)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("upsert allowed versions setting: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("commit profile transaction: {}", e)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, SettingsStore};
+    use super::{
+        DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+        SettingsStore,
+    };
     use sqlx::AnyPool;
 
     async fn make_store() -> SettingsStore {
@@ -139,6 +238,17 @@ mod tests {
             .await
             .expect("migrate");
         SettingsStore::new(pool)
+    }
+
+    async fn make_store_with_pool() -> (SettingsStore, AnyPool) {
+        sqlx::any::install_default_drivers();
+        let tmp = std::env::temp_dir().join(format!("ccgw_settings_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("migrate");
+        (SettingsStore::new(pool.clone()), pool)
     }
 
     #[tokio::test]
@@ -165,5 +275,77 @@ mod tests {
             .await
             .expect("get value");
         assert_eq!(value, DEFAULT_ALLOW_SYSTEM_ROLE_MODELS);
+    }
+
+    #[tokio::test]
+    async fn default_profile_setting_is_current_profile_key() {
+        let store = make_store().await;
+
+        let value = store
+            .get_value(
+                "claude_code_version_profile",
+                DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+            )
+            .await
+            .expect("get value");
+
+        assert_eq!(value, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING);
+    }
+
+    #[tokio::test]
+    async fn apply_profile_updates_accounts_and_allowed_versions() {
+        let (settings_store, pool) = make_store_with_pool().await;
+        sqlx::query(
+            r#"INSERT INTO accounts (
+                email, token, device_id, canonical_env, canonical_prompt_env, canonical_process
+            ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind("user@example.com")
+        .bind("token")
+        .bind("device-1")
+        .bind(r#"{"version":"2.1.185","custom":"keep"}"#)
+        .bind("{}")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .expect("insert account");
+
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "allowed_user_agents".to_string(),
+            "custom-agent".to_string(),
+        );
+        settings_store
+            .upsert_many(&custom)
+            .await
+            .expect("upsert custom");
+
+        let profile = crate::service::version_profile::profile_for_key("2.1.173").unwrap();
+        settings_store
+            .apply_claude_code_profile(profile)
+            .await
+            .expect("apply profile");
+
+        let settings = settings_store.get_all().await.expect("settings");
+        assert_eq!(
+            settings.get("claude_code_version_profile").unwrap(),
+            "2.1.173"
+        );
+        assert_eq!(
+            settings.get("allowed_claude_code_versions").unwrap(),
+            "2.1.89-2.1.173"
+        );
+        assert_eq!(settings.get("allowed_user_agents").unwrap(), "custom-agent");
+
+        let raw: String = sqlx::query_scalar("SELECT canonical_env FROM accounts WHERE email=$1")
+            .bind("user@example.com")
+            .fetch_one(&pool)
+            .await
+            .expect("canonical_env");
+        let env: serde_json::Value = serde_json::from_str(&raw).expect("env json");
+        assert_eq!(env["version"], "2.1.173");
+        assert_eq!(env["version_base"], "2.1.173");
+        assert_eq!(env["build_time"], "2026-06-11T01:23:13Z");
+        assert_eq!(env["custom"], "keep");
     }
 }

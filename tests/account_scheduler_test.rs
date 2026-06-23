@@ -1,4 +1,4 @@
-use chrono::{Duration, Utc};
+use chrono::{Duration, Timelike, Utc};
 use sqlx::AnyPool;
 use std::sync::Arc;
 
@@ -71,6 +71,14 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
         .await
         .expect("failed to create account");
     account
+}
+
+/// 避开 RPM 分钟窗口末尾，防止粘性等待测试在等待期间跨入下一分钟。
+async fn wait_for_stable_rpm_window() {
+    let second = Utc::now().second();
+    if second >= 52 {
+        tokio::time::sleep(std::time::Duration::from_secs((61 - second) as u64)).await;
+    }
 }
 
 // ─── 429 限流测试 ────────────────────────────────────────────
@@ -408,6 +416,8 @@ async fn test_uncommitted_session_selection_does_not_pollute_rpm_retry() {
 
 #[tokio::test]
 async fn test_sticky_rpm_saturation_rejects_instead_of_switching() {
+    wait_for_stable_rpm_window().await;
+
     let (_store, svc) = setup().await;
     let mut account = create_test_account(&svc, "sticky-rpm-reject@example.com").await;
     account.rpm_limit = 1;

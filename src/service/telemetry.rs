@@ -16,8 +16,8 @@ use crate::model::identity::{
 use crate::service::account::AccountService;
 use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
-    EVENT_LOGGING_V2_PATH, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, claude_code_user_agent,
-    growthbook_user_agent, is_event_logging_path, normalize_version,
+    EVENT_LOGGING_V2_PATH, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, TelemetryShape,
+    claude_code_user_agent, is_event_logging_path, normalize_version, profile_for_version,
 };
 use crate::store::account_store::AccountStore;
 
@@ -350,6 +350,7 @@ async fn telemetry_loop(
         };
         if should_gb {
             let payload = build_growthbook_eval(&session.account, &session.run_profile);
+            let user_agent = growthbook_user_agent_for_account(&session.account);
             let token = session.token.clone();
             let c = client.clone();
             session.last_growthbook_at = Some(now);
@@ -361,7 +362,7 @@ async fn telemetry_loop(
                 &format!("{}/api/eval/{}", UPSTREAM_BASE, GROWTHBOOK_CLIENT_KEY),
                 &token,
                 &payload,
-                growthbook_user_agent(),
+                user_agent,
                 false,
             )
             .await;
@@ -385,6 +386,13 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
         .map(|a| device_profile(&a).env.version)
         .unwrap_or_default();
     claude_code_user_agent(normalize_version(&version))
+}
+
+fn growthbook_user_agent_for_account(account: &Account) -> &'static str {
+    let profile = device_profile(account);
+    profile_for_version(&profile.env.version)
+        .telemetry
+        .growthbook_user_agent
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +491,7 @@ fn build_event_batch(
     events: &[TelemetryEvent],
 ) -> serde_json::Value {
     let profile = device_profile(account);
+    let version_profile = profile_for_version(&profile.env.version);
     let process_b64 = {
         let snapshot = process_snapshot(&profile.process, &profile.device_id, uptime_secs);
         let p = process_snapshot_json(&snapshot);
@@ -490,7 +499,7 @@ fn build_event_batch(
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     };
 
-    let env_obj = telemetry_env_json(&profile);
+    let env_obj = telemetry_env_json(&profile, version_profile.telemetry.shape);
 
     let mut auth = json!({});
     auth["account_uuid"] = json!(profile.account_uuid);
@@ -500,7 +509,17 @@ fn build_event_batch(
 
     let events: Vec<serde_json::Value> = events
         .iter()
-        .map(|event| build_event_json(event, run_profile, &profile, &env_obj, &auth, &process_b64))
+        .map(|event| {
+            build_event_json(
+                event,
+                run_profile,
+                &profile,
+                version_profile.telemetry.shape,
+                &env_obj,
+                &auth,
+                &process_b64,
+            )
+        })
         .collect();
 
     json!({ "events": events })
@@ -510,6 +529,7 @@ fn build_event_json(
     event: &TelemetryEvent,
     run_profile: &RunProfile,
     profile: &crate::model::identity::DeviceProfile,
+    shape: TelemetryShape,
     env_obj: &serde_json::Value,
     auth: &serde_json::Value,
     process_b64: &str,
@@ -521,6 +541,7 @@ fn build_event_json(
                 event,
                 run_profile,
                 profile,
+                shape,
                 env_obj,
                 auth,
                 process_b64,
@@ -569,6 +590,7 @@ fn base_internal_event_data(
     event: &TelemetryEvent,
     run_profile: &RunProfile,
     profile: &crate::model::identity::DeviceProfile,
+    shape: TelemetryShape,
     env_obj: &serde_json::Value,
     auth: &serde_json::Value,
     process_b64: &str,
@@ -578,6 +600,9 @@ fn base_internal_event_data(
     event_data.insert("event_name".into(), json!(event_name));
     event_data.insert("client_timestamp".into(), json!(js_iso_timestamp()));
     event_data.insert("device_id".into(), json!(profile.device_id));
+    if shape == TelemetryShape::ClaudeCode2173 {
+        event_data.insert("email".into(), json!(profile.email));
+    }
     event_data.insert(
         "session_id".into(),
         json!(
@@ -592,7 +617,13 @@ fn base_internal_event_data(
     event_data.insert("is_interactive".into(), json!(true));
     event_data.insert("client_type".into(), json!("cli"));
     event_data.insert("entrypoint".into(), json!("cli"));
-    event_data.insert("betas".into(), json!(MESSAGE_BETA_TOKENS));
+    event_data.insert(
+        "betas".into(),
+        json!(match shape {
+            TelemetryShape::ClaudeCode2173 => "",
+            TelemetryShape::ClaudeCode2185 => MESSAGE_BETA_TOKENS,
+        }),
+    );
     event_data.insert("agent_sdk_version".into(), json!(""));
     event_data.insert("swe_bench_run_id".into(), json!(""));
     event_data.insert("swe_bench_instance_id".into(), json!(""));
@@ -604,24 +635,27 @@ fn base_internal_event_data(
     event_data.insert("skill_name".into(), json!(""));
     event_data.insert("plugin_name".into(), json!(""));
     event_data.insert("marketplace_name".into(), json!(""));
-    event_data.insert(
-        "additional_metadata".into(),
-        json!(encoded_additional_metadata(event, profile)),
-    );
+    let additional_metadata = match shape {
+        TelemetryShape::ClaudeCode2173 => String::new(),
+        TelemetryShape::ClaudeCode2185 => encoded_additional_metadata(event, profile),
+    };
+    event_data.insert("additional_metadata".into(), json!(additional_metadata));
     event_data.insert("auth".into(), auth.clone());
     event_data.insert("env".into(), env_obj.clone());
     event_data.insert("process".into(), json!(process_b64));
     event_data
 }
 
-fn telemetry_env_json(profile: &DeviceProfile) -> serde_json::Value {
+fn telemetry_env_json(profile: &DeviceProfile, shape: TelemetryShape) -> serde_json::Value {
     let mut env_obj = build_full_env_json(&profile.env);
-    if let Some(map) = env_obj.as_object_mut() {
-        map.insert("shell".into(), json!(profile.prompt.shell));
-        map.insert(
-            "is_running_with_bun".into(),
-            json!(profile.env.is_running_with_bun),
-        );
+    if shape == TelemetryShape::ClaudeCode2185 {
+        if let Some(map) = env_obj.as_object_mut() {
+            map.insert("shell".into(), json!(profile.prompt.shell));
+            map.insert(
+                "is_running_with_bun".into(),
+                json!(profile.env.is_running_with_bun),
+            );
+        }
     }
     env_obj
 }
@@ -945,6 +979,7 @@ fn normalized_model(model: &str) -> String {
 /// 构造 /api/eval/{clientKey} 请求体（GrowthBook remote eval）。
 fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_json::Value {
     let profile = device_profile(account);
+    let shape = profile_for_version(&profile.env.version).telemetry.shape;
     let mut attrs = json!({
         "id": profile.device_id,
         "sessionId": run_profile.growthbook_session_id,
@@ -956,6 +991,9 @@ fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_j
         "rateLimitTier": rate_limit_tier(&profile.subscription_type),
         "entrypoint": "cli",
     });
+    if shape == TelemetryShape::ClaudeCode2173 {
+        attrs["email"] = json!(profile.email);
+    }
 
     if let Some(ref org) = profile.organization_uuid {
         attrs["organizationUUID"] = json!(org);
@@ -964,12 +1002,18 @@ fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_j
         attrs["subscriptionType"] = json!(sub);
     }
 
-    json!({
-        "attributes": attrs,
-        "forcedVariations": {},
-        "forcedFeatures": [],
-        "url": "",
-    })
+    match shape {
+        TelemetryShape::ClaudeCode2173 => json!({
+            "attributes": attrs,
+            "forcedFeatures": {},
+        }),
+        TelemetryShape::ClaudeCode2185 => json!({
+            "attributes": attrs,
+            "forcedVariations": {},
+            "forcedFeatures": [],
+            "url": "",
+        }),
+    }
 }
 
 /// 根据订阅类型生成 GrowthBook rateLimitTier。
@@ -1025,7 +1069,8 @@ mod tests {
     use crate::service::rewriter::ordered_anthropic_headers;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, claude_code_user_agent,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, apply_identity_to_env_json, claude_code_user_agent,
+        profile_for_key,
     };
     use base64::Engine;
     use chrono::{TimeZone, Utc};
@@ -1089,6 +1134,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn test_account_with_profile(key: &str) -> Account {
+        let mut account = test_account();
+        let profile = profile_for_key(key).expect("profile");
+        apply_identity_to_env_json(&mut account.canonical_env, &profile.identity);
+        account
     }
 
     #[test]
@@ -1191,6 +1243,27 @@ mod tests {
     }
 
     #[test]
+    fn growthbook_eval_uses_2173_shape_and_profile_version() {
+        let account = test_account_with_profile("2.1.173");
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap(),
+        );
+        let payload = build_growthbook_eval(&account, &run);
+        let attrs = payload.get("attributes").unwrap();
+
+        assert_eq!(
+            super::growthbook_user_agent_for_account(&account),
+            "Bun/1.3.14"
+        );
+        assert!(payload.get("forcedVariations").is_none());
+        assert!(payload.get("forcedFeatures").unwrap().is_object());
+        assert!(payload.get("url").is_none());
+        assert_eq!(attrs.get("email").unwrap(), "user@example.com");
+        assert_eq!(attrs.get("appVersion").unwrap(), "2.1.173");
+    }
+
+    #[test]
     fn event_batch_uses_unified_profile_and_bounded_process() {
         let account = test_account();
         let run = run_profile(
@@ -1240,6 +1313,30 @@ mod tests {
         let process: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert!(process["heapUsed"].as_i64().unwrap() <= process["heapTotal"].as_i64().unwrap());
         assert_eq!(process["constrainedMemory"], 0);
+    }
+
+    #[test]
+    fn event_batch_uses_2173_legacy_telemetry_shape() {
+        let account = test_account_with_profile("2.1.173");
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap(),
+        );
+        let events = vec![internal_event(
+            "tengu_api_success",
+            "claude-sonnet-4-20250514",
+            Some("session-1".into()),
+        )];
+        let payload = build_event_batch(&account, &run, 12.5, &events);
+        let event = &payload["events"][0]["event_data"];
+
+        assert_eq!(event["email"], "user@example.com");
+        assert_eq!(event["betas"], "");
+        assert_eq!(event["additional_metadata"], "");
+        assert_eq!(event["env"]["version"], "2.1.173");
+        assert_eq!(event["env"]["version_base"], "2.1.173");
+        assert_eq!(event["env"]["build_time"], "2026-06-11T01:23:13Z");
+        assert!(event["env"].get("shell").is_none());
     }
 
     #[test]

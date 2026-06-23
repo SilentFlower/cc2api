@@ -148,6 +148,8 @@ export interface PrimeLogEntry {
   duration_ms: number;
 }
 
+export type SettingsMap = Record<string, string>
+
 export const api = {
   listAccounts: (page = 1, pageSize = 12) =>
     request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
@@ -173,8 +175,8 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
 
   // 设置
-  getSettings: () => request<Record<string, string>>('GET', '/admin/settings'),
-  updateSettings: (data: Record<string, string>) => request<{ ok: boolean }>('PUT', '/admin/settings', data),
+  getSettings: () => request<SettingsMap>('GET', '/admin/settings'),
+  updateSettings: (data: SettingsMap) => request<{ ok: boolean }>('PUT', '/admin/settings', data),
 
   // 峰值预热日志
   getPrimeLogs: () => request<PrimeLogEntry[]>('GET', '/admin/prime-logs'),

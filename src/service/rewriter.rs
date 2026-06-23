@@ -15,8 +15,9 @@ use crate::model::identity::{
 use crate::service::version_profile::{
     CODE_TRIGGERS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
     MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS,
-    OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
-    claude_code_user_agent, growthbook_user_agent, is_event_logging_path, normalize_version,
+    OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, TelemetryShape,
+    claude_cli_user_agent, claude_code_user_agent, is_event_logging_path, normalize_version,
+    profile_for_version,
 };
 
 /// header wire 大小写映射。
@@ -601,7 +602,13 @@ impl Rewriter {
             }
             if path.starts_with("/api/eval/") {
                 out.insert("Accept".into(), "*/*".into());
-                out.insert("User-Agent".into(), growthbook_user_agent().into());
+                out.insert(
+                    "User-Agent".into(),
+                    profile_for_version(version)
+                        .telemetry
+                        .growthbook_user_agent
+                        .into(),
+                );
                 out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
             } else if is_event_logging_path(path) {
                 out.insert("Accept".into(), "application/json, text/plain, */*".into());
@@ -735,7 +742,10 @@ impl Rewriter {
                 match lower.as_str() {
                     "user-agent" => {
                         let user_agent = if path.starts_with("/api/eval/") {
-                            growthbook_user_agent().to_string()
+                            profile_for_version(version)
+                                .telemetry
+                                .growthbook_user_agent
+                                .to_string()
                         } else if is_event_logging_path(path)
                             || path.starts_with("/api/claude_cli/bootstrap")
                         {
@@ -1311,6 +1321,7 @@ impl Rewriter {
 
     fn rewrite_event_batch(&self, body: &mut serde_json::Value, account: &Account) {
         let profile = device_profile(account);
+        let telemetry_shape = profile_for_version(&profile.env.version).telemetry.shape;
 
         let events = match body.get_mut("events").and_then(|e| e.as_array_mut()) {
             Some(e) => e,
@@ -1325,9 +1336,9 @@ impl Rewriter {
                 None => continue,
             };
 
-            rewrite_event_fields(e, &profile, &canonical_env);
+            rewrite_event_fields(e, &profile, telemetry_shape, &canonical_env);
             if let Some(event_data) = e.get_mut("event_data").and_then(|v| v.as_object_mut()) {
-                rewrite_event_fields(event_data, &profile, &canonical_env);
+                rewrite_event_fields(event_data, &profile, telemetry_shape, &canonical_env);
             }
         }
     }
@@ -1336,12 +1347,16 @@ impl Rewriter {
 
     fn rewrite_growthbook_eval(&self, body: &mut serde_json::Value, account: &Account) {
         let profile = device_profile(account);
-        let attrs = match body.get_mut("attributes").and_then(|a| a.as_object_mut()) {
-            Some(a) => a,
-            None => return,
-        };
+        let telemetry_shape = profile_for_version(&profile.env.version).telemetry.shape;
+        {
+            let attrs = match body.get_mut("attributes").and_then(|a| a.as_object_mut()) {
+                Some(a) => a,
+                None => return,
+            };
 
-        apply_growthbook_attributes(attrs, &profile);
+            apply_growthbook_attributes(attrs, &profile, telemetry_shape);
+        }
+        rewrite_growthbook_payload_shape(body, telemetry_shape);
     }
 
     // --- 通用身份改写 ---
@@ -1815,6 +1830,7 @@ fn build_canonical_env_map(env: &CanonicalEnvData) -> serde_json::Value {
 fn rewrite_event_fields(
     map: &mut serde_json::Map<String, serde_json::Value>,
     profile: &DeviceProfile,
+    shape: TelemetryShape,
     canonical_env: &serde_json::Value,
 ) {
     if map.contains_key("device_id") {
@@ -1823,11 +1839,13 @@ fn rewrite_event_fields(
             serde_json::Value::String(profile.device_id.clone()),
         );
     }
-    if map.contains_key("email") {
+    if shape == TelemetryShape::ClaudeCode2173 && map.contains_key("email") {
         map.insert(
             "email".into(),
             serde_json::Value::String(profile.email.clone()),
         );
+    } else if shape == TelemetryShape::ClaudeCode2185 {
+        map.remove("email");
     }
 
     map.remove("baseUrl");
@@ -1945,20 +1963,22 @@ fn rewrite_user_attributes_json(json_str: &str, account: &Account) -> String {
 
 /// 改写 GrowthBook 实验事件中 user_attributes JSON 字符串内的身份字段。
 fn rewrite_user_attributes_json_with_profile(json_str: &str, profile: &DeviceProfile) -> String {
+    let shape = profile_for_version(&profile.env.version).telemetry.shape;
     let mut obj: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
     };
     if let Some(map) = obj.as_object_mut() {
-        apply_growthbook_attributes(map, profile);
+        apply_growthbook_attributes(map, profile, shape);
     }
     serde_json::to_string(&obj).unwrap_or_else(|_| json_str.to_string())
 }
 
-/// 对 GrowthBook attributes 补齐 Claude Code 2.1.156 抓包中的关键身份字段。
+/// 对 GrowthBook attributes 补齐当前版本画像中的关键身份字段。
 fn apply_growthbook_attributes(
     map: &mut serde_json::Map<String, serde_json::Value>,
     profile: &DeviceProfile,
+    shape: TelemetryShape,
 ) {
     map.insert(
         "id".into(),
@@ -1968,10 +1988,14 @@ fn apply_growthbook_attributes(
         "deviceID".into(),
         serde_json::Value::String(profile.device_id.clone()),
     );
-    map.insert(
-        "email".into(),
-        serde_json::Value::String(profile.email.clone()),
-    );
+    if shape == TelemetryShape::ClaudeCode2173 {
+        map.insert(
+            "email".into(),
+            serde_json::Value::String(profile.email.clone()),
+        );
+    } else {
+        map.remove("email");
+    }
     map.insert(
         "accountUUID".into(),
         serde_json::Value::String(profile.account_uuid.clone()),
@@ -2012,6 +2036,24 @@ fn apply_growthbook_attributes(
             "appVersion".into(),
             serde_json::Value::String(profile.env.version.clone()),
         );
+    }
+}
+
+fn rewrite_growthbook_payload_shape(body: &mut serde_json::Value, shape: TelemetryShape) {
+    let Some(map) = body.as_object_mut() else {
+        return;
+    };
+    match shape {
+        TelemetryShape::ClaudeCode2173 => {
+            map.remove("forcedVariations");
+            map.remove("url");
+            map.insert("forcedFeatures".into(), serde_json::json!({}));
+        }
+        TelemetryShape::ClaudeCode2185 => {
+            map.insert("forcedVariations".into(), serde_json::json!({}));
+            map.insert("forcedFeatures".into(), serde_json::json!([]));
+            map.insert("url".into(), serde_json::Value::String(String::new()));
+        }
     }
 }
 
@@ -4773,8 +4815,8 @@ mod tests {
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_FALLBACK_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
         MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS,
-        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, claude_cli_user_agent,
-        claude_code_user_agent,
+        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json,
+        claude_cli_user_agent, claude_code_user_agent, profile_for_key,
     };
     use base64::Engine;
     use chrono::Utc;
@@ -4849,6 +4891,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn test_account_with_profile(key: &str) -> Account {
+        let mut account = test_account();
+        let profile = profile_for_key(key).expect("profile");
+        apply_identity_to_env_json(&mut account.canonical_env, &profile.identity);
+        account
     }
 
     fn rewrite_messages_body(
@@ -8677,6 +8726,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let attrs = parsed.get("attributes").unwrap();
         assert_eq!(attrs.get("id").unwrap(), "device-1");
+        assert!(attrs.get("email").is_none());
         assert_eq!(attrs.get("userType").unwrap(), "external");
         assert_eq!(
             attrs.get("rateLimitTier").unwrap(),
@@ -8687,7 +8737,43 @@ mod tests {
             attrs.get("appVersion").unwrap(),
             DEFAULT_CLAUDE_CODE_VERSION
         );
+        assert!(parsed.get("forcedVariations").unwrap().is_object());
+        assert!(parsed.get("forcedFeatures").unwrap().is_array());
+        assert_eq!(parsed.get("url").unwrap(), "");
         assert!(attrs.get("apiBaseUrlHost").is_none());
+    }
+
+    #[test]
+    fn growthbook_rewrite_uses_2173_payload_shape() {
+        let account = test_account_with_profile("2.1.173");
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "attributes": {
+                "email": "old@example.com",
+                "apiBaseUrlHost": "proxy.local"
+            },
+            "forcedVariations": {},
+            "forcedFeatures": [],
+            "url": "",
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/eval/sdk-zAZezfDKGoZuXXKe",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let attrs = parsed.get("attributes").unwrap();
+
+        assert_eq!(attrs.get("email").unwrap(), "user@example.com");
+        assert_eq!(attrs.get("appVersion").unwrap(), "2.1.173");
+        assert!(parsed.get("forcedVariations").is_none());
+        assert!(parsed.get("forcedFeatures").unwrap().is_object());
+        assert!(parsed.get("url").is_none());
     }
 
     #[test]
@@ -8733,11 +8819,12 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let event = &parsed["events"][0]["event_data"];
         assert_eq!(event["device_id"], "device-1");
-        assert_eq!(event["email"], "user@example.com");
+        assert!(event.get("email").is_none());
         assert_eq!(event["account_uuid"], "account-uuid");
         assert_eq!(event["organization_uuid"], "org-uuid");
         let attrs: serde_json::Value =
             serde_json::from_str(event["user_attributes"].as_str().unwrap()).unwrap();
+        assert!(attrs.get("email").is_none());
         assert_eq!(attrs["userType"], "external");
         assert!(attrs.get("apiBaseUrlHost").is_none());
 
@@ -8765,6 +8852,41 @@ mod tests {
             compute_cc_version_suffix("abcd你fghijklmnopqrstuv", "2.1.156"),
             "45e"
         );
+    }
+
+    #[test]
+    fn event_logging_rewrite_uses_2173_shape() {
+        let account = test_account_with_profile("2.1.173");
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "events": [{
+                "event_type": "ClaudeCodeInternalEvent",
+                "event_data": {
+                    "device_id": "old",
+                    "email": "old@example.com",
+                    "env": {},
+                    "user_attributes": "{\"email\":\"old@example.com\"}"
+                }
+            }]
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let event = &parsed["events"][0]["event_data"];
+        let attrs: serde_json::Value =
+            serde_json::from_str(event["user_attributes"].as_str().unwrap()).unwrap();
+
+        assert_eq!(event["email"], "user@example.com");
+        assert_eq!(event["env"]["version"], "2.1.173");
+        assert_eq!(attrs["email"], "user@example.com");
     }
 
     #[test]

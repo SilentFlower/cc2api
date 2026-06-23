@@ -34,6 +34,7 @@ const primeModel = ref('claude-haiku-4-5-20251001');
 const allowSystemRoleModels = ref('claude-opus-4-8');
 
 /** 客户端访问策略表单 */
+const claudeCodeVersionProfile = ref('2.1.185');
 const allowedClaudeCodeVersions = ref('2.1.89-2.1.185');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
@@ -88,6 +89,38 @@ const logsLoading = ref(false);
 const saving = ref(false);
 const loaded = ref(false);
 
+interface ClaudeCodeVersionProfileOption {
+  key: string;
+  version: string;
+  version_base?: string;
+  build_time: string;
+  allowed_claude_code_versions: string;
+  growthbook_user_agent: string;
+  telemetry_shape: string;
+}
+
+/** Claude Code 版本画像选项 */
+const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
+  {
+    key: '2.1.185',
+    version: '2.1.185',
+    version_base: '2.1.185',
+    build_time: '2026-06-20T06:38:30Z',
+    allowed_claude_code_versions: '2.1.89-2.1.185',
+    growthbook_user_agent: 'Bun/1.4.0',
+    telemetry_shape: 'claude_code_2_1_185',
+  },
+  {
+    key: '2.1.173',
+    version: '2.1.173',
+    version_base: '2.1.173',
+    build_time: '2026-06-11T01:23:13Z',
+    allowed_claude_code_versions: '2.1.89-2.1.173',
+    growthbook_user_agent: 'Bun/1.3.14',
+    telemetry_shape: 'claude_code_2_1_173',
+  },
+]);
+
 /** 权重总和 */
 const totalWeight = computed(() => {
   return parseFloat(w7d.value || '0') + parseFloat(w5h.value || '0') + parseFloat(wconc.value || '0');
@@ -115,6 +148,37 @@ function parseAutoModeClassifierMode(raw: string | undefined): AutoModeClassifie
     return raw;
   }
   return 'passthrough';
+}
+
+/** 解析后端返回的 Claude Code 版本画像列表 */
+function parseClaudeCodeVersionProfiles(raw: string | undefined): ClaudeCodeVersionProfileOption[] {
+  if (!raw) return claudeCodeVersionProfiles.value;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return claudeCodeVersionProfiles.value;
+    const options = parsed
+      .map((item) => item as Partial<ClaudeCodeVersionProfileOption>)
+      .filter((item) => {
+        return typeof item.key === 'string'
+          && typeof item.version === 'string'
+          && typeof item.build_time === 'string'
+          && typeof item.allowed_claude_code_versions === 'string'
+          && typeof item.growthbook_user_agent === 'string'
+          && typeof item.telemetry_shape === 'string';
+      })
+      .map((item) => ({
+        key: item.key as string,
+        version: item.version as string,
+        version_base: item.version_base,
+        build_time: item.build_time as string,
+        allowed_claude_code_versions: item.allowed_claude_code_versions as string,
+        growthbook_user_agent: item.growthbook_user_agent as string,
+        telemetry_shape: item.telemetry_shape as string,
+      }));
+    return options.length > 0 ? options : claudeCodeVersionProfiles.value;
+  } catch {
+    return claudeCodeVersionProfiles.value;
+  }
 }
 
 /** 预热小时输入是否合法(逗号分隔的 0-23,允许空) */
@@ -239,6 +303,8 @@ async function loadSettings() {
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
+    claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
+    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.185';
     allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.185';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
@@ -352,6 +418,7 @@ async function saveSettings() {
       peak_prime_hours: primeHours.value.trim(),
       peak_prime_model: primeModel.value.trim(),
       allow_system_role_models: allowSystemRoleModels.value.trim(),
+      claude_code_version_profile: claudeCodeVersionProfile.value,
       allowed_claude_code_versions: allowedClaudeCodeVersions.value.trim(),
       allowed_user_agents: allowedUserAgents.value.trim(),
       passthrough_shell: passthroughShell.value ? 'true' : 'false',
@@ -379,6 +446,7 @@ async function saveSettings() {
       intercept_auto_mode_classifier_stage1_mode: interceptAutoModeClassifierStage1Mode.value,
       intercept_auto_mode_classifier_stage2_mode: interceptAutoModeClassifierStage2Mode.value,
     });
+    await loadSettings();
     toast('保存成功');
   } catch (e) {
     toast((e as Error).message || '保存失败');
@@ -1071,6 +1139,42 @@ onMounted(async () => {
           </p>
         </div>
 
+        <div class="space-y-3 border-b border-[#f0ebe4] pb-4">
+          <div>
+            <Label class="text-[#5c5647] text-sm">Claude Code 版本特征</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              保存后同步所有账号 canonical env，并覆盖 Claude Code 版本范围；其他允许 UA 保持独立配置。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="space-y-1.5">
+              <select
+                v-model="claudeCodeVersionProfile"
+                class="h-9 w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 text-sm text-[#29261e] focus:outline-none focus:ring-2 focus:ring-[#c4704f]"
+              >
+                <option
+                  v-for="profile in claudeCodeVersionProfiles"
+                  :key="profile.key"
+                  :value="profile.key"
+                >
+                  {{ profile.version }}
+                </option>
+              </select>
+            </div>
+            <div class="text-[11px] text-[#8c8475] leading-5">
+              <template v-for="profile in claudeCodeVersionProfiles" :key="profile.key">
+                <div v-if="profile.key === claudeCodeVersionProfile">
+                  <span class="font-mono">{{ profile.allowed_claude_code_versions }}</span>
+                  <span class="mx-1">·</span>
+                  <span>{{ profile.growthbook_user_agent }}</span>
+                  <span class="mx-1">·</span>
+                  <span>{{ profile.telemetry_shape }}</span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">Claude Code 版本范围</Label>
@@ -1078,23 +1182,11 @@ onMounted(async () => {
               v-model="allowedClaudeCodeVersions"
               rows="4"
               placeholder="2.1.89-2.1.185"
-              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm bg-[#f9f6f1]"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
+              readonly
             />
-            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、2.1.*、2.1.89-2.1.185；逗号或换行分隔</p>
-            <div class="flex flex-wrap gap-1.5">
-              <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
-              <button
-                type="button"
-                @click="allowedClaudeCodeVersions = '2.1.89-2.1.185'"
-                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-              >2.1.89-2.1.185</button>
-              <button
-                type="button"
-                @click="allowedClaudeCodeVersions = ''"
-                class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-red-300 hover:bg-red-50 hover:text-red-600 transition-colors"
-              >关闭版本限制</button>
-            </div>
+            <p class="text-[11px] text-[#b5b0a6]">该值由版本特征强制覆盖，保存后按后端返回值回显。</p>
           </div>
 
           <div class="space-y-2">

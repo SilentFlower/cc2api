@@ -5,7 +5,8 @@ use serde_json::json;
 use crate::error::AppError;
 
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
-pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str = "2.1.89-2.1.185";
+pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str =
+    crate::service::version_profile::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS: &str = "AI-Hub-Monitor*\npython-httpx*";
 

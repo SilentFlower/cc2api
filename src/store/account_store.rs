@@ -6,6 +6,7 @@ use sqlx::any::AnyRow;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
+use crate::service::version_profile::IdentityProfile;
 
 pub struct AccountStore {
     pool: AnyPool,
@@ -242,6 +243,56 @@ impl AccountStore {
             .bind(auto_poll_usage_int)
             .bind(&a.allow_1m_models)
             .bind(a.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 批量覆盖所有账号 canonical env 中的 Claude Code 版本身份字段。
+    ///
+    /// @param identity 目标版本身份画像。
+    /// @return 更新成功返回 `Ok(())`，数据库失败时返回业务错误。
+    pub async fn update_all_canonical_env_identity(
+        &self,
+        identity: &IdentityProfile,
+    ) -> Result<(), AppError> {
+        let q = if self.is_pg() {
+            format!(
+                r#"
+                UPDATE accounts
+                SET canonical_env = jsonb_set(
+                    jsonb_set(
+                        jsonb_set(canonical_env, '{{version}}', to_jsonb($1::text), true),
+                        '{{version_base}}', to_jsonb($2::text), true
+                    ),
+                    '{{build_time}}', to_jsonb($3::text), true
+                ),
+                updated_at={}
+                "#,
+                self.now_expr()
+            )
+        } else {
+            format!(
+                r#"
+                UPDATE accounts
+                SET canonical_env = json_set(
+                    CASE
+                        WHEN json_valid(canonical_env) THEN canonical_env
+                        ELSE '{{}}'
+                    END,
+                    '$.version', $1,
+                    '$.version_base', $2,
+                    '$.build_time', $3
+                ),
+                updated_at={}
+                "#,
+                self.now_expr()
+            )
+        };
+        sqlx::query(&q)
+            .bind(identity.version)
+            .bind(identity.version_base)
+            .bind(identity.build_time)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -522,5 +573,44 @@ mod tests {
             .unwrap()
             .and_utc();
         assert_eq!(store.fmt_time(t), "2026-04-09T12:30:45Z");
+    }
+
+    #[tokio::test]
+    async fn update_all_canonical_env_identity_preserves_other_env_fields() {
+        let store = make_store("sqlite").await;
+        crate::store::db::migrate(&store.pool, "sqlite")
+            .await
+            .expect("migrate");
+        sqlx::query(
+            r#"INSERT INTO accounts (
+                email, token, device_id, canonical_env, canonical_prompt_env, canonical_process
+            ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind("user@example.com")
+        .bind("token")
+        .bind("device-1")
+        .bind(r#"{"version":"2.1.185","version_base":"2.1.185","build_time":"old","platform":"linux"}"#)
+        .bind("{}")
+        .bind("{}")
+        .execute(&store.pool)
+        .await
+        .expect("insert account");
+
+        let profile = crate::service::version_profile::profile_for_key("2.1.173").unwrap();
+        store
+            .update_all_canonical_env_identity(&profile.identity)
+            .await
+            .expect("update identity");
+
+        let raw: String = sqlx::query_scalar("SELECT canonical_env FROM accounts WHERE email=$1")
+            .bind("user@example.com")
+            .fetch_one(&store.pool)
+            .await
+            .expect("canonical_env");
+        let env: serde_json::Value = serde_json::from_str(&raw).expect("env json");
+        assert_eq!(env["version"], "2.1.173");
+        assert_eq!(env["version_base"], "2.1.173");
+        assert_eq!(env["build_time"], "2026-06-11T01:23:13Z");
+        assert_eq!(env["platform"], "linux");
     }
 }

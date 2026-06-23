@@ -27,11 +27,13 @@ use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrite};
 use crate::service::telemetry::TelemetryService;
+use crate::service::version_profile::{all_profiles, profile_for_key};
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
-    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -719,6 +721,14 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("allowed_claude_code_versions".into())
         .or_insert_with(|| DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS.to_string());
     settings
+        .entry("claude_code_version_profile".into())
+        .or_insert_with(|| DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING.to_string());
+    settings.insert(
+        "claude_code_version_profiles".into(),
+        serde_json::to_string(&claude_code_version_profile_options())
+            .unwrap_or_else(|_| "[]".into()),
+    );
+    settings
         .entry("allowed_user_agents".into())
         .or_insert_with(|| DEFAULT_ALLOWED_USER_AGENTS.to_string());
     settings
@@ -800,6 +810,26 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     Ok(Json(serde_json::json!(settings)))
 }
 
+/// 构造前端可选 Claude Code 版本画像列表。
+///
+/// @return 可序列化的版本画像摘要列表。
+fn claude_code_version_profile_options() -> Vec<serde_json::Value> {
+    all_profiles()
+        .iter()
+        .map(|profile| {
+            serde_json::json!({
+                "key": profile.key,
+                "version": profile.identity.version,
+                "version_base": profile.identity.version_base,
+                "build_time": profile.identity.build_time,
+                "allowed_claude_code_versions": profile.access_policy.allowed_claude_code_versions,
+                "growthbook_user_agent": profile.telemetry.growthbook_user_agent,
+                "telemetry_shape": profile.telemetry.shape.as_str(),
+            })
+        })
+        .collect()
+}
+
 /// 批量更新设置项。
 async fn update_settings(
     State(state): State<AppState>,
@@ -854,6 +884,20 @@ async fn update_settings(
     // 允许 messages[].role=system 的模型列表:逗号分隔,允许为空;非空项必须是模型 ID 安全集。
     if let Some(val) = body.get("allow_system_role_models") {
         validate_model_id_list("allow_system_role_models", val)?;
+    }
+    let selected_profile = if let Some(val) = body.get("claude_code_version_profile") {
+        Some(profile_for_key(val)?)
+    } else {
+        None
+    };
+    if let Some(profile) = selected_profile {
+        body.insert(
+            "allowed_claude_code_versions".into(),
+            profile
+                .access_policy
+                .allowed_claude_code_versions
+                .to_string(),
+        );
     }
     if let Some(val) = body.get("allowed_claude_code_versions") {
         validate_claude_code_versions(val)?;
@@ -936,6 +980,15 @@ async fn update_settings(
     if let Some(val) = body.get("bootstrap_additional_model_options") {
         parse_bootstrap_additional_model_options(val)?;
     }
+    let profile_changed = selected_profile.is_some();
+    if let Some(profile) = selected_profile {
+        state
+            .settings_store
+            .apply_claude_code_profile(profile)
+            .await?;
+        body.remove("claude_code_version_profile");
+        body.remove("allowed_claude_code_versions");
+    }
     state.settings_store.upsert_many(&body).await?;
     if let Some(val) = body.get("proxy_client_pool_enabled") {
         crate::tlsfp::set_request_client_pool_enabled(val == "true");
@@ -943,7 +996,9 @@ async fn update_settings(
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
     }
-    if body.contains_key("allowed_claude_code_versions") || body.contains_key("allowed_user_agents")
+    if profile_changed
+        || body.contains_key("allowed_claude_code_versions")
+        || body.contains_key("allowed_user_agents")
     {
         state.gateway_svc.reload_access_policy().await?;
     }

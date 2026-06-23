@@ -166,6 +166,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING,
         ),
         (
+            "claude_code_version_profile",
+            crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+        ),
+        (
             "allowed_user_agents",
             crate::store::settings_store::DEFAULT_ALLOWED_USER_AGENTS_SETTING,
         ),
@@ -335,9 +339,7 @@ async fn upgrade_account_claude_code_profile(
     pool: &AnyPool,
     driver: &str,
 ) -> Result<(), sqlx::Error> {
-    let version = crate::service::version_profile::DEFAULT_CLAUDE_CODE_VERSION;
-    let version_base = crate::service::version_profile::DEFAULT_CLAUDE_CODE_VERSION_BASE;
-    let build_time = crate::service::version_profile::DEFAULT_CLAUDE_CODE_BUILD_TIME;
+    let identity = &crate::service::version_profile::default_profile().identity;
     let sql = if driver == "sqlite" {
         r#"
         UPDATE accounts
@@ -364,9 +366,9 @@ async fn upgrade_account_claude_code_profile(
         "#
     };
     sqlx::query(sql)
-        .bind(version)
-        .bind(version_base)
-        .bind(build_time)
+        .bind(identity.version)
+        .bind(identity.version_base)
+        .bind(identity.build_time)
         .execute(pool)
         .await?;
     Ok(())
@@ -582,6 +584,23 @@ mod tests {
             .await
             .expect("custom setting");
         assert_eq!(custom, "2.1.*");
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_default_claude_code_version_profile_setting() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let profile: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("claude_code_version_profile")
+            .fetch_one(&pool)
+            .await
+            .expect("profile setting");
+
+        assert_eq!(
+            profile,
+            crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING
+        );
     }
 
     #[tokio::test]

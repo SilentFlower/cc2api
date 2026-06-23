@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType};
 use crate::service::rewriter::ClientType;
+use crate::service::version_profile::{
+    apply_identity_to_env_json, default_profile, profile_for_key,
+};
 use crate::store::account_store::AccountStore;
 use crate::store::cache::CacheStore;
 
@@ -394,7 +397,7 @@ impl AccountService {
         let (device_id, env, prompt, process) =
             crate::model::identity::generate_canonical_identity();
         a.device_id = device_id;
-        a.canonical_env = env;
+        a.canonical_env = self.current_profile_env(env).await;
         a.canonical_prompt = prompt;
         a.canonical_process = process;
 
@@ -418,6 +421,26 @@ impl AccountService {
         normalize_account_auth(a)?;
 
         self.store.create(a).await
+    }
+
+    /// 将当前 settings 中选定的 Claude Code 版本画像应用到新账号 env。
+    ///
+    /// @param env 新账号随机预设生成的 canonical env。
+    /// @return 覆盖版本字段后的 canonical env。
+    async fn current_profile_env(&self, mut env: serde_json::Value) -> serde_json::Value {
+        let profile = match self
+            .settings_store
+            .get_value(
+                "claude_code_version_profile",
+                crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+            )
+            .await
+        {
+            Ok(key) => profile_for_key(&key).unwrap_or_else(|_| default_profile()),
+            Err(_) => default_profile(),
+        };
+        apply_identity_to_env_json(&mut env, &profile.identity);
+        env
     }
 
     pub async fn update_account(&self, a: &Account) -> Result<(), AppError> {
@@ -1523,6 +1546,28 @@ mod tests {
         (store, svc)
     }
 
+    async fn setup_account_service_with_settings()
+    -> (Arc<AccountStore>, Arc<SettingsStore>, Arc<AccountService>) {
+        sqlx::any::install_default_drivers();
+        let tmp =
+            std::env::temp_dir().join(format!("ccgw_account_service_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("migrate");
+
+        let store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let cache = Arc::new(MemoryStore::new());
+        let settings_store = Arc::new(SettingsStore::new(pool));
+        let svc = Arc::new(AccountService::new(
+            store.clone(),
+            cache,
+            settings_store.clone(),
+        ));
+        (store, settings_store, svc)
+    }
+
     /// 生成一个相对当前时间指定偏移的 RFC3339 字符串。
     fn rfc3339_at(offset: ChronoDuration) -> String {
         (Utc::now() + offset).to_rfc3339()
@@ -1569,6 +1614,68 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn new_account_request(email: &str) -> Account {
+        Account {
+            id: 0,
+            name: "测试账号".into(),
+            email: email.into(),
+            status: AccountStatus::Active,
+            auth_type: AccountAuthType::Oauth,
+            setup_token: String::new(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+            oauth_refreshed_at: None,
+            auth_error: String::new(),
+            proxy_url: String::new(),
+            device_id: String::new(),
+            canonical_env: json!({}),
+            canonical_prompt: json!({}),
+            canonical_process: json!({}),
+            billing_mode: BillingMode::Strip,
+            account_uuid: None,
+            organization_uuid: None,
+            subscription_type: None,
+            concurrency: 3,
+            priority: 50,
+            rpm_limit: 0,
+            rate_limited_at: None,
+            rate_limit_reset_at: None,
+            disable_reason: String::new(),
+            auto_telemetry: false,
+            auto_poll_usage: false,
+            allow_1m_models: "opus".into(),
+            telemetry_count: 0,
+            usage_data: json!({}),
+            usage_fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_account_uses_selected_claude_code_profile() {
+        let (_store, settings_store, svc) = setup_account_service_with_settings().await;
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            "claude_code_version_profile".to_string(),
+            "2.1.173".to_string(),
+        );
+        settings_store
+            .upsert_many(&settings)
+            .await
+            .expect("upsert setting");
+
+        let mut account = new_account_request("profile@example.com");
+        svc.create_account(&mut account)
+            .await
+            .expect("create account");
+
+        assert_eq!(account.canonical_env["version"], "2.1.173");
+        assert_eq!(account.canonical_env["version_base"], "2.1.173");
+        assert_eq!(account.canonical_env["build_time"], "2026-06-11T01:23:13Z");
     }
 
     // ---- check_usage_window ----

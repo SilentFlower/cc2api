@@ -69,7 +69,10 @@ async fn main() {
         pool.clone(),
         driver.clone(),
     ));
-    let settings_store = Arc::new(store::settings_store::SettingsStore::new(pool.clone()));
+    let settings_store = Arc::new(store::settings_store::SettingsStore::new_with_driver(
+        pool.clone(),
+        driver.clone(),
+    ));
     let prime_log_store = Arc::new(store::prime_log_store::PrimeLogStore::new(pool.clone()));
 
     let proxy_client_pool_enabled = settings_store
