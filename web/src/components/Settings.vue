@@ -36,6 +36,7 @@ const allowSystemRoleModels = ref('claude-opus-4-8');
 /** 客户端访问策略表单 */
 const claudeCodeVersionProfile = ref('2.1.187');
 const allowedClaudeCodeVersions = ref('2.1.89-2.1.187');
+const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
 /** 系统提示词环境字段「真值透传」开关(工作目录默认透传) */
@@ -226,9 +227,9 @@ const isValidSystemRoleModels = computed(() => {
   });
 });
 
-/** Claude Code 版本范围是否合法 */
-const isValidClaudeCodeVersions = computed(() => {
-  const raw = allowedClaudeCodeVersions.value.trim();
+/** Claude Code 版本规则列表是否合法 */
+function isValidClaudeCodeVersionRules(rawValue: string): boolean {
+  const raw = rawValue.trim();
   if (!raw) return true;
   return raw.split(/[,\n\r]+/).every((s) => {
     const item = s.trim();
@@ -239,7 +240,13 @@ const isValidClaudeCodeVersions = computed(() => {
     const range = new RegExp(`^${version}-${version}$`);
     return exact.test(item) || wildcard.test(item) || range.test(item);
   });
-});
+}
+
+/** Claude Code 版本范围是否合法 */
+const isValidClaudeCodeVersions = computed(() => isValidClaudeCodeVersionRules(allowedClaudeCodeVersions.value));
+
+/** 禁止的 Claude Code 版本范围是否合法 */
+const isValidBlockedClaudeCodeVersions = computed(() => isValidClaudeCodeVersionRules(blockedClaudeCodeVersions.value));
 
 /** UA pattern 列表是否合法 */
 const isValidAllowedUserAgents = computed(() => {
@@ -326,6 +333,7 @@ async function loadSettings() {
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
     claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.187';
     allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.187';
+    blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
     passthroughOsVersion.value = (data.passthrough_os_version ?? 'false') === 'true';
@@ -400,6 +408,10 @@ async function saveSettings() {
     toast('Claude Code 版本范围格式不正确');
     return;
   }
+  if (!isValidBlockedClaudeCodeVersions.value) {
+    toast('禁止 Claude Code 版本格式不正确');
+    return;
+  }
   if (!isValidAllowedUserAgents.value) {
     toast('UA 白名单包含非法字符');
     return;
@@ -440,6 +452,7 @@ async function saveSettings() {
       allow_system_role_models: allowSystemRoleModels.value.trim(),
       claude_code_version_profile: claudeCodeVersionProfile.value,
       allowed_claude_code_versions: allowedClaudeCodeVersions.value.trim(),
+      blocked_claude_code_versions: blockedClaudeCodeVersions.value.trim(),
       allowed_user_agents: allowedUserAgents.value.trim(),
       passthrough_shell: passthroughShell.value ? 'true' : 'false',
       passthrough_os_version: passthroughOsVersion.value ? 'true' : 'false',
@@ -1195,7 +1208,7 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">Claude Code 版本范围</Label>
             <Textarea
@@ -1207,6 +1220,18 @@ onMounted(async () => {
               readonly
             />
             <p class="text-[11px] text-[#b5b0a6]">该值由版本特征强制覆盖，保存后按后端返回值回显。</p>
+          </div>
+
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">禁止 Claude Code 版本</Label>
+            <Textarea
+              v-model="blockedClaudeCodeVersions"
+              rows="4"
+              placeholder="2.1.187&#10;2.2.*"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+              :class="isValidBlockedClaudeCodeVersions ? '' : 'border-red-400'"
+            />
+            <p class="text-[11px] text-[#b5b0a6]">支持精确版本、* 通配和区间；优先于允许范围，允许范围为空时仍生效。</p>
           </div>
 
           <div class="space-y-2">
@@ -1241,7 +1266,7 @@ onMounted(async () => {
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidStreamKeepaliveIntervalSecs || !isValidStreamUpstreamIdleTimeoutSecs || !isValidBootstrapAdditionalModelOptions"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidBlockedClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidStreamKeepaliveIntervalSecs || !isValidStreamUpstreamIdleTimeoutSecs || !isValidBootstrapAdditionalModelOptions"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}

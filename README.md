@@ -519,10 +519,13 @@ cc-bridge/
 网关通过全局 settings 控制客户端入口访问，校验发生在账号选择和上游请求之前：
 
 - `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.187`
+- `blocked_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认空；命中后优先拒绝
 - `allowed_user_agents`：只作用于非 Claude Code / CLI UA，默认允许 `AI-Hub-Monitor*` 和 `python-httpx*`
 - 版本规则支持精确版本、通配和闭区间，例如 `2.1.187`、`2.1.*`、`2.1.89-2.1.187`
+- 禁止版本规则与允许版本规则语法一致；同一版本同时命中允许和禁止时，禁止规则优先生效
 - UA 规则支持 `*` 通配，例如 `AI-Hub-Monitor*`、`python-httpx*`
-- 对应配置清空表示关闭该项限制
+- `allowed_claude_code_versions` 清空表示关闭允许范围限制，但 `blocked_claude_code_versions` 非空时仍会拦截命中的 Claude Code / CLI 版本
+- `blocked_claude_code_versions` 清空表示关闭禁止版本限制；`allowed_user_agents` 清空表示关闭非 Claude Code UA 限制
 - 未命中策略时本地返回 403，不请求上游
 
 ### 会话哈希

@@ -16,6 +16,7 @@ use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+    DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, validate_blocked_claude_code_versions,
     validate_claude_code_versions, validate_user_agent_patterns,
 };
 use crate::service::account::AccountService;
@@ -721,6 +722,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("allowed_claude_code_versions".into())
         .or_insert_with(|| DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS.to_string());
     settings
+        .entry("blocked_claude_code_versions".into())
+        .or_insert_with(|| DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS.to_string());
+    settings
         .entry("claude_code_version_profile".into())
         .or_insert_with(|| DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING.to_string());
     settings.insert(
@@ -902,6 +906,9 @@ async fn update_settings(
     if let Some(val) = body.get("allowed_claude_code_versions") {
         validate_claude_code_versions(val)?;
     }
+    if let Some(val) = body.get("blocked_claude_code_versions") {
+        validate_blocked_claude_code_versions(val)?;
+    }
     if let Some(val) = body.get("allowed_user_agents") {
         validate_user_agent_patterns(val)?;
     }
@@ -998,6 +1005,7 @@ async fn update_settings(
     }
     if profile_changed
         || body.contains_key("allowed_claude_code_versions")
+        || body.contains_key("blocked_claude_code_versions")
         || body.contains_key("allowed_user_agents")
     {
         state.gateway_svc.reload_access_policy().await?;

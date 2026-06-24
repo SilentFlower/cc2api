@@ -167,6 +167,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING,
         ),
         (
+            "blocked_claude_code_versions",
+            crate::store::settings_store::DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING,
+        ),
+        (
             "claude_code_version_profile",
             crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
         ),
@@ -684,6 +688,24 @@ mod tests {
         assert_eq!(
             profile,
             crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_default_blocked_claude_code_versions_setting() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let blocked_versions: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind("blocked_claude_code_versions")
+                .fetch_one(&pool)
+                .await
+                .expect("blocked versions setting");
+
+        assert_eq!(
+            blocked_versions,
+            crate::store::settings_store::DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING
         );
     }
 

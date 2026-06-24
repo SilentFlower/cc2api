@@ -20,7 +20,7 @@ use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
-    access_policy_error_response,
+    DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, access_policy_error_response,
 };
 use crate::service::account::{AccountService, QueueWaitError, RateLimitDecision};
 use crate::service::rewriter::{
@@ -350,6 +350,7 @@ impl GatewayService {
             access_policy: RwLock::new(
                 AccessPolicy::parse(
                     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+                    DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
                     DEFAULT_ALLOWED_USER_AGENTS,
                 )
                 .expect("默认访问策略必须合法"),
@@ -690,11 +691,18 @@ impl GatewayService {
                 DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
             )
             .await?;
+        let raw_blocked_versions = self
+            .settings_store
+            .get_value(
+                "blocked_claude_code_versions",
+                DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
+            )
+            .await?;
         let raw_user_agents = self
             .settings_store
             .get_value("allowed_user_agents", DEFAULT_ALLOWED_USER_AGENTS)
             .await?;
-        let policy = AccessPolicy::parse(&raw_versions, &raw_user_agents)?;
+        let policy = AccessPolicy::parse(&raw_versions, &raw_blocked_versions, &raw_user_agents)?;
         *self.access_policy.write().await = policy;
         Ok(())
     }

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use crate::error::AppError;
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
+    DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
 };
 use crate::service::version_profile::{ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_VERSION_PROFILE};
 
@@ -12,6 +13,8 @@ use crate::service::version_profile::{ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_VER
 pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
+/// 默认禁止的 Claude Code / Claude CLI 版本范围。
+pub const DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS;
 /// 默认 Claude Code 版本画像 key。
 pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING: &str = DEFAULT_CLAUDE_CODE_VERSION_PROFILE;
 /// 默认允许的非 Claude Code 客户端 User-Agent。
@@ -224,8 +227,8 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
-        SettingsStore,
+        DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING,
+        DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, SettingsStore,
     };
     use sqlx::AnyPool;
 
@@ -315,6 +318,10 @@ mod tests {
             "allowed_user_agents".to_string(),
             "custom-agent".to_string(),
         );
+        custom.insert(
+            "blocked_claude_code_versions".to_string(),
+            "2.1.187".to_string(),
+        );
         settings_store
             .upsert_many(&custom)
             .await
@@ -336,6 +343,10 @@ mod tests {
             "2.1.89-2.1.173"
         );
         assert_eq!(settings.get("allowed_user_agents").unwrap(), "custom-agent");
+        assert_eq!(
+            settings.get("blocked_claude_code_versions").unwrap(),
+            "2.1.187"
+        );
 
         let raw: String = sqlx::query_scalar("SELECT canonical_env FROM accounts WHERE email=$1")
             .bind("user@example.com")
@@ -347,5 +358,20 @@ mod tests {
         assert_eq!(env["version_base"], "2.1.173");
         assert_eq!(env["build_time"], "2026-06-11T01:23:13Z");
         assert_eq!(env["custom"], "keep");
+    }
+
+    #[tokio::test]
+    async fn default_blocked_versions_setting_is_empty() {
+        let store = make_store().await;
+
+        let value = store
+            .get_value(
+                "blocked_claude_code_versions",
+                DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING,
+            )
+            .await
+            .expect("get value");
+
+        assert_eq!(value, DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING);
     }
 }
