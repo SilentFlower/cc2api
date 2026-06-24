@@ -21,6 +21,10 @@ pub const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
 ///
 /// `context-1m-2025-08-07` 仍由账号白名单单独控制,不能放进必需集合。
 pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.187 Haiku 非流式标题/探测请求使用的窄 beta token 集合。
+pub const HAIKU_PROBE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+/// Claude Code 2.1.187 Haiku 流式标题请求使用的窄 beta token 集合。
+pub const HAIKU_STREAMING_TITLE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07";
 /// Claude Code 2.1.187 Fable 主请求额外启用的 fallback beta token 集合。
 pub const FABLE_FALLBACK_BETA_TOKENS: &str =
     "server-side-fallback-2026-06-01,fallback-credit-2026-06-01";

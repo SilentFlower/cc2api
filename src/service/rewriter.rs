@@ -8,16 +8,16 @@ use std::sync::Mutex;
 use tracing::info;
 
 use crate::error::AppError;
-use crate::model::account::{Account, BillingMode, CanonicalEnvData, CanonicalPromptEnvData};
+use crate::model::account::{Account, BillingMode, CanonicalPromptEnvData};
 use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
     CODE_TRIGGERS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
-    MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS,
-    OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, TelemetryShape,
-    claude_cli_user_agent, claude_code_user_agent, is_event_logging_path, normalize_version,
-    profile_for_version,
+    HAIKU_PROBE_BETA_TOKENS, HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
+    MCP_PROTOCOL_VERSION, MCP_SERVERS_BETA_TOKEN, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN,
+    STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, TelemetryShape, claude_cli_user_agent,
+    claude_code_user_agent, is_event_logging_path, normalize_version, profile_for_version,
 };
 
 /// header wire 大小写映射。
@@ -178,7 +178,7 @@ fn beta_header_for_model(model_id: &str) -> String {
 }
 
 /// 根据 endpoint 返回当前 Claude Code 画像的必需 beta token。
-fn beta_header_for_path(path: &str, model_id: &str) -> String {
+fn beta_header_for_path(path: &str, model_id: &str, body: &serde_json::Value) -> String {
     if path == "/v1/messages/count_tokens" {
         COUNT_TOKENS_BETA_TOKENS.to_string()
     } else if is_event_logging_path(path)
@@ -193,6 +193,12 @@ fn beta_header_for_path(path: &str, model_id: &str) -> String {
         CODE_TRIGGERS_BETA_TOKEN.to_string()
     } else if path.starts_with("/v1/mcp_servers") {
         MCP_SERVERS_BETA_TOKEN.to_string()
+    } else if path.starts_with("/v1/messages") && is_haiku_probe_or_title_request(model_id, body) {
+        if is_streaming_messages_body(body) {
+            HAIKU_STREAMING_TITLE_BETA_TOKENS.to_string()
+        } else {
+            HAIKU_PROBE_BETA_TOKENS.to_string()
+        }
     } else {
         beta_header_for_model(model_id)
     }
@@ -201,6 +207,60 @@ fn beta_header_for_path(path: &str, model_id: &str) -> String {
 fn is_fable_model(model_id: &str) -> bool {
     // 2.1.173 抓包显示 Fable `[1m]` 不会改变主请求画像，不能用后缀裁剪推断 beta。
     model_id == FABLE_MODEL_ID
+}
+
+fn is_haiku_probe_or_title_request(model_id: &str, body: &serde_json::Value) -> bool {
+    if !model_id.to_ascii_lowercase().contains("haiku") {
+        return false;
+    }
+    let tools_empty = body
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| tools.is_empty())
+        .unwrap_or(true);
+    let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    tools_empty && (max_tokens == 1 || (max_tokens == 32000 && has_title_prompt_marker(body)))
+}
+
+fn requires_exact_beta_profile(path: &str, model_id: &str, body: &serde_json::Value) -> bool {
+    path.starts_with("/v1/messages") && is_haiku_probe_or_title_request(model_id, body)
+}
+
+fn is_streaming_messages_body(body: &serde_json::Value) -> bool {
+    body.get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or(false)
+}
+
+fn has_title_prompt_marker(body: &serde_json::Value) -> bool {
+    text_values(body).iter().any(|text| {
+        text.contains("Generate a concise, sentence-case title")
+            || text.contains("Please write a 5-10 word title for the following conversation:")
+            || text.contains("extract a 2-3 word title")
+    })
+}
+
+fn text_values(value: &serde_json::Value) -> Vec<&str> {
+    let mut out = Vec::new();
+    collect_text_values(value, &mut out);
+    out
+}
+
+fn collect_text_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_text_values(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_text_values(value, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 判断该 endpoint 是否应该发送 anthropic-beta。
@@ -594,7 +654,7 @@ impl Rewriter {
             if requires_anthropic_beta(path) {
                 out.insert(
                     "anthropic-beta".into(),
-                    beta_header_for_path(path, model_id),
+                    beta_header_for_path(path, model_id, body_map),
                 );
             }
             if requires_json_content_type(path) {
@@ -798,13 +858,16 @@ impl Rewriter {
                 strip_beta_token(&existing_beta, CONTEXT_1M_BETA_TOKEN)
             };
             if requires_anthropic_beta(path) {
-                out.insert(
-                    "anthropic-beta".into(),
+                let required_beta = beta_header_for_path(path, model_id, body_map);
+                let beta = if requires_exact_beta_profile(path, model_id, body_map) {
+                    required_beta
+                } else {
                     order_context_1m_after_oauth(merge_anthropic_beta(
-                        beta_header_for_path(path, model_id).as_str(),
+                        required_beta.as_str(),
                         &filtered_existing,
-                    )),
-                );
+                    ))
+                };
+                out.insert("anthropic-beta".into(), beta);
             }
             if is_event_logging_path(path) {
                 out.insert("x-service-name".into(), "claude-code".into());
@@ -1328,7 +1391,7 @@ impl Rewriter {
             None => return,
         };
 
-        let canonical_env = build_canonical_env_map(&profile.env);
+        let canonical_env = build_event_env_map(&profile, telemetry_shape);
 
         for event in events.iter_mut() {
             let e = match event.as_object_mut() {
@@ -1824,8 +1887,21 @@ where
     }
 }
 
-fn build_canonical_env_map(env: &CanonicalEnvData) -> serde_json::Value {
-    crate::model::identity::build_full_env_json(env)
+fn build_event_env_map(profile: &DeviceProfile, shape: TelemetryShape) -> serde_json::Value {
+    let mut env_obj = crate::model::identity::build_full_env_json(&profile.env);
+    if shape == TelemetryShape::ClaudeCode2185 {
+        if let Some(map) = env_obj.as_object_mut() {
+            map.insert(
+                "shell".into(),
+                serde_json::Value::String(profile.prompt.shell.clone()),
+            );
+            map.insert(
+                "is_running_with_bun".into(),
+                serde_json::Value::Bool(profile.env.is_running_with_bun),
+            );
+        }
+    }
+    env_obj
 }
 
 /// 改写 event_logging 事件字段，兼容旧顶层结构和 2.1.156 的 event_data 结构。
@@ -4816,9 +4892,10 @@ mod tests {
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_FALLBACK_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
-        MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS,
-        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json,
-        claude_cli_user_agent, claude_code_user_agent, profile_for_key,
+        HAIKU_PROBE_BETA_TOKENS, HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
+        MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION,
+        STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json, claude_cli_user_agent,
+        claude_code_user_agent, profile_for_key,
     };
     use base64::Engine;
     use chrono::Utc;
@@ -8007,6 +8084,93 @@ mod tests {
     }
 
     #[test]
+    fn haiku_non_stream_probe_uses_capture_narrow_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "count"}]
+        });
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            HAIKU_PROBE_BETA_TOKENS
+        );
+    }
+
+    #[test]
+    fn haiku_streaming_title_uses_capture_narrow_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "stream": true,
+            "max_tokens": 32000,
+            "tools": [],
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are Claude Code. Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session."
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert(
+            "anthropic-beta".to_string(),
+            MESSAGE_BETA_TOKENS.to_string(),
+        );
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            HAIKU_STREAMING_TITLE_BETA_TOKENS
+        );
+    }
+
+    #[test]
+    fn haiku_normal_request_keeps_full_message_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "stream": true,
+            "max_tokens": 32000,
+            "tools": [],
+            "messages": [{"role": "user", "content": "请分析这个项目"}]
+        });
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+
+        assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
+    }
+
+    #[test]
     fn opus_claude_code_headers_preserve_context_1m_when_allowed() {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -8842,6 +9006,43 @@ mod tests {
                 <= rewritten_process["heapTotal"].as_i64().unwrap()
         );
         assert_eq!(rewritten_process["constrainedMemory"], 0);
+    }
+
+    #[test]
+    fn event_logging_2187_env_preserves_bun_and_shell_profile() {
+        let mut account = test_account();
+        let mut env: CanonicalEnvData =
+            serde_json::from_value(account.canonical_env.clone()).unwrap();
+        env.is_running_with_bun = true;
+        account.canonical_env = serde_json::to_value(env).unwrap();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "events": [{
+                "event_type": "ClaudeCodeInternalEvent",
+                "event_data": {
+                    "env": {
+                        "is_running_with_bun": true,
+                        "shell": "bash"
+                    }
+                }
+            }]
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let env = &parsed["events"][0]["event_data"]["env"];
+
+        assert_eq!(env["version"], DEFAULT_CLAUDE_CODE_VERSION);
+        assert_eq!(env["shell"], "bash");
+        assert_eq!(env["is_running_with_bun"], true);
     }
 
     #[test]

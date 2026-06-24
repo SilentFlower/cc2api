@@ -1316,19 +1316,25 @@ impl GatewayService {
 
             let final_body = rewritten_body.clone();
 
-            let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
-                Ok(t) => t,
-                Err(e) => {
-                    // SlotReleaseGuard drop 会自动释放槽位
-                    return Err(e);
+            let upstream_token = if requires_upstream_authorization(&path) {
+                match self.account_svc.resolve_upstream_token(account.id).await {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        // SlotReleaseGuard drop 会自动释放槽位
+                        return Err(e);
+                    }
                 }
+            } else {
+                None
             };
             info!(
                 "[耗时] 请求改写+Token解析: {:.0}ms",
                 t_rewrite.elapsed().as_millis()
             );
             let mut final_headers = rewritten_headers;
-            final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+            if let Some(upstream_token) = upstream_token {
+                final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+            }
 
             if path.starts_with("/v1/messages")
                 && !is_streaming_messages_request(&rewritten_body_map)
@@ -1634,17 +1640,7 @@ impl GatewayService {
         body: &[u8],
         account: &Account,
     ) -> Result<Response, AppError> {
-        let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
-        if !query.is_empty() {
-            let q = if query.contains("beta=true") {
-                query.to_string()
-            } else {
-                format!("{}&beta=true", query)
-            };
-            target_url = format!("{}?{}", target_url, q);
-        } else {
-            target_url = format!("{}?beta=true", target_url);
-        }
+        let target_url = upstream_url(path, query);
 
         debug!("upstream URL: {}", target_url);
 
@@ -1966,6 +1962,36 @@ fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, Str
         }
     }
     map
+}
+
+fn requires_upstream_authorization(path: &str) -> bool {
+    !path.starts_with("/mcp-registry/") && path != "/"
+}
+
+fn requires_upstream_beta_query(path: &str) -> bool {
+    path == "/v1/messages" || path == COUNT_TOKENS_PATH
+}
+
+fn upstream_url(path: &str, query: &str) -> String {
+    let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
+    let mut query = query.to_string();
+    if requires_upstream_beta_query(path) && !query_contains_beta_true(&query) {
+        if query.is_empty() {
+            query = "beta=true".to_string();
+        } else {
+            query.push_str("&beta=true");
+        }
+    }
+    if !query.is_empty() {
+        target_url = format!("{}?{}", target_url, query);
+    }
+    target_url
+}
+
+fn query_contains_beta_true(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|part| matches!(part.split_once('='), Some(("beta", "true"))))
 }
 
 fn count_tokens_upstream_url() -> String {
@@ -5180,6 +5206,42 @@ mod tests {
             super::count_tokens_upstream_url(),
             "https://api.anthropic.com/v1/messages/count_tokens?beta=true"
         );
+    }
+
+    #[test]
+    fn upstream_url_adds_beta_query_only_for_messages_paths() {
+        assert_eq!(
+            super::upstream_url("/v1/messages", ""),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        assert_eq!(
+            super::upstream_url("/v1/messages", "beta=true"),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        assert_eq!(
+            super::upstream_url("/v1/messages", "foo=bar"),
+            "https://api.anthropic.com/v1/messages?foo=bar&beta=true"
+        );
+        assert_eq!(
+            super::upstream_url("/api/event_logging/v2/batch", ""),
+            "https://api.anthropic.com/api/event_logging/v2/batch"
+        );
+        assert_eq!(
+            super::upstream_url("/mcp-registry/v0/servers", "version=latest&limit=100"),
+            "https://api.anthropic.com/mcp-registry/v0/servers?version=latest&limit=100"
+        );
+    }
+
+    #[test]
+    fn public_registry_paths_do_not_require_upstream_authorization() {
+        assert!(!super::requires_upstream_authorization(
+            "/mcp-registry/v0/servers"
+        ));
+        assert!(!super::requires_upstream_authorization("/"));
+        assert!(super::requires_upstream_authorization("/v1/messages"));
+        assert!(super::requires_upstream_authorization(
+            "/api/event_logging/v2/batch"
+        ));
     }
 
     #[test]
