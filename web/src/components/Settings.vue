@@ -190,6 +190,17 @@ function parseClaudeCodeVersionProfiles(raw: string | undefined): ClaudeCodeVers
   }
 }
 
+/** 格式化 telemetry 结构标识，避免误读为当前 Claude Code 版本。 */
+function formatTelemetryShape(shape: string): string {
+  if (shape === 'claude_code_2_1_185') {
+    return 'Telemetry 结构兼容 2.1.185';
+  }
+  if (shape === 'claude_code_2_1_173') {
+    return 'Telemetry 结构 2.1.173';
+  }
+  return `Telemetry 结构 ${shape}`;
+}
+
 /** 预热小时输入是否合法(逗号分隔的 0-23,允许空) */
 const isValidHours = computed(() => {
   const raw = primeHours.value.trim();
@@ -1177,7 +1188,7 @@ onMounted(async () => {
                   <span class="mx-1">·</span>
                   <span>{{ profile.growthbook_user_agent }}</span>
                   <span class="mx-1">·</span>
-                  <span>{{ profile.telemetry_shape }}</span>
+                  <span>{{ formatTelemetryShape(profile.telemetry_shape) }}</span>
                 </div>
               </template>
             </div>
