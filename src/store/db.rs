@@ -6,6 +6,7 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.169",
     "2.1.89-2.1.172",
     "2.1.89-2.1.173",
+    "2.1.89-2.1.185",
 ];
 const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
     "intercept_warmup_non_stream_aux_enabled",
@@ -292,9 +293,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             .await
             .ok();
     }
-    upgrade_default_settings(pool).await?;
+    let claude_code_profile = selected_claude_code_profile(pool).await?;
+    upgrade_default_settings(pool, claude_code_profile).await?;
     remove_obsolete_settings(pool).await?;
-    upgrade_account_claude_code_profile(pool, driver).await?;
+    upgrade_account_claude_code_profile(pool, driver, claude_code_profile).await?;
 
     // prime_logs 表（峰值预热调用日志）
     let prime_logs_schema = if driver == "sqlite" {
@@ -313,7 +315,26 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-async fn upgrade_default_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
+async fn selected_claude_code_profile(
+    pool: &AnyPool,
+) -> Result<&'static crate::service::version_profile::ClaudeCodeProfile, sqlx::Error> {
+    let configured: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+        .bind("claude_code_version_profile")
+        .fetch_optional(pool)
+        .await?;
+    Ok(configured
+        .as_deref()
+        .and_then(|key| crate::service::version_profile::profile_for_key(key).ok())
+        .unwrap_or_else(crate::service::version_profile::default_profile))
+}
+
+async fn upgrade_default_settings(
+    pool: &AnyPool,
+    profile: &crate::service::version_profile::ClaudeCodeProfile,
+) -> Result<(), sqlx::Error> {
+    if profile.key != crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING {
+        return Ok(());
+    }
     for previous in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
         sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
             .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
@@ -338,8 +359,9 @@ async fn remove_obsolete_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
 async fn upgrade_account_claude_code_profile(
     pool: &AnyPool,
     driver: &str,
+    profile: &crate::service::version_profile::ClaudeCodeProfile,
 ) -> Result<(), sqlx::Error> {
-    let identity = &crate::service::version_profile::default_profile().identity;
+    let identity = &profile.identity;
     let sql = if driver == "sqlite" {
         r#"
         UPDATE accounts
@@ -584,6 +606,68 @@ mod tests {
             .await
             .expect("custom setting");
         assert_eq!(custom, "2.1.*");
+    }
+
+    #[tokio::test]
+    async fn migrate_preserves_explicit_old_claude_code_profile() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        sqlx::query(
+            r#"INSERT INTO accounts (
+                email, token, device_id, canonical_env, canonical_prompt_env, canonical_process
+            ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind("user@example.com")
+        .bind("token")
+        .bind("device-1")
+        .bind(
+            r#"{"version":"2.1.187","version_base":"2.1.187","build_time":"new","custom":"keep"}"#,
+        )
+        .bind("{}")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .expect("insert account");
+
+        for (profile_key, allowed_versions, build_time) in [
+            ("2.1.173", "2.1.89-2.1.173", "2026-06-11T01:23:13Z"),
+            ("2.1.185", "2.1.89-2.1.185", "2026-06-20T06:38:30Z"),
+        ] {
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind(profile_key)
+                .bind("claude_code_version_profile")
+                .execute(&pool)
+                .await
+                .expect("set profile");
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind(allowed_versions)
+                .bind("allowed_claude_code_versions")
+                .execute(&pool)
+                .await
+                .expect("set allowed versions");
+
+            migrate(&pool, "sqlite").await.expect("rerun migrate");
+
+            let stored_allowed: String =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                    .bind("allowed_claude_code_versions")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("allowed versions");
+            assert_eq!(stored_allowed, allowed_versions);
+
+            let raw: String =
+                sqlx::query_scalar("SELECT canonical_env FROM accounts WHERE email=$1")
+                    .bind("user@example.com")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("canonical_env");
+            let env: serde_json::Value = serde_json::from_str(&raw).expect("json");
+            assert_eq!(env["version"], profile_key);
+            assert_eq!(env["version_base"], profile_key);
+            assert_eq!(env["build_time"], build_time);
+            assert_eq!(env["custom"], "keep");
+        }
     }
 
     #[tokio::test]

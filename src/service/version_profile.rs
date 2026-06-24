@@ -3,28 +3,28 @@ use serde_json::Value;
 use crate::error::AppError;
 
 /// 默认 Claude Code 版本画像 key。
-pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.185";
+pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.187";
 /// Claude Code 默认兼容版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_185.identity.version;
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_187.identity.version;
 /// Claude Code 默认基础版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_185.identity.version_base;
-/// Claude Code 2.1.185 抓包对应的构建时间。
-pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_185.identity.build_time;
+pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_187.identity.version_base;
+/// Claude Code 2.1.187 抓包对应的构建时间。
+pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_187.identity.build_time;
 /// 默认画像对应的 Claude Code / Claude CLI 允许版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str =
-    PROFILE_2_1_185.access_policy.allowed_claude_code_versions;
-/// Claude Code 2.1.185 使用的 Stainless SDK 版本。
+    PROFILE_2_1_187.access_policy.allowed_claude_code_versions;
+/// Claude Code 2.1.187 使用的 Stainless SDK 版本。
 pub const STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
-/// Claude Code 2.1.185 抓包中的 Node runtime 版本。
+/// Claude Code 2.1.187 抓包中的 Node runtime 版本。
 pub const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
-/// Claude Code 2.1.185 抓包中的通用 message beta token 集合。
+/// Claude Code 2.1.187 抓包中的通用 message beta token 集合。
 ///
 /// `context-1m-2025-08-07` 仍由账号白名单单独控制,不能放进必需集合。
 pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
-/// Claude Code 2.1.185 Fable 主请求额外启用的 fallback beta token 集合。
+/// Claude Code 2.1.187 Fable 主请求额外启用的 fallback beta token 集合。
 pub const FABLE_FALLBACK_BETA_TOKENS: &str =
     "server-side-fallback-2026-06-01,fallback-credit-2026-06-01";
-/// Claude Code 2.1.185 Fable 主请求使用的完整 message beta token 集合。
+/// Claude Code 2.1.187 Fable 主请求使用的完整 message beta token 集合。
 pub const FABLE_MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-06-01,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code OAuth 相关端点使用的 beta token。
 pub const OAUTH_BETA_TOKEN: &str = "oauth-2025-04-20";
@@ -36,11 +36,11 @@ pub const COUNT_TOKENS_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-2
 pub const CODE_TRIGGERS_BETA_TOKEN: &str = "ccr-triggers-2026-01-30";
 /// Claude Code MCP servers 端点使用的 beta token。
 pub const MCP_SERVERS_BETA_TOKEN: &str = "mcp-servers-2025-12-04";
-/// Claude Code 2.1.185 MCP servers 请求声明的客户端能力。
+/// Claude Code 2.1.187 MCP servers 请求声明的客户端能力。
 pub const MCP_CLIENT_CAPABILITIES: &str = "eyJyb290cyI6e30sImVsaWNpdGF0aW9uIjp7fX0=";
-/// Claude Code 2.1.185 MCP servers 请求声明的协议版本。
+/// Claude Code 2.1.187 MCP servers 请求声明的协议版本。
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
-/// Claude Code 2.1.185 的 event logging v2 路径。
+/// Claude Code 2.1.187 的 event logging v2 路径。
 pub const EVENT_LOGGING_V2_PATH: &str = "/api/event_logging/v2/batch";
 /// 旧版 event logging 路径，保留用于客户端请求兼容。
 pub const EVENT_LOGGING_LEGACY_PATH: &str = "/api/event_logging/batch";
@@ -170,6 +170,40 @@ const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
     },
 };
 
+const PROFILE_2_1_187: ClaudeCodeProfile = ClaudeCodeProfile {
+    key: "2.1.187",
+    identity: IdentityProfile {
+        version: "2.1.187",
+        version_base: "2.1.187",
+        build_time: "2026-06-23T16:59:46Z",
+        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
+    },
+    access_policy: AccessPolicyProfile {
+        allowed_claude_code_versions: "2.1.89-2.1.187",
+    },
+    request: RequestProfile {
+        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
+        count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
+        oauth_beta_token: OAUTH_BETA_TOKEN,
+        code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
+        mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+    },
+    billing: BillingProfile {
+        cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
+        cch_profile: CchProfile::ClaudeCode2172Plus,
+    },
+    telemetry: TelemetryProfile {
+        shape: TelemetryShape::ClaudeCode2185,
+        growthbook_user_agent: "Bun/1.4.0",
+    },
+    endpoints: EndpointProfile {
+        event_logging_path: EVENT_LOGGING_V2_PATH,
+        event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+    },
+};
+
 const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.173",
     identity: IdentityProfile {
@@ -204,13 +238,14 @@ const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
     },
 };
 
-static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 2] = [&PROFILE_2_1_185, &PROFILE_2_1_173];
+static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 3] =
+    [&PROFILE_2_1_187, &PROFILE_2_1_185, &PROFILE_2_1_173];
 
 /// 返回默认 Claude Code 版本画像。
 ///
 /// @return 默认版本画像。
 pub fn default_profile() -> &'static ClaudeCodeProfile {
-    &PROFILE_2_1_185
+    &PROFILE_2_1_187
 }
 
 /// 返回所有内置 Claude Code 版本画像。
@@ -370,11 +405,19 @@ mod tests {
 
     #[test]
     fn profile_declares_known_telemetry_differences() {
-        let current = profile_for_key("2.1.185").unwrap();
+        let current = profile_for_key("2.1.187").unwrap();
         assert_eq!(current.telemetry.shape, TelemetryShape::ClaudeCode2185);
         assert_eq!(current.telemetry.growthbook_user_agent, "Bun/1.4.0");
         assert_eq!(
             current.access_policy.allowed_claude_code_versions,
+            "2.1.89-2.1.187"
+        );
+
+        let previous = profile_for_key("2.1.185").unwrap();
+        assert_eq!(previous.telemetry.shape, TelemetryShape::ClaudeCode2185);
+        assert_eq!(previous.telemetry.growthbook_user_agent, "Bun/1.4.0");
+        assert_eq!(
+            previous.access_policy.allowed_claude_code_versions,
             "2.1.89-2.1.185"
         );
 

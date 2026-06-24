@@ -518,9 +518,9 @@ cc-bridge/
 
 网关通过全局 settings 控制客户端入口访问，校验发生在账号选择和上游请求之前：
 
-- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.185`
+- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.187`
 - `allowed_user_agents`：只作用于非 Claude Code / CLI UA，默认允许 `AI-Hub-Monitor*` 和 `python-httpx*`
-- 版本规则支持精确版本、通配和闭区间，例如 `2.1.185`、`2.1.*`、`2.1.89-2.1.185`
+- 版本规则支持精确版本、通配和闭区间，例如 `2.1.187`、`2.1.*`、`2.1.89-2.1.187`
 - UA 规则支持 `*` 通配，例如 `AI-Hub-Monitor*`、`python-httpx*`
 - 对应配置清空表示关闭该项限制
 - 未命中策略时本地返回 403，不请求上游

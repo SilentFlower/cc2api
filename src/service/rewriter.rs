@@ -1442,7 +1442,7 @@ fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
 fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
     if !matches!(
         normalize_version(version),
-        "2.1.172" | "2.1.173" | "2.1.185"
+        "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187"
     ) {
         return body.to_vec();
     }
@@ -1490,7 +1490,9 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
-        "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" => CCH_ATTESTATION_SEED_2156,
+        "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" => {
+            CCH_ATTESTATION_SEED_2156
+        }
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -8914,6 +8916,10 @@ mod tests {
             compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.185"),
             "b04"
         );
+        assert_eq!(
+            compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.187"),
+            "979"
+        );
     }
 
     #[test]
@@ -8934,6 +8940,7 @@ mod tests {
         assert_eq!(cch_attestation_seed("2.1.172"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.173"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.185"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.187"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
@@ -8947,7 +8954,7 @@ mod tests {
     }
 
     #[test]
-    fn cch_2172_2173_and_2185_opus_normalize_top_level_model_and_max_tokens() {
+    fn cch_2172_2173_2185_and_2187_opus_normalize_top_level_model_and_max_tokens() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":64000,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.173.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
         let normalized = cch_attestation_input(body, "2.1.173");
 
@@ -8957,6 +8964,7 @@ mod tests {
         );
         assert_eq!(cch_attestation_input(body, "2.1.172"), normalized);
         assert_eq!(cch_attestation_input(body, "2.1.185"), normalized);
+        assert_eq!(cch_attestation_input(body, "2.1.187"), normalized);
 
         let out = compute_cch_attestation(body.to_vec(), "2.1.173");
         let expected_hash = xxhash_rust::xxh64::xxh64(&normalized, cch_attestation_seed("2.1.173"));
@@ -8965,14 +8973,16 @@ mod tests {
     }
 
     #[test]
-    fn cch_2172_2173_and_2185_fable_normalize_top_level_fallbacks_only() {
+    fn cch_2172_2173_2185_and_2187_fable_normalize_top_level_fallbacks_only() {
         let body = br#"{"model":"claude-fable-5","max_tokens":64000,"tools":[{"name":"Nested","input_schema":{"type":"object","properties":{"fallbacks":{"model":"keep-nested"},"max_tokens":{"type":"integer"}}}}],"fallbacks":[{"model":"claude-opus-4-8"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.173.b94; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"nested model and fallbacks stay"}]}]}"#;
         let normalized = String::from_utf8(cch_attestation_input(body, "2.1.173")).unwrap();
         let normalized_2172 = String::from_utf8(cch_attestation_input(body, "2.1.172")).unwrap();
         let normalized_2185 = String::from_utf8(cch_attestation_input(body, "2.1.185")).unwrap();
+        let normalized_2187 = String::from_utf8(cch_attestation_input(body, "2.1.187")).unwrap();
 
         assert_eq!(normalized_2172, normalized);
         assert_eq!(normalized_2185, normalized);
+        assert_eq!(normalized_2187, normalized);
         assert!(normalized.contains(r#""model":"""#));
         assert!(!normalized.contains(r#","max_tokens":64000"#));
         assert!(!normalized.contains(r#","fallbacks":[{"model":"claude-opus-4-8"}]"#));
