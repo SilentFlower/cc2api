@@ -9010,11 +9010,7 @@ mod tests {
 
     #[test]
     fn event_logging_2187_env_preserves_bun_and_shell_profile() {
-        let mut account = test_account();
-        let mut env: CanonicalEnvData =
-            serde_json::from_value(account.canonical_env.clone()).unwrap();
-        env.is_running_with_bun = true;
-        account.canonical_env = serde_json::to_value(env).unwrap();
+        let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
             "events": [{

@@ -235,8 +235,12 @@ impl Account {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// 存储 20+ 维度的环境指纹数据。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalEnvData {
     pub platform: String,
     pub platform_raw: String,
@@ -245,7 +249,7 @@ pub struct CanonicalEnvData {
     pub terminal: String,
     pub package_managers: String,
     pub runtimes: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub is_running_with_bun: bool,
     #[serde(default)]
     pub is_ci: bool,
@@ -274,6 +278,37 @@ pub struct CanonicalEnvData {
     pub linux_distro_version: String,
     #[serde(default)]
     pub linux_kernel: String,
+}
+
+impl Default for CanonicalEnvData {
+    fn default() -> Self {
+        Self {
+            platform: String::new(),
+            platform_raw: String::new(),
+            arch: String::new(),
+            node_version: String::new(),
+            terminal: String::new(),
+            package_managers: String::new(),
+            runtimes: String::new(),
+            is_running_with_bun: true,
+            is_ci: false,
+            is_claubbit: false,
+            is_claude_code_remote: false,
+            is_local_agent_mode: false,
+            is_conductor: false,
+            is_github_action: false,
+            is_claude_code_action: false,
+            is_claude_ai_auth: false,
+            version: String::new(),
+            version_base: String::new(),
+            build_time: String::new(),
+            deployment_environment: String::new(),
+            vcs: String::new(),
+            linux_distro_id: String::new(),
+            linux_distro_version: String::new(),
+            linux_kernel: String::new(),
+        }
+    }
 }
 
 /// 系统提示词中的环境改写数据。

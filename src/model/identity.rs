@@ -403,7 +403,7 @@ pub fn build_full_env_json(env: &CanonicalEnvData) -> Value {
         "terminal": env.terminal,
         "package_managers": env.package_managers,
         "runtimes": env.runtimes,
-        "is_running_with_bun": false,
+        "is_running_with_bun": env.is_running_with_bun,
         "is_ci": false,
         "is_claubbit": false,
         "is_claude_code_remote": false,
@@ -617,6 +617,7 @@ pub fn process_snapshot_json(snapshot: &ProcessSnapshot) -> Value {
 
 /// 旧账号兼容补齐环境字段，不覆盖已有非空值。
 pub fn normalize_env(mut env: CanonicalEnvData) -> CanonicalEnvData {
+    env.is_running_with_bun = true;
     if env.platform.is_empty() {
         env.platform = "linux".into();
     }
@@ -859,6 +860,7 @@ mod tests {
             assert_eq!(preset.env.version, DEFAULT_CLAUDE_CODE_VERSION);
             assert_eq!(preset.env.version_base, DEFAULT_CLAUDE_CODE_VERSION_BASE);
             assert_eq!(preset.env.build_time, DEFAULT_CLAUDE_CODE_BUILD_TIME);
+            assert!(preset.env.is_running_with_bun);
             assert!(preset.process.heap_used_range[1] < preset.process.heap_total_range[1]);
 
             match preset.env.platform.as_str() {
@@ -892,6 +894,7 @@ mod tests {
 
             assert_eq!(device_id.len(), 64);
             assert_eq!(prompt.platform, env.platform);
+            assert!(env.is_running_with_bun);
             assert!(process.heap_used_range[1] < process.heap_total_range[1]);
         }
     }
@@ -902,6 +905,7 @@ mod tests {
         assert_eq!(env.platform, "linux");
         assert_eq!(env.node_version, "v24.3.0");
         assert_eq!(env.version, DEFAULT_CLAUDE_CODE_VERSION);
+        assert!(env.is_running_with_bun);
         assert_eq!(env.linux_distro_id, "ubuntu");
         assert_eq!(env.linux_kernel, "6.8.0-60-generic");
 
@@ -912,6 +916,16 @@ mod tests {
         });
         assert!(process.heap_used_range[1] < process.heap_total_range[1]);
         assert!(process.rss_range[1] > process.rss_range[0]);
+    }
+
+    #[test]
+    fn normalize_env_aligns_legacy_false_bun_to_current_profile() {
+        let env = normalize_env(CanonicalEnvData {
+            is_running_with_bun: false,
+            ..Default::default()
+        });
+
+        assert!(env.is_running_with_bun);
     }
 
     #[test]

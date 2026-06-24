@@ -1085,7 +1085,7 @@ mod tests {
             terminal: "ssh-session".into(),
             package_managers: "npm".into(),
             runtimes: "node".into(),
-            is_running_with_bun: false,
+            is_running_with_bun: true,
             is_claude_ai_auth: true,
             version: DEFAULT_CLAUDE_CODE_VERSION.into(),
             version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
@@ -1294,7 +1294,7 @@ mod tests {
         );
         assert_eq!(event["env"]["build_time"], DEFAULT_CLAUDE_CODE_BUILD_TIME);
         assert_eq!(event["env"]["shell"], "bash");
-        assert_eq!(event["env"]["is_running_with_bun"], false);
+        assert_eq!(event["env"]["is_running_with_bun"], true);
         assert_eq!(event["env"]["linux_distro_id"], "ubuntu");
 
         let metadata_b64 = event["additional_metadata"].as_str().unwrap();
