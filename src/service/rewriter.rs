@@ -966,7 +966,7 @@ impl Rewriter {
     /// @param env_pt 环境透传配置。
     /// @param cache_ttl_rewrite cache_control TTL 改写配置。
     /// @param message_cache_rewrite message cache_control 断点改写配置。
-    /// @param message_body_order_fingerprint_enabled 是否对齐 `/v1/messages` 顶层字段顺序。
+    /// @param message_body_order_fingerprint_enabled 是否对 API mimicry 生成的 `/v1/messages` 顶层字段按 Claude Code 画像排序。
     /// @param disabled_thinking_rewrite `thinking.type=disabled` 兼容改写配置。
     /// @return 改写后的 body 与可选 stateful 延迟提交句柄。
     pub fn rewrite_body_with_stateful_completion(
@@ -1078,7 +1078,8 @@ impl Rewriter {
             );
             rewrite_existing_ephemeral_cache_control_ttl(&mut parsed, cache_ttl_rewrite);
             rewrite_disabled_thinking_to_adaptive(&mut parsed, disabled_thinking_rewrite);
-            if message_body_order_fingerprint_enabled {
+            // 真实 Claude Code 客户端已经带原始 wire 顺序；这里只对 API mimicry 生成的 body 套画像顺序。
+            if message_body_order_fingerprint_enabled && client_type == ClientType::API {
                 order_message_body_top_level_fields(&mut parsed);
             }
         } else if is_event_logging_path(path) {
@@ -4921,7 +4922,7 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
     None
 }
 
-/// 按 2.1.195 抓包画像重排 `/v1/messages` 顶层字段,未知字段追加并保留原相对顺序。
+/// 按 2.1.195 抓包画像重排 API mimicry 生成的 `/v1/messages` 顶层字段,未知字段追加并保留原相对顺序。
 fn order_message_body_top_level_fields(body: &mut serde_json::Value) {
     let Some(map) = body.as_object_mut() else {
         return;
@@ -8567,7 +8568,7 @@ mod tests {
     }
 
     #[test]
-    fn message_body_order_aligns_opus_main_profile_and_keeps_unknown_tail() {
+    fn api_message_body_order_aligns_opus_main_profile_and_keeps_unknown_tail() {
         let body = json!({
             "unknown_a": 1,
             "stream": true,
@@ -8590,7 +8591,7 @@ mod tests {
             "unknown_b": 2
         });
 
-        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
+        let out = rewrite_messages_body_bytes(body, ClientType::API, true);
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
 
         assert_eq!(
@@ -8616,7 +8617,7 @@ mod tests {
     }
 
     #[test]
-    fn message_body_order_aligns_haiku_probe_profile() {
+    fn api_message_body_order_aligns_haiku_probe_profile() {
         let body = json!({
             "metadata": {
                 "user_id": json!({
@@ -8630,16 +8631,24 @@ mod tests {
             "model": "claude-haiku-4-5-20251001"
         });
 
-        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
+        let out = rewrite_messages_body_bytes(body, ClientType::API, true);
 
         assert_eq!(
             top_level_keys(&out),
-            vec!["model", "max_tokens", "messages", "metadata"]
+            vec![
+                "model",
+                "messages",
+                "system",
+                "tools",
+                "metadata",
+                "max_tokens",
+                "stream"
+            ]
         );
     }
 
     #[test]
-    fn message_body_order_aligns_haiku_streaming_title_profile() {
+    fn api_message_body_order_aligns_generated_haiku_title_profile() {
         let body = json!({
             "stream": true,
             "output_config": {"type": "text"},
@@ -8659,7 +8668,7 @@ mod tests {
             "model": "claude-haiku-4-5-20251001"
         });
 
-        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
+        let out = rewrite_messages_body_bytes(body, ClientType::API, true);
 
         assert_eq!(
             top_level_keys(&out),
@@ -8671,7 +8680,6 @@ mod tests {
                 "metadata",
                 "max_tokens",
                 "thinking",
-                "temperature",
                 "output_config",
                 "stream",
             ]
@@ -8679,7 +8687,7 @@ mod tests {
     }
 
     #[test]
-    fn message_body_order_switch_off_keeps_existing_top_level_order() {
+    fn api_message_body_order_switch_off_keeps_existing_top_level_order() {
         let body = json!({
             "metadata": {
                 "user_id": json!({
@@ -8695,7 +8703,40 @@ mod tests {
             "system": [{"type": "text", "text": "Platform: linux\nShell: bash\nOS Version: Linux\nWorking directory: /home/user/project"}]
         });
 
-        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, false);
+        let out = rewrite_messages_body_bytes(body, ClientType::API, false);
+
+        assert_eq!(
+            top_level_keys(&out),
+            vec![
+                "metadata",
+                "stream",
+                "tools",
+                "max_tokens",
+                "model",
+                "system",
+                "messages",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_code_message_body_order_keeps_original_top_level_order_when_switch_on() {
+        let body = json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-cc-order"
+                }).to_string()
+            },
+            "stream": true,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "max_tokens": 64000,
+            "model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": "Platform: linux\nShell: bash\nOS Version: Linux\nWorking directory: /home/user/project"}]
+        });
+
+        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
 
         assert_eq!(
             top_level_keys(&out),
@@ -8711,15 +8752,11 @@ mod tests {
     }
 
     #[test]
-    fn message_body_order_happens_before_cch_attestation() {
+    fn api_message_body_order_happens_before_cch_attestation() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
             "stream": true,
-            "system": [{
-                "type": "text",
-                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
-            }],
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hello cch order"}]}],
             "max_tokens": 64000,
             "metadata": {
@@ -8736,7 +8773,7 @@ mod tests {
             &serde_json::to_vec(&body).unwrap(),
             "/v1/messages",
             &account,
-            ClientType::ClaudeCode,
+            ClientType::API,
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
@@ -8765,6 +8802,7 @@ mod tests {
                 "model",
                 "messages",
                 "system",
+                "tools",
                 "metadata",
                 "max_tokens",
                 "stream",

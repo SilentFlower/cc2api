@@ -451,9 +451,9 @@ impl GatewayService {
         Ok(())
     }
 
-    /// 从全局设置刷新 `/v1/messages` 顶层字段顺序指纹对齐开关。
+    /// 从全局设置刷新 API mimicry `/v1/messages` 顶层字段顺序指纹对齐开关。
     ///
-    /// 排序本身发生在 rewriter 完成所有 body 改写之后、CCH attestation 计算之前。
+    /// API 请求排序发生在 rewriter 完成所有 body 改写之后、CCH attestation 计算之前。
     ///
     /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
     pub async fn reload_message_body_order_fingerprint_enabled(&self) -> Result<(), AppError> {

@@ -203,7 +203,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "message_cache_control_rewrite",
             crate::store::settings_store::DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
         ),
-        // `/v1/messages` 顶层字段顺序默认对齐真实 Claude Code 抓包;可在设置页关闭回滚。
+        // API mimicry `/v1/messages` 顶层字段顺序默认对齐真实 Claude Code 抓包;可在设置页关闭回滚。
         (
             "message_body_order_fingerprint_enabled",
             crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,

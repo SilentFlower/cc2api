@@ -50,7 +50,7 @@ const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 /** Claude Code messages 缓存断点改写模式 */
 const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' | 'sub2api'>('off');
 
-/** /v1/messages 顶层字段顺序指纹对齐开关 */
+/** API mimicry /v1/messages 顶层字段顺序指纹对齐开关 */
 const messageBodyOrderFingerprintEnabled = ref(true);
 
 /** thinking.type=disabled 兼容改写配置 */
@@ -1091,7 +1091,7 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">请求体字段顺序指纹</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              对齐 2.1.195 抓包中的 /v1/messages 顶层字段顺序；仅重排顶层 key,未知字段保留在已知字段之后。
+              对齐 API mimicry 生成的 /v1/messages 顶层字段顺序；Claude Code 客户端请求保留原始顺序。
             </p>
           </div>
           <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
@@ -1103,7 +1103,7 @@ onMounted(async () => {
             <span class="text-sm text-[#29261e]">{{ messageBodyOrderFingerprintEnabled ? '已启用' : '保持序列化原序' }}</span>
           </label>
           <p class="text-[11px] text-[#b5b0a6]">
-            排序发生在所有 body 改写之后、CCH attestation 计算之前；关闭后可用于线上对照和快速回滚。
+            排序发生在 API body 改写之后、CCH attestation 计算之前；未知字段保留在已知字段之后。
           </p>
         </div>
 
