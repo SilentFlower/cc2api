@@ -93,6 +93,32 @@ const API_DEFAULT_MAX_TOKENS: u64 = 32000;
 const CONTEXT_1M_BETA_TOKEN: &str = "context-1m-2025-08-07";
 const FABLE_MODEL_ID: &str = "claude-fable-5";
 const FABLE_FALLBACK_MODEL_ID: &str = "claude-opus-4-8";
+const MESSAGE_BODY_ORDER_OPUS_MAIN: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "metadata",
+    "max_tokens",
+    "thinking",
+    "context_management",
+    "output_config",
+    "diagnostics",
+    "stream",
+];
+const MESSAGE_BODY_ORDER_HAIKU_TITLE: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "metadata",
+    "max_tokens",
+    "thinking",
+    "temperature",
+    "output_config",
+    "stream",
+];
+const MESSAGE_BODY_ORDER_HAIKU_PROBE: &[&str] = &["model", "max_tokens", "messages", "metadata"];
 
 /// 从逗号分隔的 anthropic-beta header 中剥离指定 token，保留其它 token 和相对顺序。
 ///
@@ -914,6 +940,7 @@ impl Rewriter {
         env_pt: EnvPassthrough,
         cache_ttl_rewrite: CacheControlTtlRewrite,
         message_cache_rewrite: MessageCacheControlRewrite,
+        message_body_order_fingerprint_enabled: bool,
     ) -> Vec<u8> {
         let (output, completion) = self.rewrite_body_inner(
             body,
@@ -923,6 +950,7 @@ impl Rewriter {
             env_pt,
             cache_ttl_rewrite,
             message_cache_rewrite,
+            message_body_order_fingerprint_enabled,
             &DisabledThinkingRewrite::off(),
         );
         self.complete_stateful_cache(completion);
@@ -938,6 +966,7 @@ impl Rewriter {
     /// @param env_pt 环境透传配置。
     /// @param cache_ttl_rewrite cache_control TTL 改写配置。
     /// @param message_cache_rewrite message cache_control 断点改写配置。
+    /// @param message_body_order_fingerprint_enabled 是否对齐 `/v1/messages` 顶层字段顺序。
     /// @param disabled_thinking_rewrite `thinking.type=disabled` 兼容改写配置。
     /// @return 改写后的 body 与可选 stateful 延迟提交句柄。
     pub fn rewrite_body_with_stateful_completion(
@@ -949,6 +978,7 @@ impl Rewriter {
         env_pt: EnvPassthrough,
         cache_ttl_rewrite: CacheControlTtlRewrite,
         message_cache_rewrite: MessageCacheControlRewrite,
+        message_body_order_fingerprint_enabled: bool,
         disabled_thinking_rewrite: &DisabledThinkingRewrite,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         self.rewrite_body_inner(
@@ -959,6 +989,7 @@ impl Rewriter {
             env_pt,
             cache_ttl_rewrite,
             message_cache_rewrite,
+            message_body_order_fingerprint_enabled,
             disabled_thinking_rewrite,
         )
     }
@@ -1023,6 +1054,7 @@ impl Rewriter {
         env_pt: EnvPassthrough,
         cache_ttl_rewrite: CacheControlTtlRewrite,
         message_cache_rewrite: MessageCacheControlRewrite,
+        message_body_order_fingerprint_enabled: bool,
         disabled_thinking_rewrite: &DisabledThinkingRewrite,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         if body.is_empty() {
@@ -1046,6 +1078,9 @@ impl Rewriter {
             );
             rewrite_existing_ephemeral_cache_control_ttl(&mut parsed, cache_ttl_rewrite);
             rewrite_disabled_thinking_to_adaptive(&mut parsed, disabled_thinking_rewrite);
+            if message_body_order_fingerprint_enabled {
+                order_message_body_top_level_fields(&mut parsed);
+            }
         } else if is_event_logging_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
@@ -4886,6 +4921,53 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
     None
 }
 
+/// 按 2.1.195 抓包画像重排 `/v1/messages` 顶层字段,未知字段追加并保留原相对顺序。
+fn order_message_body_top_level_fields(body: &mut serde_json::Value) {
+    let Some(map) = body.as_object_mut() else {
+        return;
+    };
+    let profile_order = message_body_order_profile(map);
+    let mut original = std::mem::take(map);
+    let mut ordered = serde_json::Map::new();
+    for key in profile_order {
+        if let Some(value) = original.shift_remove(*key) {
+            ordered.insert((*key).to_string(), value);
+        }
+    }
+    for (key, value) in original {
+        ordered.insert(key, value);
+    }
+    *map = ordered;
+}
+
+fn message_body_order_profile(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> &'static [&'static str] {
+    let model = map
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if model.contains("haiku")
+        && map.get("max_tokens").and_then(|value| value.as_u64()) == Some(1)
+        && !map.contains_key("system")
+        && !map.contains_key("tools")
+    {
+        return MESSAGE_BODY_ORDER_HAIKU_PROBE;
+    }
+    if model.contains("haiku")
+        && map.get("stream").and_then(|value| value.as_bool()) == Some(true)
+        && map.contains_key("temperature")
+        && map
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .is_some_and(|tools| tools.is_empty())
+    {
+        return MESSAGE_BODY_ORDER_HAIKU_TITLE;
+    }
+    MESSAGE_BODY_ORDER_OPUS_MAIN
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5029,6 +5111,7 @@ mod tests {
             EnvPassthrough::default(),
             cache_ttl_rewrite,
             message_cache_rewrite,
+            true,
         );
         serde_json::from_slice(&out).unwrap()
     }
@@ -5047,6 +5130,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
             &disabled_thinking_rewrite,
         );
         serde_json::from_slice(&out).unwrap()
@@ -5068,6 +5152,7 @@ mod tests {
             EnvPassthrough::default(),
             cache_ttl_rewrite,
             message_cache_rewrite,
+            true,
         );
         serde_json::from_slice(&out).unwrap()
     }
@@ -5085,9 +5170,39 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Stateful,
+            true,
             &DisabledThinkingRewrite::off(),
         );
         (serde_json::from_slice(&out).unwrap(), completion)
+    }
+
+    fn rewrite_messages_body_bytes(
+        body: serde_json::Value,
+        client_type: ClientType,
+        message_body_order_fingerprint_enabled: bool,
+    ) -> Vec<u8> {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            client_type,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            message_body_order_fingerprint_enabled,
+        )
+    }
+
+    fn top_level_keys(body: &[u8]) -> Vec<String> {
+        let parsed: serde_json::Value = serde_json::from_slice(body).unwrap();
+        parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| key.to_string())
+            .collect()
     }
 
     fn message_cache_control_positions(body: &serde_json::Value) -> Vec<(usize, usize)> {
@@ -5303,6 +5418,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
             MessageCacheControlRewrite::Auto,
+            true,
             &DisabledThinkingRewrite {
                 enabled: true,
                 models: vec!["claude-fable-5".into()],
@@ -8284,6 +8400,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let user_id = parsed["metadata"]["user_id"].as_str().unwrap();
@@ -8415,6 +8532,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Auto,
+            true,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -8445,6 +8563,213 @@ mod tests {
         ))
         .unwrap();
 
+        assert!(expected.contains(&actual));
+    }
+
+    #[test]
+    fn message_body_order_aligns_opus_main_profile_and_keeps_unknown_tail() {
+        let body = json!({
+            "unknown_a": 1,
+            "stream": true,
+            "diagnostics": {"enabled": true},
+            "output_config": {"type": "json"},
+            "context_management": {"enabled": true},
+            "thinking": {"type": "adaptive"},
+            "max_tokens": 64000,
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-order"
+                }).to_string()
+            },
+            "tools": [{"name": "Read"}],
+            "system": [{"type": "text", "text": "Platform: linux\nShell: bash\nOS Version: Linux\nWorking directory: /home/user/project"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "model": "claude-opus-4-8",
+            "unknown_b": 2
+        });
+
+        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            top_level_keys(&out),
+            vec![
+                "model",
+                "messages",
+                "system",
+                "tools",
+                "metadata",
+                "max_tokens",
+                "thinking",
+                "context_management",
+                "output_config",
+                "diagnostics",
+                "stream",
+                "unknown_a",
+                "unknown_b",
+            ]
+        );
+        assert_eq!(parsed["unknown_a"], json!(1));
+        assert_eq!(parsed["unknown_b"], json!(2));
+    }
+
+    #[test]
+    fn message_body_order_aligns_haiku_probe_profile() {
+        let body = json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-probe"
+                }).to_string()
+            },
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "probe"}]}],
+            "max_tokens": 1,
+            "model": "claude-haiku-4-5-20251001"
+        });
+
+        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
+
+        assert_eq!(
+            top_level_keys(&out),
+            vec!["model", "max_tokens", "messages", "metadata"]
+        );
+    }
+
+    #[test]
+    fn message_body_order_aligns_haiku_streaming_title_profile() {
+        let body = json!({
+            "stream": true,
+            "output_config": {"type": "text"},
+            "temperature": 0.5,
+            "thinking": {"type": "disabled"},
+            "max_tokens": 32000,
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-title"
+                }).to_string()
+            },
+            "tools": [],
+            "system": [{"type": "text", "text": "Generate a concise title"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "title"}]}],
+            "model": "claude-haiku-4-5-20251001"
+        });
+
+        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, true);
+
+        assert_eq!(
+            top_level_keys(&out),
+            vec![
+                "model",
+                "messages",
+                "system",
+                "tools",
+                "metadata",
+                "max_tokens",
+                "thinking",
+                "temperature",
+                "output_config",
+                "stream",
+            ]
+        );
+    }
+
+    #[test]
+    fn message_body_order_switch_off_keeps_existing_top_level_order() {
+        let body = json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-off"
+                }).to_string()
+            },
+            "stream": true,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "max_tokens": 64000,
+            "model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": "Platform: linux\nShell: bash\nOS Version: Linux\nWorking directory: /home/user/project"}]
+        });
+
+        let out = rewrite_messages_body_bytes(body, ClientType::ClaudeCode, false);
+
+        assert_eq!(
+            top_level_keys(&out),
+            vec![
+                "metadata",
+                "stream",
+                "messages",
+                "max_tokens",
+                "model",
+                "system",
+            ]
+        );
+    }
+
+    #[test]
+    fn message_body_order_happens_before_cch_attestation() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "stream": true,
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.156.abc; cc_entrypoint=cli; cch=12345;"
+            }],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello cch order"}]}],
+            "max_tokens": 64000,
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "session-cch-order"
+                }).to_string()
+            },
+            "model": "claude-opus-4-8"
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+        );
+        let text = String::from_utf8(out.clone()).unwrap();
+        let actual = super::CCH_VALUE_REGEX
+            .find(&text)
+            .map(|m| m.as_str().to_string())
+            .expect("cch value exists");
+        let mut placeholder_body = out.clone();
+        let cch_pos = placeholder_body
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        let expected = String::from_utf8(compute_cch_attestation(
+            placeholder_body,
+            DEFAULT_CLAUDE_CODE_VERSION,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            top_level_keys(&out),
+            vec![
+                "model",
+                "messages",
+                "system",
+                "metadata",
+                "max_tokens",
+                "stream",
+            ]
+        );
         assert!(expected.contains(&actual));
     }
 
@@ -8516,6 +8841,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
 
@@ -8897,6 +9223,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let attrs = parsed.get("attributes").unwrap();
@@ -8940,6 +9267,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let attrs = parsed.get("attributes").unwrap();
@@ -8990,6 +9318,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let event = &parsed["events"][0]["event_data"];
@@ -9041,6 +9370,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let env = &parsed["events"][0]["event_data"]["env"];
@@ -9086,6 +9416,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            true,
         );
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let event = &parsed["events"][0]["event_data"];
@@ -9324,6 +9655,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
             MessageCacheControlRewrite::Auto,
+            true,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -9389,6 +9721,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
             MessageCacheControlRewrite::Auto,
+            true,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -9437,6 +9770,7 @@ mod tests {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::FiveMinutes,
             MessageCacheControlRewrite::Stateful,
+            true,
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();

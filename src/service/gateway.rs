@@ -42,8 +42,9 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
-    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PASSTHROUGH_OS_VERSION,
+    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
     DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
@@ -322,6 +323,7 @@ pub struct GatewayService {
     env_passthrough: RwLock<EnvPassthrough>,
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
+    message_body_order_fingerprint_enabled: RwLock<bool>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
@@ -358,6 +360,9 @@ impl GatewayService {
             env_passthrough: RwLock::new(default_env_passthrough()),
             cache_control_ttl_rewrite: RwLock::new(default_cache_control_ttl_rewrite()),
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
+            message_body_order_fingerprint_enabled: RwLock::new(
+                default_message_body_order_fingerprint_enabled(),
+            ),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
             disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
             assistant_prefill_intercept_config: RwLock::new(
@@ -443,6 +448,23 @@ impl GatewayService {
             .await?;
         *self.message_cache_control_rewrite.write().await =
             MessageCacheControlRewrite::parse(&raw)?;
+        Ok(())
+    }
+
+    /// 从全局设置刷新 `/v1/messages` 顶层字段顺序指纹对齐开关。
+    ///
+    /// 排序本身发生在 rewriter 完成所有 body 改写之后、CCH attestation 计算之前。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_message_body_order_fingerprint_enabled(&self) -> Result<(), AppError> {
+        let raw = self
+            .settings_store
+            .get_value(
+                "message_body_order_fingerprint_enabled",
+                DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
+            )
+            .await?;
+        *self.message_body_order_fingerprint_enabled.write().await = parse_setting_flag(&raw);
         Ok(())
     }
 
@@ -1256,6 +1278,8 @@ impl GatewayService {
             let env_pt = *self.env_passthrough.read().await;
             let cache_ttl = *self.cache_control_ttl_rewrite.read().await;
             let message_cache = *self.message_cache_control_rewrite.read().await;
+            let message_body_order_fingerprint_enabled =
+                *self.message_body_order_fingerprint_enabled.read().await;
             let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
             let (rewritten_body, stateful_cache_completion) =
                 self.rewriter.rewrite_body_with_stateful_completion(
@@ -1266,6 +1290,7 @@ impl GatewayService {
                     env_pt,
                     cache_ttl,
                     message_cache,
+                    message_body_order_fingerprint_enabled,
                     &disabled_thinking,
                 );
             debug!(
@@ -4123,6 +4148,11 @@ fn default_cache_control_ttl_rewrite() -> CacheControlTtlRewrite {
 fn default_message_cache_control_rewrite() -> MessageCacheControlRewrite {
     MessageCacheControlRewrite::parse(DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE)
         .expect("默认 message cache_control 改写模式必须合法")
+}
+
+/// 构造 `/v1/messages` 顶层字段顺序指纹对齐开关初始值。
+fn default_message_body_order_fingerprint_enabled() -> bool {
+    parse_setting_flag(DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED)
 }
 
 /// 构造预热请求拦截配置初始值(reload 之前的兜底,与设置默认值保持一致)。

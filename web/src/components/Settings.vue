@@ -50,6 +50,9 @@ const cacheControlTtlRewrite = ref<'off' | '5m' | '1h'>('off');
 /** Claude Code messages 缓存断点改写模式 */
 const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' | 'sub2api'>('off');
 
+/** /v1/messages 顶层字段顺序指纹对齐开关 */
+const messageBodyOrderFingerprintEnabled = ref(true);
+
 /** thinking.type=disabled 兼容改写配置 */
 const rewriteDisabledThinkingEnabled = ref(false);
 const rewriteDisabledThinkingModels = ref('claude-fable-5');
@@ -357,6 +360,7 @@ async function loadSettings() {
     } else {
       messageCacheControlRewrite.value = 'off';
     }
+    messageBodyOrderFingerprintEnabled.value = (data.message_body_order_fingerprint_enabled ?? 'true') === 'true';
     proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
     rewriteDisabledThinkingEnabled.value = (data.rewrite_disabled_thinking_enabled ?? 'false') === 'true';
     rewriteDisabledThinkingModels.value = data.rewrite_disabled_thinking_models ?? 'claude-fable-5';
@@ -468,6 +472,7 @@ async function saveSettings() {
       passthrough_working_dir: passthroughWorkingDir.value ? 'true' : 'false',
       cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
       message_cache_control_rewrite: messageCacheControlRewrite.value,
+      message_body_order_fingerprint_enabled: messageBodyOrderFingerprintEnabled.value ? 'true' : 'false',
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
       rewrite_disabled_thinking_enabled: rewriteDisabledThinkingEnabled.value ? 'true' : 'false',
       rewrite_disabled_thinking_models: rewriteDisabledThinkingModels.value.trim(),
@@ -1081,6 +1086,26 @@ onMounted(async () => {
         <p class="text-[11px] text-[#b5b0a6]">
           这些设置只影响 Anthropic /v1/messages 转发,发生在 CCH attestation 重新计算之前。off 可作为回滚开关。
         </p>
+
+        <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">请求体字段顺序指纹</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              对齐 2.1.195 抓包中的 /v1/messages 顶层字段顺序；仅重排顶层 key,未知字段保留在已知字段之后。
+            </p>
+          </div>
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="messageBodyOrderFingerprintEnabled"
+              type="checkbox"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">{{ messageBodyOrderFingerprintEnabled ? '已启用' : '保持序列化原序' }}</span>
+          </label>
+          <p class="text-[11px] text-[#b5b0a6]">
+            排序发生在所有 body 改写之后、CCH attestation 计算之前；关闭后可用于线上对照和快速回滚。
+          </p>
+        </div>
 
         <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
           <div>

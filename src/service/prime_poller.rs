@@ -13,7 +13,7 @@ use crate::service::rewriter::{
     ordered_anthropic_headers,
 };
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
-use crate::store::settings_store::SettingsStore;
+use crate::store::settings_store::{DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, SettingsStore};
 
 /// 上游 `/v1/messages` 地址,与 gateway.rs 的 UPSTREAM_BASE 保持一致。
 const UPSTREAM_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
@@ -43,6 +43,7 @@ struct PrimeConfig {
     enabled: bool,
     hours: Vec<u32>,
     model: String,
+    message_body_order_fingerprint_enabled: bool,
 }
 
 /// 预热结果,用于写入日志表。
@@ -133,7 +134,8 @@ impl PrimePollerService {
             "prime poller: tick at {}:{:02}, model = {}",
             h, TRIGGER_MINUTE, cfg.model
         );
-        self.run_round(h, &cfg.model).await;
+        self.run_round(h, &cfg.model, cfg.message_body_order_fingerprint_enabled)
+            .await;
     }
 
     /// 读取并解析设置,解析失败或总开关关闭返回 None。
@@ -164,17 +166,27 @@ impl PrimePollerService {
             .cloned()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+        let message_body_order_fingerprint_enabled = all
+            .get("message_body_order_fingerprint_enabled")
+            .map(|s| s == "true")
+            .unwrap_or(DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED == "true");
 
         Some(PrimeConfig {
             enabled,
             hours,
             model,
+            message_body_order_fingerprint_enabled,
         })
     }
 
     /// 对所有活跃账号依次发起预热请求,账号间间隔 PER_ACCOUNT_GAP。
     /// 仍处于 429 冷却期的账号会被跳过(避免续命式延长冷却),但仍写入 skip 日志。
-    async fn run_round(&self, hour: u32, model: &str) {
+    async fn run_round(
+        &self,
+        hour: u32,
+        model: &str,
+        message_body_order_fingerprint_enabled: bool,
+    ) {
         let accounts = match self.account_svc.list_accounts().await {
             Ok(list) => list,
             Err(e) => {
@@ -195,7 +207,8 @@ impl PrimePollerService {
         for account in targets {
             let triggered_at = chrono::Local::now().to_rfc3339();
             let outcome = if account.is_schedulable() {
-                self.prime_one(&account, model).await
+                self.prime_one(&account, model, message_body_order_fingerprint_enabled)
+                    .await
             } else {
                 // 处于速率冷却期,不发请求,但在日志里留痕,便于排查"今天没预热"的原因。
                 let reset = account
@@ -337,7 +350,12 @@ impl PrimePollerService {
     }
 
     /// 对单个账号执行一次预热请求,不抛错,所有结果都归并到 PrimeOutcome。
-    async fn prime_one(&self, account: &Account, model: &str) -> PrimeOutcome {
+    async fn prime_one(
+        &self,
+        account: &Account,
+        model: &str,
+        message_body_order_fingerprint_enabled: bool,
+    ) -> PrimeOutcome {
         let started = Instant::now();
 
         // 取账号凭证(OAuth 会自动刷新,SetupToken 直接返回)。
@@ -393,6 +411,7 @@ impl PrimePollerService {
             EnvPassthrough::default(),
             CacheControlTtlRewrite::Off,
             MessageCacheControlRewrite::Off,
+            message_body_order_fingerprint_enabled,
         );
         // rewriter 已把 metadata.user_id 写成最终上游 body；header 直接从同一字段提取 session_id。
         let body_value: serde_json::Value =

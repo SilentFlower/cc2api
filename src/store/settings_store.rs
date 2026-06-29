@@ -31,6 +31,8 @@ pub const DEFAULT_PASSTHROUGH_WORKING_DIR: &str = "true";
 pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
 /// Claude Code messages 缓存断点稳定化默认关闭,保持旧请求体行为。
 pub const DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE: &str = "off";
+/// `/v1/messages` 顶层字段顺序指纹对齐默认开启,用于贴近 2.1.195 抓包。
+pub const DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED: &str = "true";
 /// 代理 HTTP 客户端连接池默认开启,用于复用同一代理下的底层连接。
 pub const DEFAULT_PROXY_CLIENT_POOL_ENABLED: &str = "true";
 /// 标题/`Warmup` 预热请求本地拦截默认关闭,避免升级后改变请求行为。
@@ -233,7 +235,8 @@ impl SettingsStore {
 mod tests {
     use super::{
         DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING,
-        DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, SettingsStore,
+        DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+        DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, SettingsStore,
     };
     use sqlx::AnyPool;
 
@@ -385,5 +388,20 @@ mod tests {
             .expect("get value");
 
         assert_eq!(value, DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING);
+    }
+
+    #[tokio::test]
+    async fn default_message_body_order_fingerprint_setting_is_enabled() {
+        let store = make_store().await;
+
+        let value = store
+            .get_value(
+                "message_body_order_fingerprint_enabled",
+                DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
+            )
+            .await
+            .expect("get value");
+
+        assert_eq!(value, DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED);
     }
 }

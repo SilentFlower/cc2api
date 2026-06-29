@@ -39,11 +39,11 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
-    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
-    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
-    SettingsStore,
+    DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
+    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -755,6 +755,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("message_cache_control_rewrite".into())
         .or_insert_with(|| DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE.to_string());
     settings
+        .entry("message_body_order_fingerprint_enabled".into())
+        .or_insert_with(|| DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED.to_string());
+    settings
         .entry("proxy_client_pool_enabled".into())
         .or_insert_with(|| DEFAULT_PROXY_CLIENT_POOL_ENABLED.to_string());
     settings
@@ -950,6 +953,7 @@ async fn update_settings(
         "log_non_stream_request_enabled",
         "non_stream_probe_cache_enabled",
         "stream_keepalive_enabled",
+        "message_body_order_fingerprint_enabled",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -1023,6 +1027,12 @@ async fn update_settings(
         state
             .gateway_svc
             .reload_message_cache_control_rewrite()
+            .await?;
+    }
+    if body.contains_key("message_body_order_fingerprint_enabled") {
+        state
+            .gateway_svc
+            .reload_message_body_order_fingerprint_enabled()
             .await?;
     }
     if body.contains_key("intercept_warmup_title_enabled")

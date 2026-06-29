@@ -132,6 +132,10 @@ async fn main() {
         .await
         .expect("load message cache control rewrite failed");
     gateway_svc
+        .reload_message_body_order_fingerprint_enabled()
+        .await
+        .expect("load message body order fingerprint setting failed");
+    gateway_svc
         .reload_warmup_intercept_config()
         .await
         .expect("load warmup intercept config failed");

@@ -203,6 +203,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "message_cache_control_rewrite",
             crate::store::settings_store::DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
         ),
+        // `/v1/messages` 顶层字段顺序默认对齐真实 Claude Code 抓包;可在设置页关闭回滚。
+        (
+            "message_body_order_fingerprint_enabled",
+            crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
+        ),
         // 代理 reqwest Client 连接池默认开启,可通过设置页关闭用于排查连接复用问题。
         (
             "proxy_client_pool_enabled",
@@ -771,6 +776,23 @@ mod tests {
         assert_eq!(
             blocked_versions,
             crate::store::settings_store::DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_default_message_body_order_fingerprint_setting() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let enabled: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("message_body_order_fingerprint_enabled")
+            .fetch_one(&pool)
+            .await
+            .expect("message body order setting");
+
+        assert_eq!(
+            enabled,
+            crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED
         );
     }
 
