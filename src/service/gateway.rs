@@ -4341,6 +4341,22 @@ fn build_message_telemetry_context(
             .map(|tools| tools.len())
             .unwrap_or(0),
         attachment_count: count_attachment_blocks(original_body),
+        image_block_count: count_blocks_by_types(
+            original_body,
+            &["image", "image_url", "input_image"],
+        ),
+        image_total_bytes: estimate_payload_bytes_by_types(
+            original_body,
+            &["image", "image_url", "input_image"],
+        ),
+        document_block_count: count_blocks_by_types(
+            original_body,
+            &["document", "file", "input_file"],
+        ),
+        document_total_bytes: estimate_payload_bytes_by_types(
+            original_body,
+            &["document", "file", "input_file"],
+        ),
         system_prompt_block_count: count_system_prompt_blocks(rewritten_body),
         system_prompt_text_length: system_prompt_text_length(rewritten_body),
         system_cache_breakpoint_count: count_cache_breakpoints_in_array_field(
@@ -4530,6 +4546,111 @@ fn count_attachment_value(value: &serde_json::Value) -> usize {
                     .unwrap_or_default()
         }
         _ => 0,
+    }
+}
+
+fn count_blocks_by_types(body: &serde_json::Value, types: &[&str]) -> usize {
+    let mut count = 0;
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for message in messages {
+            count += count_blocks_by_types_value(
+                message.get("content").unwrap_or(&serde_json::Value::Null),
+                types,
+            );
+        }
+    }
+    count
+}
+
+fn count_blocks_by_types_value(value: &serde_json::Value, types: &[&str]) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| count_blocks_by_types_value(item, types))
+            .sum(),
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let self_count = types.contains(&kind) as usize;
+            self_count
+                + map
+                    .get("content")
+                    .map(|content| count_blocks_by_types_value(content, types))
+                    .unwrap_or_default()
+        }
+        _ => 0,
+    }
+}
+
+fn estimate_payload_bytes_by_types(body: &serde_json::Value, types: &[&str]) -> usize {
+    let mut bytes = 0;
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for message in messages {
+            bytes += estimate_payload_bytes_by_types_value(
+                message.get("content").unwrap_or(&serde_json::Value::Null),
+                types,
+            );
+        }
+    }
+    bytes
+}
+
+fn estimate_payload_bytes_by_types_value(value: &serde_json::Value, types: &[&str]) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| estimate_payload_bytes_by_types_value(item, types))
+            .sum(),
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let own_bytes = if types.contains(&kind) {
+                estimate_payload_bytes(map)
+            } else {
+                0
+            };
+            own_bytes
+                + map
+                    .get("content")
+                    .map(|content| estimate_payload_bytes_by_types_value(content, types))
+                    .unwrap_or_default()
+        }
+        _ => 0,
+    }
+}
+
+fn estimate_payload_bytes(map: &serde_json::Map<String, serde_json::Value>) -> usize {
+    estimate_payload_bytes_from_value(map.get("source"))
+        .or_else(|| estimate_payload_bytes_from_value(map.get("data")))
+        .or_else(|| estimate_payload_bytes_from_value(map.get("url")))
+        .or_else(|| estimate_payload_bytes_from_value(map.get("file_id")))
+        .unwrap_or(0)
+}
+
+fn estimate_payload_bytes_from_value(value: Option<&serde_json::Value>) -> Option<usize> {
+    match value {
+        Some(serde_json::Value::String(text)) => Some(estimated_encoded_payload_len(text)),
+        Some(serde_json::Value::Object(map)) => {
+            if let Some(data) = map.get("data").and_then(|data| data.as_str()) {
+                return Some(estimated_encoded_payload_len(data));
+            }
+            if let Some(url) = map.get("url").and_then(|url| url.as_str()) {
+                return Some(url.len());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn estimated_encoded_payload_len(text: &str) -> usize {
+    let len = text.len();
+    if text.len() >= 8
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+    {
+        len.saturating_mul(3) / 4
+    } else {
+        len
     }
 }
 
@@ -7487,6 +7608,10 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
         assert!(context.stream);
         assert_eq!(context.tool_count, 2);
         assert_eq!(context.attachment_count, 2);
+        assert_eq!(context.image_block_count, 1);
+        assert!(context.image_total_bytes > 0);
+        assert_eq!(context.document_block_count, 1);
+        assert_eq!(context.document_total_bytes, "file_123".len());
         assert_eq!(context.system_prompt_block_count, 1);
         assert_eq!(
             context.system_prompt_text_length,

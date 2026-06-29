@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,8 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_BATCH_MAX: usize = 25;
 const EVENT_QUEUE_MAX: usize = 200;
 const SLOW_FIRST_BYTE_MS: u64 = 10_000;
+const ADDITIONAL_METADATA_LONG_TEXT_LIMIT: usize = 1024;
+const EVENT_DATA_LONG_TEXT_LIMIT: usize = 4096;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
@@ -106,6 +108,14 @@ pub struct MessageTelemetryContext {
     pub tool_count: usize,
     /// 请求中附件或文件块数量。
     pub attachment_count: usize,
+    /// 请求中的图片 block 数量。
+    pub image_block_count: usize,
+    /// 请求中可安全估算的图片 payload 字节数。
+    pub image_total_bytes: usize,
+    /// 请求中的文档/文件 block 数量。
+    pub document_block_count: usize,
+    /// 请求中可安全估算的文档/文件 payload 字节数。
+    pub document_total_bytes: usize,
     /// 改写后 system prompt 文本块数量。
     pub system_prompt_block_count: usize,
     /// 改写后 system prompt 文本总长度，只记录长度不记录正文。
@@ -207,10 +217,53 @@ struct MessageCorrelation {
     time_since_last_api_call_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct TelemetryPayloadScanSummary {
+    event_count: usize,
+    event_name_counts: BTreeMap<String, usize>,
+    dropped_fields: usize,
+    dropped_events: usize,
+    reason_counts: BTreeMap<&'static str, usize>,
+    field_drops: Vec<TelemetryFieldDrop>,
+}
+
+#[derive(Debug, Clone)]
+struct TelemetryFieldDrop {
+    event_name: String,
+    path: String,
+    reason: &'static str,
+    action: &'static str,
+}
+
+impl TelemetryFieldDrop {
+    fn as_log_tuple(&self) -> (&str, &str, &'static str, &'static str) {
+        (
+            self.event_name.as_str(),
+            self.path.as_str(),
+            self.reason,
+            self.action,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TelemetryShapeSummary {
+    event_name_counts: BTreeMap<String, usize>,
+    metadata_keys_by_event: BTreeMap<String, BTreeMap<String, usize>>,
+    metadata_types_by_event: BTreeMap<String, BTreeMap<String, BTreeMap<String, usize>>>,
+    dropped_fields: usize,
+    dropped_events: usize,
+    reason_counts: BTreeMap<&'static str, usize>,
+}
+
 impl TelemetryCorrelationStore {
-    fn register_request(&mut self, context: &MessageTelemetryContext) -> MessageCorrelation {
+    fn register_request(
+        &mut self,
+        context: &MessageTelemetryContext,
+        fallback_session_id: &str,
+    ) -> MessageCorrelation {
         let now = Instant::now();
-        let session_key = correlation_session_key(context);
+        let session_key = correlation_session_key(context, fallback_session_id);
         let session = self
             .by_session
             .entry(session_key)
@@ -234,10 +287,14 @@ impl TelemetryCorrelationStore {
         correlation
     }
 
-    fn resolve_result(&mut self, context: &MessageTelemetryContext) -> MessageCorrelation {
+    fn resolve_result(
+        &mut self,
+        context: &MessageTelemetryContext,
+        fallback_session_id: &str,
+    ) -> MessageCorrelation {
         self.by_request
             .remove(&context.request_key)
-            .unwrap_or_else(|| self.register_request(context))
+            .unwrap_or_else(|| self.register_request(context, fallback_session_id))
     }
 }
 
@@ -252,11 +309,11 @@ impl TelemetrySessionCorrelation {
     }
 }
 
-fn correlation_session_key(context: &MessageTelemetryContext) -> String {
+fn correlation_session_key(context: &MessageTelemetryContext, fallback_session_id: &str) -> String {
     context
         .session_id
         .clone()
-        .unwrap_or_else(|| format!("request:{}", context.request_key))
+        .unwrap_or_else(|| format!("run:{}", fallback_session_id))
 }
 
 fn prefixed_random_id(prefix: &str) -> String {
@@ -366,7 +423,9 @@ impl TelemetryService {
         if let Some(session) = sessions.get_mut(&account.id) {
             session.expires_at = Instant::now() + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
-            let correlation = session.correlations.register_request(&context);
+            let correlation = session
+                .correlations
+                .register_request(&context, &session.run_profile.session_id);
             enqueue_events(
                 &mut session.pending_events,
                 message_request_events(&context, &correlation),
@@ -390,7 +449,9 @@ impl TelemetryService {
         if let Some(session) = sessions.get_mut(&account.id) {
             session.expires_at = Instant::now() + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
-            let correlation = session.correlations.resolve_result(&context);
+            let correlation = session
+                .correlations
+                .resolve_result(&context, &session.run_profile.session_id);
             enqueue_events(
                 &mut session.pending_events,
                 message_result_events(&context, &result, &correlation),
@@ -450,15 +511,18 @@ async fn telemetry_loop(
                     None => break,
                 }
             }
-            let payload =
+            let mut payload =
                 build_event_batch(&session.account, &session.run_profile, uptime_secs, &events);
+            let scan_summary = sanitize_telemetry_payload(&mut payload);
             let token = session.token.clone();
             let c = client.clone();
             session.last_event_batch_at = now;
             session.send_count += 1;
             let event_count = events.len();
+            let event_name_counts = scan_summary.event_name_counts.clone();
             drop(map);
 
+            log_simulated_batch_pre_send(account_id, &scan_summary);
             send_telemetry(
                 &c,
                 &format!("{}{}", UPSTREAM_BASE, EVENT_LOGGING_V2_PATH),
@@ -466,13 +530,16 @@ async fn telemetry_loop(
                 &payload,
                 &session_ua(&store, account_id).await,
                 true,
+                Some(&scan_summary),
             )
             .await;
 
             let _ = store.increment_telemetry_count(account_id, 1).await;
             debug!(
-                "telemetry: sent {} queued events for account {}",
-                event_count, account_id
+                event_count,
+                account_id,
+                event_name_counts = ?event_name_counts,
+                "telemetry: simulated batch queued for send"
             );
             continue;
         }
@@ -498,6 +565,7 @@ async fn telemetry_loop(
                 &payload,
                 user_agent,
                 false,
+                None,
             )
             .await;
 
@@ -540,6 +608,7 @@ async fn send_telemetry(
     body: &serde_json::Value,
     user_agent: &str,
     service_header: bool,
+    scan_summary: Option<&TelemetryPayloadScanSummary>,
 ) {
     let path = telemetry_path_from_url(url);
     let headers = telemetry_request_headers(path, token, user_agent, service_header);
@@ -556,14 +625,49 @@ async fn send_telemetry(
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                debug!("telemetry: {} → {}", url, status);
+                if let Some(summary) = scan_summary {
+                    info!(
+                        url,
+                        status = %status,
+                        event_count = summary.event_count,
+                        dropped_fields = summary.dropped_fields,
+                        dropped_events = summary.dropped_events,
+                        reason_counts = ?summary.reason_counts,
+                        "telemetry: simulated batch send succeeded"
+                    );
+                } else {
+                    debug!("telemetry: {} → {}", url, status);
+                }
             } else {
-                let text = resp.text().await.unwrap_or_default();
-                warn!("telemetry: {} → {} {}", url, status, text);
+                if let Some(summary) = scan_summary {
+                    warn!(
+                        url,
+                        status = %status,
+                        event_count = summary.event_count,
+                        dropped_fields = summary.dropped_fields,
+                        dropped_events = summary.dropped_events,
+                        reason_counts = ?summary.reason_counts,
+                        "telemetry: simulated batch send failed"
+                    );
+                } else {
+                    warn!("telemetry: {} → {}", url, status);
+                }
             }
         }
         Err(e) => {
-            warn!("telemetry: {} failed: {}", url, e);
+            if let Some(summary) = scan_summary {
+                warn!(
+                    url,
+                    error_kind = %e,
+                    event_count = summary.event_count,
+                    dropped_fields = summary.dropped_fields,
+                    dropped_events = summary.dropped_events,
+                    reason_counts = ?summary.reason_counts,
+                    "telemetry: simulated batch send errored"
+                );
+            } else {
+                warn!("telemetry: {} failed: {}", url, e);
+            }
         }
     }
 }
@@ -657,6 +761,381 @@ fn build_event_batch(
         .collect();
 
     json!({ "events": events })
+}
+
+fn sanitize_telemetry_payload(payload: &mut serde_json::Value) -> TelemetryPayloadScanSummary {
+    let mut summary = TelemetryPayloadScanSummary::default();
+    let Some(events) = payload
+        .get_mut("events")
+        .and_then(|events| events.as_array_mut())
+    else {
+        return summary;
+    };
+
+    let mut kept_events = Vec::with_capacity(events.len());
+    for mut event in std::mem::take(events) {
+        let event_name = telemetry_event_name(&event);
+        *summary
+            .event_name_counts
+            .entry(event_name.clone())
+            .or_default() += 1;
+        summary.event_count += 1;
+
+        if sanitize_event_value(&mut event, &event_name, &mut summary) {
+            kept_events.push(event);
+        } else {
+            summary.dropped_events += 1;
+            *summary.reason_counts.entry("invalid_event").or_default() += 1;
+        }
+    }
+    *events = kept_events;
+    summary
+}
+
+fn sanitize_event_value(
+    event: &mut serde_json::Value,
+    event_name: &str,
+    summary: &mut TelemetryPayloadScanSummary,
+) -> bool {
+    let Some(event_data) = event
+        .get_mut("event_data")
+        .and_then(|data| data.as_object_mut())
+    else {
+        return false;
+    };
+
+    sanitize_json_object(
+        event_data,
+        event_name,
+        "event_data",
+        EVENT_DATA_LONG_TEXT_LIMIT,
+        summary,
+    );
+
+    if let Some(metadata_value) = event_data.get_mut("additional_metadata") {
+        sanitize_additional_metadata(metadata_value, event_name, summary);
+    }
+
+    true
+}
+
+fn sanitize_additional_metadata(
+    metadata_value: &mut serde_json::Value,
+    event_name: &str,
+    summary: &mut TelemetryPayloadScanSummary,
+) {
+    let Some(encoded) = metadata_value.as_str() else {
+        return;
+    };
+    if encoded.is_empty() {
+        return;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        record_field_drop(
+            summary,
+            event_name,
+            "event_data.additional_metadata",
+            "invalid_base64_metadata",
+        );
+        *metadata_value = json!("");
+        return;
+    };
+    let Ok(mut metadata) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        record_field_drop(
+            summary,
+            event_name,
+            "event_data.additional_metadata",
+            "invalid_json_metadata",
+        );
+        *metadata_value = json!("");
+        return;
+    };
+    if let Some(map) = metadata.as_object_mut() {
+        sanitize_json_object(
+            map,
+            event_name,
+            "event_data.additional_metadata",
+            ADDITIONAL_METADATA_LONG_TEXT_LIMIT,
+            summary,
+        );
+        let bytes = serde_json::to_vec(&serde_json::Value::Object(map.clone())).unwrap_or_default();
+        *metadata_value = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+    } else {
+        record_field_drop(
+            summary,
+            event_name,
+            "event_data.additional_metadata",
+            "non_object_metadata",
+        );
+        *metadata_value = json!("");
+    }
+}
+
+fn sanitize_json_object(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    event_name: &str,
+    path: &str,
+    long_text_limit: usize,
+    summary: &mut TelemetryPayloadScanSummary,
+) {
+    map.retain(|key, value| {
+        let field_path = format!("{}.{}", path, key);
+        let reason = sensitive_field_reason(key, value, &field_path, long_text_limit);
+        if let Some(reason) = reason {
+            record_field_drop(summary, event_name, &field_path, reason);
+            return false;
+        }
+
+        sanitize_nested_value(value, event_name, &field_path, long_text_limit, summary)
+    });
+}
+
+fn sanitize_nested_value(
+    value: &mut serde_json::Value,
+    event_name: &str,
+    path: &str,
+    long_text_limit: usize,
+    summary: &mut TelemetryPayloadScanSummary,
+) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            sanitize_json_object(map, event_name, path, long_text_limit, summary);
+            true
+        }
+        serde_json::Value::Array(items) => {
+            let mut index = 0;
+            items.retain_mut(|item| {
+                let item_path = format!("{}[{}]", path, index);
+                index += 1;
+                sanitize_nested_value(item, event_name, &item_path, long_text_limit, summary)
+            });
+            true
+        }
+        serde_json::Value::String(_) => {
+            if let Some(reason) = sensitive_field_reason("", value, path, long_text_limit) {
+                record_field_drop(summary, event_name, path, reason);
+                return false;
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn sensitive_field_reason(
+    key: &str,
+    value: &serde_json::Value,
+    path: &str,
+    long_text_limit: usize,
+) -> Option<&'static str> {
+    let key_lower = key.to_ascii_lowercase();
+    if sensitive_key(&key_lower) {
+        return Some("sensitive_key");
+    }
+    let Some(text) = value.as_str() else {
+        return None;
+    };
+    if text.len() > long_text_limit && !allowed_long_text_path(path) {
+        return Some("long_text");
+    }
+    if looks_like_email(text) {
+        return Some("email_value");
+    }
+    if looks_like_bearer_or_cookie(text) {
+        return Some("credential_value");
+    }
+    if looks_like_uuid(text) && !allowed_uuid_path(path) {
+        return Some("uuid_value");
+    }
+    None
+}
+
+fn sensitive_key(key_lower: &str) -> bool {
+    key_lower.contains("authorization")
+        || key_lower == "cookie"
+        || key_lower == "token"
+        || key_lower.contains("access_token")
+        || key_lower.contains("refresh_token")
+        || key_lower.contains("api_key")
+        || key_lower.contains("apikey")
+        || key_lower.contains("prompt")
+        || key_lower.contains("tool_input")
+        || key_lower.contains("toolinput")
+        || key_lower.contains("response_body")
+        || key_lower.contains("responsebody")
+        || key_lower.contains("email")
+}
+
+fn allowed_long_text_path(path: &str) -> bool {
+    path.ends_with(".process")
+        || path.ends_with(".env")
+        || path.ends_with(".auth")
+        || path.ends_with(".additional_metadata")
+}
+
+fn allowed_uuid_path(path: &str) -> bool {
+    path.ends_with(".event_id")
+        || path.ends_with(".device_id")
+        || path.ends_with(".session_id")
+        || path.ends_with(".queryChainId")
+        || path.ends_with(".requestId")
+        || path.ends_with(".previousRequestId")
+        || path.ends_with(".messageID")
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+}
+
+fn looks_like_bearer_or_cookie(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("bearer ")
+        || lower.contains("session=")
+        || lower.contains("cookie:")
+        || lower.contains("sk-ant-")
+        || lower.contains("oauth")
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn record_field_drop(
+    summary: &mut TelemetryPayloadScanSummary,
+    event_name: &str,
+    path: &str,
+    reason: &'static str,
+) {
+    summary.dropped_fields += 1;
+    *summary.reason_counts.entry(reason).or_default() += 1;
+    summary.field_drops.push(TelemetryFieldDrop {
+        event_name: event_name.to_string(),
+        path: path.to_string(),
+        reason,
+        action: "drop_field",
+    });
+}
+
+fn log_simulated_batch_pre_send(account_id: i64, summary: &TelemetryPayloadScanSummary) {
+    if summary.dropped_fields > 0 || summary.dropped_events > 0 {
+        let field_drops: Vec<_> = summary
+            .field_drops
+            .iter()
+            .map(TelemetryFieldDrop::as_log_tuple)
+            .collect();
+        warn!(
+            account_id,
+            event_count = summary.event_count,
+            event_name_counts = ?summary.event_name_counts,
+            dropped_fields = summary.dropped_fields,
+            dropped_events = summary.dropped_events,
+            reason_counts = ?summary.reason_counts,
+            field_drops = ?field_drops,
+            "telemetry: simulated batch sanitized before send"
+        );
+    } else {
+        debug!(
+            account_id,
+            event_count = summary.event_count,
+            event_name_counts = ?summary.event_name_counts,
+            dropped_fields = summary.dropped_fields,
+            dropped_events = summary.dropped_events,
+            "telemetry: simulated batch ready"
+        );
+    }
+}
+
+fn telemetry_shape_summary(payload: &serde_json::Value) -> TelemetryShapeSummary {
+    let mut payload = payload.clone();
+    let scan_summary = sanitize_telemetry_payload(&mut payload);
+    let mut summary = TelemetryShapeSummary {
+        event_name_counts: scan_summary.event_name_counts.clone(),
+        dropped_fields: scan_summary.dropped_fields,
+        dropped_events: scan_summary.dropped_events,
+        reason_counts: scan_summary.reason_counts.clone(),
+        ..TelemetryShapeSummary::default()
+    };
+
+    if let Some(events) = payload.get("events").and_then(|events| events.as_array()) {
+        for event in events {
+            let event_name = telemetry_event_name(event);
+            let Some(metadata_b64) = event
+                .get("event_data")
+                .and_then(|data| data.get("additional_metadata"))
+                .and_then(|metadata| metadata.as_str())
+            else {
+                continue;
+            };
+            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(metadata_b64) else {
+                continue;
+            };
+            let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+                continue;
+            };
+            let Some(map) = metadata.as_object() else {
+                continue;
+            };
+            for (key, value) in map {
+                *summary
+                    .metadata_keys_by_event
+                    .entry(event_name.clone())
+                    .or_default()
+                    .entry(key.clone())
+                    .or_default() += 1;
+                *summary
+                    .metadata_types_by_event
+                    .entry(event_name.clone())
+                    .or_default()
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(json_type_name(value).to_string())
+                    .or_default() += 1;
+            }
+        }
+    }
+    summary
+}
+
+fn telemetry_event_name(event: &serde_json::Value) -> String {
+    event
+        .get("event_data")
+        .and_then(|data| data.get("event_name"))
+        .and_then(|name| name.as_str())
+        .unwrap_or_else(|| {
+            event
+                .get("event_type")
+                .and_then(|event_type| event_type.as_str())
+                .unwrap_or("unknown")
+        })
+        .to_string()
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "int",
+        serde_json::Value::Number(_) => "float",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn build_event_json(
@@ -964,9 +1443,31 @@ fn message_request_events(
     if context.attachment_count > 0 {
         let mut attachment_fields = serde_json::Map::new();
         attachment_fields.insert("label".into(), json!("attachment_summary"));
-        attachment_fields.insert("duration_ms".into(), json!(0));
-        attachment_fields.insert("attachment_size_bytes".into(), json!(0));
         attachment_fields.insert("attachment_count".into(), json!(context.attachment_count));
+        if context.image_block_count > 0 {
+            attachment_fields.insert("image_block_count".into(), json!(context.image_block_count));
+        }
+        if context.image_total_bytes > 0 {
+            attachment_fields.insert("image_total_bytes".into(), json!(context.image_total_bytes));
+        }
+        if context.document_block_count > 0 {
+            attachment_fields.insert(
+                "document_block_count".into(),
+                json!(context.document_block_count),
+            );
+        }
+        if context.document_total_bytes > 0 {
+            attachment_fields.insert(
+                "document_total_bytes".into(),
+                json!(context.document_total_bytes),
+            );
+        }
+        let attachment_size_bytes = context
+            .image_total_bytes
+            .saturating_add(context.document_total_bytes);
+        if attachment_size_bytes > 0 {
+            attachment_fields.insert("attachment_size_bytes".into(), json!(attachment_size_bytes));
+        }
         events.push(internal_event_with_fields(
             "tengu_query_before_attachments",
             &model,
@@ -1048,16 +1549,9 @@ fn message_result_events(
     if context.tool_count > 0 && result.status_code.is_some_and(|s| (200..300).contains(&s)) {
         let mut tool_fields = tool_fields(context, correlation);
         tool_fields.insert("durationMs".into(), json!(result.duration_ms));
-        tool_fields.insert("rssDeltaBytes".into(), json!(0));
-        tool_fields.insert("heapUsedDeltaBytes".into(), json!(0));
-        tool_fields.insert("externalDeltaBytes".into(), json!(0));
-        tool_fields.insert("preToolHookDurationMs".into(), json!(0));
-        tool_fields.insert("permissionDurationMs".into(), json!(0));
-        tool_fields.insert(
-            "toolResultSizeBytes".into(),
-            json!(result.response_body_bytes.unwrap_or(0)),
-        );
-        tool_fields.insert("toolInputSizeBytes".into(), json!(0));
+        if let Some(response_body_bytes) = result.response_body_bytes {
+            tool_fields.insert("toolResultSizeBytes".into(), json!(response_body_bytes));
+        }
         events.push(internal_event_with_fields(
             "tengu_tool_use_success",
             &model,
@@ -1135,7 +1629,6 @@ fn query_fields(
         json!(context.temperature.unwrap_or(1.0)),
     );
     fields.insert("provider".into(), json!("firstParty"));
-    fields.insert("buildAgeMins".into(), json!(0));
     fields.insert("betas".into(), json!(context.betas));
     fields.insert("permissionMode".into(), json!("default"));
     fields.insert("querySource".into(), json!("repl_main_thread"));
@@ -1186,13 +1679,11 @@ fn success_fields(
         "ttftMs".into(),
         json!(result.ttft_ms.unwrap_or(result.duration_ms)),
     );
-    fields.insert("buildAgeMins".into(), json!(0));
     fields.insert("provider".into(), json!("firstParty"));
     fields.insert(
         "stop_reason".into(),
         json!(result.stop_reason.as_deref().unwrap_or("unknown")),
     );
-    fields.insert("costUSD".into(), json!(0.0));
     fields.insert("didFallBackToNonStreaming".into(), json!(false));
     fields.insert("isNonInteractiveSession".into(), json!(false));
     fields.insert("print".into(), json!(false));
@@ -1204,11 +1695,24 @@ fn success_fields(
         "textContentLength".into(),
         json!(context.input_text_char_length),
     );
-    fields.insert("imageBlockCount".into(), json!(context.attachment_count));
-    fields.insert("imageTotalPixels".into(), json!(0));
-    fields.insert("imageTotalBytes".into(), json!(0));
-    fields.insert("documentBlockCount".into(), json!(0));
-    fields.insert("documentTotalBytes".into(), json!(0));
+    if context.image_block_count > 0 {
+        fields.insert("imageBlockCount".into(), json!(context.image_block_count));
+    }
+    if context.image_total_bytes > 0 {
+        fields.insert("imageTotalBytes".into(), json!(context.image_total_bytes));
+    }
+    if context.document_block_count > 0 {
+        fields.insert(
+            "documentBlockCount".into(),
+            json!(context.document_block_count),
+        );
+    }
+    if context.document_total_bytes > 0 {
+        fields.insert(
+            "documentTotalBytes".into(),
+            json!(context.document_total_bytes),
+        );
+    }
     fields.insert(
         "inputTextCharLength".into(),
         json!(context.input_text_char_length),
@@ -1234,9 +1738,6 @@ fn success_fields(
         "cacheCreationEphemeral1hInputTokens".into(),
         json!(result.usage.cache_creation_ephemeral_1h_input_tokens),
     );
-    if context.thinking_type.as_deref() == Some("adaptive") {
-        fields.insert("thinkingContentLength".into(), json!(0));
-    }
     insert_correlation_fields(&mut fields, correlation);
     if let Some(time_since_last_api_call_ms) = correlation.time_since_last_api_call_ms {
         fields.insert(
@@ -1395,8 +1896,9 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 mod tests {
     use super::{
         MessageCorrelation, MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage,
-        TelemetryEvent, build_event_batch, build_growthbook_eval, build_metrics, enqueue_events,
-        internal_event, is_telemetry_path, message_request_events, message_result_events,
+        TelemetryCorrelationStore, TelemetryEvent, build_event_batch, build_growthbook_eval,
+        build_metrics, enqueue_events, internal_event, is_telemetry_path, message_request_events,
+        message_result_events, sanitize_telemetry_payload, telemetry_shape_summary,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1493,6 +1995,10 @@ mod tests {
             stream: true,
             tool_count: 2,
             attachment_count: 1,
+            image_block_count: 1,
+            image_total_bytes: 512,
+            document_block_count: 1,
+            document_total_bytes: 256,
             system_prompt_block_count: 3,
             system_prompt_text_length: 99,
             system_cache_breakpoint_count: 1,
@@ -1517,6 +2023,29 @@ mod tests {
             previous_request_id: Some("req_abcdefghijklmnopqrstuvwx".into()),
             time_since_last_api_call_ms: Some(321),
         }
+    }
+
+    fn encoded_metadata(value: serde_json::Value) -> String {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn decoded_metadata(event_data: &serde_json::Value) -> serde_json::Value {
+        let metadata_b64 = event_data["additional_metadata"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(metadata_b64)
+            .unwrap();
+        serde_json::from_slice(&decoded).unwrap()
+    }
+
+    fn event_data_by_name<'a>(payload: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_data"]["event_name"] == name)
+            .map(|event| &event["event_data"])
+            .expect("event data")
     }
 
     #[test]
@@ -1785,6 +2314,228 @@ mod tests {
         assert_eq!(
             success_event.fields.get("cachedInputTokens"),
             Some(&json!(40))
+        );
+    }
+
+    #[test]
+    fn message_events_omit_fixed_fake_metadata_fields() {
+        let account = test_account();
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 29, 12, 0, 0).unwrap(),
+        );
+        let context = test_message_context();
+        let correlation = test_message_correlation();
+        let request_events = message_request_events(&context, &correlation);
+        let result_events = message_result_events(
+            &context,
+            &MessageTelemetryResult {
+                status_code: Some(200),
+                duration_ms: 4567,
+                ttft_ms: Some(321),
+                error_kind: None,
+                response_body_bytes: Some(999),
+                usage: MessageTelemetryUsage::default(),
+                stop_reason: Some("end_turn".into()),
+            },
+            &correlation,
+        );
+
+        let request_payload = build_event_batch(&account, &run, 3.0, &request_events);
+        let query_metadata =
+            decoded_metadata(event_data_by_name(&request_payload, "tengu_api_query"));
+        assert!(query_metadata.get("buildAgeMins").is_none());
+
+        let attachment_metadata = decoded_metadata(event_data_by_name(
+            &request_payload,
+            "tengu_attachment_compute_duration",
+        ));
+        assert!(attachment_metadata.get("duration_ms").is_none());
+        assert_eq!(attachment_metadata["attachment_count"], 1);
+        assert_eq!(attachment_metadata["image_block_count"], 1);
+        assert_eq!(attachment_metadata["image_total_bytes"], 512);
+        assert_eq!(attachment_metadata["document_block_count"], 1);
+        assert_eq!(attachment_metadata["document_total_bytes"], 256);
+        assert_eq!(attachment_metadata["attachment_size_bytes"], 768);
+
+        let result_payload = build_event_batch(&account, &run, 3.0, &result_events);
+        let success_metadata =
+            decoded_metadata(event_data_by_name(&result_payload, "tengu_api_success"));
+        for key in [
+            "buildAgeMins",
+            "costUSD",
+            "imageTotalPixels",
+            "thinkingContentLength",
+        ] {
+            assert!(success_metadata.get(key).is_none(), "{key}");
+        }
+        assert_eq!(success_metadata["imageBlockCount"], 1);
+        assert_eq!(success_metadata["imageTotalBytes"], 512);
+        assert_eq!(success_metadata["documentBlockCount"], 1);
+        assert_eq!(success_metadata["documentTotalBytes"], 256);
+
+        let tool_metadata = decoded_metadata(event_data_by_name(
+            &result_payload,
+            "tengu_tool_use_success",
+        ));
+        for key in [
+            "rssDeltaBytes",
+            "heapUsedDeltaBytes",
+            "externalDeltaBytes",
+            "preToolHookDurationMs",
+            "permissionDurationMs",
+            "toolInputSizeBytes",
+        ] {
+            assert!(tool_metadata.get(key).is_none(), "{key}");
+        }
+        assert_eq!(tool_metadata["toolResultSizeBytes"], 999);
+    }
+
+    #[test]
+    fn simulated_payload_scan_removes_sensitive_fields_without_recording_values() {
+        let contact = format!("{}@{}", "local", "example.invalid");
+        let credential = format!("{} {}", "Bearer", "placeholder");
+        let cookie = format!("{}={}", "session", "placeholder");
+        let account_uuid = uuid::Uuid::new_v4().to_string();
+        let prompt_value = "runtime prompt marker".repeat(2);
+        let long_text = "x".repeat(super::ADDITIONAL_METADATA_LONG_TEXT_LIMIT + 1);
+        let mut payload = json!({
+            "events": [{
+                "event_type": "tengu_internal",
+                "event_data": {
+                    "event_name": "tengu_api_success",
+                    "event_id": "evt_safe",
+                    "session_id": "session-safe",
+                    "prompt": prompt_value,
+                    "contact": contact,
+                    "authorization_hint": credential,
+                    "credential_like": credential,
+                    "rawUuid": account_uuid,
+                    "nested": {
+                        "Cookie": cookie
+                    },
+                    "values": [
+                        contact,
+                        "kept"
+                    ],
+                    "additional_metadata": encoded_metadata(json!({
+                        "renderer_mode": "fullscreen",
+                        "safe_count": 3,
+                        "tool_input": {"command": "redacted"},
+                        "responseBody": "redacted",
+                        "account_uuid": account_uuid,
+                        "long_note": long_text,
+                        "safe_array": [
+                            contact,
+                            "kept"
+                        ]
+                    }))
+                }
+            }]
+        });
+
+        let summary = sanitize_telemetry_payload(&mut payload);
+        assert_eq!(summary.event_count, 1);
+        assert_eq!(summary.dropped_events, 0);
+        assert!(summary.dropped_fields >= 10);
+        for reason in [
+            "sensitive_key",
+            "email_value",
+            "credential_value",
+            "uuid_value",
+            "long_text",
+        ] {
+            assert!(summary.reason_counts.contains_key(reason), "{reason}");
+        }
+
+        let event_data = &payload["events"][0]["event_data"];
+        assert!(event_data.get("prompt").is_none());
+        assert!(event_data.get("contact").is_none());
+        assert!(event_data.get("authorization_hint").is_none());
+        assert!(event_data.get("credential_like").is_none());
+        assert!(event_data.get("rawUuid").is_none());
+        assert!(event_data["nested"].as_object().unwrap().is_empty());
+        assert_eq!(event_data["values"], json!(["kept"]));
+
+        let metadata = decoded_metadata(event_data);
+        assert_eq!(metadata["renderer_mode"], "fullscreen");
+        assert_eq!(metadata["safe_count"], 3);
+        assert_eq!(metadata["safe_array"], json!(["kept"]));
+        assert!(metadata.get("tool_input").is_none());
+        assert!(metadata.get("responseBody").is_none());
+        assert!(metadata.get("account_uuid").is_none());
+        assert!(metadata.get("long_note").is_none());
+
+        let serialized_payload = serde_json::to_string(&payload).unwrap();
+        let logged_drops = format!("{:?}", summary.field_drops);
+        for value in [contact, credential, cookie, account_uuid, prompt_value] {
+            assert!(!serialized_payload.contains(&value));
+            assert!(!logged_drops.contains(&value));
+        }
+    }
+
+    #[test]
+    fn telemetry_shape_summary_contains_only_keys_types_and_drop_counts() {
+        let contact = format!("{}@{}", "shape", "example.invalid");
+        let mut payload = json!({
+            "events": [{
+                "event_type": "tengu_internal",
+                "event_data": {
+                    "event_name": "tengu_api_success",
+                    "additional_metadata": encoded_metadata(json!({
+                        "safe_count": 3,
+                        "safe_flag": true,
+                        "contact": contact
+                    }))
+                }
+            }]
+        });
+        let summary = telemetry_shape_summary(&payload);
+
+        assert_eq!(summary.event_name_counts["tengu_api_success"], 1);
+        assert_eq!(
+            summary.metadata_keys_by_event["tengu_api_success"]["safe_count"],
+            1
+        );
+        assert_eq!(
+            summary.metadata_types_by_event["tengu_api_success"]["safe_count"]["int"],
+            1
+        );
+        assert_eq!(
+            summary.metadata_types_by_event["tengu_api_success"]["safe_flag"]["bool"],
+            1
+        );
+        assert!(
+            summary.metadata_keys_by_event["tengu_api_success"]
+                .get("contact")
+                .is_none()
+        );
+        assert_eq!(summary.dropped_fields, 1);
+        assert_eq!(summary.reason_counts["email_value"], 1);
+        assert!(format!("{:?}", summary).contains("safe_count"));
+        assert!(!format!("{:?}", summary).contains(&contact));
+
+        let scan_summary = sanitize_telemetry_payload(&mut payload);
+        assert_eq!(scan_summary.dropped_fields, summary.dropped_fields);
+    }
+
+    #[test]
+    fn correlation_fallback_uses_stable_run_session_key() {
+        let mut store = TelemetryCorrelationStore::default();
+        let mut first_context = test_message_context();
+        first_context.session_id = None;
+        first_context.request_key = "request-one".into();
+        let mut second_context = first_context.clone();
+        second_context.request_key = "request-two".into();
+
+        let first = store.register_request(&first_context, "run-session-fixed");
+        let second = store.register_request(&second_context, "run-session-fixed");
+
+        assert_eq!(first.query_chain_id, second.query_chain_id);
+        assert_eq!(second.query_depth, first.query_depth + 1);
+        assert_eq!(
+            second.previous_request_id.as_deref(),
+            Some(first.request_id.as_str())
         );
     }
 
