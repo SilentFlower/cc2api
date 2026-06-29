@@ -30,7 +30,7 @@ use crate::service::rewriter::{
     ordered_anthropic_headers, strip_beta_token, strip_empty_text_blocks,
 };
 use crate::service::telemetry::{
-    MessageTelemetryContext, MessageTelemetryResult, TelemetryService,
+    MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
 };
 use crate::service::version_profile::{COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS};
 use crate::store::settings_store::{
@@ -1448,7 +1448,11 @@ impl GatewayService {
                                 MessageTelemetryResult {
                                     status_code: None,
                                     duration_ms: t_upstream.elapsed().as_millis() as u64,
+                                    ttft_ms: None,
                                     error_kind: Some("upstream_error".into()),
+                                    response_body_bytes: None,
+                                    usage: MessageTelemetryUsage::default(),
+                                    stop_reason: None,
                                 },
                             )
                             .await;
@@ -1471,21 +1475,10 @@ impl GatewayService {
                 )
                 .await?;
 
-            if let Some(context) = telemetry_context.clone() {
-                self.telemetry_svc
-                    .record_message_result(
-                        &account,
-                        context,
-                        MessageTelemetryResult {
-                            status_code: Some(resp.status().as_u16()),
-                            duration_ms: t_upstream.elapsed().as_millis() as u64,
-                            error_kind: signature_retry_stage.map(|stage| {
-                                format!("signature_retry_{}", stage.telemetry_suffix())
-                            }),
-                        },
-                    )
-                    .await;
-            }
+            let telemetry_ttft_ms = t_upstream.elapsed().as_millis() as u64;
+            let telemetry_status_code = resp.status().as_u16();
+            let telemetry_error_kind = signature_retry_stage
+                .map(|stage| format!("signature_retry_{}", stage.telemetry_suffix()));
             info!(
                 "[耗时] 上游响应: {:.0}ms (HTTP {})",
                 t_upstream.elapsed().as_millis(),
@@ -1497,6 +1490,21 @@ impl GatewayService {
                 if let Some(lookup) = non_stream_probe_cache_lookup {
                     if resp.status().is_success() && signature_retry_stage.is_none() {
                         let (parts, body_bytes) = buffer_response_body(resp).await?;
+                        if let Some(context) = telemetry_context.clone() {
+                            self.telemetry_svc
+                                .record_message_result(
+                                    &account,
+                                    context,
+                                    build_message_telemetry_result_from_bytes(
+                                        telemetry_status_code,
+                                        telemetry_ttft_ms,
+                                        t_upstream.elapsed().as_millis() as u64,
+                                        &body_bytes,
+                                        telemetry_error_kind.clone(),
+                                    ),
+                                )
+                                .await;
+                        }
                         let cached_response = self
                             .store_non_stream_probe_cache_entry(
                                 &lookup, &account, &parts, body_bytes,
@@ -1526,8 +1534,32 @@ impl GatewayService {
                     stateful_cache_completion,
                     content_codings,
                     cache_usage_context,
+                    telemetry_context.clone(),
+                    self.telemetry_svc.clone(),
+                    account.clone(),
+                    telemetry_status_code,
+                    telemetry_ttft_ms,
+                    telemetry_error_kind.clone(),
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
+            }
+
+            if let Some(context) = telemetry_context.clone() {
+                self.telemetry_svc
+                    .record_message_result(
+                        &account,
+                        context,
+                        MessageTelemetryResult {
+                            status_code: Some(telemetry_status_code),
+                            duration_ms: t_upstream.elapsed().as_millis() as u64,
+                            ttft_ms: Some(telemetry_ttft_ms),
+                            error_kind: telemetry_error_kind.clone(),
+                            response_body_bytes: None,
+                            usage: MessageTelemetryUsage::default(),
+                            stop_reason: None,
+                        },
+                    )
+                    .await;
             }
 
             if let Some(decision) = resp.extensions().get::<RateLimitResponseDecision>() {
@@ -4286,6 +4318,7 @@ fn build_message_telemetry_context(
     betas: String,
 ) -> MessageTelemetryContext {
     MessageTelemetryContext {
+        request_key: uuid::Uuid::new_v4().to_string(),
         model: original_body
             .get("model")
             .and_then(|m| m.as_str())
@@ -4293,6 +4326,9 @@ fn build_message_telemetry_context(
             .to_string(),
         session_id: extract_message_session_id(rewritten_body)
             .or_else(|| crate::service::rewriter::extract_session_id_from_body(rewritten_body)),
+        pre_normalized_message_count: count_messages(original_body),
+        post_normalized_message_count: count_messages(rewritten_body),
+        message_content_block_count: count_message_content_blocks(rewritten_body),
         request_body_bytes,
         rewritten_body_bytes,
         stream: original_body
@@ -4306,6 +4342,26 @@ fn build_message_telemetry_context(
             .unwrap_or(0),
         attachment_count: count_attachment_blocks(original_body),
         system_prompt_block_count: count_system_prompt_blocks(rewritten_body),
+        system_prompt_text_length: system_prompt_text_length(rewritten_body),
+        system_cache_breakpoint_count: count_cache_breakpoints_in_array_field(
+            rewritten_body,
+            "system",
+        ),
+        tool_cache_breakpoint_count: count_cache_breakpoints_in_array_field(
+            rewritten_body,
+            "tools",
+        ),
+        message_cache_breakpoint_count: count_message_cache_breakpoints(rewritten_body),
+        thinking_type: original_body
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        temperature: original_body
+            .get("temperature")
+            .and_then(|value| value.as_f64()),
+        primary_tool_name: first_tool_name(original_body),
+        input_text_char_length: input_text_char_length(original_body),
         client_type: match client_type {
             ClientType::ClaudeCode => "claude_code",
             ClientType::API => "api",
@@ -4313,6 +4369,29 @@ fn build_message_telemetry_context(
         .into(),
         attempt,
         betas,
+    }
+}
+
+fn build_message_telemetry_result_from_bytes(
+    status_code: u16,
+    ttft_ms: u64,
+    duration_ms: u64,
+    body_bytes: &[u8],
+    error_kind: Option<String>,
+) -> MessageTelemetryResult {
+    let mut usage = MessageTelemetryUsage::default();
+    let mut stop_reason = None;
+    let mut buffer = String::new();
+    update_message_telemetry_from_bytes(&mut usage, &mut stop_reason, &mut buffer, body_bytes);
+    flush_message_telemetry_buffer(&mut usage, &mut stop_reason, &mut buffer);
+    MessageTelemetryResult {
+        status_code: Some(status_code),
+        duration_ms,
+        ttft_ms: Some(ttft_ms),
+        error_kind,
+        response_body_bytes: Some(body_bytes.len()),
+        usage,
+        stop_reason,
     }
 }
 
@@ -4412,6 +4491,18 @@ fn count_system_prompt_blocks(body: &serde_json::Value) -> usize {
     }
 }
 
+fn system_prompt_text_length(body: &serde_json::Value) -> usize {
+    match body.get("system") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|text| text.as_str()))
+            .map(str::len)
+            .sum(),
+        Some(serde_json::Value::String(text)) => text.len(),
+        _ => 0,
+    }
+}
+
 fn count_attachment_blocks(body: &serde_json::Value) -> usize {
     let mut count = 0;
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
@@ -4437,6 +4528,43 @@ fn count_attachment_value(value: &serde_json::Value) -> usize {
                     .get("content")
                     .map(count_attachment_value)
                     .unwrap_or_default()
+        }
+        _ => 0,
+    }
+}
+
+fn first_tool_name(body: &serde_json::Value) -> Option<String> {
+    body.get("tools")
+        .and_then(|tools| tools.as_array())
+        .and_then(|tools| tools.first())
+        .and_then(|tool| tool.get("name"))
+        .and_then(|name| name.as_str())
+        .map(|name| name.to_string())
+}
+
+fn input_text_char_length(body: &serde_json::Value) -> usize {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content"))
+                .map(text_char_length_value)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn text_char_length_value(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(items) => items.iter().map(text_char_length_value).sum(),
+        serde_json::Value::Object(map) => {
+            map.get("text")
+                .and_then(|text| text.as_str())
+                .map(str::len)
+                .unwrap_or(0)
+                + map.get("content").map(text_char_length_value).unwrap_or(0)
         }
         _ => 0,
     }
@@ -4562,6 +4690,26 @@ struct SlotGuardBody {
     account_name: String,
     /// prompt cache usage 诊断上下文。
     cache_usage_context: Option<CacheUsageLogContext>,
+    /// `/v1/messages` 自动遥测请求摘要。
+    telemetry_context: Option<MessageTelemetryContext>,
+    /// 自动遥测服务，用于响应体结束后写入 usage 摘要。
+    telemetry_svc: Arc<TelemetryService>,
+    /// 当前承载请求的账号。
+    telemetry_account: Account,
+    /// 上游响应状态码。
+    telemetry_status_code: u16,
+    /// 到响应头的耗时。
+    telemetry_ttft_ms: u64,
+    /// 上游错误类别。
+    telemetry_error_kind: Option<String>,
+    /// 上游响应体字节数，只累计长度不记录正文。
+    message_telemetry_response_bytes: usize,
+    /// 上游响应中的 token/cache 数值摘要。
+    message_telemetry_usage: MessageTelemetryUsage,
+    /// 跨 frame 保留未完成的 telemetry SSE 行。
+    message_telemetry_buffer: String,
+    /// 上游响应 stop_reason。
+    message_telemetry_stop_reason: Option<String>,
     /// 是否已收到第一个 frame。
     first_frame_logged: bool,
 }
@@ -4647,6 +4795,12 @@ impl SlotGuardBody {
         stateful_cache_completion: Option<StatefulCacheCompletion>,
         response_content_codings: Vec<String>,
         cache_usage_context: Option<CacheUsageLogContext>,
+        telemetry_context: Option<MessageTelemetryContext>,
+        telemetry_svc: Arc<TelemetryService>,
+        telemetry_account: Account,
+        telemetry_status_code: u16,
+        telemetry_ttft_ms: u64,
+        telemetry_error_kind: Option<String>,
     ) -> Self {
         Self {
             inner,
@@ -4661,8 +4815,40 @@ impl SlotGuardBody {
             req_start,
             account_name,
             cache_usage_context,
+            telemetry_context,
+            telemetry_svc,
+            telemetry_account,
+            telemetry_status_code,
+            telemetry_ttft_ms,
+            telemetry_error_kind,
+            message_telemetry_response_bytes: 0,
+            message_telemetry_usage: MessageTelemetryUsage::default(),
+            message_telemetry_buffer: String::new(),
+            message_telemetry_stop_reason: None,
             first_frame_logged: false,
         }
+    }
+
+    fn record_message_telemetry_result(&mut self, error_kind: Option<String>) {
+        let Some(context) = self.telemetry_context.take() else {
+            return;
+        };
+        let result = MessageTelemetryResult {
+            status_code: Some(self.telemetry_status_code),
+            duration_ms: self.req_start.elapsed().as_millis() as u64,
+            ttft_ms: Some(self.telemetry_ttft_ms),
+            error_kind: error_kind.or_else(|| self.telemetry_error_kind.clone()),
+            response_body_bytes: Some(self.message_telemetry_response_bytes),
+            usage: self.message_telemetry_usage,
+            stop_reason: self.message_telemetry_stop_reason.clone(),
+        };
+        let telemetry_svc = self.telemetry_svc.clone();
+        let account = self.telemetry_account.clone();
+        tokio::spawn(async move {
+            telemetry_svc
+                .record_message_result(&account, context, result)
+                .await;
+        });
     }
 }
 
@@ -4691,6 +4877,23 @@ impl http_body::Body for SlotGuardBody {
             update_stateful_cache_usage_from_frame(&mut usage, &mut buffer, frame);
             self.stateful_cache_usage = usage;
             self.stateful_cache_usage_buffer = buffer;
+            if let Some(bytes) = frame.data_ref() {
+                let mut message_usage = self.message_telemetry_usage;
+                let mut message_buffer = std::mem::take(&mut self.message_telemetry_buffer);
+                let mut stop_reason = self.message_telemetry_stop_reason.take();
+                update_message_telemetry_from_bytes(
+                    &mut message_usage,
+                    &mut stop_reason,
+                    &mut message_buffer,
+                    bytes,
+                );
+                self.message_telemetry_usage = message_usage;
+                self.message_telemetry_stop_reason = stop_reason;
+                self.message_telemetry_buffer = message_buffer;
+                self.message_telemetry_response_bytes = self
+                    .message_telemetry_response_bytes
+                    .saturating_add(bytes.len());
+            }
             if !self.response_content_codings.is_empty() {
                 if let Some(bytes) = frame.data_ref() {
                     let mut side_tap = std::mem::take(&mut self.stateful_cache_usage_side_tap);
@@ -4718,10 +4921,23 @@ impl http_body::Body for SlotGuardBody {
             log_prompt_cache_usage(self.cache_usage_context.as_ref(), usage);
             self.rewriter
                 .complete_stateful_cache_with_usage(completion, usage);
+            let mut message_usage = self.message_telemetry_usage;
+            let mut message_buffer = std::mem::take(&mut self.message_telemetry_buffer);
+            let mut stop_reason = self.message_telemetry_stop_reason.take();
+            flush_message_telemetry_buffer(
+                &mut message_usage,
+                &mut stop_reason,
+                &mut message_buffer,
+            );
+            self.message_telemetry_usage = message_usage;
+            self.message_telemetry_stop_reason = stop_reason;
+            self.message_telemetry_buffer = message_buffer;
+            self.record_message_telemetry_result(None);
         } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
             // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
             log_prompt_cache_usage_read_error(self.cache_usage_context.as_ref());
             let _ = self.stateful_cache_completion.take();
+            self.record_message_telemetry_result(Some("response_body_error".into()));
         }
         result
     }
@@ -4896,6 +5112,46 @@ fn flush_stateful_cache_usage_buffer(usage: &mut StatefulCacheUsage, buffer: &mu
     merge_stateful_cache_usage_from_lines(usage, remaining.lines());
 }
 
+fn update_message_telemetry_from_bytes(
+    usage: &mut MessageTelemetryUsage,
+    stop_reason: &mut Option<String>,
+    buffer: &mut String,
+    bytes: &[u8],
+) {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        merge_message_telemetry_from_value(usage, stop_reason, &value);
+    }
+
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    if buffer.len() > STATEFUL_USAGE_BUFFER_LIMIT {
+        let keep_from = next_char_boundary(buffer, buffer.len() - STATEFUL_USAGE_BUFFER_LIMIT);
+        buffer.drain(..keep_from);
+        if let Some(newline_idx) = buffer.find('\n') {
+            buffer.drain(..=newline_idx);
+        }
+    }
+    let complete_len = match buffer.rfind('\n') {
+        Some(index) => index + 1,
+        None => return,
+    };
+    let complete = buffer[..complete_len].to_string();
+    buffer.drain(..complete_len);
+
+    merge_message_telemetry_from_lines(usage, stop_reason, complete.lines());
+}
+
+fn flush_message_telemetry_buffer(
+    usage: &mut MessageTelemetryUsage,
+    stop_reason: &mut Option<String>,
+    buffer: &mut String,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let remaining = std::mem::take(buffer);
+    merge_message_telemetry_from_lines(usage, stop_reason, remaining.lines());
+}
+
 /// 从 SSE 行集合中合并 prompt cache usage。
 fn merge_stateful_cache_usage_from_lines<'a>(
     usage: &mut StatefulCacheUsage,
@@ -4915,6 +5171,25 @@ fn merge_stateful_cache_usage_from_lines<'a>(
     }
 }
 
+fn merge_message_telemetry_from_lines<'a>(
+    usage: &mut MessageTelemetryUsage,
+    stop_reason: &mut Option<String>,
+    lines: impl Iterator<Item = &'a str>,
+) {
+    for line in lines {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            merge_message_telemetry_from_value(usage, stop_reason, &value);
+        }
+    }
+}
+
 /// 合并 Anthropic usage 字段,同一响应多次 delta 时取最大值。
 fn merge_stateful_cache_usage_from_value(
     usage: &mut StatefulCacheUsage,
@@ -4925,6 +5200,25 @@ fn merge_stateful_cache_usage_from_value(
     merge_stateful_cache_usage_from_usage_value(usage, value.pointer("/delta/usage"));
 }
 
+fn merge_message_telemetry_from_value(
+    usage: &mut MessageTelemetryUsage,
+    stop_reason: &mut Option<String>,
+    value: &serde_json::Value,
+) {
+    merge_message_telemetry_from_usage_value(usage, value.get("usage"));
+    merge_message_telemetry_from_usage_value(usage, value.pointer("/message/usage"));
+    merge_message_telemetry_from_usage_value(usage, value.pointer("/delta/usage"));
+    if let Some(reason) = value.get("stop_reason").and_then(|reason| reason.as_str()) {
+        *stop_reason = Some(reason.to_string());
+    }
+    if let Some(reason) = value
+        .pointer("/delta/stop_reason")
+        .and_then(|reason| reason.as_str())
+    {
+        *stop_reason = Some(reason.to_string());
+    }
+}
+
 /// 合并单个 Anthropic usage 对象。
 fn merge_stateful_cache_usage_from_usage_value(
     usage: &mut StatefulCacheUsage,
@@ -4933,6 +5227,59 @@ fn merge_stateful_cache_usage_from_usage_value(
     let Some(cache_usage) = cache_usage else {
         return;
     };
+    if let Some(cache_read_input_tokens) = cache_usage
+        .get("cache_read_input_tokens")
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(cache_read_input_tokens);
+    }
+    if let Some(cache_creation_input_tokens) = cache_usage
+        .get("cache_creation_input_tokens")
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .max(cache_creation_input_tokens);
+    }
+    if let Some(cache_creation_ephemeral_5m_input_tokens) = cache_usage
+        .get("cache_creation")
+        .and_then(|cache_creation| cache_creation.get("ephemeral_5m_input_tokens"))
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_creation_ephemeral_5m_input_tokens = usage
+            .cache_creation_ephemeral_5m_input_tokens
+            .max(cache_creation_ephemeral_5m_input_tokens);
+    }
+    if let Some(cache_creation_ephemeral_1h_input_tokens) = cache_usage
+        .get("cache_creation")
+        .and_then(|cache_creation| cache_creation.get("ephemeral_1h_input_tokens"))
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.cache_creation_ephemeral_1h_input_tokens = usage
+            .cache_creation_ephemeral_1h_input_tokens
+            .max(cache_creation_ephemeral_1h_input_tokens);
+    }
+}
+
+fn merge_message_telemetry_from_usage_value(
+    usage: &mut MessageTelemetryUsage,
+    cache_usage: Option<&serde_json::Value>,
+) {
+    let Some(cache_usage) = cache_usage else {
+        return;
+    };
+    if let Some(input_tokens) = cache_usage
+        .get("input_tokens")
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.input_tokens = usage.input_tokens.max(input_tokens);
+    }
+    if let Some(output_tokens) = cache_usage
+        .get("output_tokens")
+        .and_then(|tokens| tokens.as_u64())
+    {
+        usage.output_tokens = usage.output_tokens.max(output_tokens);
+    }
     if let Some(cache_read_input_tokens) = cache_usage
         .get("cache_read_input_tokens")
         .and_then(|tokens| tokens.as_u64())
@@ -5005,11 +5352,12 @@ mod tests {
         signature_retry_body_for_stage, stable_upstream_stream,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
-        update_stateful_cache_usage_from_bytes,
+        update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
     };
     use crate::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
     use crate::service::account::AccountService;
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
+    use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_VERSION, STAINLESS_PACKAGE_VERSION, claude_code_user_agent,
@@ -6778,6 +7126,48 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
     }
 
     #[test]
+    fn message_telemetry_parser_reads_json_usage_and_stop_reason() {
+        let mut usage = MessageTelemetryUsage::default();
+        let mut stop_reason = None;
+        let mut buffer = String::new();
+
+        update_message_telemetry_from_bytes(
+            &mut usage,
+            &mut stop_reason,
+            &mut buffer,
+            br#"{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":40,"cache_creation_input_tokens":60},"stop_reason":"end_turn"}"#,
+        );
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.cache_read_input_tokens, 40);
+        assert_eq!(usage.cache_creation_input_tokens, 60);
+        assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn message_telemetry_parser_reads_sse_delta_usage_and_stop_reason() {
+        let mut usage = MessageTelemetryUsage::default();
+        let mut stop_reason = None;
+        let mut buffer = String::new();
+
+        update_message_telemetry_from_bytes(
+            &mut usage,
+            &mut stop_reason,
+            &mut buffer,
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":700,"cache_read_input_tokens":300}}}
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":12,"cache_creation_input_tokens":88}}
+"#,
+        );
+
+        assert_eq!(usage.input_tokens, 700);
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, 300);
+        assert_eq!(usage.cache_creation_input_tokens, 88);
+        assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
     fn stateful_cache_usage_parser_reads_gzip_side_tap() {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
@@ -7088,12 +7478,25 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
 
         assert_eq!(context.model, "claude-sonnet-4-20250514");
         assert_eq!(context.session_id.as_deref(), Some("session-from-user-id"));
+        assert!(!context.request_key.is_empty());
+        assert_eq!(context.pre_normalized_message_count, 1);
+        assert_eq!(context.post_normalized_message_count, 0);
+        assert_eq!(context.message_content_block_count, 0);
         assert_eq!(context.request_body_bytes, 111);
         assert_eq!(context.rewritten_body_bytes, 222);
         assert!(context.stream);
         assert_eq!(context.tool_count, 2);
         assert_eq!(context.attachment_count, 2);
         assert_eq!(context.system_prompt_block_count, 1);
+        assert_eq!(
+            context.system_prompt_text_length,
+            "system prompt body".len()
+        );
+        assert_eq!(context.system_cache_breakpoint_count, 0);
+        assert_eq!(context.tool_cache_breakpoint_count, 0);
+        assert_eq!(context.message_cache_breakpoint_count, 0);
+        assert_eq!(context.primary_tool_name.as_deref(), Some("Read"));
+        assert_eq!(context.input_text_char_length, "raw-prompt-marker".len());
         assert_eq!(context.client_type, "claude_code");
         assert_eq!(context.attempt, 1);
         assert_eq!(context.betas, "claude-code-20250219");
@@ -7122,6 +7525,10 @@ data: {"type":"message_delta","delta":{"usage":{"cache_read_input_tokens":73308,
 
         assert_eq!(context.session_id, None);
         assert_eq!(context.system_prompt_block_count, 1);
+        assert_eq!(
+            context.system_prompt_text_length,
+            "system prompt body".len()
+        );
         assert_eq!(context.client_type, "api");
     }
 

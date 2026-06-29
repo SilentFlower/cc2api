@@ -69,6 +69,7 @@ struct TelemetrySession {
     started_at: Instant,
     run_profile: RunProfile,
     pending_events: VecDeque<TelemetryEvent>,
+    correlations: TelemetryCorrelationStore,
     expires_at: Instant,
     expires_at_utc: chrono::DateTime<Utc>,
     last_event_batch_at: Instant,
@@ -83,10 +84,18 @@ struct TelemetrySession {
 /// 该结构只保存字段计数、长度、状态等安全信息，不包含 prompt、tool input、响应正文或 token。
 #[derive(Debug, Clone)]
 pub struct MessageTelemetryContext {
+    /// 网关内部请求键，只用于把 request/result 两个记录点关联起来，不发送到上游。
+    pub request_key: String,
     /// 请求声明的模型名称。为空时事件构造会回退到默认 Claude Code 模型。
     pub model: String,
     /// 请求级 session id，只来自 metadata 派生字段，不来自正文原文。
     pub session_id: Option<String>,
+    /// 改写前 message 数量。
+    pub pre_normalized_message_count: usize,
+    /// 改写后 message 数量。
+    pub post_normalized_message_count: usize,
+    /// 改写后 message content block 总数。
+    pub message_content_block_count: usize,
     /// 原始请求体字节数。
     pub request_body_bytes: usize,
     /// 改写后请求体字节数。
@@ -99,6 +108,22 @@ pub struct MessageTelemetryContext {
     pub attachment_count: usize,
     /// 改写后 system prompt 文本块数量。
     pub system_prompt_block_count: usize,
+    /// 改写后 system prompt 文本总长度，只记录长度不记录正文。
+    pub system_prompt_text_length: usize,
+    /// 改写后 system prompt cache breakpoint 数量。
+    pub system_cache_breakpoint_count: usize,
+    /// 改写后 tool cache breakpoint 数量。
+    pub tool_cache_breakpoint_count: usize,
+    /// 改写后 message cache breakpoint 数量。
+    pub message_cache_breakpoint_count: usize,
+    /// 请求 thinking.type。
+    pub thinking_type: Option<String>,
+    /// 请求 temperature，只保留数值字段。
+    pub temperature: Option<f64>,
+    /// 请求中首个工具名，只保留工具名不保留 tool input。
+    pub primary_tool_name: Option<String>,
+    /// 输入 text block 的字符总长度，只记录长度不记录正文。
+    pub input_text_char_length: usize,
     /// 请求来源类型，用于区分 Claude Code 客户端和纯 API 客户端。
     pub client_type: String,
     /// 当前网关重试序号。
@@ -112,10 +137,35 @@ pub struct MessageTelemetryContext {
 pub struct MessageTelemetryResult {
     /// 上游 HTTP 状态码。网络错误时为空。
     pub status_code: Option<u16>,
-    /// 从发送上游请求到收到响应头或错误的耗时。
+    /// 从发送上游请求到响应体结束或错误的耗时。
     pub duration_ms: u64,
+    /// 从发送上游请求到收到响应头或首个可用结果的耗时。
+    pub ttft_ms: Option<u64>,
     /// 上游请求失败类型。成功响应为空。
     pub error_kind: Option<String>,
+    /// 上游响应体字节数，只记录长度不记录正文。
+    pub response_body_bytes: Option<usize>,
+    /// 上游响应 usage 数值摘要。
+    pub usage: MessageTelemetryUsage,
+    /// 上游 stop_reason，只保留枚举值。
+    pub stop_reason: Option<String>,
+}
+
+/// 表示 `/v1/messages` 上游响应中的安全 usage 数值摘要。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MessageTelemetryUsage {
+    /// 输入 token 数。
+    pub input_tokens: u64,
+    /// 输出 token 数。
+    pub output_tokens: u64,
+    /// prompt cache 读取 token 数。
+    pub cache_read_input_tokens: u64,
+    /// prompt cache 写入 token 数。
+    pub cache_creation_input_tokens: u64,
+    /// 5 分钟 cache 写入 token 数。
+    pub cache_creation_ephemeral_5m_input_tokens: u64,
+    /// 1 小时 cache 写入 token 数。
+    pub cache_creation_ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +181,87 @@ struct TelemetryEvent {
 enum TelemetryEventType {
     Internal,
     GrowthbookExperiment,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TelemetryCorrelationStore {
+    by_session: HashMap<String, TelemetrySessionCorrelation>,
+    by_request: HashMap<String, MessageCorrelation>,
+}
+
+#[derive(Debug, Clone)]
+struct TelemetrySessionCorrelation {
+    query_chain_id: String,
+    query_depth: u64,
+    last_request_id: Option<String>,
+    last_api_call_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct MessageCorrelation {
+    query_chain_id: String,
+    query_depth: u64,
+    request_id: String,
+    message_id: String,
+    previous_request_id: Option<String>,
+    time_since_last_api_call_ms: Option<u64>,
+}
+
+impl TelemetryCorrelationStore {
+    fn register_request(&mut self, context: &MessageTelemetryContext) -> MessageCorrelation {
+        let now = Instant::now();
+        let session_key = correlation_session_key(context);
+        let session = self
+            .by_session
+            .entry(session_key)
+            .or_insert_with(TelemetrySessionCorrelation::new);
+        let time_since_last_api_call_ms = session
+            .last_api_call_at
+            .map(|last| now.duration_since(last).as_millis() as u64);
+        let correlation = MessageCorrelation {
+            query_chain_id: session.query_chain_id.clone(),
+            query_depth: session.query_depth,
+            request_id: prefixed_random_id("req"),
+            message_id: prefixed_random_id("msg"),
+            previous_request_id: session.last_request_id.clone(),
+            time_since_last_api_call_ms,
+        };
+        session.last_request_id = Some(correlation.request_id.clone());
+        session.last_api_call_at = Some(now);
+        session.query_depth = session.query_depth.saturating_add(1);
+        self.by_request
+            .insert(context.request_key.clone(), correlation.clone());
+        correlation
+    }
+
+    fn resolve_result(&mut self, context: &MessageTelemetryContext) -> MessageCorrelation {
+        self.by_request
+            .remove(&context.request_key)
+            .unwrap_or_else(|| self.register_request(context))
+    }
+}
+
+impl TelemetrySessionCorrelation {
+    fn new() -> Self {
+        Self {
+            query_chain_id: uuid::Uuid::new_v4().to_string(),
+            query_depth: 0,
+            last_request_id: None,
+            last_api_call_at: None,
+        }
+    }
+}
+
+fn correlation_session_key(context: &MessageTelemetryContext) -> String {
+    context
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("request:{}", context.request_key))
+}
+
+fn prefixed_random_id(prefix: &str) -> String {
+    let raw = uuid::Uuid::new_v4().simple().to_string();
+    format!("{}_{}", prefix, &raw[..24])
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +329,7 @@ impl TelemetryService {
             started_at: now,
             run_profile: run_profile(account, started_at_utc),
             pending_events: startup_events(account),
+            correlations: TelemetryCorrelationStore::default(),
             expires_at: now + SESSION_TTL,
             expires_at_utc: started_at_utc + chrono::Duration::from_std(SESSION_TTL).unwrap(),
             last_event_batch_at: now - EVENT_BATCH_INTERVAL, // 立即触发首次
@@ -234,9 +366,10 @@ impl TelemetryService {
         if let Some(session) = sessions.get_mut(&account.id) {
             session.expires_at = Instant::now() + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+            let correlation = session.correlations.register_request(&context);
             enqueue_events(
                 &mut session.pending_events,
-                message_request_events(&context),
+                message_request_events(&context, &correlation),
             );
         }
     }
@@ -257,9 +390,10 @@ impl TelemetryService {
         if let Some(session) = sessions.get_mut(&account.id) {
             session.expires_at = Instant::now() + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+            let correlation = session.correlations.resolve_result(&context);
             enqueue_events(
                 &mut session.pending_events,
-                message_result_events(&context, &result),
+                message_result_events(&context, &result, &correlation),
             );
         }
     }
@@ -546,9 +680,7 @@ fn build_event_json(
                 auth,
                 process_b64,
             );
-            for (key, value) in &event.fields {
-                event_data.insert(key.clone(), value.clone());
-            }
+            apply_internal_top_level_fields(&mut event_data, event);
             json!({
                 "event_type": "ClaudeCodeInternalEvent",
                 "event_data": event_data,
@@ -581,6 +713,17 @@ fn build_event_json(
                 "event_type": "GrowthbookExperimentEvent",
                 "event_data": event_data,
             })
+        }
+    }
+}
+
+fn apply_internal_top_level_fields(
+    event_data: &mut serde_json::Map<String, serde_json::Value>,
+    event: &TelemetryEvent,
+) {
+    for key in ["betas"] {
+        if let Some(value) = event.fields.get(key) {
+            event_data.insert(key.to_string(), value.clone());
         }
     }
 }
@@ -662,19 +805,27 @@ fn telemetry_env_json(profile: &DeviceProfile, shape: TelemetryShape) -> serde_j
 
 fn encoded_additional_metadata(event: &TelemetryEvent, profile: &DeviceProfile) -> String {
     let mut metadata = serde_json::Map::new();
-    metadata.insert("renderer_mode".into(), json!("cli"));
-    metadata.insert("entrypoint".into(), json!("cli"));
-    metadata.insert("provider".into(), json!("anthropic"));
+    metadata.insert("renderer_mode".into(), json!("fullscreen"));
     metadata.insert("model".into(), json!(event.model));
     metadata.insert(
         "subscription_type".into(),
         json!(profile.subscription_type.clone().unwrap_or_default()),
     );
-    if let Some(attempt) = event.fields.get("attempt") {
-        metadata.insert("attempt".into(), attempt.clone());
+    for (key, value) in &event.fields {
+        if should_skip_additional_metadata_key(key) {
+            continue;
+        }
+        metadata.insert(key.clone(), value.clone());
     }
     let bytes = serde_json::to_vec(&serde_json::Value::Object(metadata)).unwrap_or_default();
     base64::engine::general_purpose::STANDARD.encode(&bytes)
+}
+
+fn should_skip_additional_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "api_endpoint" | "request_body_bytes" | "rewritten_body_bytes" | "client_type_source"
+    )
 }
 
 fn enqueue_events(queue: &mut VecDeque<TelemetryEvent>, events: Vec<TelemetryEvent>) {
@@ -729,31 +880,29 @@ fn startup_events(account: &Account) -> VecDeque<TelemetryEvent> {
     events
 }
 
-fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEvent> {
+fn message_request_events(
+    context: &MessageTelemetryContext,
+    correlation: &MessageCorrelation,
+) -> Vec<TelemetryEvent> {
     let mut events = Vec::new();
     let model = normalized_model(&context.model);
     let session_id = context.session_id.clone();
 
-    let mut before = common_message_fields(context);
-    before.insert("phase".into(), json!("before_normalize"));
     events.push(internal_event_with_fields(
         "tengu_api_before_normalize",
         &model,
         session_id.clone(),
-        before,
+        before_normalize_fields(context),
     ));
 
-    let mut after = common_message_fields(context);
-    after.insert("phase".into(), json!("after_normalize"));
     events.push(internal_event_with_fields(
         "tengu_api_after_normalize",
         &model,
         session_id.clone(),
-        after,
+        after_normalize_fields(context),
     ));
 
-    let mut query = common_message_fields(context);
-    query.insert("api_endpoint".into(), json!("/v1/messages"));
+    let query = query_fields(context, correlation);
     events.push(internal_event_with_fields(
         "tengu_api_query",
         &model,
@@ -774,11 +923,15 @@ fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEve
         system_prompt_fields(context),
     ));
 
-    let mut cache_fields = common_message_fields(context);
+    let mut cache_fields = serde_json::Map::new();
     cache_fields.insert(
-        "breakpoint_count".into(),
-        json!(context.system_prompt_block_count),
+        "totalMessageCount".into(),
+        json!(context.post_normalized_message_count),
     );
+    cache_fields.insert("cachingEnabled".into(), json!(true));
+    cache_fields.insert("skipCacheWrite".into(), json!(false));
+    cache_fields.insert("forkPointPinned".into(), json!(false));
+    cache_fields.insert("markerCount".into(), json!(cache_marker_count(context)));
     events.push(internal_event_with_fields(
         "tengu_api_cache_breakpoints",
         &model,
@@ -787,8 +940,7 @@ fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEve
     ));
 
     if context.tool_count > 0 {
-        let mut tool_fields = common_message_fields(context);
-        tool_fields.insert("tool_count".into(), json!(context.tool_count));
+        let tool_fields = tool_fields(context, correlation);
         events.push(internal_event_with_fields(
             "tengu_tool_search_mode_decision",
             &model,
@@ -810,7 +962,10 @@ fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEve
     }
 
     if context.attachment_count > 0 {
-        let mut attachment_fields = common_message_fields(context);
+        let mut attachment_fields = serde_json::Map::new();
+        attachment_fields.insert("label".into(), json!("attachment_summary"));
+        attachment_fields.insert("duration_ms".into(), json!(0));
+        attachment_fields.insert("attachment_size_bytes".into(), json!(0));
         attachment_fields.insert("attachment_count".into(), json!(context.attachment_count));
         events.push(internal_event_with_fields(
             "tengu_query_before_attachments",
@@ -831,9 +986,11 @@ fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEve
             attachment_fields,
         ));
 
-        let mut file_fields = common_message_fields(context);
+        let mut file_fields = serde_json::Map::new();
         file_fields.insert("operation".into(), json!("attachment_summary"));
-        file_fields.insert("file_count".into(), json!(context.attachment_count));
+        file_fields.insert("tool".into(), json!("attachment"));
+        file_fields.insert("filePathHash".into(), json!("redacted"));
+        file_fields.insert("type".into(), json!("attachment"));
         events.push(internal_event_with_fields(
             "tengu_file_operation",
             &model,
@@ -848,15 +1005,12 @@ fn message_request_events(context: &MessageTelemetryContext) -> Vec<TelemetryEve
 fn message_result_events(
     context: &MessageTelemetryContext,
     result: &MessageTelemetryResult,
+    correlation: &MessageCorrelation,
 ) -> Vec<TelemetryEvent> {
     let mut events = Vec::new();
     let model = normalized_model(&context.model);
     let session_id = context.session_id.clone();
-    let mut fields = common_message_fields(context);
-    fields.insert("duration_ms".into(), json!(result.duration_ms));
-    if let Some(status) = result.status_code {
-        fields.insert("status_code".into(), json!(status));
-    }
+    let mut fields = success_fields(context, result, correlation);
     if let Some(ref error_kind) = result.error_kind {
         fields.insert("error_kind".into(), json!(error_kind));
     }
@@ -875,17 +1029,35 @@ fn message_result_events(
     ));
 
     if result.duration_ms >= SLOW_FIRST_BYTE_MS {
+        let mut slow_fields = serde_json::Map::new();
+        slow_fields.insert("model".into(), json!(model));
+        slow_fields.insert("provider".into(), json!("firstParty"));
+        slow_fields.insert("attempt".into(), json!(context.attempt));
+        slow_fields.insert(
+            "elapsed_ms".into(),
+            json!(result.ttft_ms.unwrap_or(result.duration_ms)),
+        );
         events.push(internal_event_with_fields(
             "tengu_api_slow_first_byte",
             &model,
             session_id.clone(),
-            fields.clone(),
+            slow_fields,
         ));
     }
 
     if context.tool_count > 0 && result.status_code.is_some_and(|s| (200..300).contains(&s)) {
-        let mut tool_fields = fields.clone();
-        tool_fields.insert("tool_count".into(), json!(context.tool_count));
+        let mut tool_fields = tool_fields(context, correlation);
+        tool_fields.insert("durationMs".into(), json!(result.duration_ms));
+        tool_fields.insert("rssDeltaBytes".into(), json!(0));
+        tool_fields.insert("heapUsedDeltaBytes".into(), json!(0));
+        tool_fields.insert("externalDeltaBytes".into(), json!(0));
+        tool_fields.insert("preToolHookDurationMs".into(), json!(0));
+        tool_fields.insert("permissionDurationMs".into(), json!(0));
+        tool_fields.insert(
+            "toolResultSizeBytes".into(),
+            json!(result.response_body_bytes.unwrap_or(0)),
+        );
+        tool_fields.insert("toolInputSizeBytes".into(), json!(0));
         events.push(internal_event_with_fields(
             "tengu_tool_use_success",
             &model,
@@ -926,30 +1098,195 @@ fn growthbook_experiment_event(model: &str, session_id: Option<String>) -> Telem
     }
 }
 
-fn common_message_fields(
+fn before_normalize_fields(
     context: &MessageTelemetryContext,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut fields = serde_json::Map::new();
-    fields.insert("betas".into(), json!(context.betas));
-    fields.insert("api_endpoint".into(), json!("/v1/messages"));
     fields.insert(
-        "request_body_bytes".into(),
-        json!(context.request_body_bytes),
+        "preNormalizedMessageCount".into(),
+        json!(context.pre_normalized_message_count),
     );
-    fields.insert(
-        "rewritten_body_bytes".into(),
-        json!(context.rewritten_body_bytes),
-    );
-    fields.insert("stream".into(), json!(context.stream));
-    fields.insert("tool_count".into(), json!(context.tool_count));
-    fields.insert("attachment_count".into(), json!(context.attachment_count));
-    fields.insert(
-        "system_prompt_block_count".into(),
-        json!(context.system_prompt_block_count),
-    );
-    fields.insert("client_type_source".into(), json!(context.client_type));
-    fields.insert("attempt".into(), json!(context.attempt));
     fields
+}
+
+fn after_normalize_fields(
+    context: &MessageTelemetryContext,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "postNormalizedMessageCount".into(),
+        json!(context.post_normalized_message_count),
+    );
+    fields
+}
+
+fn query_fields(
+    context: &MessageTelemetryContext,
+    correlation: &MessageCorrelation,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("model".into(), json!(normalized_model(&context.model)));
+    fields.insert(
+        "messagesLength".into(),
+        json!(context.post_normalized_message_count),
+    );
+    fields.insert(
+        "temperature".into(),
+        json!(context.temperature.unwrap_or(1.0)),
+    );
+    fields.insert("provider".into(), json!("firstParty"));
+    fields.insert("buildAgeMins".into(), json!(0));
+    fields.insert("betas".into(), json!(context.betas));
+    fields.insert("permissionMode".into(), json!("default"));
+    fields.insert("querySource".into(), json!("repl_main_thread"));
+    fields.insert(
+        "thinkingType".into(),
+        json!(context.thinking_type.as_deref().unwrap_or("disabled")),
+    );
+    fields.insert("fastMode".into(), json!(false));
+    insert_correlation_fields(&mut fields, correlation);
+    fields
+}
+
+fn success_fields(
+    context: &MessageTelemetryContext,
+    result: &MessageTelemetryResult,
+    correlation: &MessageCorrelation,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("model".into(), json!(normalized_model(&context.model)));
+    fields.insert("betas".into(), json!(context.betas));
+    fields.insert(
+        "messageCount".into(),
+        json!(context.post_normalized_message_count),
+    );
+    let message_tokens = result
+        .usage
+        .input_tokens
+        .saturating_add(result.usage.output_tokens);
+    fields.insert("messageTokens".into(), json!(message_tokens));
+    fields.insert("inputTokens".into(), json!(result.usage.input_tokens));
+    fields.insert("outputTokens".into(), json!(result.usage.output_tokens));
+    fields.insert(
+        "cachedInputTokens".into(),
+        json!(result.usage.cache_read_input_tokens),
+    );
+    let uncached_input_tokens = result
+        .usage
+        .input_tokens
+        .saturating_sub(result.usage.cache_read_input_tokens);
+    fields.insert("uncachedInputTokens".into(), json!(uncached_input_tokens));
+    fields.insert("durationMs".into(), json!(result.duration_ms));
+    fields.insert(
+        "durationMsIncludingRetries".into(),
+        json!(result.duration_ms),
+    );
+    fields.insert("attempt".into(), json!(context.attempt));
+    fields.insert(
+        "ttftMs".into(),
+        json!(result.ttft_ms.unwrap_or(result.duration_ms)),
+    );
+    fields.insert("buildAgeMins".into(), json!(0));
+    fields.insert("provider".into(), json!("firstParty"));
+    fields.insert(
+        "stop_reason".into(),
+        json!(result.stop_reason.as_deref().unwrap_or("unknown")),
+    );
+    fields.insert("costUSD".into(), json!(0.0));
+    fields.insert("didFallBackToNonStreaming".into(), json!(false));
+    fields.insert("isNonInteractiveSession".into(), json!(false));
+    fields.insert("print".into(), json!(false));
+    fields.insert("isTTY".into(), json!(true));
+    fields.insert("querySource".into(), json!("repl_main_thread"));
+    fields.insert("permissionMode".into(), json!("default"));
+    fields.insert("globalCacheStrategy".into(), json!("system_prompt"));
+    fields.insert(
+        "textContentLength".into(),
+        json!(context.input_text_char_length),
+    );
+    fields.insert("imageBlockCount".into(), json!(context.attachment_count));
+    fields.insert("imageTotalPixels".into(), json!(0));
+    fields.insert("imageTotalBytes".into(), json!(0));
+    fields.insert("documentBlockCount".into(), json!(0));
+    fields.insert("documentTotalBytes".into(), json!(0));
+    fields.insert(
+        "inputTextCharLength".into(),
+        json!(context.input_text_char_length),
+    );
+    fields.insert(
+        "estimatedInputTokens".into(),
+        json!(estimated_tokens(context.input_text_char_length)),
+    );
+    fields.insert("fastMode".into(), json!(false));
+    fields.insert(
+        "preNormalizedModel".into(),
+        json!(normalized_model(&context.model)),
+    );
+    fields.insert(
+        "cacheCreationInputTokens".into(),
+        json!(result.usage.cache_creation_input_tokens),
+    );
+    fields.insert(
+        "cacheCreationEphemeral5mInputTokens".into(),
+        json!(result.usage.cache_creation_ephemeral_5m_input_tokens),
+    );
+    fields.insert(
+        "cacheCreationEphemeral1hInputTokens".into(),
+        json!(result.usage.cache_creation_ephemeral_1h_input_tokens),
+    );
+    if context.thinking_type.as_deref() == Some("adaptive") {
+        fields.insert("thinkingContentLength".into(), json!(0));
+    }
+    insert_correlation_fields(&mut fields, correlation);
+    if let Some(time_since_last_api_call_ms) = correlation.time_since_last_api_call_ms {
+        fields.insert(
+            "timeSinceLastApiCallMs".into(),
+            json!(time_since_last_api_call_ms),
+        );
+    }
+    fields
+}
+
+fn tool_fields(
+    context: &MessageTelemetryContext,
+    correlation: &MessageCorrelation,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("messageID".into(), json!(correlation.message_id));
+    fields.insert(
+        "toolName".into(),
+        json!(context.primary_tool_name.as_deref().unwrap_or("Tool")),
+    );
+    fields.insert("isMcp".into(), json!(false));
+    insert_correlation_fields(&mut fields, correlation);
+    fields
+}
+
+fn insert_correlation_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    correlation: &MessageCorrelation,
+) {
+    fields.insert("queryChainId".into(), json!(correlation.query_chain_id));
+    fields.insert("queryDepth".into(), json!(correlation.query_depth));
+    fields.insert("requestId".into(), json!(correlation.request_id));
+    if let Some(previous_request_id) = &correlation.previous_request_id {
+        fields.insert("previousRequestId".into(), json!(previous_request_id));
+    }
+}
+
+fn cache_marker_count(context: &MessageTelemetryContext) -> usize {
+    context
+        .system_cache_breakpoint_count
+        .saturating_add(context.tool_cache_breakpoint_count)
+        .saturating_add(context.message_cache_breakpoint_count)
+}
+
+fn estimated_tokens(char_count: usize) -> usize {
+    if char_count == 0 {
+        0
+    } else {
+        char_count.saturating_add(3) / 4
+    }
 }
 
 fn system_prompt_fields(
@@ -957,14 +1294,14 @@ fn system_prompt_fields(
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut fields = serde_json::Map::new();
     fields.insert(
-        "system_prompt_block_count".into(),
+        "blockCount".into(),
         json!(context.system_prompt_block_count),
     );
     fields.insert(
-        "has_system_prompt".into(),
-        json!(context.system_prompt_block_count > 0),
+        "staticBlockLength".into(),
+        json!(context.system_prompt_text_length),
     );
-    fields.insert("content_strategy".into(), json!("redacted_summary"));
+    fields.insert("dynamicBlockLength".into(), json!(0));
     fields
 }
 
@@ -1057,9 +1394,9 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageTelemetryContext, MessageTelemetryResult, TelemetryEvent, build_event_batch,
-        build_growthbook_eval, build_metrics, enqueue_events, internal_event, is_telemetry_path,
-        message_request_events, message_result_events,
+        MessageCorrelation, MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage,
+        TelemetryEvent, build_event_batch, build_growthbook_eval, build_metrics, enqueue_events,
+        internal_event, is_telemetry_path, message_request_events, message_result_events,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -1141,6 +1478,45 @@ mod tests {
         let profile = profile_for_key(key).expect("profile");
         apply_identity_to_env_json(&mut account.canonical_env, &profile.identity);
         account
+    }
+
+    fn test_message_context() -> MessageTelemetryContext {
+        MessageTelemetryContext {
+            request_key: uuid::Uuid::new_v4().to_string(),
+            model: "claude-sonnet-4-20250514".into(),
+            session_id: Some("session-1".into()),
+            pre_normalized_message_count: 1,
+            post_normalized_message_count: 2,
+            message_content_block_count: 3,
+            request_body_bytes: 123,
+            rewritten_body_bytes: 456,
+            stream: true,
+            tool_count: 2,
+            attachment_count: 1,
+            system_prompt_block_count: 3,
+            system_prompt_text_length: 99,
+            system_cache_breakpoint_count: 1,
+            tool_cache_breakpoint_count: 1,
+            message_cache_breakpoint_count: 1,
+            thinking_type: Some("adaptive".into()),
+            temperature: Some(1.0),
+            primary_tool_name: Some("Bash".into()),
+            input_text_char_length: 400,
+            client_type: "api".into(),
+            attempt: 1,
+            betas: "claude-code-20250219".into(),
+        }
+    }
+
+    fn test_message_correlation() -> MessageCorrelation {
+        MessageCorrelation {
+            query_chain_id: "11111111-2222-4333-8444-555555555555".into(),
+            query_depth: 2,
+            request_id: "req_123456789012345678901234".into(),
+            message_id: "msg_123456789012345678901234".into(),
+            previous_request_id: Some("req_abcdefghijklmnopqrstuvwx".into()),
+            time_since_last_api_call_ms: Some(321),
+        }
     }
 
     #[test]
@@ -1302,9 +1678,9 @@ mod tests {
             .decode(metadata_b64)
             .unwrap();
         let metadata: serde_json::Value = serde_json::from_slice(&decoded_metadata).unwrap();
-        assert_eq!(metadata["renderer_mode"], "cli");
+        assert_eq!(metadata["renderer_mode"], "fullscreen");
         assert_eq!(metadata["subscription_type"], "max");
-        assert_eq!(metadata["provider"], "anthropic");
+        assert!(metadata.get("provider").is_none());
 
         let process_b64 = event["process"].as_str().unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
@@ -1341,21 +1717,10 @@ mod tests {
 
     #[test]
     fn message_lifecycle_events_are_request_driven() {
-        let context = MessageTelemetryContext {
-            model: "claude-sonnet-4-20250514".into(),
-            session_id: Some("session-1".into()),
-            request_body_bytes: 123,
-            rewritten_body_bytes: 456,
-            stream: true,
-            tool_count: 2,
-            attachment_count: 1,
-            system_prompt_block_count: 3,
-            client_type: "api".into(),
-            attempt: 1,
-            betas: "claude-code-20250219".into(),
-        };
+        let context = test_message_context();
+        let correlation = test_message_correlation();
 
-        let request_events = message_request_events(&context);
+        let request_events = message_request_events(&context, &correlation);
         let names: Vec<_> = request_events
             .iter()
             .filter_map(|event| event.name.as_deref())
@@ -1374,8 +1739,20 @@ mod tests {
             &MessageTelemetryResult {
                 status_code: Some(200),
                 duration_ms: 12_001,
+                ttft_ms: Some(456),
                 error_kind: None,
+                response_body_bytes: Some(2048),
+                usage: MessageTelemetryUsage {
+                    input_tokens: 100,
+                    output_tokens: 25,
+                    cache_read_input_tokens: 40,
+                    cache_creation_input_tokens: 60,
+                    cache_creation_ephemeral_5m_input_tokens: 10,
+                    cache_creation_ephemeral_1h_input_tokens: 20,
+                },
+                stop_reason: Some("end_turn".into()),
             },
+            &correlation,
         );
         let result_names: Vec<_> = result_events
             .iter()
@@ -1400,6 +1777,15 @@ mod tests {
             success_event.fields.get("betas"),
             Some(&json!("claude-code-20250219"))
         );
+        assert_eq!(
+            success_event.fields.get("requestId"),
+            Some(&json!(correlation.request_id))
+        );
+        assert_eq!(success_event.fields.get("inputTokens"), Some(&json!(100)));
+        assert_eq!(
+            success_event.fields.get("cachedInputTokens"),
+            Some(&json!(40))
+        );
     }
 
     #[test]
@@ -1409,28 +1795,66 @@ mod tests {
             &account,
             Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0).unwrap(),
         );
-        let context = MessageTelemetryContext {
-            model: "claude-sonnet-4-20250514".into(),
-            session_id: Some("session-1".into()),
-            request_body_bytes: 777,
-            rewritten_body_bytes: 888,
-            stream: false,
-            tool_count: 0,
-            attachment_count: 0,
-            system_prompt_block_count: 1,
-            client_type: "api".into(),
-            attempt: 0,
-            betas: "server-side-fallback-2026-06-01,fallback-credit-2026-06-01".into(),
-        };
-        let events = message_request_events(&context);
+        let mut context = test_message_context();
+        context.tool_count = 0;
+        context.attachment_count = 0;
+        context.betas = "server-side-fallback-2026-06-01,fallback-credit-2026-06-01".into();
+        let events = message_request_events(&context, &test_message_correlation());
         let payload = build_event_batch(&account, &run, 3.0, &events);
         let serialized = serde_json::to_string(&payload).unwrap();
 
         assert!(!serialized.contains("raw-token-marker"));
         assert!(!serialized.contains("raw-prompt-marker"));
         assert!(!serialized.contains("raw-tool-input-marker"));
-        assert!(serialized.contains("redacted_summary"));
-        assert!(serialized.contains("request_body_bytes"));
+        assert!(!serialized.contains("request_body_bytes"));
+    }
+
+    #[test]
+    fn event_batch_places_request_metadata_inside_additional_metadata() {
+        let account = test_account();
+        let run = run_profile(
+            &account,
+            Utc.with_ymd_and_hms(2026, 6, 29, 12, 0, 0).unwrap(),
+        );
+        let context = test_message_context();
+        let correlation = test_message_correlation();
+        let events = message_result_events(
+            &context,
+            &MessageTelemetryResult {
+                status_code: Some(200),
+                duration_ms: 4567,
+                ttft_ms: Some(321),
+                error_kind: None,
+                response_body_bytes: Some(999),
+                usage: MessageTelemetryUsage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cache_read_input_tokens: 50,
+                    cache_creation_input_tokens: 70,
+                    cache_creation_ephemeral_5m_input_tokens: 11,
+                    cache_creation_ephemeral_1h_input_tokens: 22,
+                },
+                stop_reason: Some("end_turn".into()),
+            },
+            &correlation,
+        );
+        let payload = build_event_batch(&account, &run, 3.0, &events);
+        let event = &payload["events"][0]["event_data"];
+        let metadata_b64 = event["additional_metadata"].as_str().unwrap();
+        let decoded_metadata = base64::engine::general_purpose::STANDARD
+            .decode(metadata_b64)
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&decoded_metadata).unwrap();
+
+        assert_eq!(metadata["renderer_mode"], "fullscreen");
+        assert_eq!(metadata["provider"], "firstParty");
+        assert_eq!(metadata["requestId"], correlation.request_id);
+        assert_eq!(metadata["messageTokens"], 150);
+        assert_eq!(metadata["cachedInputTokens"], 50);
+        assert_eq!(metadata["stop_reason"], "end_turn");
+        assert!(event.get("requestId").is_none());
+        assert!(event.get("inputTokens").is_none());
+        assert!(event.get("durationMs").is_none());
     }
 
     #[test]
@@ -1440,22 +1864,20 @@ mod tests {
             &account,
             Utc.with_ymd_and_hms(2026, 6, 10, 16, 30, 37).unwrap(),
         );
-        let context = MessageTelemetryContext {
-            model: "claude-fable-5".into(),
-            session_id: Some("session-1".into()),
-            request_body_bytes: 111,
-            rewritten_body_bytes: 222,
-            stream: true,
-            tool_count: 0,
-            attachment_count: 0,
-            system_prompt_block_count: 2,
-            client_type: "api".into(),
-            attempt: 0,
-            betas: "server-side-fallback-2026-06-01,fallback-credit-2026-06-01".into(),
-        };
-        let events = message_request_events(&context);
+        let mut context = test_message_context();
+        context.model = "claude-fable-5".into();
+        context.tool_count = 0;
+        context.attachment_count = 0;
+        context.betas = "server-side-fallback-2026-06-01,fallback-credit-2026-06-01".into();
+        let events = message_request_events(&context, &test_message_correlation());
         let payload = build_event_batch(&account, &run, 3.0, &events);
-        let event = &payload["events"][0]["event_data"];
+        let event = payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_data"]["event_name"] == "tengu_api_query")
+            .map(|event| &event["event_data"])
+            .expect("query event");
         let serialized = serde_json::to_string(&payload).unwrap();
 
         assert_eq!(event["model"], json!("claude-fable-5"));
