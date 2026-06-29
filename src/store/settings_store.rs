@@ -161,13 +161,16 @@ impl SettingsStore {
             r#"
             UPDATE accounts
             SET canonical_env = jsonb_set(
-                jsonb_set(
-                    jsonb_set(canonical_env, '{version}', to_jsonb($1::text), true),
-                    '{version_base}', to_jsonb($2::text), true
+                    jsonb_set(
+                        jsonb_set(
+                            jsonb_set(canonical_env, '{version}', to_jsonb($1::text), true),
+                            '{version_base}', to_jsonb($2::text), true
+                        ),
+                        '{build_time}', to_jsonb($3::text), true
+                    ),
+                    '{node_version}', to_jsonb($4::text), true
                 ),
-                '{build_time}', to_jsonb($3::text), true
-            ),
-            updated_at=NOW()
+                updated_at=NOW()
             "#
         } else {
             r#"
@@ -179,7 +182,8 @@ impl SettingsStore {
                 END,
                 '$.version', $1,
                 '$.version_base', $2,
-                '$.build_time', $3
+                '$.build_time', $3,
+                '$.node_version', $4
             ),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
             "#
@@ -194,6 +198,7 @@ impl SettingsStore {
             .bind(identity.version)
             .bind(identity.version_base)
             .bind(identity.build_time)
+            .bind(identity.stainless_runtime_version)
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Internal(format!("update account profile: {}", e)))?;
@@ -357,6 +362,13 @@ mod tests {
         assert_eq!(env["version"], "2.1.173");
         assert_eq!(env["version_base"], "2.1.173");
         assert_eq!(env["build_time"], "2026-06-11T01:23:13Z");
+        assert_eq!(
+            env["node_version"],
+            crate::service::version_profile::profile_for_key("2.1.173")
+                .unwrap()
+                .identity
+                .stainless_runtime_version
+        );
         assert_eq!(env["custom"], "keep");
     }
 

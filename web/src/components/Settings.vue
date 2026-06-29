@@ -34,8 +34,8 @@ const primeModel = ref('claude-haiku-4-5-20251001');
 const allowSystemRoleModels = ref('claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const claudeCodeVersionProfile = ref('2.1.187');
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.187');
+const claudeCodeVersionProfile = ref('2.1.195');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.195');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
@@ -102,6 +102,15 @@ interface ClaudeCodeVersionProfileOption {
 
 /** Claude Code 版本画像选项 */
 const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
+  {
+    key: '2.1.195',
+    version: '2.1.195',
+    version_base: '2.1.195',
+    build_time: '2026-06-26T01:00:56Z',
+    allowed_claude_code_versions: '2.1.89-2.1.195',
+    growthbook_user_agent: 'Bun/1.4.0',
+    telemetry_shape: 'claude_code_2_1_185',
+  },
   {
     key: '2.1.187',
     version: '2.1.187',
@@ -331,8 +340,8 @@ async function loadSettings() {
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
-    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.187';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.187';
+    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.195';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.195';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
@@ -1214,7 +1223,7 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.187"
+              placeholder="2.1.89-2.1.195"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm bg-[#f9f6f1]"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
               readonly

@@ -5,6 +5,7 @@ use serde_json::Value;
 use super::account::{Account, CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData};
 use crate::service::version_profile::{
     DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION, DEFAULT_CLAUDE_CODE_VERSION_BASE,
+    STAINLESS_RUNTIME_VERSION,
 };
 
 const DEFAULT_ACCOUNT_ID_SEED: &str = "account";
@@ -632,7 +633,7 @@ pub fn normalize_env(mut env: CanonicalEnvData) -> CanonicalEnvData {
         };
     }
     if env.node_version.is_empty() {
-        env.node_version = "v24.3.0".into();
+        env.node_version = STAINLESS_RUNTIME_VERSION.into();
     }
     if env.terminal.is_empty() {
         env.terminal = match env.platform.as_str() {
@@ -803,7 +804,7 @@ mod tests {
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, STAINLESS_RUNTIME_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -903,7 +904,7 @@ mod tests {
     fn legacy_env_and_process_are_normalized_without_storage_writeback() {
         let env = normalize_env(CanonicalEnvData::default());
         assert_eq!(env.platform, "linux");
-        assert_eq!(env.node_version, "v24.3.0");
+        assert_eq!(env.node_version, STAINLESS_RUNTIME_VERSION);
         assert_eq!(env.version, DEFAULT_CLAUDE_CODE_VERSION);
         assert!(env.is_running_with_bun);
         assert_eq!(env.linux_distro_id, "ubuntu");

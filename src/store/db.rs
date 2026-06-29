@@ -7,7 +7,9 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.172",
     "2.1.89-2.1.173",
     "2.1.89-2.1.185",
+    "2.1.89-2.1.187",
 ];
+const PREVIOUS_DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTINGS: &[&str] = &["2.1.187"];
 const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
     "intercept_warmup_non_stream_aux_enabled",
     "intercept_warmup_non_stream_aux_mode",
@@ -297,6 +299,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             .await
             .ok();
     }
+    upgrade_default_profile_setting(pool).await?;
     let claude_code_profile = selected_claude_code_profile(pool).await?;
     upgrade_default_settings(pool, claude_code_profile).await?;
     remove_obsolete_settings(pool).await?;
@@ -350,6 +353,35 @@ async fn upgrade_default_settings(
     Ok(())
 }
 
+async fn upgrade_default_profile_setting(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    for previous_profile in PREVIOUS_DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTINGS {
+        for previous_allowed in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
+            sqlx::query(
+                r#"
+                UPDATE settings
+                SET value=$1
+                WHERE key=$2
+                  AND value=$3
+                  AND EXISTS (
+                      SELECT 1
+                      FROM settings allowed_versions
+                      WHERE allowed_versions.key=$4
+                        AND allowed_versions.value=$5
+                  )
+                "#,
+            )
+            .bind(crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING)
+            .bind("claude_code_version_profile")
+            .bind(previous_profile)
+            .bind("allowed_claude_code_versions")
+            .bind(previous_allowed)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn remove_obsolete_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
     for key in OBSOLETE_SETTINGS_KEYS {
         sqlx::query("DELETE FROM settings WHERE key=$1")
@@ -376,7 +408,8 @@ async fn upgrade_account_claude_code_profile(
             END,
             '$.version', $1,
             '$.version_base', $2,
-            '$.build_time', $3
+            '$.build_time', $3,
+            '$.node_version', $4
         )
         "#
     } else {
@@ -384,10 +417,13 @@ async fn upgrade_account_claude_code_profile(
         UPDATE accounts
         SET canonical_env = jsonb_set(
             jsonb_set(
-                jsonb_set(canonical_env, '{version}', to_jsonb($1::text), true),
-                '{version_base}', to_jsonb($2::text), true
+                jsonb_set(
+                    jsonb_set(canonical_env, '{version}', to_jsonb($1::text), true),
+                    '{version_base}', to_jsonb($2::text), true
+                ),
+                '{build_time}', to_jsonb($3::text), true
             ),
-            '{build_time}', to_jsonb($3::text), true
+            '{node_version}', to_jsonb($4::text), true
         )
         "#
     };
@@ -395,6 +431,7 @@ async fn upgrade_account_claude_code_profile(
         .bind(identity.version)
         .bind(identity.version_base)
         .bind(identity.build_time)
+        .bind(identity.stainless_runtime_version)
         .execute(pool)
         .await?;
     Ok(())
@@ -569,6 +606,10 @@ mod tests {
             env["build_time"],
             crate::service::version_profile::DEFAULT_CLAUDE_CODE_BUILD_TIME
         );
+        assert_eq!(
+            env["node_version"],
+            crate::service::version_profile::STAINLESS_RUNTIME_VERSION
+        );
         assert_eq!(env["platform"], "linux");
         assert_eq!(env["custom"], "keep");
     }
@@ -578,6 +619,12 @@ mod tests {
         let pool = make_sqlite_pool().await;
         migrate(&pool, "sqlite").await.expect("initial migrate");
         for previous in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind("2.1.187")
+                .bind("claude_code_version_profile")
+                .execute(&pool)
+                .await
+                .expect("set old profile default");
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
                 .bind(previous)
                 .bind("allowed_claude_code_versions")
@@ -594,6 +641,16 @@ mod tests {
             assert_eq!(
                 upgraded,
                 crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING
+            );
+            let upgraded_profile: String =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                    .bind("claude_code_version_profile")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("upgraded profile setting");
+            assert_eq!(
+                upgraded_profile,
+                crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING
             );
         }
 
@@ -613,7 +670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_preserves_explicit_old_claude_code_profile() {
+    async fn migrate_preserves_explicit_old_claude_code_profile_with_custom_allowed_versions() {
         let pool = make_sqlite_pool().await;
         migrate(&pool, "sqlite").await.expect("initial migrate");
         sqlx::query(
@@ -634,8 +691,9 @@ mod tests {
         .expect("insert account");
 
         for (profile_key, allowed_versions, build_time) in [
-            ("2.1.173", "2.1.89-2.1.173", "2026-06-11T01:23:13Z"),
-            ("2.1.185", "2.1.89-2.1.185", "2026-06-20T06:38:30Z"),
+            ("2.1.173", "2.1.173", "2026-06-11T01:23:13Z"),
+            ("2.1.185", "2.1.185", "2026-06-20T06:38:30Z"),
+            ("2.1.187", "2.1.187", "2026-06-23T16:59:46Z"),
         ] {
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
                 .bind(profile_key)
@@ -670,6 +728,13 @@ mod tests {
             assert_eq!(env["version"], profile_key);
             assert_eq!(env["version_base"], profile_key);
             assert_eq!(env["build_time"], build_time);
+            assert_eq!(
+                env["node_version"],
+                crate::service::version_profile::profile_for_key(profile_key)
+                    .unwrap()
+                    .identity
+                    .stainless_runtime_version
+            );
             assert_eq!(env["custom"], "keep");
         }
     }
