@@ -180,6 +180,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "allowed_user_agents",
             crate::store::settings_store::DEFAULT_ALLOWED_USER_AGENTS_SETTING,
         ),
+        // Claude Code base URL 风险治理默认只观测并输出脱敏摘要,不改写请求体。
+        (
+            "claude_code_context_sanitizer_mode",
+            crate::store::settings_store::DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
+        ),
         // 系统提示词环境字段「真值透传」开关:工作目录默认透传,shell/os_version 默认改写。
         (
             "passthrough_shell",
@@ -758,6 +763,23 @@ mod tests {
         assert_eq!(
             profile,
             crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_default_claude_code_context_sanitizer_mode() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let mode: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("claude_code_context_sanitizer_mode")
+            .fetch_one(&pool)
+            .await
+            .expect("context sanitizer setting");
+
+        assert_eq!(
+            mode,
+            crate::store::settings_store::DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE
         );
     }
 

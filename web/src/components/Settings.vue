@@ -39,6 +39,9 @@ const allowedClaudeCodeVersions = ref('2.1.89-2.1.195');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
+/** Claude Code 上下文风险控制模式 */
+const claudeCodeContextSanitizerMode = ref<'off' | 'report_only' | 'normalize'>('report_only');
+
 /** 系统提示词环境字段「真值透传」开关(工作目录默认透传) */
 const passthroughShell = ref(false);
 const passthroughOsVersion = ref(false);
@@ -347,6 +350,8 @@ async function loadSettings() {
     allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.195';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
+    const contextSanitizerMode = data.claude_code_context_sanitizer_mode ?? 'report_only';
+    claudeCodeContextSanitizerMode.value = contextSanitizerMode === 'off' || contextSanitizerMode === 'normalize' ? contextSanitizerMode : 'report_only';
     passthroughShell.value = (data.passthrough_shell ?? 'false') === 'true';
     passthroughOsVersion.value = (data.passthrough_os_version ?? 'false') === 'true';
     passthroughWorkingDir.value = (data.passthrough_working_dir ?? 'true') === 'true';
@@ -467,6 +472,7 @@ async function saveSettings() {
       allowed_claude_code_versions: allowedClaudeCodeVersions.value.trim(),
       blocked_claude_code_versions: blockedClaudeCodeVersions.value.trim(),
       allowed_user_agents: allowedUserAgents.value.trim(),
+      claude_code_context_sanitizer_mode: claudeCodeContextSanitizerMode.value,
       passthrough_shell: passthroughShell.value ? 'true' : 'false',
       passthrough_os_version: passthroughOsVersion.value ? 'true' : 'false',
       passthrough_working_dir: passthroughWorkingDir.value ? 'true' : 'false',
@@ -1193,6 +1199,52 @@ onMounted(async () => {
           />
           <p class="text-[11px] text-[#b5b0a6]">必须是 JSON 数组；每项至少包含 model 字符串。空数组表示不额外暴露模型。</p>
         </div>
+      </div>
+    </Card>
+
+    <!-- Claude Code 上下文风险控制 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">Claude Code 上下文风险控制</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            仅作用于 Claude Code /v1/messages 自动上下文中的 currentDate 标记；默认只记录脱敏摘要，不修改请求体。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="claudeCodeContextSanitizerMode"
+              type="radio"
+              value="off"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">关闭</span>
+          </label>
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="claudeCodeContextSanitizerMode"
+              type="radio"
+              value="report_only"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">仅观测</span>
+          </label>
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="claudeCodeContextSanitizerMode"
+              type="radio"
+              value="normalize"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">规范化 currentDate</span>
+          </label>
+        </div>
+
+        <p class="text-[11px] text-[#b5b0a6]">
+          normalize 会把命中的日期句式恢复为稳定的 YYYY-MM-DD 格式；telemetry 中的 base URL / gateway / proxy 痕迹会持续清洗。
+        </p>
       </div>
     </Card>
 

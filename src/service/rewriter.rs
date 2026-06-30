@@ -5,7 +5,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::AppError;
 use crate::model::account::{Account, BillingMode, CanonicalPromptEnvData};
@@ -289,6 +289,181 @@ fn collect_text_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>)
     }
 }
 
+fn scan_or_normalize_current_date_context(
+    body: &mut serde_json::Value,
+    config: ClaudeCodeContextSanitizerConfig,
+    client_type: ClientType,
+) {
+    if client_type != ClientType::ClaudeCode || config.mode == ClaudeCodeContextSanitizerMode::Off {
+        return;
+    }
+
+    scan_or_normalize_system_current_date(body, config);
+    scan_or_normalize_message_current_date(body, config);
+}
+
+fn scan_or_normalize_system_current_date(
+    body: &mut serde_json::Value,
+    config: ClaudeCodeContextSanitizerConfig,
+) {
+    let Some(system) = body.get_mut("system") else {
+        return;
+    };
+    match system {
+        serde_json::Value::String(text) => {
+            scan_or_normalize_current_date_text(text, "system", config);
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter_mut().enumerate() {
+                if let Some(serde_json::Value::String(text)) = item.get_mut("text") {
+                    scan_or_normalize_current_date_text(
+                        text,
+                        &format!("system[{}].text", idx),
+                        config,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_or_normalize_message_current_date(
+    body: &mut serde_json::Value,
+    config: ClaudeCodeContextSanitizerConfig,
+) {
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(|messages| messages.as_array_mut())
+    else {
+        return;
+    };
+    for (message_idx, message) in messages.iter_mut().enumerate() {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        match content {
+            serde_json::Value::String(text) => {
+                if has_claude_code_context_marker(text) {
+                    scan_or_normalize_current_date_text(
+                        text,
+                        &format!("messages[{}].content", message_idx),
+                        config,
+                    );
+                }
+            }
+            serde_json::Value::Array(blocks) => {
+                let text_block_count = blocks
+                    .iter()
+                    .filter(|block| block.get("text").and_then(|text| text.as_str()).is_some())
+                    .count();
+                let mut is_first_text_block = true;
+                for (block_idx, block) in blocks.iter_mut().enumerate() {
+                    let Some(serde_json::Value::String(text)) = block.get_mut("text") else {
+                        continue;
+                    };
+                    let scan_as_context = has_claude_code_context_marker(text)
+                        || (text_block_count > 1 && is_first_text_block);
+                    is_first_text_block = false;
+                    if scan_as_context {
+                        scan_or_normalize_current_date_text(
+                            text,
+                            &format!("messages[{}].content[{}].text", message_idx, block_idx),
+                            config,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_or_normalize_current_date_text(
+    text: &mut String,
+    path: &str,
+    config: ClaudeCodeContextSanitizerConfig,
+) {
+    if !CLAUDE_CODE_CURRENT_DATE_REGEX.is_match(text) {
+        return;
+    }
+    let original = text.clone();
+    let action = if config.mode == ClaudeCodeContextSanitizerMode::Normalize {
+        *text = normalize_current_date_text(text);
+        "normalize"
+    } else {
+        "report_only"
+    };
+    log_current_date_context_finding(&original, path, config.mode, action);
+}
+
+fn normalize_current_date_text(text: &str) -> String {
+    CLAUDE_CODE_CURRENT_DATE_REGEX
+        .replace_all(text, |caps: &regex::Captures| {
+            if caps.get(2).map(|m| m.as_str()) != caps.get(4).map(|m| m.as_str()) {
+                caps.get(0)
+                    .map(|m| m.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                format!("Today's date is {}-{}-{}.", &caps[1], &caps[3], &caps[5])
+            }
+        })
+        .to_string()
+}
+
+fn log_current_date_context_finding(
+    text: &str,
+    path: &str,
+    mode: ClaudeCodeContextSanitizerMode,
+    action: &str,
+) {
+    let digest = Sha256::digest(text.as_bytes());
+    let hash = format!("{:x}", digest);
+    let Some(caps) = CLAUDE_CODE_CURRENT_DATE_REGEX.captures(text) else {
+        return;
+    };
+    if caps.get(2).map(|m| m.as_str()) != caps.get(4).map(|m| m.as_str()) {
+        return;
+    }
+    let apostrophe_variant = current_date_apostrophe_variant(text);
+    let date_separator = caps.get(2).map(|m| m.as_str()).unwrap_or("-");
+    warn!(
+        target: "cc2api::context_sanitizer",
+        mode = mode.as_str(),
+        action,
+        path,
+        finding = "claude_code_current_date",
+        date_separator,
+        apostrophe_variant,
+        text_len = text.len(),
+        text_hash = &hash[..16],
+        client_type = ClientType::ClaudeCode.as_str(),
+        "claude_code_context_sanitizer finding"
+    );
+}
+
+fn current_date_apostrophe_variant(text: &str) -> &'static str {
+    if text.contains("Today\u{2019}s date is") {
+        "right_single_quote"
+    } else if text.contains("Today\u{02BC}s date is") {
+        "modifier_letter_apostrophe"
+    } else if text.contains("Today\u{02B9}s date is") {
+        "modifier_letter_prime"
+    } else if text.contains("Today\u{2032}s date is") {
+        "prime"
+    } else {
+        "ascii"
+    }
+}
+
+fn has_claude_code_context_marker(text: &str) -> bool {
+    text.contains("<system-reminder>")
+        || text.contains("<env>")
+        || text.contains("Platform:")
+        || text.contains("Working directory:")
+}
+
 /// 判断该 endpoint 是否应该发送 anthropic-beta。
 fn requires_anthropic_beta(path: &str) -> bool {
     !path.starts_with("/mcp-registry/") && path != "/"
@@ -509,6 +684,73 @@ impl DisabledThinkingRewrite {
     /// @return 不改写任何请求的配置。
     pub fn off() -> Self {
         Self::default()
+    }
+}
+
+/// Claude Code 自动上下文风险扫描/规范化模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClaudeCodeContextSanitizerMode {
+    /// 关闭扫描与日志。
+    Off,
+    /// 只扫描并记录脱敏摘要,不改写请求体。
+    #[default]
+    ReportOnly,
+    /// 扫描并规范化 Claude Code 自动注入的 currentDate 句式。
+    Normalize,
+}
+
+impl ClaudeCodeContextSanitizerMode {
+    /// 从 settings 字符串解析上下文治理模式。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回枚举值,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "off" => Ok(Self::Off),
+            "report_only" => Ok(Self::ReportOnly),
+            "normalize" => Ok(Self::Normalize),
+            other => Err(AppError::BadRequest(format!(
+                "'claude_code_context_sanitizer_mode' 必须是 off、report_only 或 normalize,当前值: {}",
+                other
+            ))),
+        }
+    }
+
+    /// 返回日志和前端使用的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ReportOnly => "report_only",
+            Self::Normalize => "normalize",
+        }
+    }
+}
+
+/// Claude Code 自动上下文风险扫描/规范化配置。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaudeCodeContextSanitizerConfig {
+    /// 当前治理模式。
+    pub mode: ClaudeCodeContextSanitizerMode,
+}
+
+impl ClaudeCodeContextSanitizerConfig {
+    /// 构造关闭状态配置。
+    ///
+    /// @return 不扫描、不改写的配置。
+    pub fn off() -> Self {
+        Self {
+            mode: ClaudeCodeContextSanitizerMode::Off,
+        }
+    }
+
+    /// 从 settings 字符串解析治理配置。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回配置,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        Ok(Self {
+            mode: ClaudeCodeContextSanitizerMode::parse(raw)?,
+        })
     }
 }
 
@@ -952,6 +1194,7 @@ impl Rewriter {
             message_cache_rewrite,
             message_body_order_fingerprint_enabled,
             &DisabledThinkingRewrite::off(),
+            ClaudeCodeContextSanitizerConfig::off(),
         );
         self.complete_stateful_cache(completion);
         output
@@ -980,6 +1223,7 @@ impl Rewriter {
         message_cache_rewrite: MessageCacheControlRewrite,
         message_body_order_fingerprint_enabled: bool,
         disabled_thinking_rewrite: &DisabledThinkingRewrite,
+        context_sanitizer_config: ClaudeCodeContextSanitizerConfig,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         self.rewrite_body_inner(
             body,
@@ -991,6 +1235,7 @@ impl Rewriter {
             message_cache_rewrite,
             message_body_order_fingerprint_enabled,
             disabled_thinking_rewrite,
+            context_sanitizer_config,
         )
     }
 
@@ -1056,6 +1301,7 @@ impl Rewriter {
         message_cache_rewrite: MessageCacheControlRewrite,
         message_body_order_fingerprint_enabled: bool,
         disabled_thinking_rewrite: &DisabledThinkingRewrite,
+        context_sanitizer_config: ClaudeCodeContextSanitizerConfig,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         if body.is_empty() {
             return (body.to_vec(), None);
@@ -1069,7 +1315,13 @@ impl Rewriter {
         let mut stateful_completion = None;
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
-            self.rewrite_messages(&mut parsed, account, client_type, env_pt);
+            self.rewrite_messages(
+                &mut parsed,
+                account,
+                client_type,
+                env_pt,
+                context_sanitizer_config,
+            );
             stateful_completion = self.rewrite_message_cache_control(
                 &mut parsed,
                 account,
@@ -1133,6 +1385,7 @@ impl Rewriter {
         account: &Account,
         client_type: ClientType,
         env_pt: EnvPassthrough,
+        context_sanitizer_config: ClaudeCodeContextSanitizerConfig,
     ) {
         let profile = device_profile(account);
 
@@ -1147,6 +1400,7 @@ impl Rewriter {
                 env_pt,
             );
             scrub_git_user_in_reminders(body, &account.name);
+            scan_or_normalize_current_date_context(body, context_sanitizer_config, client_type);
         } else {
             // 注入模式
             self.inject_metadata_user_id(body, &profile, account);
@@ -1512,6 +1766,12 @@ static SKILLS_LIST_REGEX: Lazy<Regex> =
 static DEFERRED_TOOLS_LIST_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?s)^(<system-reminder>\nThe following deferred tools are now available[^\n]*\n)(.+?)(\n</system-reminder>\s*)$",
+    )
+    .unwrap()
+});
+static CLAUDE_CODE_CURRENT_DATE_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\bToday['\u{2019}\u{02BC}\u{02B9}\u{2032}]s date is (\d{4})([-/])(\d{2})([-/])(\d{2})\.",
     )
     .unwrap()
 });
@@ -4972,10 +5232,11 @@ fn message_body_order_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
-        MessageCacheControlRewrite, Rewriter, cch_attestation_input, cch_attestation_seed,
-        compute_cc_version_suffix, compute_cch_attestation, extract_first_user_message,
-        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
+        CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClaudeCodeContextSanitizerMode,
+        ClientType, DisabledThinkingRewrite, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
+        cch_attestation_input, cch_attestation_seed, compute_cc_version_suffix,
+        compute_cch_attestation, extract_first_user_message, matches_1m_whitelist,
+        ordered_anthropic_headers, strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -5133,6 +5394,29 @@ mod tests {
             MessageCacheControlRewrite::Off,
             true,
             &disabled_thinking_rewrite,
+            ClaudeCodeContextSanitizerConfig::off(),
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn rewrite_messages_body_with_context_sanitizer(
+        body: serde_json::Value,
+        client_type: ClientType,
+        mode: ClaudeCodeContextSanitizerMode,
+    ) -> serde_json::Value {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            client_type,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+            &DisabledThinkingRewrite::off(),
+            ClaudeCodeContextSanitizerConfig { mode },
         );
         serde_json::from_slice(&out).unwrap()
     }
@@ -5173,6 +5457,7 @@ mod tests {
             MessageCacheControlRewrite::Stateful,
             true,
             &DisabledThinkingRewrite::off(),
+            ClaudeCodeContextSanitizerConfig::off(),
         );
         (serde_json::from_slice(&out).unwrap(), completion)
     }
@@ -5424,6 +5709,7 @@ mod tests {
                 enabled: true,
                 models: vec!["claude-fable-5".into()],
             },
+            ClaudeCodeContextSanitizerConfig::off(),
         );
         let text = String::from_utf8(out.clone()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -8102,6 +8388,137 @@ mod tests {
 
         assert_eq!(existing["max_tokens"], json!(128000));
         assert!(missing.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn context_sanitizer_report_only_keeps_current_date_body() {
+        let body = json!({
+            "system": [{
+                "type": "text",
+                "text": "Platform: linux\nToday's date is 2026/07/01."
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "真实用户正文"}]
+            }]
+        });
+
+        let parsed = rewrite_messages_body_with_context_sanitizer(
+            body,
+            ClientType::ClaudeCode,
+            ClaudeCodeContextSanitizerMode::ReportOnly,
+        );
+
+        assert_eq!(
+            parsed["system"][0]["text"],
+            json!("Platform: linux\nToday's date is 2026/07/01.")
+        );
+    }
+
+    #[test]
+    fn context_sanitizer_normalize_rewrites_current_date_before_cch() {
+        let body = json!({
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.195.abc; cc_entrypoint=cli; cch=00000;\nPlatform: linux\nToday\u{2019}s date is 2026/07/01."
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hello current date"}]
+            }]
+        });
+
+        let parsed = rewrite_messages_body_with_context_sanitizer(
+            body,
+            ClientType::ClaudeCode,
+            ClaudeCodeContextSanitizerMode::Normalize,
+        );
+        let text = parsed["system"][0]["text"].as_str().unwrap();
+
+        assert!(text.contains("Today's date is 2026-07-01."));
+        assert!(!text.contains("2026/07/01"));
+        assert!(!text.contains("cch=00000"));
+    }
+
+    #[test]
+    fn context_sanitizer_normalize_handles_known_unicode_apostrophes() {
+        for apostrophe in ["'", "\u{2019}", "\u{02BC}", "\u{02B9}"] {
+            let body = json!({
+                "system": [{
+                    "type": "text",
+                    "text": format!("Platform: linux\nToday{}s date is 2026/06/30.", apostrophe)
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}]
+                }]
+            });
+
+            let parsed = rewrite_messages_body_with_context_sanitizer(
+                body,
+                ClientType::ClaudeCode,
+                ClaudeCodeContextSanitizerMode::Normalize,
+            );
+
+            assert_eq!(
+                parsed["system"][0]["text"],
+                json!("Platform: linux\nToday's date is 2026-06-30.")
+            );
+        }
+    }
+
+    #[test]
+    fn context_sanitizer_does_not_rewrite_plain_user_date_text() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "Today's date is 2026/07/01."}]
+            }]
+        });
+
+        let parsed = rewrite_messages_body_with_context_sanitizer(
+            body,
+            ClientType::ClaudeCode,
+            ClaudeCodeContextSanitizerMode::Normalize,
+        );
+
+        assert_eq!(
+            parsed["messages"][0]["content"][0]["text"],
+            json!("Today's date is 2026/07/01.")
+        );
+    }
+
+    #[test]
+    fn context_sanitizer_does_not_run_for_api_mode() {
+        let body = json!({
+            "system": "Platform: linux\nToday's date is 2026/07/01.",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }]
+        });
+
+        let parsed = rewrite_messages_body_with_context_sanitizer(
+            body,
+            ClientType::API,
+            ClaudeCodeContextSanitizerMode::Normalize,
+        );
+        let messages = parsed["messages"].as_array().unwrap();
+        let original_system = messages.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .map(|content| {
+                    content.iter().any(|block| {
+                        block["text"]
+                            .as_str()
+                            .map(|text| text.contains("Today's date is 2026/07/01."))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+
+        assert!(original_system);
     }
 
     #[test]

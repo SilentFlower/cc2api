@@ -24,10 +24,11 @@ use crate::service::access_policy::{
 };
 use crate::service::account::{AccountService, QueueWaitError, RateLimitDecision};
 use crate::service::rewriter::{
-    CacheControlTtlRewrite, ClientType, DisabledThinkingRewrite, EnvPassthrough,
-    MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion, StatefulCacheUsage,
-    detect_client_type, matches_1m_whitelist, merge_anthropic_beta, order_context_1m_after_oauth,
-    ordered_anthropic_headers, strip_beta_token, strip_empty_text_blocks,
+    CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
+    EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
+    StatefulCacheUsage, detect_client_type, matches_1m_whitelist, merge_anthropic_beta,
+    order_context_1m_after_oauth, ordered_anthropic_headers, strip_beta_token,
+    strip_empty_text_blocks,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
@@ -36,8 +37,8 @@ use crate::service::version_profile::{COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
-    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -332,6 +333,7 @@ pub struct GatewayService {
     non_stream_probe_cache: RwLock<HashMap<String, CachedProbeResponse>>,
     stream_stability_config: RwLock<StreamStabilityConfig>,
     bootstrap_profile_config: RwLock<BootstrapProfileConfig>,
+    context_sanitizer_config: RwLock<ClaudeCodeContextSanitizerConfig>,
 }
 
 impl GatewayService {
@@ -373,6 +375,7 @@ impl GatewayService {
             non_stream_probe_cache: RwLock::new(HashMap::new()),
             stream_stability_config: RwLock::new(default_stream_stability_config()),
             bootstrap_profile_config: RwLock::new(default_bootstrap_profile_config()),
+            context_sanitizer_config: RwLock::new(default_context_sanitizer_config()),
         }
     }
 
@@ -699,6 +702,25 @@ impl GatewayService {
             mode: parsed_mode,
             additional_model_options: parsed_options,
         };
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Claude Code 自动上下文风险扫描/规范化配置。
+    ///
+    /// 配置缓存到内存,用于 `/v1/messages` body 改写阶段,确保在 CCH 和 `cc_version`
+    /// 最终刷新前完成扫描或规范化。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析枚举失败时返回业务错误。
+    pub async fn reload_context_sanitizer_config(&self) -> Result<(), AppError> {
+        let raw = self
+            .settings_store
+            .get_value(
+                "claude_code_context_sanitizer_mode",
+                DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
+            )
+            .await?;
+        *self.context_sanitizer_config.write().await =
+            ClaudeCodeContextSanitizerConfig::parse(&raw)?;
         Ok(())
     }
 
@@ -1281,6 +1303,7 @@ impl GatewayService {
             let message_body_order_fingerprint_enabled =
                 *self.message_body_order_fingerprint_enabled.read().await;
             let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
+            let context_sanitizer_config = *self.context_sanitizer_config.read().await;
             let (rewritten_body, stateful_cache_completion) =
                 self.rewriter.rewrite_body_with_stateful_completion(
                     &body_bytes,
@@ -1292,6 +1315,7 @@ impl GatewayService {
                     message_cache,
                     message_body_order_fingerprint_enabled,
                     &disabled_thinking,
+                    context_sanitizer_config,
                 );
             debug!(
                 "request body summary AFTER rewrite: {}",
@@ -4261,6 +4285,12 @@ fn default_bootstrap_profile_config() -> BootstrapProfileConfig {
         )
         .expect("默认 bootstrap 额外模型选项必须合法"),
     }
+}
+
+/// 构造 Claude Code 上下文风险治理配置初始值。
+fn default_context_sanitizer_config() -> ClaudeCodeContextSanitizerConfig {
+    ClaudeCodeContextSanitizerConfig::parse(DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE)
+        .expect("默认 Claude Code 上下文风险治理模式必须合法")
 }
 
 /// 解析 429 请求体日志字符上限。非法值回落到默认值。

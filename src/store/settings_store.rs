@@ -19,6 +19,8 @@ pub const DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_BLOCKED_C
 pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING: &str = DEFAULT_CLAUDE_CODE_VERSION_PROFILE;
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS_SETTING: &str = DEFAULT_ALLOWED_USER_AGENTS;
+/// Claude Code 上下文风险控制默认仅观测,不改写请求体。
+pub const DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE: &str = "report_only";
 
 /// 系统提示词 `Shell:` 行是否默认真值透传。默认关闭(仍改写为账号预设)。
 pub const DEFAULT_PASSTHROUGH_SHELL: &str = "false";
@@ -235,7 +237,7 @@ impl SettingsStore {
 mod tests {
     use super::{
         DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING,
-        DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+        DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
         DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, SettingsStore,
     };
     use sqlx::AnyPool;
@@ -301,6 +303,21 @@ mod tests {
             .expect("get value");
 
         assert_eq!(value, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING);
+    }
+
+    #[tokio::test]
+    async fn default_claude_code_context_sanitizer_mode_is_report_only() {
+        let store = make_store().await;
+
+        let value = store
+            .get_value(
+                "claude_code_context_sanitizer_mode",
+                DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
+            )
+            .await
+            .expect("get value");
+
+        assert_eq!(value, DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE);
     }
 
     #[tokio::test]

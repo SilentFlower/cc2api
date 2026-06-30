@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::Utc;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -935,6 +937,9 @@ fn sensitive_field_reason(
     let Some(text) = value.as_str() else {
         return None;
     };
+    if proxy_gateway_key(&key_lower) && !is_allowed_public_anthropic_value(text) {
+        return Some("proxy_gateway_key");
+    }
     if text.len() > long_text_limit && !allowed_long_text_path(path) {
         return Some("long_text");
     }
@@ -946,6 +951,9 @@ fn sensitive_field_reason(
     }
     if looks_like_uuid(text) && !allowed_uuid_path(path) {
         return Some("uuid_value");
+    }
+    if looks_like_proxy_or_gateway_value(text) {
+        return Some("proxy_gateway_value");
     }
     None
 }
@@ -964,6 +972,21 @@ fn sensitive_key(key_lower: &str) -> bool {
         || key_lower.contains("response_body")
         || key_lower.contains("responsebody")
         || key_lower.contains("email")
+}
+
+fn proxy_gateway_key(key_lower: &str) -> bool {
+    key_lower == "baseurl"
+        || key_lower == "base_url"
+        || key_lower == "anthropic_base_url"
+        || key_lower == "apibaseurl"
+        || key_lower == "api_base_url"
+        || key_lower == "gateway"
+        || key_lower == "gatewayhost"
+        || key_lower == "gateway_host"
+        || key_lower == "proxyhost"
+        || key_lower == "proxy_host"
+        || key_lower == "proxy_url"
+        || key_lower == "proxyurl"
 }
 
 fn allowed_long_text_path(path: &str) -> bool {
@@ -988,6 +1011,72 @@ fn looks_like_email(value: &str) -> bool {
         return false;
     };
     !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+}
+
+static URL_OR_HOST_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:https?|socks5h?)://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|\b[A-Za-z0-9][A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\d+)?\b").unwrap()
+});
+
+fn looks_like_proxy_or_gateway_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if !(lower.contains("base_url")
+        || lower.contains("baseurl")
+        || lower.contains("gateway")
+        || lower.contains("proxy")
+        || lower.contains("anthropic_base_url")
+        || lower.contains("anthropic-base-url")
+        || lower.contains("api_base")
+        || lower.contains("api-base")
+        || lower.contains("socks5://")
+        || lower.contains("socks5h://"))
+    {
+        return false;
+    }
+
+    URL_OR_HOST_REGEX.find_iter(value).any(|matched| {
+        let host = extract_host_like(matched.as_str());
+        !host.is_empty() && !is_allowed_public_anthropic_host(host)
+    })
+}
+
+fn is_allowed_public_anthropic_value(value: &str) -> bool {
+    let mut saw_host = false;
+    for matched in URL_OR_HOST_REGEX.find_iter(value) {
+        let host = extract_host_like(matched.as_str());
+        if host.is_empty() {
+            continue;
+        }
+        saw_host = true;
+        if !is_allowed_public_anthropic_host(host) {
+            return false;
+        }
+    }
+    saw_host
+}
+
+fn extract_host_like(raw: &str) -> &str {
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let without_userinfo = after_scheme
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(after_scheme);
+    without_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .split(':')
+        .next()
+        .unwrap_or_default()
+}
+
+fn is_allowed_public_anthropic_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "anthropic.com" | "api.anthropic.com" | "claude.ai" | "console.anthropic.com"
+    ) || host.ends_with(".anthropic.com")
+        || host.ends_with(".claude.ai")
 }
 
 fn looks_like_bearer_or_cookie(value: &str) -> bool {
@@ -2472,6 +2561,51 @@ mod tests {
             assert!(!serialized_payload.contains(&value));
             assert!(!logged_drops.contains(&value));
         }
+    }
+
+    #[test]
+    fn telemetry_sanitizer_drops_proxy_gateway_keys_and_values() {
+        let mut payload = json!({
+            "events": [{
+                "event_type": "tengu_internal",
+                "event_data": {
+                    "event_name": "tengu_api_success",
+                    "baseUrl": "https://api.anthropic.com",
+                    "gatewayHost": "https://cc2api.internal.example/v1/messages",
+                    "nested": {
+                        "note": "proxy connected through socks5h://127.0.0.1:1080",
+                        "docs_url": "https://docs.example.invalid/guide",
+                        "official": "https://api.anthropic.com/v1/messages"
+                    },
+                    "additional_metadata": encoded_metadata(json!({
+                        "proxy_url": "http://127.0.0.1:8080",
+                        "apiBaseUrl": "https://api.anthropic.com"
+                    }))
+                }
+            }]
+        });
+
+        let summary = sanitize_telemetry_payload(&mut payload);
+
+        assert_eq!(summary.event_count, 1);
+        assert!(summary.reason_counts.contains_key("proxy_gateway_key"));
+        assert!(summary.reason_counts.contains_key("proxy_gateway_value"));
+        let event_data = &payload["events"][0]["event_data"];
+        assert_eq!(event_data["baseUrl"], "https://api.anthropic.com");
+        assert!(event_data.get("gatewayHost").is_none());
+        assert!(event_data["nested"].get("note").is_none());
+        assert_eq!(
+            event_data["nested"]["docs_url"],
+            "https://docs.example.invalid/guide"
+        );
+        assert_eq!(
+            event_data["nested"]["official"],
+            "https://api.anthropic.com/v1/messages"
+        );
+
+        let metadata = decoded_metadata(event_data);
+        assert!(metadata.get("proxy_url").is_none());
+        assert_eq!(metadata["apiBaseUrl"], "https://api.anthropic.com");
     }
 
     #[test]

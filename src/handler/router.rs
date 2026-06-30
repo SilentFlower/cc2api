@@ -26,15 +26,17 @@ use crate::service::gateway::{
 };
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
-use crate::service::rewriter::{CacheControlTtlRewrite, MessageCacheControlRewrite};
+use crate::service::rewriter::{
+    CacheControlTtlRewrite, ClaudeCodeContextSanitizerMode, MessageCacheControlRewrite,
+};
 use crate::service::telemetry::TelemetryService;
 use crate::service::version_profile::{all_profiles, profile_for_key};
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
-    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
-    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
+    DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -736,6 +738,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("allowed_user_agents".into())
         .or_insert_with(|| DEFAULT_ALLOWED_USER_AGENTS.to_string());
     settings
+        .entry("claude_code_context_sanitizer_mode".into())
+        .or_insert_with(|| DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE.to_string());
+    settings
         .entry("passthrough_shell".into())
         .or_insert_with(|| crate::store::settings_store::DEFAULT_PASSTHROUGH_SHELL.to_string());
     settings
@@ -936,6 +941,9 @@ async fn update_settings(
     if let Some(val) = body.get("message_cache_control_rewrite") {
         MessageCacheControlRewrite::parse(val)?;
     }
+    if let Some(val) = body.get("claude_code_context_sanitizer_mode") {
+        ClaudeCodeContextSanitizerMode::parse(val)?;
+    }
     if let Some(val) = body.get("proxy_client_pool_enabled") {
         if val != "true" && val != "false" {
             return Err(AppError::BadRequest(
@@ -1034,6 +1042,9 @@ async fn update_settings(
             .gateway_svc
             .reload_message_body_order_fingerprint_enabled()
             .await?;
+    }
+    if body.contains_key("claude_code_context_sanitizer_mode") {
+        state.gateway_svc.reload_context_sanitizer_config().await?;
     }
     if body.contains_key("intercept_warmup_title_enabled")
         || body.contains_key("intercept_warmup_suggestion_enabled")
@@ -1134,7 +1145,7 @@ async fn get_prime_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_model_id_list;
+    use super::{ClaudeCodeContextSanitizerMode, validate_model_id_list};
 
     #[test]
     fn model_id_list_allows_empty_and_valid_ids() {
@@ -1154,5 +1165,18 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("bad/model"));
+    }
+
+    #[test]
+    fn context_sanitizer_mode_accepts_only_known_values() {
+        assert_eq!(
+            ClaudeCodeContextSanitizerMode::parse("report_only").unwrap(),
+            ClaudeCodeContextSanitizerMode::ReportOnly
+        );
+        assert_eq!(
+            ClaudeCodeContextSanitizerMode::parse("normalize").unwrap(),
+            ClaudeCodeContextSanitizerMode::Normalize
+        );
+        assert!(ClaudeCodeContextSanitizerMode::parse("rewrite").is_err());
     }
 }
