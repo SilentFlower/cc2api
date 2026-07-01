@@ -8,8 +8,10 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.173",
     "2.1.89-2.1.185",
     "2.1.89-2.1.187",
+    "2.1.89-2.1.195",
 ];
-const PREVIOUS_DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTINGS: &[&str] = &["2.1.187"];
+const PREVIOUS_DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTINGS: &[&str] = &["2.1.187", "2.1.195"];
+const MIGRATION_ALLOW_1M_MODELS_2_1_197_KEY: &str = "migration_allow_1m_models_2_1_197_done";
 const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
     "intercept_warmup_non_stream_aux_enabled",
     "intercept_warmup_non_stream_aux_mode",
@@ -114,10 +116,13 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN allow_1m_models TEXT NOT NULL DEFAULT 'opus'")
-        .execute(pool)
-        .await
-        .ok();
+    sqlx::query(&format!(
+        "ALTER TABLE accounts ADD COLUMN allow_1m_models TEXT NOT NULL DEFAULT '{}'",
+        crate::model::account::DEFAULT_ALLOW_1M_MODELS
+    ))
+    .execute(pool)
+    .await
+    .ok();
     sqlx::query("ALTER TABLE accounts ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await
@@ -312,6 +317,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     upgrade_default_profile_setting(pool).await?;
     let claude_code_profile = selected_claude_code_profile(pool).await?;
     upgrade_default_settings(pool, claude_code_profile).await?;
+    upgrade_default_allow_1m_models(pool).await?;
     remove_obsolete_settings(pool).await?;
     upgrade_account_claude_code_profile(pool, driver, claude_code_profile).await?;
 
@@ -360,6 +366,32 @@ async fn upgrade_default_settings(
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+async fn upgrade_default_allow_1m_models(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let already_done: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind(MIGRATION_ALLOW_1M_MODELS_2_1_197_KEY)
+            .fetch_optional(pool)
+            .await?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+
+    sqlx::query("UPDATE accounts SET allow_1m_models=$1 WHERE allow_1m_models=$2")
+        .bind(crate::model::account::DEFAULT_ALLOW_1M_MODELS)
+        .bind("opus")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(MIGRATION_ALLOW_1M_MODELS_2_1_197_KEY)
+    .bind("true")
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -704,6 +736,7 @@ mod tests {
             ("2.1.173", "2.1.173", "2026-06-11T01:23:13Z"),
             ("2.1.185", "2.1.185", "2026-06-20T06:38:30Z"),
             ("2.1.187", "2.1.187", "2026-06-23T16:59:46Z"),
+            ("2.1.195", "2.1.195", "2026-06-26T01:00:56Z"),
         ] {
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
                 .bind(profile_key)
@@ -764,6 +797,82 @@ mod tests {
             profile,
             crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING
         );
+    }
+
+    #[tokio::test]
+    async fn migrate_upgrades_only_old_default_allow_1m_models() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        sqlx::query("DELETE FROM settings WHERE key=$1")
+            .bind(MIGRATION_ALLOW_1M_MODELS_2_1_197_KEY)
+            .execute(&pool)
+            .await
+            .expect("remove migration marker");
+        sqlx::query(
+            r#"INSERT INTO accounts (
+                email, token, device_id, canonical_env, canonical_prompt_env, canonical_process, allow_1m_models
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind("default@example.com")
+        .bind("token")
+        .bind("device-1")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("opus")
+        .execute(&pool)
+        .await
+        .expect("insert default account");
+        sqlx::query(
+            r#"INSERT INTO accounts (
+                email, token, device_id, canonical_env, canonical_prompt_env, canonical_process, allow_1m_models
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind("custom@example.com")
+        .bind("token")
+        .bind("device-2")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("opus,custom")
+        .execute(&pool)
+        .await
+        .expect("insert custom account");
+
+        migrate(&pool, "sqlite").await.expect("second migrate");
+
+        let upgraded: String =
+            sqlx::query_scalar("SELECT allow_1m_models FROM accounts WHERE email=$1")
+                .bind("default@example.com")
+                .fetch_one(&pool)
+                .await
+                .expect("upgraded allow_1m_models");
+        assert_eq!(upgraded, crate::model::account::DEFAULT_ALLOW_1M_MODELS);
+
+        let custom: String =
+            sqlx::query_scalar("SELECT allow_1m_models FROM accounts WHERE email=$1")
+                .bind("custom@example.com")
+                .fetch_one(&pool)
+                .await
+                .expect("custom allow_1m_models");
+        assert_eq!(custom, "opus,custom");
+
+        sqlx::query("UPDATE accounts SET allow_1m_models=$1 WHERE email=$2")
+            .bind("opus")
+            .bind("default@example.com")
+            .execute(&pool)
+            .await
+            .expect("admin rollback to opus");
+        migrate(&pool, "sqlite")
+            .await
+            .expect("third migrate should not rerun migration");
+        let retained: String =
+            sqlx::query_scalar("SELECT allow_1m_models FROM accounts WHERE email=$1")
+                .bind("default@example.com")
+                .fetch_one(&pool)
+                .await
+                .expect("retained allow_1m_models");
+        assert_eq!(retained, "opus");
     }
 
     #[tokio::test]

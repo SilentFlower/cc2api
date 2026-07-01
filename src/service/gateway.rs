@@ -5505,7 +5505,9 @@ mod tests {
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
     };
-    use crate::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
+    use crate::model::account::{
+        Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
+    };
     use crate::service::account::AccountService;
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use crate::service::telemetry::MessageTelemetryUsage;
@@ -5643,7 +5645,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: false,
             auto_poll_usage: false,
-            allow_1m_models: "opus".into(),
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,

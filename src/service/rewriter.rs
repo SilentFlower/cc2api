@@ -1127,7 +1127,7 @@ impl Rewriter {
             // 合并客户端 beta 与必需 beta；对于不在账号 1M 白名单内的模型，
             // 强制剥掉 context-1m-2025-08-07（即便客户端传了）。
             // 对应 sub2api BetaPolicy(action=filter, model_whitelist=..., fallback=filter)：
-            // 默认放行 "opus" 家族，运维可在账号设置里改 allow_1m_models 字段。
+            // 默认精确放行 Opus 与 Sonnet 5，避免宽泛 "sonnet" 误放行 Sonnet 4.6。
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             let filtered_existing = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
                 existing_beta
@@ -1810,7 +1810,7 @@ fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
 fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
     if !matches!(
         normalize_version(version),
-        "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195"
+        "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195" | "2.1.197"
     ) {
         return body.to_vec();
     }
@@ -1858,9 +1858,8 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
-        "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195" => {
-            CCH_ATTESTATION_SEED_2156
-        }
+        "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195"
+        | "2.1.197" => CCH_ATTESTATION_SEED_2156,
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -5240,7 +5239,7 @@ mod tests {
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
-        CanonicalProcessData, CanonicalPromptEnvData,
+        CanonicalProcessData, CanonicalPromptEnvData, DEFAULT_ALLOW_1M_MODELS,
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
@@ -5316,7 +5315,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: false,
             auto_poll_usage: false,
-            allow_1m_models: "opus".into(),
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,
@@ -8562,6 +8561,50 @@ mod tests {
     }
 
     #[test]
+    fn sonnet5_context_1m_beta_keeps_claude_code_order_when_allowed_by_default() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), CTX_1M.to_string());
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-sonnet-5",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(
+            beta,
+            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
+        );
+    }
+
+    #[test]
+    fn sonnet46_context_1m_beta_is_filtered_by_default() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), CTX_1M.to_string());
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-sonnet-4-6",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(beta, MESSAGE_BETA_TOKENS);
+        assert!(!beta.contains(CTX_1M));
+    }
+
+    #[test]
     fn fable_messages_headers_use_fallback_beta_without_context_1m() {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -9916,6 +9959,10 @@ mod tests {
             compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.195"),
             "71f"
         );
+        assert_eq!(
+            compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.197"),
+            "490"
+        );
     }
 
     #[test]
@@ -9950,6 +9997,7 @@ mod tests {
         assert_eq!(cch_attestation_seed("2.1.185"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.187"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.195"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.197"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
@@ -9975,6 +10023,7 @@ mod tests {
         assert_eq!(cch_attestation_input(body, "2.1.185"), normalized);
         assert_eq!(cch_attestation_input(body, "2.1.187"), normalized);
         assert_eq!(cch_attestation_input(body, "2.1.195"), normalized);
+        assert_eq!(cch_attestation_input(body, "2.1.197"), normalized);
 
         let out = compute_cch_attestation(body.to_vec(), "2.1.173");
         let expected_hash = xxhash_rust::xxh64::xxh64(&normalized, cch_attestation_seed("2.1.173"));
@@ -9990,11 +10039,13 @@ mod tests {
         let normalized_2185 = String::from_utf8(cch_attestation_input(body, "2.1.185")).unwrap();
         let normalized_2187 = String::from_utf8(cch_attestation_input(body, "2.1.187")).unwrap();
         let normalized_2195 = String::from_utf8(cch_attestation_input(body, "2.1.195")).unwrap();
+        let normalized_2197 = String::from_utf8(cch_attestation_input(body, "2.1.197")).unwrap();
 
         assert_eq!(normalized_2172, normalized);
         assert_eq!(normalized_2185, normalized);
         assert_eq!(normalized_2187, normalized);
         assert_eq!(normalized_2195, normalized);
+        assert_eq!(normalized_2197, normalized);
         assert!(normalized.contains(r#""model":"""#));
         assert!(!normalized.contains(r#","max_tokens":64000"#));
         assert!(!normalized.contains(r#","fallbacks":[{"model":"claude-opus-4-8"}]"#));
@@ -10326,18 +10377,40 @@ mod tests {
     // ---- matches_1m_whitelist ----
 
     #[test]
-    fn whitelist_default_opus_matches_opus_models() {
-        assert!(matches_1m_whitelist("claude-opus-4-7", "opus"));
-        assert!(matches_1m_whitelist("claude-opus-4-6", "opus"));
+    fn whitelist_default_matches_opus_and_sonnet5_models() {
+        assert!(matches_1m_whitelist(
+            "claude-opus-4-7",
+            DEFAULT_ALLOW_1M_MODELS
+        ));
+        assert!(matches_1m_whitelist(
+            "claude-opus-4-6",
+            DEFAULT_ALLOW_1M_MODELS
+        ));
+        assert!(matches_1m_whitelist(
+            "claude-sonnet-5",
+            DEFAULT_ALLOW_1M_MODELS
+        ));
         // 大小写不敏感
-        assert!(matches_1m_whitelist("Claude-Opus-4-7", "opus"));
-        assert!(matches_1m_whitelist("claude-opus-4-7", "OPUS"));
+        assert!(matches_1m_whitelist(
+            "Claude-Opus-4-7",
+            DEFAULT_ALLOW_1M_MODELS
+        ));
+        assert!(matches_1m_whitelist(
+            "claude-sonnet-5",
+            "OPUS,CLAUDE-SONNET-5"
+        ));
     }
 
     #[test]
-    fn whitelist_default_opus_rejects_non_opus() {
-        assert!(!matches_1m_whitelist("claude-sonnet-4-5", "opus"));
-        assert!(!matches_1m_whitelist("claude-haiku-4-5", "opus"));
+    fn whitelist_default_rejects_sonnet46_and_haiku() {
+        assert!(!matches_1m_whitelist(
+            "claude-sonnet-4-6",
+            DEFAULT_ALLOW_1M_MODELS
+        ));
+        assert!(!matches_1m_whitelist(
+            "claude-haiku-4-5",
+            DEFAULT_ALLOW_1M_MODELS
+        ));
     }
 
     #[test]

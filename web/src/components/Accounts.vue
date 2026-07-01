@@ -12,6 +12,8 @@ import {
 } from '@/components/ui/dialog';
 import { useToast } from '../composables/useToast';
 
+const DEFAULT_ALLOW_1M_MODELS = 'opus,claude-sonnet-5';
+
 const emit = defineEmits<{ refresh: [] }>();
 const { show: toast } = useToast();
 
@@ -68,7 +70,7 @@ const form = ref({
   rpm_limit: 0,
   auto_telemetry: false,
   auto_poll_usage: false,
-  allow_1m_models: 'opus',
+  allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -147,7 +149,7 @@ function openCreate() {
     rpm_limit: 0,
     auto_telemetry: false,
     auto_poll_usage: false,
-    allow_1m_models: 'opus',
+    allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
   };
   showForm.value = true;
 }
@@ -176,7 +178,7 @@ function openEdit(a: Account) {
     rpm_limit: a.rpm_limit ?? 0,
     auto_telemetry: a.auto_telemetry ?? false,
     auto_poll_usage: a.auto_poll_usage ?? false,
-    allow_1m_models: a.allow_1m_models ?? 'opus',
+    allow_1m_models: a.allow_1m_models ?? DEFAULT_ALLOW_1M_MODELS,
   };
   showForm.value = true;
 }
@@ -580,7 +582,7 @@ function applyOAuthResult() {
     rpm_limit: 0,
     auto_telemetry: false,
     auto_poll_usage: false,
-    allow_1m_models: 'opus',
+    allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
   };
   showForm.value = true;
 }
@@ -1190,7 +1192,7 @@ async function copyText(text: string) {
             <input
               v-model="form.allow_1m_models"
               type="text"
-              placeholder="opus"
+              placeholder="opus,claude-sonnet-5"
               class="w-full px-3 py-2 text-sm rounded-lg border border-[#e8e2d9] bg-[#f9f6f1] text-[#5c5647] focus:border-[#8c8475] focus:outline-none transition-colors"
             />
             <div class="flex flex-wrap gap-1.5">
@@ -1202,9 +1204,9 @@ async function copyText(text: string) {
               >仅 Opus</button>
               <button
                 type="button"
-                @click="form.allow_1m_models = 'opus,sonnet'"
+                @click="form.allow_1m_models = DEFAULT_ALLOW_1M_MODELS"
                 class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-              >Opus + Sonnet</button>
+              >Opus + Sonnet 5</button>
               <button
                 type="button"
                 @click="form.allow_1m_models = ''"
@@ -1212,7 +1214,7 @@ async function copyText(text: string) {
               >全部关闭</button>
             </div>
             <p class="text-xs text-[#b5b0a6]">
-              逗号分隔的子串列表(大小写不敏感)。留空 = 所有模型都过滤掉 context-1m-2025-08-07。默认 "opus" 只放行 Opus 家族。
+              逗号分隔的子串列表(大小写不敏感)。留空 = 所有模型都过滤掉 context-1m-2025-08-07。默认仅放行 Opus 与 Sonnet 5；不要写宽泛 "sonnet"，否则会影响 Sonnet 4.6。
             </p>
           </div>
           <div class="grid grid-cols-3 gap-3">

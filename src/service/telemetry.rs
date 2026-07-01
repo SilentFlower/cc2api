@@ -1991,7 +1991,7 @@ mod tests {
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
-        CanonicalProcessData, CanonicalPromptEnvData,
+        CanonicalProcessData, CanonicalPromptEnvData, DEFAULT_ALLOW_1M_MODELS,
     };
     use crate::model::identity::run_profile;
     use crate::service::rewriter::ordered_anthropic_headers;
@@ -2055,7 +2055,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: true,
             auto_poll_usage: false,
-            allow_1m_models: "opus".into(),
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,

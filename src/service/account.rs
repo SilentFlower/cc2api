@@ -1521,7 +1521,7 @@ pub fn generate_session_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::account::{AccountStatus, BillingMode};
+    use crate::model::account::{AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS};
     use crate::store::account_store::AccountStore;
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::SettingsStore;
@@ -1607,7 +1607,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: false,
             auto_poll_usage: false,
-            allow_1m_models: "opus".into(),
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
             telemetry_count: 0,
             usage_data,
             usage_fetched_at: None,
@@ -1646,7 +1646,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: false,
             auto_poll_usage: false,
-            allow_1m_models: "opus".into(),
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,

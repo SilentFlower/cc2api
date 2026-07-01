@@ -5,7 +5,7 @@ use sqlx::Row;
 use sqlx::any::AnyRow;
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountStatus};
+use crate::model::account::{Account, AccountStatus, DEFAULT_ALLOW_1M_MODELS};
 use crate::service::version_profile::IdentityProfile;
 
 pub struct AccountStore {
@@ -125,7 +125,7 @@ impl AccountStore {
             auto_poll_usage: row.try_get::<i32, _>("auto_poll_usage").unwrap_or(0) != 0,
             allow_1m_models: row
                 .try_get::<String, _>("allow_1m_models")
-                .unwrap_or_else(|_| "opus".into()),
+                .unwrap_or_else(|_| DEFAULT_ALLOW_1M_MODELS.into()),
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),

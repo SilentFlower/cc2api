@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
-use crate::model::account::{Account, AccountAuthType, AccountStatus};
+use crate::model::account::{Account, AccountAuthType, AccountStatus, DEFAULT_ALLOW_1M_MODELS};
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -328,7 +328,9 @@ async fn create_account(
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         auto_poll_usage: req.auto_poll_usage.unwrap_or(false),
-        allow_1m_models: req.allow_1m_models.unwrap_or_else(|| "opus".to_string()),
+        allow_1m_models: req
+            .allow_1m_models
+            .unwrap_or_else(|| DEFAULT_ALLOW_1M_MODELS.to_string()),
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,

@@ -800,7 +800,7 @@ mod tests {
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
-        CanonicalProcessData, CanonicalPromptEnvData,
+        CanonicalProcessData, CanonicalPromptEnvData, DEFAULT_ALLOW_1M_MODELS,
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
@@ -839,7 +839,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: false,
             auto_poll_usage: false,
-            allow_1m_models: "opus".into(),
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,
