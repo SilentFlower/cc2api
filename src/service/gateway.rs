@@ -81,6 +81,17 @@ struct RateLimitResponseDecision {
     delay: std::time::Duration,
 }
 
+struct GatewayAccountAdmission {
+    permit: OwnedSemaphorePermit,
+    slot_wait: std::time::Duration,
+}
+
+#[derive(Debug)]
+enum GatewayAdmissionError {
+    Queue(QueueWaitError),
+    Rpm(AppError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WarmupInterceptConfig {
     title_enabled: bool,
@@ -377,6 +388,43 @@ impl GatewayService {
             bootstrap_profile_config: RwLock::new(default_bootstrap_profile_config()),
             context_sanitizer_config: RwLock::new(default_context_sanitizer_config()),
         }
+    }
+
+    /// 获取账号执行槽位，并在槽位到手后才预占 RPM。
+    ///
+    /// @param account 目标账号。
+    /// @param sticky_account 当前请求是否命中粘性会话账号。
+    /// @param session_hash 会话哈希，仅用于 RPM 日志。
+    /// @param timeout 并发槽位等待超时时间。
+    /// @return 成功返回槽位 permit 与实际槽位等待耗时；失败返回队列或 RPM admission 错误。
+    async fn acquire_account_admission(
+        &self,
+        account: &Account,
+        sticky_account: bool,
+        session_hash: &str,
+        timeout: std::time::Duration,
+    ) -> Result<GatewayAccountAdmission, GatewayAdmissionError> {
+        let t_slot = std::time::Instant::now();
+        let queue = self
+            .account_svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let permit = queue
+            .acquire(timeout)
+            .await
+            .map_err(GatewayAdmissionError::Queue)?;
+        let slot_wait = t_slot.elapsed();
+
+        // RPM 表示即将发往上游的请求数；排队阶段不能提前消耗 RPM。
+        if let Err(e) = self
+            .account_svc
+            .acquire_account_rpm(account, sticky_account, session_hash)
+            .await
+        {
+            return Err(GatewayAdmissionError::Rpm(e));
+        }
+
+        Ok(GatewayAccountAdmission { permit, slot_wait })
     }
 
     /// 从全局设置刷新允许 `messages[].role=system` 的模型白名单。
@@ -1229,36 +1277,25 @@ impl GatewayService {
                 }
             }
 
-            // 瞬时 429 软退避是账号级、进程内状态。等待放在 RPM/并发前,
+            // 瞬时 429 软退避是账号级、进程内状态。等待放在并发/RPM 前,
             // 避免把上游临时锁定窗口算进本地 RPM 或占住账号并发槽。
             self.account_svc
                 .wait_transient_rate_limit_backoff(&account)
                 .await;
 
-            // RPM admission 放在并发槽位之前：粘性会话超限时等待/拒绝,非粘性请求超限时换号。
-            // 这样不会因为 RPM 等待长期占用账号并发槽位,也不会把已有粘性会话随意切到其他账号。
-            match self
-                .account_svc
-                .acquire_account_rpm(&account, sticky_account, &session_hash)
+            // 先获得并发槽位，再做 RPM admission：排队中的请求还没有准备发往上游，
+            // 不能提前占用当前分钟 RPM。若 RPM 饱和导致换号，返回前会释放本账号槽位。
+            let admission = match self
+                .acquire_account_admission(
+                    &account,
+                    sticky_account,
+                    &session_hash,
+                    SLOT_WAIT_TIMEOUT,
+                )
                 .await
             {
-                Ok(()) => {}
-                Err(AppError::ServiceUnavailable(_)) if !sticky_account => {
-                    exclude_ids.push(account.id);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-
-            // 获取并发槽位：走账号级 FIFO 排队器（tokio Semaphore 按调用顺序授予 permit）
-            let t_slot = std::time::Instant::now();
-            let queue = self
-                .account_svc
-                .get_or_create_queue(account.id, account.concurrency)
-                .await;
-            let slot_permit = match queue.acquire(SLOT_WAIT_TIMEOUT).await {
-                Ok(p) => p,
-                Err(QueueWaitError::QueueFull) => {
+                Ok(admission) => admission,
+                Err(GatewayAdmissionError::Queue(QueueWaitError::QueueFull)) => {
                     warn!(
                         "account {} wait queue full, falling back to another account",
                         account.id
@@ -1266,7 +1303,7 @@ impl GatewayService {
                     exclude_ids.push(account.id);
                     continue;
                 }
-                Err(QueueWaitError::Timeout) => {
+                Err(GatewayAdmissionError::Queue(QueueWaitError::Timeout)) => {
                     warn!(
                         "account {} slot wait timed out, falling back to another account",
                         account.id
@@ -1274,21 +1311,28 @@ impl GatewayService {
                     exclude_ids.push(account.id);
                     continue;
                 }
-                Err(QueueWaitError::Closed) => {
+                Err(GatewayAdmissionError::Queue(QueueWaitError::Closed)) => {
                     return Err(AppError::Internal("slot semaphore closed".into()));
                 }
+                Err(GatewayAdmissionError::Rpm(AppError::ServiceUnavailable(_)))
+                    if !sticky_account =>
+                {
+                    exclude_ids.push(account.id);
+                    continue;
+                }
+                Err(GatewayAdmissionError::Rpm(e)) => return Err(e),
             };
 
             // 槽位释放绑定到响应体 stream 的生命周期上。
             // SlotReleaseGuard 兜底：若转发前出错或 panic，drop permit 自动归还槽位。
             // 成功包装 stream 后 defuse() 解除，由 SlotGuardBody 持有 permit 直到流结束。
-            let slot_ms = t_slot.elapsed().as_millis();
+            let slot_ms = admission.slot_wait.as_millis();
             if slot_ms > 10 {
                 info!("[耗时] 槽位获取: {:.0}ms (排队等待)", slot_ms);
             } else {
                 info!("[耗时] 槽位获取: {:.0}ms", slot_ms);
             }
-            let mut slot_guard = SlotReleaseGuard::new(slot_permit);
+            let mut slot_guard = SlotReleaseGuard::new(admission.permit);
 
             // 改写请求体
             let t_rewrite = std::time::Instant::now();
@@ -5481,10 +5525,10 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, BootstrapModelOptionsMode,
-        BootstrapProfileConfig, CachedProbeResponse, GatewayService, NON_STREAM_PROBE_CACHE_TTL,
-        NonStreamProbeCacheLookup, NonStreamProbeType, RateLimitRequestLogConfig,
-        STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES, SignatureRetryStage,
-        StreamStabilityConfig, WarmupInterceptConfig, WarmupInterceptType,
+        BootstrapProfileConfig, CachedProbeResponse, GatewayAdmissionError, GatewayService,
+        NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
+        RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES,
+        SignatureRetryStage, StreamStabilityConfig, WarmupInterceptConfig, WarmupInterceptType,
         assistant_prefill_intercept_body, auto_mode_classifier_response,
         buffered_error_body_for_downstream, buffered_response_body_for_downstream,
         build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
@@ -5508,7 +5552,7 @@ mod tests {
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
     };
-    use crate::service::account::AccountService;
+    use crate::service::account::{AccountService, QueueWaitError};
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
@@ -5721,6 +5765,41 @@ mod tests {
         )
     }
 
+    async fn create_gateway_account(
+        service: &GatewayService,
+        email: &str,
+        concurrency: i32,
+        rpm_limit: i32,
+    ) -> Account {
+        let mut account = test_account();
+        account.id = 0;
+        account.name = email.into();
+        account.email = email.into();
+        account.setup_token = "sk-ant-oat01-test-token-placeholder-value".into();
+        account.concurrency = concurrency;
+        account.rpm_limit = rpm_limit;
+        service
+            .account_svc
+            .create_account(&mut account)
+            .await
+            .expect("create account");
+        account
+    }
+
+    async fn wait_until_queue_waiting(service: &GatewayService, account: &Account, expected: i64) {
+        let queue = service
+            .account_svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        for _ in 0..50 {
+            if queue.waiting_count() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.waiting_count(), expected);
+    }
+
     #[test]
     fn safe_body_summary_hides_raw_body() {
         let body = br#"{"private_text":"raw-prompt-marker","private_token":"raw-token-marker"}"#;
@@ -5729,6 +5808,128 @@ mod tests {
         assert!(summary.starts_with(&format!("{} bytes sha256:", body.len())));
         assert!(!summary.contains("raw-prompt-marker"));
         assert!(!summary.contains("raw-token-marker"));
+    }
+
+    #[tokio::test]
+    async fn account_admission_waiting_slot_does_not_consume_rpm() {
+        let service = Arc::new(test_gateway_service().await);
+        let account = create_gateway_account(&service, "rpm-waiting-slot@example.com", 1, 10).await;
+        let queue = service
+            .account_svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let held_permit = queue
+            .acquire(Duration::from_secs(1))
+            .await
+            .expect("hold active slot");
+
+        let waiter_service = service.clone();
+        let waiter_account = account.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_service
+                .acquire_account_admission(&waiter_account, false, "", Duration::from_secs(5))
+                .await
+        });
+
+        wait_until_queue_waiting(&service, &account, 1).await;
+        let waiting_status = service
+            .account_svc
+            .get_account_rpm_status(&account)
+            .await
+            .expect("rpm status while waiting");
+        assert_eq!(waiting_status.current, 0);
+
+        drop(held_permit);
+        let admission = waiter
+            .await
+            .expect("waiter task")
+            .expect("waiter admission");
+        let admitted_status = service
+            .account_svc
+            .get_account_rpm_status(&account)
+            .await
+            .expect("rpm status after admission");
+        assert_eq!(admitted_status.current, 1);
+        drop(admission.permit);
+    }
+
+    #[tokio::test]
+    async fn account_admission_slot_timeout_does_not_consume_rpm() {
+        let service = test_gateway_service().await;
+        let account = create_gateway_account(&service, "rpm-slot-timeout@example.com", 1, 10).await;
+        let queue = service
+            .account_svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let held_permit = queue
+            .acquire(Duration::from_secs(1))
+            .await
+            .expect("hold active slot");
+
+        let result = service
+            .acquire_account_admission(&account, false, "", Duration::from_millis(10))
+            .await;
+        match result {
+            Err(GatewayAdmissionError::Queue(QueueWaitError::Timeout)) => {}
+            _ => panic!("expected slot timeout"),
+        }
+        let status = service
+            .account_svc
+            .get_account_rpm_status(&account)
+            .await
+            .expect("rpm status after timeout");
+        assert_eq!(status.current, 0);
+        drop(held_permit);
+    }
+
+    #[tokio::test]
+    async fn account_admission_queue_full_does_not_consume_rpm() {
+        let service = Arc::new(test_gateway_service().await);
+        let account = create_gateway_account(&service, "rpm-queue-full@example.com", 1, 10).await;
+        let queue = service
+            .account_svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let held_permit = queue
+            .acquire(Duration::from_secs(1))
+            .await
+            .expect("hold active slot");
+
+        let first_service = service.clone();
+        let first_account = account.clone();
+        let first_waiter = tokio::spawn(async move {
+            first_service
+                .acquire_account_admission(&first_account, false, "", Duration::from_secs(5))
+                .await
+        });
+        let second_service = service.clone();
+        let second_account = account.clone();
+        let second_waiter = tokio::spawn(async move {
+            second_service
+                .acquire_account_admission(&second_account, false, "", Duration::from_secs(5))
+                .await
+        });
+        wait_until_queue_waiting(&service, &account, 2).await;
+
+        let result = service
+            .acquire_account_admission(&account, false, "", Duration::from_secs(1))
+            .await;
+        match result {
+            Err(GatewayAdmissionError::Queue(QueueWaitError::QueueFull)) => {}
+            _ => panic!("expected queue full"),
+        }
+        let status = service
+            .account_svc
+            .get_account_rpm_status(&account)
+            .await
+            .expect("rpm status after queue full");
+        assert_eq!(status.current, 0);
+
+        first_waiter.abort();
+        second_waiter.abort();
+        let _ = first_waiter.await;
+        let _ = second_waiter.await;
+        drop(held_permit);
     }
 
     #[test]
