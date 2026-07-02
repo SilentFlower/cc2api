@@ -7,7 +7,7 @@ use crate::service::version_profile::{
 use crate::tlsfp::get_request_client;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -191,5 +191,156 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .json()
         .await
         .map_err(|e| AppError::Internal(format!("usage parse failed: {}", e)))?;
-    Ok(data)
+    Ok(normalize_usage_response(data))
+}
+
+/// 规范化 OAuth usage 返回，补齐前端稳定展示字段。
+fn normalize_usage_response(mut data: Value) -> Value {
+    let seven_day_fable = scoped_weekly_usage_window(&data, "Fable");
+    if let Some(obj) = data.as_object_mut() {
+        if !matches!(obj.get("seven_day_fable"), Some(Value::Object(_))) {
+            if let Some(window) = seven_day_fable {
+                obj.insert("seven_day_fable".into(), window);
+            }
+        }
+    }
+    data
+}
+
+/// 从新版 `limits` scoped 结构里提取指定模型的周用量窗口。
+fn scoped_weekly_usage_window(usage: &Value, model_name: &str) -> Option<Value> {
+    let limits = usage.get("limits")?.as_array()?;
+    let expected = model_name.to_ascii_lowercase();
+    for item in limits {
+        let Some(model) = item.get("scope").and_then(|scope| scope.get("model")) else {
+            continue;
+        };
+        let display_name = model.get("display_name").and_then(Value::as_str);
+        let model_id = model.get("id").and_then(Value::as_str);
+        let matches_name = display_name
+            .map(|value| value.eq_ignore_ascii_case(model_name))
+            .unwrap_or(false);
+        let matches_id = model_id
+            .map(|value| value.to_ascii_lowercase().contains(&expected))
+            .unwrap_or(false);
+        if !matches_name && !matches_id {
+            continue;
+        }
+        let kind = item.get("kind").and_then(Value::as_str);
+        let group = item.get("group").and_then(Value::as_str);
+        if kind != Some("weekly_scoped") && group != Some("weekly") {
+            continue;
+        }
+        let Some(percent) = item.get("percent").and_then(Value::as_f64) else {
+            continue;
+        };
+        let reset_at = item.get("resets_at").and_then(Value::as_str);
+        let mut window = Map::new();
+        window.insert("utilization".into(), json!(percent));
+        window.insert(
+            "resets_at".into(),
+            reset_at.map(|value| json!(value)).unwrap_or(Value::Null),
+        );
+        return Some(Value::Object(window));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_usage_response_adds_fable_from_scoped_limit() {
+        let data = json!({
+            "five_hour": {"utilization": 10, "resets_at": "2026-07-02T05:20:00Z"},
+            "limits": [
+                {
+                    "kind": "session",
+                    "group": "session",
+                    "percent": 10,
+                    "resets_at": "2026-07-02T05:20:00Z",
+                    "scope": null
+                },
+                {
+                    "kind": "weekly_all",
+                    "group": "weekly",
+                    "percent": 2,
+                    "resets_at": "2026-07-07T06:00:00Z",
+                    "scope": null
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 37.5,
+                    "resets_at": "2026-07-07T06:00:00Z",
+                    "scope": {
+                        "model": {
+                            "id": null,
+                            "display_name": "Fable"
+                        },
+                        "surface": null
+                    }
+                }
+            ]
+        });
+
+        let normalized = normalize_usage_response(data);
+
+        assert_eq!(normalized["seven_day_fable"]["utilization"], json!(37.5));
+        assert_eq!(
+            normalized["seven_day_fable"]["resets_at"],
+            json!("2026-07-07T06:00:00Z")
+        );
+    }
+
+    #[test]
+    fn normalize_usage_response_keeps_existing_fable_window() {
+        let data = json!({
+            "seven_day_fable": {"utilization": 12, "resets_at": null},
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 90,
+                    "resets_at": null,
+                    "scope": {
+                        "model": {
+                            "id": null,
+                            "display_name": "Fable"
+                        }
+                    }
+                }
+            ]
+        });
+
+        let normalized = normalize_usage_response(data);
+
+        assert_eq!(normalized["seven_day_fable"]["utilization"], json!(12));
+    }
+
+    #[test]
+    fn normalize_usage_response_ignores_other_scoped_limits() {
+        let data = json!({
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 80,
+                    "resets_at": null,
+                    "scope": {
+                        "model": {
+                            "id": null,
+                            "display_name": "Sonnet"
+                        }
+                    }
+                }
+            ]
+        });
+
+        let normalized = normalize_usage_response(data);
+
+        assert!(normalized.get("seven_day_fable").is_none());
+    }
 }

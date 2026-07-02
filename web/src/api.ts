@@ -92,13 +92,28 @@ export interface PagedResult<T> {
 
 export interface UsageWindow {
   utilization: number
-  resets_at: string
+  resets_at?: string | null
+}
+
+export interface UsageLimit {
+  kind?: string
+  group?: string
+  percent?: number
+  resets_at?: string | null
+  scope?: {
+    model?: {
+      id?: string | null
+      display_name?: string | null
+    } | null
+  } | null
 }
 
 export interface UsageData {
   five_hour?: UsageWindow
   seven_day?: UsageWindow
   seven_day_sonnet?: UsageWindow
+  seven_day_fable?: UsageWindow
+  limits?: UsageLimit[]
 }
 
 export interface ApiToken {
