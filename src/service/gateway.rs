@@ -13,10 +13,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountStatus};
+use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -76,6 +77,8 @@ const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
 /// 非流式单消息探针缓存固定 TTL。只缓存强特征探针,避免误缓存真实业务请求。
 const NON_STREAM_PROBE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Fable 请求结束后稍等再查 usage，避免刚 EOF 时上游计量还没落到 usage API。
+const FABLE_USAGE_REFRESH_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 #[derive(Clone, Copy)]
 struct RateLimitResponseDecision {
     delay: std::time::Duration,
@@ -84,6 +87,35 @@ struct RateLimitResponseDecision {
 struct GatewayAccountAdmission {
     permit: OwnedSemaphorePermit,
     slot_wait: std::time::Duration,
+}
+
+#[derive(Clone)]
+struct FableUsageRefreshContext {
+    account_svc: Arc<AccountService>,
+    account_id: i64,
+}
+
+impl FableUsageRefreshContext {
+    fn spawn_delayed(self) {
+        tokio::spawn(async move {
+            sleep(FABLE_USAGE_REFRESH_DELAY).await;
+            match self
+                .account_svc
+                .refresh_usage_after_fable_request(self.account_id)
+                .await
+            {
+                Ok(true) => debug!("fable usage refreshed for account {}", self.account_id),
+                Ok(false) => debug!(
+                    "fable usage refresh skipped by throttle for account {}",
+                    self.account_id
+                ),
+                Err(e) => warn!(
+                    "fable usage refresh failed for account {}: {}",
+                    self.account_id, e
+                ),
+            }
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -1557,6 +1589,13 @@ impl GatewayService {
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 if let Some(lookup) = non_stream_probe_cache_lookup {
                     if resp.status().is_success() && signature_retry_stage.is_none() {
+                        let fable_usage_refresh = fable_usage_refresh_context(
+                            self.account_svc.clone(),
+                            &account,
+                            &path,
+                            model_id,
+                            resp.status(),
+                        );
                         let (parts, body_bytes) = buffer_response_body(resp).await?;
                         if let Some(context) = telemetry_context.clone() {
                             self.telemetry_svc
@@ -1578,6 +1617,7 @@ impl GatewayService {
                                 &lookup, &account, &parts, body_bytes,
                             )
                             .await?;
+                        spawn_fable_usage_refresh(fable_usage_refresh);
                         return Ok(cached_response);
                     }
                 }
@@ -1592,6 +1632,13 @@ impl GatewayService {
                 };
                 let permit = slot_guard.defuse();
                 let content_codings = response_content_codings(resp.headers());
+                let fable_usage_refresh = fable_usage_refresh_context(
+                    self.account_svc.clone(),
+                    &account,
+                    &path,
+                    model_id,
+                    resp.status(),
+                );
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
                     body,
@@ -1608,6 +1655,7 @@ impl GatewayService {
                     telemetry_status_code,
                     telemetry_ttft_ms,
                     telemetry_error_kind.clone(),
+                    fable_usage_refresh,
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -2888,6 +2936,43 @@ fn query_model_is_fable(query: &str) -> bool {
             .map(|model| model.starts_with("claude-fable-5"))
             .unwrap_or(false)
     })
+}
+
+fn should_refresh_fable_usage_after_response(
+    account: &Account,
+    path: &str,
+    model_id: &str,
+    status: StatusCode,
+) -> bool {
+    status.is_success()
+        && path == "/v1/messages"
+        && account.auth_type == AccountAuthType::Oauth
+        && is_fable_model_id(model_id)
+}
+
+fn fable_usage_refresh_context(
+    account_svc: Arc<AccountService>,
+    account: &Account,
+    path: &str,
+    model_id: &str,
+    status: StatusCode,
+) -> Option<FableUsageRefreshContext> {
+    should_refresh_fable_usage_after_response(account, path, model_id, status).then_some(
+        FableUsageRefreshContext {
+            account_svc,
+            account_id: account.id,
+        },
+    )
+}
+
+fn spawn_fable_usage_refresh(context: Option<FableUsageRefreshContext>) {
+    if let Some(context) = context {
+        context.spawn_delayed();
+    }
+}
+
+fn is_fable_model_id(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("claude-fable-")
 }
 
 fn bootstrap_query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -4905,6 +4990,8 @@ struct SlotGuardBody {
     message_telemetry_buffer: String,
     /// 上游响应 stop_reason。
     message_telemetry_stop_reason: Option<String>,
+    /// Fable 请求成功传输完成后触发的 usage 刷新上下文。
+    fable_usage_refresh: Option<FableUsageRefreshContext>,
     /// 是否已收到第一个 frame。
     first_frame_logged: bool,
 }
@@ -4996,6 +5083,7 @@ impl SlotGuardBody {
         telemetry_status_code: u16,
         telemetry_ttft_ms: u64,
         telemetry_error_kind: Option<String>,
+        fable_usage_refresh: Option<FableUsageRefreshContext>,
     ) -> Self {
         Self {
             inner,
@@ -5020,6 +5108,7 @@ impl SlotGuardBody {
             message_telemetry_usage: MessageTelemetryUsage::default(),
             message_telemetry_buffer: String::new(),
             message_telemetry_stop_reason: None,
+            fable_usage_refresh,
             first_frame_logged: false,
         }
     }
@@ -5128,6 +5217,7 @@ impl http_body::Body for SlotGuardBody {
             self.message_telemetry_stop_reason = stop_reason;
             self.message_telemetry_buffer = message_buffer;
             self.record_message_telemetry_result(None);
+            spawn_fable_usage_refresh(self.fable_usage_refresh.take());
         } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
             // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
             log_prompt_cache_usage_read_error(self.cache_usage_context.as_ref());
@@ -5544,8 +5634,8 @@ mod tests {
         redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
         rewrite_bootstrap_response, safe_body_summary, safe_non_stream_probe_response_headers,
         sanitize_count_tokens_body, should_intercept_assistant_prefill,
-        signature_retry_body_for_stage, stable_upstream_stream,
-        strip_signature_sensitive_blocks_from_messages_request,
+        should_refresh_fable_usage_after_response, signature_retry_body_for_stage,
+        stable_upstream_stream, strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
     };
@@ -5696,6 +5786,51 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn fable_usage_refresh_only_triggers_for_successful_oauth_fable_messages() {
+        let mut account = test_account();
+        account.auth_type = AccountAuthType::Oauth;
+
+        assert!(should_refresh_fable_usage_after_response(
+            &account,
+            "/v1/messages",
+            "claude-fable-5",
+            StatusCode::OK
+        ));
+        assert!(should_refresh_fable_usage_after_response(
+            &account,
+            "/v1/messages",
+            "claude-fable-5[1m]",
+            StatusCode::CREATED
+        ));
+        assert!(!should_refresh_fable_usage_after_response(
+            &account,
+            "/v1/messages/count_tokens",
+            "claude-fable-5",
+            StatusCode::OK
+        ));
+        assert!(!should_refresh_fable_usage_after_response(
+            &account,
+            "/v1/messages",
+            "claude-sonnet-4-6",
+            StatusCode::OK
+        ));
+        assert!(!should_refresh_fable_usage_after_response(
+            &account,
+            "/v1/messages",
+            "claude-fable-5",
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+
+        account.auth_type = AccountAuthType::SetupToken;
+        assert!(!should_refresh_fable_usage_after_response(
+            &account,
+            "/v1/messages",
+            "claude-fable-5",
+            StatusCode::OK
+        ));
     }
 
     fn non_stream_probe_request(text: &str) -> serde_json::Value {

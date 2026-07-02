@@ -27,6 +27,8 @@ const OAUTH_WAIT_ATTEMPTS: usize = 20;
 const RPM_KEY_TTL: Duration = Duration::from_secs(120);
 const RPM_WAIT_MAX: Duration = Duration::from_secs(5);
 const RPM_WAIT_STEP: Duration = Duration::from_millis(250);
+/// Fable 请求完成后自动刷新 usage 的账号级最小间隔，避免高并发请求打爆 usage 端点。
+const OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
@@ -350,6 +352,8 @@ pub struct AccountService {
     ///
     /// 这里不写数据库、不改变账号状态。它只阻止当前进程在上游临时锁定窗口内继续打同一账号。
     transient_rate_limit_backoffs: RwLock<HashMap<i64, TransientRateLimitBackoff>>,
+    /// 请求完成后顺手触发的 usage 刷新节流:account_id → 上次预留刷新时间。
+    opportunistic_usage_refreshes: RwLock<HashMap<i64, Instant>>,
 }
 
 impl AccountService {
@@ -365,6 +369,7 @@ impl AccountService {
             settings_store,
             queues: RwLock::new(HashMap::new()),
             transient_rate_limit_backoffs: RwLock::new(HashMap::new()),
+            opportunistic_usage_refreshes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -909,6 +914,39 @@ impl AccountService {
         let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(id, &usage_str).await?;
         Ok(usage)
+    }
+
+    /// Fable 请求完成后异步刷新账号 usage。
+    ///
+    /// @param id 账号 ID。
+    /// @return `true` 表示本次实际发起 usage API 刷新，`false` 表示命中节流并跳过。
+    pub async fn refresh_usage_after_fable_request(&self, id: i64) -> Result<bool, AppError> {
+        if !self.reserve_opportunistic_usage_refresh(id).await {
+            return Ok(false);
+        }
+        self.refresh_usage(id).await?;
+        Ok(true)
+    }
+
+    async fn reserve_opportunistic_usage_refresh(&self, id: i64) -> bool {
+        let now = Instant::now();
+        let stale_after =
+            OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL + OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL;
+        let mut refreshes = self.opportunistic_usage_refreshes.write().await;
+        refreshes
+            .retain(|_, reserved_at| now.saturating_duration_since(*reserved_at) <= stale_after);
+        if refreshes
+            .get(&id)
+            .map(|reserved_at| {
+                now.saturating_duration_since(*reserved_at)
+                    < OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL
+            })
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        refreshes.insert(id, now);
+        true
     }
 
     /// 从上游响应头被动采集的用量数据合并到数据库。
@@ -1653,6 +1691,15 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn opportunistic_usage_refresh_reservation_is_throttled_per_account() {
+        let (_store, svc) = setup_account_service().await;
+
+        assert!(svc.reserve_opportunistic_usage_refresh(1).await);
+        assert!(!svc.reserve_opportunistic_usage_refresh(1).await);
+        assert!(svc.reserve_opportunistic_usage_refresh(2).await);
     }
 
     #[tokio::test]
