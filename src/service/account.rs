@@ -29,6 +29,12 @@ const RPM_WAIT_MAX: Duration = Duration::from_secs(5);
 const RPM_WAIT_STEP: Duration = Duration::from_millis(250);
 /// Fable 请求完成后自动刷新 usage 的账号级最小间隔，避免高并发请求打爆 usage 端点。
 const OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// 一个标准并发槽对应的内部信号量单位数。
+pub const SLOT_UNIT_SCALE: i32 = 2;
+/// 普通请求占用的内部单位数。
+pub const DEFAULT_REQUEST_SLOT_UNITS: u32 = SLOT_UNIT_SCALE as u32;
+/// Haiku 请求占用的内部单位数。
+pub const HAIKU_REQUEST_SLOT_UNITS: u32 = 1;
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
@@ -60,14 +66,22 @@ pub struct AccountScoreInfo {
     pub detail_7d: WindowDetail,
     /// 5 小时窗口计算详情。
     pub detail_5h: WindowDetail,
-    /// 并发负载百分比（当前/最大 × 100）。
+    /// 并发负载百分比（当前内部单位 + 排队预计内部单位）/ 最大内部单位 × 100。
     pub concurrency_pct: f64,
     /// 当前使用的权重 (w7d, w5h, w_concurrency)。
     pub weights: (f64, f64, f64),
-    /// 当前占用的并发槽位数。
-    pub current_concurrency: i64,
+    /// 当前占用的标准并发槽位数。
+    pub current_concurrency: f64,
+    /// 当前占用的内部单位数。
+    pub current_concurrency_units: i64,
+    /// 最大内部单位数。
+    pub max_concurrency_units: i64,
+    /// 当前活跃请求数。
+    pub active_requests: i64,
     /// 当前等待队列中的请求数。
     pub queued: i64,
+    /// 当前等待队列中请求预计占用的内部单位数。
+    pub queued_request_units: i64,
     /// 正在等待瞬时 429 软退避的请求数。
     pub transient_backoff_waiting: i64,
     /// 瞬时 429 软退避剩余毫秒数。
@@ -125,14 +139,22 @@ const DEFAULT_W7D: f64 = 0.5;
 const DEFAULT_W5H: f64 = 0.3;
 const DEFAULT_WCONC: f64 = 0.2;
 
+fn standard_concurrency_to_slot_units(concurrency: i32) -> i32 {
+    concurrency.max(1).saturating_mul(SLOT_UNIT_SCALE)
+}
+
+fn waiting_queue_capacity(concurrency: i32) -> i32 {
+    concurrency.max(1).saturating_mul(2)
+}
+
 /// 单账号并发槽位 FIFO 排队器。
 ///
 /// 底层依赖 [`tokio::sync::Semaphore`]：其 `acquire` 文档保证按调用顺序授予 permit，
 /// 因此同一账号上多个等待者天然按到达顺序获得槽位，不存在"抢锁"竞争。
 ///
 /// # 两把信号量的职责
-/// - `slots`：目标 permit 数 = `slot_max`（即账号当前的 `concurrency`），控制同时活跃的请求数。
-/// - `queue_cap`：目标 permit 数 = `queue_max` = `2 × concurrency`，作为"等待位"上限。
+/// - `slots`：目标 permit 数 = `slot_max`（即 `concurrency × 2` 内部单位），控制同时活跃的请求权重。
+/// - `queue_cap`：目标 permit 数 = `queue_max` = `2 × concurrency`，作为"等待请求数"上限。
 ///   只有进入等待队列才会持有该 permit，活跃阶段不占用。用它是为了在等待人数达上限时
 ///   快速降级到其他账号。2 倍系数给突发流量留出缓冲，而不是刚好满就拒绝。
 ///
@@ -145,7 +167,7 @@ const DEFAULT_WCONC: f64 = 0.2;
 ///   期间如果又被扩容，旧吞任务会在下次循环发现 cap 已达标直接退出——**不会遗留过期吞任务**。
 ///
 /// # 单账号系统内最多请求数
-/// `active ≤ concurrency` + `waiting ≤ 2 × concurrency` = `3 × concurrency`。缩容时
+/// `active_units ≤ concurrency × 2` + `waiting_requests ≤ 2 × concurrency`。缩容时
 /// 短暂可能超过 new 直到已有 waiter 耗尽（被 honor）——这是可接受的过渡态。
 ///
 /// # 客户端中断 / 超时安全
@@ -157,7 +179,7 @@ pub struct AccountQueue {
     slots: Arc<Semaphore>,
     /// 等待位信号量（仅等待中持有，拿到槽位前归还）。
     queue_cap: Arc<Semaphore>,
-    /// 槽位容量目标（== 账号当前 `concurrency`）。shrinker 循环读这个值作为裁决依据,
+    /// 槽位容量目标（== 账号当前 `concurrency × 2` 内部单位）。shrinker 循环读这个值作为裁决依据,
     /// 扩容时自动撤销旧的 shrink 意图。
     slot_max: Arc<AtomicI32>,
     /// 等待位容量目标（== `2 × concurrency`）。单独存一个 atomic 供 queue_cap 的 shrinker 读取。
@@ -169,6 +191,32 @@ pub struct AccountQueue {
     qc_cap: Arc<AtomicI32>,
     /// 正在等待槽位的请求数（仅供 UI 展示用）。包 Arc 是为了 scopeguard 的 move 闭包能引用。
     waiting: Arc<AtomicI64>,
+    /// 正在等待槽位的请求预计占用的内部单位数。
+    waiting_units: Arc<AtomicI64>,
+    /// 当前已经拿到槽位的活跃请求数。
+    active_requests: Arc<AtomicI64>,
+}
+
+/// 账号槽位 permit 包装器，Drop 时自动归还底层信号量 permit，并同步减少活跃请求计数。
+pub struct AccountSlotPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    active_requests: Arc<AtomicI64>,
+}
+
+impl AccountSlotPermit {
+    fn new(permit: OwnedSemaphorePermit, active_requests: Arc<AtomicI64>) -> Self {
+        Self {
+            permit: Some(permit),
+            active_requests,
+        }
+    }
+}
+
+impl Drop for AccountSlotPermit {
+    fn drop(&mut self) {
+        let _ = self.permit.take();
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// [`AccountQueue::acquire`] 的错误原因。
@@ -183,10 +231,10 @@ pub enum QueueWaitError {
 }
 
 impl AccountQueue {
-    /// 构造一个新的排队器，`slots` 容量 = `concurrency`，`queue_cap` 容量 = `2 × concurrency`。
+    /// 构造一个新的排队器，`slots` 容量 = `concurrency × 2`，`queue_cap` 容量 = `2 × concurrency`。
     fn new(concurrency: i32) -> Self {
-        let cap = concurrency.max(1);
-        let qc = cap.saturating_mul(2);
+        let cap = standard_concurrency_to_slot_units(concurrency);
+        let qc = waiting_queue_capacity(concurrency);
         Self {
             slots: Arc::new(Semaphore::new(cap as usize)),
             queue_cap: Arc::new(Semaphore::new(qc as usize)),
@@ -195,10 +243,14 @@ impl AccountQueue {
             slots_cap: Arc::new(AtomicI32::new(cap)),
             qc_cap: Arc::new(AtomicI32::new(qc)),
             waiting: Arc::new(AtomicI64::new(0)),
+            waiting_units: Arc::new(AtomicI64::new(0)),
+            active_requests: Arc::new(AtomicI64::new(0)),
         }
     }
 
     /// 原地调整槽位容量（admin 修改 concurrency 时调用），不替换 queue 实例,已占用 permit 不受影响。
+    ///
+    /// @param new 新的标准并发槽位数，内部会换算成 `new × 2` 个信号量单位。
     ///
     /// # 关键设计
     /// `slot_max` / `queue_max` 是共享的 target，所有后台 shrinker 任务每次循环都读取最新值。因此：
@@ -206,10 +258,10 @@ impl AccountQueue {
     ///   `cap(10) <= target(10)` 后把 permit 归还并退出，不会继续悄悄吞；
     /// - 缩容 10→5→1：两次调整合并到同一个 target=1，新旧 shrinker 共同工作至 `cap=1`。
     fn adjust_capacity(&self, new: i32) {
-        let new = new.max(1);
-        self.slot_max.store(new, Ordering::Release);
-        self.queue_max
-            .store(new.saturating_mul(2), Ordering::Release);
+        let new_slot_units = standard_concurrency_to_slot_units(new);
+        let new_queue_cap = waiting_queue_capacity(new);
+        self.slot_max.store(new_slot_units, Ordering::Release);
+        self.queue_max.store(new_queue_cap, Ordering::Release);
         Self::adjust_semaphore(&self.slots, &self.slots_cap, &self.slot_max);
         Self::adjust_semaphore(&self.queue_cap, &self.qc_cap, &self.queue_max);
     }
@@ -280,7 +332,11 @@ impl AccountQueue {
 
     /// 获取一个活跃槽位 permit，超时或队列满时返回对应错误。
     ///
-    /// 成功返回的 [`OwnedSemaphorePermit`] 由调用方持有至请求结束——drop 时自动归还槽位。
+    /// @param timeout 等待账号槽位的最长时间。
+    /// @param slot_units 当前请求需要占用的内部单位数，普通请求为 2，Haiku 请求为 1。
+    /// @return 成功返回槽位 permit；失败返回队列满、等待超时或信号量关闭。
+    ///
+    /// 成功返回的 [`AccountSlotPermit`] 由调用方持有至请求结束——drop 时自动归还槽位。
     ///
     /// # 流程
     /// 1. `queue_cap.try_acquire_owned()`：拿不到等待位 → `QueueFull`（队列上限，直接降级）；
@@ -294,7 +350,12 @@ impl AccountQueue {
     /// （官方源码：直接对底层计数 CAS，不走 waker 队列）。一旦走快速路径，新请求就可能
     /// 插队到已在等的老请求前面，破坏 FIFO。故此处统一走 `acquire_owned`——无人等待时
     /// 它自己就会立即 ready，不会有额外开销。
-    pub async fn acquire(&self, timeout: Duration) -> Result<OwnedSemaphorePermit, QueueWaitError> {
+    pub async fn acquire(
+        &self,
+        timeout: Duration,
+        slot_units: u32,
+    ) -> Result<AccountSlotPermit, QueueWaitError> {
+        let slot_units = slot_units.max(1);
         // 1. 进等待区：拿不到等待位说明队列满，降级。
         //    queue_cap 用 try_acquire 是 OK 的：它仅作上限计数，无用户 waiter 排队。
         let queue_permit = self
@@ -306,13 +367,19 @@ impl AccountQueue {
         // 2. 等待计数（仅展示用）+ 退出保护（包括 Future 被 drop 的路径）
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let waiting = self.waiting.clone();
+        self.waiting_units
+            .fetch_add(slot_units as i64, Ordering::Relaxed);
+        let waiting_units = self.waiting_units.clone();
         let _w_guard = scopeguard::guard((), move |_| {
             waiting.fetch_sub(1, Ordering::Relaxed);
+            waiting_units.fetch_sub(slot_units as i64, Ordering::Relaxed);
         });
 
         // 3. FIFO 获取槽位（tokio Semaphore 对 acquire 保证公平，不会插队）
         let slot_permit =
-            match tokio::time::timeout(timeout, self.slots.clone().acquire_owned()).await {
+            match tokio::time::timeout(timeout, self.slots.clone().acquire_many_owned(slot_units))
+                .await
+            {
                 Ok(Ok(p)) => p,
                 Ok(Err(_)) => return Err(QueueWaitError::Closed),
                 Err(_) => return Err(QueueWaitError::Timeout),
@@ -320,19 +387,43 @@ impl AccountQueue {
 
         // 4. 已进入活跃区，显式归还等待位，让下一个 waiter 有空间排队
         drop(queue_permit);
-        Ok(slot_permit)
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        Ok(AccountSlotPermit::new(
+            slot_permit,
+            self.active_requests.clone(),
+        ))
     }
 
-    /// 当前活跃槽位占用数 = `slots` 当前总 permit - 可用 permit。
+    /// 当前活跃内部单位数 = `slots` 当前总 permit - 可用 permit。
     /// 用 `slots_cap`（信号量实际容量）而非 `slot_max`（目标）——缩容过渡期两者可能暂时不等。
-    pub fn active_count(&self) -> i64 {
+    pub fn active_units(&self) -> i64 {
         let cap = self.slots_cap.load(Ordering::Relaxed) as i64;
         (cap - self.slots.available_permits() as i64).max(0)
+    }
+
+    /// 当前活跃标准槽位数。
+    pub fn active_standard_slots(&self) -> f64 {
+        self.active_units() as f64 / SLOT_UNIT_SCALE as f64
+    }
+
+    /// 当前活跃请求数。
+    pub fn active_request_count(&self) -> i64 {
+        self.active_requests.load(Ordering::Relaxed)
     }
 
     /// 当前等待槽位的请求数(仅用于 UI 展示)。
     pub fn waiting_count(&self) -> i64 {
         self.waiting.load(Ordering::Relaxed)
+    }
+
+    /// 当前等待请求预计占用的内部单位数。
+    pub fn waiting_units(&self) -> i64 {
+        self.waiting_units.load(Ordering::Relaxed)
+    }
+
+    /// 当前目标最大内部单位数。
+    pub fn max_units(&self) -> i64 {
+        self.slot_max.load(Ordering::Relaxed) as i64
     }
 }
 
@@ -878,11 +969,12 @@ impl AccountService {
         concurrency: i32,
     ) -> Arc<AccountQueue> {
         let concurrency = concurrency.max(1);
+        let slot_units = standard_concurrency_to_slot_units(concurrency);
         // 读锁快路径:容量匹配直接返回
         {
             let map = self.queues.read().await;
             if let Some(q) = map.get(&account_id) {
-                if q.slot_max.load(Ordering::Relaxed) == concurrency {
+                if q.slot_max.load(Ordering::Relaxed) == slot_units {
                     return q.clone();
                 }
             }
@@ -890,7 +982,7 @@ impl AccountService {
         // 写锁:二次检查后原地调整或创建新实例
         let mut map = self.queues.write().await;
         if let Some(q) = map.get(&account_id) {
-            if q.slot_max.load(Ordering::Relaxed) != concurrency {
+            if q.slot_max.load(Ordering::Relaxed) != slot_units {
                 q.adjust_capacity(concurrency);
             }
             return q.clone();
@@ -1211,7 +1303,7 @@ impl AccountService {
     /// 评分公式：`score = eff_7d * w7d + eff_5h * w5h + concurrency_load_pct * wconc`（权重可在设置页面配置）
     /// - `eff_Xd = utilization × 阶梯衰减`，快重置的窗口衰减更大（分 3 档：1.0/0.8/0.6）
     /// - 无 resets_at 数据时衰减因子为 1.0（最保守）
-    /// - `concurrency_load_pct = (活跃 + 排队) / concurrency × 100`,排队中的请求也计入负载
+    /// - `concurrency_load_pct = (活跃内部单位 + 排队预计内部单位) / 最大内部单位 × 100`
     /// - 并发已满的账号优先排除，仅在所有账号都满时才参与评分
     /// - 得分相同时随机选择
     async fn select_by_score(&self, accounts: &[Account]) -> Account {
@@ -1242,13 +1334,14 @@ impl AccountService {
                 effective_utilization_detail(acc, "seven_day", 7.0 * 24.0 * 3600.0, now).effective;
             // 从 FIFO 排队器读取实时活跃/等待数
             let queue = self.get_or_create_queue(acc.id, acc.concurrency).await;
-            let current = queue.active_count();
-            let waiting = queue.waiting_count();
-            let full = acc.concurrency > 0 && current >= acc.concurrency as i64;
-            // 把"排队中"的请求也作为负载计入评分:单位仍是 % concurrency,
+            let current_units = queue.active_units();
+            let waiting_units = queue.waiting_units();
+            let max_units = queue.max_units();
+            let full = max_units > 0 && current_units >= max_units;
+            // 把"排队中"的请求也作为负载计入评分：单位统一为内部槽位单位,
             // 两个账号都活跃满时,排队少的负载百分比更低,优先被选中。
-            let conc_pct = if acc.concurrency > 0 {
-                ((current + waiting) as f64) / (acc.concurrency as f64) * 100.0
+            let conc_pct = if max_units > 0 {
+                ((current_units + waiting_units) as f64) / (max_units as f64) * 100.0
             } else {
                 0.0
             };
@@ -1296,13 +1389,19 @@ impl AccountService {
         let queue = self
             .get_or_create_queue(account.id, account.concurrency)
             .await;
-        let current_concurrency = queue.active_count();
+        let current_concurrency_units = queue.active_units();
+        let current_concurrency = queue.active_standard_slots();
+        let max_concurrency_units = queue.max_units();
+        let active_requests = queue.active_request_count();
         let queued = queue.waiting_count();
+        let queued_request_units = queue.waiting_units();
         let (transient_backoff_waiting, transient_backoff_remaining_ms) =
             self.transient_rate_limit_backoff_status(account.id).await;
-        // 负载 % = (活跃 + 排队) / concurrency × 100,与 select_by_score 保持一致
-        let concurrency_pct = if account.concurrency > 0 {
-            ((current_concurrency + queued) as f64) / (account.concurrency as f64) * 100.0
+        // 负载 % = (活跃内部单位 + 排队预计内部单位) / 最大内部单位 × 100,与 select_by_score 保持一致。
+        let concurrency_pct = if max_concurrency_units > 0 {
+            ((current_concurrency_units + queued_request_units) as f64)
+                / (max_concurrency_units as f64)
+                * 100.0
         } else {
             0.0
         };
@@ -1318,7 +1417,11 @@ impl AccountService {
             concurrency_pct,
             weights: (w7d, w5h, wconc),
             current_concurrency,
+            current_concurrency_units,
+            max_concurrency_units,
+            active_requests,
             queued,
+            queued_request_units,
             transient_backoff_waiting,
             transient_backoff_remaining_ms,
         }
@@ -1691,6 +1794,263 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    async fn wait_until_queue_waiting(queue: &AccountQueue, expected: i64, expected_units: i64) {
+        for _ in 0..50 {
+            if queue.waiting_count() == expected && queue.waiting_units() == expected_units {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.waiting_count(), expected);
+        assert_eq!(queue.waiting_units(), expected_units);
+    }
+
+    async fn wait_until_queue_capacity_units(queue: &AccountQueue, expected: i32) {
+        for _ in 0..50 {
+            if queue.slots_cap.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.slots_cap.load(Ordering::Relaxed), expected);
+    }
+
+    #[tokio::test]
+    async fn account_queue_regular_request_uses_full_standard_slot() {
+        let queue = AccountQueue::new(1);
+        let permit = queue
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
+            .await
+            .expect("regular permit");
+
+        assert_eq!(queue.active_units(), 2);
+        assert_eq!(queue.active_standard_slots(), 1.0);
+        assert_eq!(queue.active_request_count(), 1);
+
+        let blocked = queue
+            .acquire(Duration::from_millis(10), HAIKU_REQUEST_SLOT_UNITS)
+            .await;
+        assert!(matches!(blocked, Err(QueueWaitError::Timeout)));
+
+        drop(permit);
+        assert_eq!(queue.active_units(), 0);
+        assert_eq!(queue.active_request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn account_queue_two_haiku_requests_share_one_standard_slot() {
+        let queue = AccountQueue::new(1);
+        let first = queue
+            .acquire(Duration::from_secs(1), HAIKU_REQUEST_SLOT_UNITS)
+            .await
+            .expect("first haiku permit");
+        let second = queue
+            .acquire(Duration::from_secs(1), HAIKU_REQUEST_SLOT_UNITS)
+            .await
+            .expect("second haiku permit");
+
+        assert_eq!(queue.active_units(), 2);
+        assert_eq!(queue.active_standard_slots(), 1.0);
+        assert_eq!(queue.active_request_count(), 2);
+
+        let blocked = queue
+            .acquire(Duration::from_millis(10), HAIKU_REQUEST_SLOT_UNITS)
+            .await;
+        assert!(matches!(blocked, Err(QueueWaitError::Timeout)));
+
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn account_queue_mixed_requests_use_internal_units() {
+        let queue = AccountQueue::new(2);
+        let regular = queue
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
+            .await
+            .expect("regular permit");
+        let haiku = queue
+            .acquire(Duration::from_secs(1), HAIKU_REQUEST_SLOT_UNITS)
+            .await
+            .expect("haiku permit");
+
+        assert_eq!(queue.active_units(), 3);
+        assert_eq!(queue.active_standard_slots(), 1.5);
+        assert_eq!(queue.active_request_count(), 2);
+
+        let second_haiku = queue
+            .acquire(Duration::from_secs(1), HAIKU_REQUEST_SLOT_UNITS)
+            .await
+            .expect("second haiku fills remaining half slot");
+        assert_eq!(queue.active_units(), 4);
+
+        let blocked = queue
+            .acquire(Duration::from_millis(10), HAIKU_REQUEST_SLOT_UNITS)
+            .await;
+        assert!(matches!(blocked, Err(QueueWaitError::Timeout)));
+
+        drop(regular);
+        drop(haiku);
+        drop(second_haiku);
+    }
+
+    #[tokio::test]
+    async fn account_queue_keeps_fifo_when_head_needs_two_units() {
+        let queue = Arc::new(AccountQueue::new(1));
+        let held_half_slot = queue
+            .acquire(Duration::from_secs(1), HAIKU_REQUEST_SLOT_UNITS)
+            .await
+            .expect("held haiku permit");
+
+        let (regular_acquired_tx, mut regular_acquired_rx) = tokio::sync::oneshot::channel();
+        let (regular_release_tx, regular_release_rx) = tokio::sync::oneshot::channel();
+        let regular_queue = queue.clone();
+        let regular_waiter = tokio::spawn(async move {
+            let permit = regular_queue
+                .acquire(Duration::from_secs(5), DEFAULT_REQUEST_SLOT_UNITS)
+                .await
+                .expect("regular waiter permit");
+            let _ = regular_acquired_tx.send(());
+            let _ = regular_release_rx.await;
+            drop(permit);
+        });
+        wait_until_queue_waiting(&queue, 1, 2).await;
+
+        let (haiku_acquired_tx, mut haiku_acquired_rx) = tokio::sync::oneshot::channel();
+        let haiku_queue = queue.clone();
+        let haiku_waiter = tokio::spawn(async move {
+            let permit = haiku_queue
+                .acquire(Duration::from_secs(5), HAIKU_REQUEST_SLOT_UNITS)
+                .await
+                .expect("haiku waiter permit");
+            let _ = haiku_acquired_tx.send(());
+            drop(permit);
+        });
+        wait_until_queue_waiting(&queue, 2, 3).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut haiku_acquired_rx)
+                .await
+                .is_err()
+        );
+
+        drop(held_half_slot);
+        tokio::time::timeout(Duration::from_secs(1), &mut regular_acquired_rx)
+            .await
+            .expect("regular waiter should acquire first")
+            .expect("regular acquired signal");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut haiku_acquired_rx)
+                .await
+                .is_err()
+        );
+
+        regular_release_tx.send(()).expect("release regular waiter");
+        tokio::time::timeout(Duration::from_secs(1), &mut haiku_acquired_rx)
+            .await
+            .expect("haiku waiter should acquire after regular releases")
+            .expect("haiku acquired signal");
+        regular_waiter.await.expect("regular waiter task");
+        haiku_waiter.await.expect("haiku waiter task");
+    }
+
+    #[tokio::test]
+    async fn account_queue_waiting_capacity_stays_request_count_based() {
+        let queue = Arc::new(AccountQueue::new(1));
+        let held = queue
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
+            .await
+            .expect("held regular permit");
+
+        let first_queue = queue.clone();
+        let first_waiter = tokio::spawn(async move {
+            first_queue
+                .acquire(Duration::from_secs(5), HAIKU_REQUEST_SLOT_UNITS)
+                .await
+        });
+        let second_queue = queue.clone();
+        let second_waiter = tokio::spawn(async move {
+            second_queue
+                .acquire(Duration::from_secs(5), HAIKU_REQUEST_SLOT_UNITS)
+                .await
+        });
+        wait_until_queue_waiting(&queue, 2, 2).await;
+
+        let result = queue
+            .acquire(Duration::from_millis(10), HAIKU_REQUEST_SLOT_UNITS)
+            .await;
+        assert!(matches!(result, Err(QueueWaitError::QueueFull)));
+
+        first_waiter.abort();
+        second_waiter.abort();
+        let _ = first_waiter.await;
+        let _ = second_waiter.await;
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn account_queue_shrink_does_not_cancel_existing_requests() {
+        let queue = AccountQueue::new(2);
+        let first = queue
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
+            .await
+            .expect("first regular permit");
+        let second = queue
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
+            .await
+            .expect("second regular permit");
+        assert_eq!(queue.active_units(), 4);
+        assert_eq!(queue.active_request_count(), 2);
+
+        queue.adjust_capacity(1);
+        assert_eq!(queue.max_units(), 2);
+        assert_eq!(queue.active_units(), 4);
+        assert_eq!(queue.active_request_count(), 2);
+
+        drop(first);
+        wait_until_queue_capacity_units(&queue, 2).await;
+        assert_eq!(queue.active_units(), 2);
+        assert_eq!(queue.active_request_count(), 1);
+
+        let blocked = queue
+            .acquire(Duration::from_millis(10), HAIKU_REQUEST_SLOT_UNITS)
+            .await;
+        assert!(matches!(blocked, Err(QueueWaitError::Timeout)));
+
+        drop(second);
+        let next = queue
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
+            .await
+            .expect("regular permit after shrink settled");
+        drop(next);
+    }
+
+    #[tokio::test]
+    async fn account_score_info_uses_internal_units_for_concurrency_load() {
+        let (_store, svc) = setup_account_service().await;
+        let mut account = new_account_request("score-half-slot@example.com");
+        account.concurrency = 2;
+        svc.create_account(&mut account)
+            .await
+            .expect("create account");
+        let queue = svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let _haiku = queue
+            .acquire(Duration::from_secs(1), HAIKU_REQUEST_SLOT_UNITS)
+            .await
+            .expect("haiku permit");
+
+        let info = svc.get_account_score_info(&account).await;
+        assert_eq!(info.current_concurrency, 0.5);
+        assert_eq!(info.current_concurrency_units, 1);
+        assert_eq!(info.max_concurrency_units, 4);
+        assert_eq!(info.active_requests, 1);
+        assert_eq!(info.queued, 0);
+        assert_eq!(info.queued_request_units, 0);
+        assert_eq!(info.concurrency_pct, 25.0);
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, RwLock};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -23,7 +23,10 @@ use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, access_policy_error_response,
 };
-use crate::service::account::{AccountService, QueueWaitError, RateLimitDecision};
+use crate::service::account::{
+    AccountService, AccountSlotPermit, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS,
+    QueueWaitError, RateLimitDecision,
+};
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
@@ -85,7 +88,7 @@ struct RateLimitResponseDecision {
 }
 
 struct GatewayAccountAdmission {
-    permit: OwnedSemaphorePermit,
+    permit: AccountSlotPermit,
     slot_wait: std::time::Duration,
 }
 
@@ -428,6 +431,7 @@ impl GatewayService {
     /// @param sticky_account 当前请求是否命中粘性会话账号。
     /// @param session_hash 会话哈希，仅用于 RPM 日志。
     /// @param timeout 并发槽位等待超时时间。
+    /// @param slot_units 当前请求需要占用的内部并发单位数。
     /// @return 成功返回槽位 permit 与实际槽位等待耗时；失败返回队列或 RPM admission 错误。
     async fn acquire_account_admission(
         &self,
@@ -435,6 +439,7 @@ impl GatewayService {
         sticky_account: bool,
         session_hash: &str,
         timeout: std::time::Duration,
+        slot_units: u32,
     ) -> Result<GatewayAccountAdmission, GatewayAdmissionError> {
         let t_slot = std::time::Instant::now();
         let queue = self
@@ -442,7 +447,7 @@ impl GatewayService {
             .get_or_create_queue(account.id, account.concurrency)
             .await;
         let permit = queue
-            .acquire(timeout)
+            .acquire(timeout, slot_units)
             .await
             .map_err(GatewayAdmissionError::Queue)?;
         let slot_wait = t_slot.elapsed();
@@ -1315,6 +1320,8 @@ impl GatewayService {
                 .wait_transient_rate_limit_backoff(&account)
                 .await;
 
+            let slot_units = request_slot_units(&path, &body_map);
+
             // 先获得并发槽位，再做 RPM admission：排队中的请求还没有准备发往上游，
             // 不能提前占用当前分钟 RPM。若 RPM 饱和导致换号，返回前会释放本账号槽位。
             let admission = match self
@@ -1323,6 +1330,7 @@ impl GatewayService {
                     sticky_account,
                     &session_hash,
                     SLOT_WAIT_TIMEOUT,
+                    slot_units,
                 )
                 .await
             {
@@ -2973,6 +2981,23 @@ fn spawn_fable_usage_refresh(context: Option<FableUsageRefreshContext>) {
 
 fn is_fable_model_id(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("claude-fable-")
+}
+
+fn request_slot_units(path: &str, body: &serde_json::Value) -> u32 {
+    if path == "/v1/messages"
+        && body
+            .get("model")
+            .and_then(|model| model.as_str())
+            .map(is_haiku_model_id)
+            .unwrap_or(false)
+    {
+        return HAIKU_REQUEST_SLOT_UNITS;
+    }
+    DEFAULT_REQUEST_SLOT_UNITS
+}
+
+fn is_haiku_model_id(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("haiku")
 }
 
 fn bootstrap_query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -4917,18 +4942,18 @@ fn normalize_reset_timestamp(raw: &str) -> Option<String> {
 /// 并发槽位释放守卫：drop permit 时自动归还 semaphore，防止错误路径或 panic 导致泄漏。
 /// 成功包装 stream 后调用 `defuse()` 把 permit 交给 `SlotGuardBody` 管理。
 struct SlotReleaseGuard {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<AccountSlotPermit>,
 }
 
 impl SlotReleaseGuard {
-    fn new(permit: OwnedSemaphorePermit) -> Self {
+    fn new(permit: AccountSlotPermit) -> Self {
         Self {
             permit: Some(permit),
         }
     }
 
     /// 解除守卫并取出 permit，调用后本 guard drop 不再释放。
-    fn defuse(&mut self) -> OwnedSemaphorePermit {
+    fn defuse(&mut self) -> AccountSlotPermit {
         self.permit
             .take()
             .expect("SlotReleaseGuard already defused")
@@ -4949,7 +4974,7 @@ impl Drop for SlotReleaseGuard {
 struct SlotGuardBody {
     inner: Body,
     /// `Some(permit)` 表示槽位尚未归还；`Drop` 时 take 让 permit 自动归还 semaphore。
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<AccountSlotPermit>,
     /// stateful 缓存状态只在上游响应体读到 EOF 后提交。
     stateful_cache_completion: Option<StatefulCacheCompletion>,
     /// 上游 Anthropic 响应中已观察到的 prompt cache 使用量。
@@ -5070,7 +5095,7 @@ impl CacheUsageLogContext {
 impl SlotGuardBody {
     fn new(
         inner: Body,
-        permit: OwnedSemaphorePermit,
+        permit: AccountSlotPermit,
         req_start: std::time::Instant,
         account_name: String,
         rewriter: Arc<Rewriter>,
@@ -5632,17 +5657,20 @@ mod tests {
         non_stream_probe_cache_key, parse_bootstrap_additional_model_options,
         parse_rate_limit_request_body_limit, parse_system_role_model_list, patch_bootstrap_json,
         redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
-        rewrite_bootstrap_response, safe_body_summary, safe_non_stream_probe_response_headers,
-        sanitize_count_tokens_body, should_intercept_assistant_prefill,
-        should_refresh_fable_usage_after_response, signature_retry_body_for_stage,
-        stable_upstream_stream, strip_signature_sensitive_blocks_from_messages_request,
+        request_slot_units, rewrite_bootstrap_response, safe_body_summary,
+        safe_non_stream_probe_response_headers, sanitize_count_tokens_body,
+        should_intercept_assistant_prefill, should_refresh_fable_usage_after_response,
+        signature_retry_body_for_stage, stable_upstream_stream,
+        strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
     };
-    use crate::service::account::{AccountService, QueueWaitError};
+    use crate::service::account::{
+        AccountService, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
+    };
     use crate::service::rewriter::{ClientType, StatefulCacheUsage};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
@@ -5833,6 +5861,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn request_slot_units_counts_haiku_messages_as_half_slot() {
+        assert_eq!(
+            request_slot_units(
+                "/v1/messages",
+                &json!({ "model": "claude-haiku-4-5-20251001" })
+            ),
+            HAIKU_REQUEST_SLOT_UNITS
+        );
+        assert_eq!(
+            request_slot_units(
+                "/v1/messages",
+                &json!({ "model": "CLAUDE-HAIKU-4-5-20251001" })
+            ),
+            HAIKU_REQUEST_SLOT_UNITS
+        );
+        assert_eq!(
+            request_slot_units("/v1/messages", &json!({ "model": "claude-opus-4-8" })),
+            DEFAULT_REQUEST_SLOT_UNITS
+        );
+        assert_eq!(
+            request_slot_units(
+                "/v1/messages/count_tokens",
+                &json!({ "model": "claude-haiku-4-5-20251001" })
+            ),
+            DEFAULT_REQUEST_SLOT_UNITS
+        );
+    }
+
     fn non_stream_probe_request(text: &str) -> serde_json::Value {
         json!({
             "model": "claude-opus-4-8",
@@ -5954,7 +6011,7 @@ mod tests {
             .get_or_create_queue(account.id, account.concurrency)
             .await;
         let held_permit = queue
-            .acquire(Duration::from_secs(1))
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
             .await
             .expect("hold active slot");
 
@@ -5962,7 +6019,13 @@ mod tests {
         let waiter_account = account.clone();
         let waiter = tokio::spawn(async move {
             waiter_service
-                .acquire_account_admission(&waiter_account, false, "", Duration::from_secs(5))
+                .acquire_account_admission(
+                    &waiter_account,
+                    false,
+                    "",
+                    Duration::from_secs(5),
+                    DEFAULT_REQUEST_SLOT_UNITS,
+                )
                 .await
         });
 
@@ -5997,12 +6060,18 @@ mod tests {
             .get_or_create_queue(account.id, account.concurrency)
             .await;
         let held_permit = queue
-            .acquire(Duration::from_secs(1))
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
             .await
             .expect("hold active slot");
 
         let result = service
-            .acquire_account_admission(&account, false, "", Duration::from_millis(10))
+            .acquire_account_admission(
+                &account,
+                false,
+                "",
+                Duration::from_millis(10),
+                DEFAULT_REQUEST_SLOT_UNITS,
+            )
             .await;
         match result {
             Err(GatewayAdmissionError::Queue(QueueWaitError::Timeout)) => {}
@@ -6026,7 +6095,7 @@ mod tests {
             .get_or_create_queue(account.id, account.concurrency)
             .await;
         let held_permit = queue
-            .acquire(Duration::from_secs(1))
+            .acquire(Duration::from_secs(1), DEFAULT_REQUEST_SLOT_UNITS)
             .await
             .expect("hold active slot");
 
@@ -6034,20 +6103,38 @@ mod tests {
         let first_account = account.clone();
         let first_waiter = tokio::spawn(async move {
             first_service
-                .acquire_account_admission(&first_account, false, "", Duration::from_secs(5))
+                .acquire_account_admission(
+                    &first_account,
+                    false,
+                    "",
+                    Duration::from_secs(5),
+                    DEFAULT_REQUEST_SLOT_UNITS,
+                )
                 .await
         });
         let second_service = service.clone();
         let second_account = account.clone();
         let second_waiter = tokio::spawn(async move {
             second_service
-                .acquire_account_admission(&second_account, false, "", Duration::from_secs(5))
+                .acquire_account_admission(
+                    &second_account,
+                    false,
+                    "",
+                    Duration::from_secs(5),
+                    DEFAULT_REQUEST_SLOT_UNITS,
+                )
                 .await
         });
         wait_until_queue_waiting(&service, &account, 2).await;
 
         let result = service
-            .acquire_account_admission(&account, false, "", Duration::from_secs(1))
+            .acquire_account_admission(
+                &account,
+                false,
+                "",
+                Duration::from_secs(1),
+                DEFAULT_REQUEST_SLOT_UNITS,
+            )
             .await;
         match result {
             Err(GatewayAdmissionError::Queue(QueueWaitError::QueueFull)) => {}

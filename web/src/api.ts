@@ -70,7 +70,11 @@ export interface Account {
     weights?: { w7d: number; w5h: number; wconc: number }
   }
   current_concurrency?: number
+  current_concurrency_units?: number
+  max_concurrency_units?: number
+  active_requests?: number
   queued_requests?: number
+  queued_request_units?: number
   transient_backoff_waiting?: number
   transient_backoff_remaining_ms?: number
   rate_limited_at?: string

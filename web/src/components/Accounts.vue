@@ -49,6 +49,24 @@ function showScoreTooltip(e: MouseEvent, account: Account) {
 function hideScoreTooltip() {
   scoreTooltip.value.visible = false;
 }
+/** 并发 Tooltip 状态 */
+const concurrencyTooltip = ref<{ visible: boolean; x: number; y: number; account: Account | null }>({
+  visible: false, x: 0, y: 0, account: null,
+});
+/** 显示并发详情 Tooltip */
+function showConcurrencyTooltip(e: MouseEvent, account: Account) {
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  concurrencyTooltip.value = {
+    visible: true,
+    x: rect.left + rect.width / 2,
+    y: rect.top - 8,
+    account,
+  };
+}
+/** 隐藏并发详情 Tooltip */
+function hideConcurrencyTooltip() {
+  concurrencyTooltip.value.visible = false;
+}
 /** 当前编辑的账号（null 表示新建） */
 const editing = ref<Account | null>(null);
 /** 表单数据 */
@@ -495,6 +513,44 @@ function transientBackoffClass(account: Account): string {
 }
 
 /**
+ * 格式化标准并发槽位。
+ * @param value 标准槽位数
+ */
+function formatConcurrencySlots(value?: number | null): string {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n)) return '0';
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+/**
+ * 格式化内部单位数。
+ * @param value 内部单位数
+ */
+function formatConcurrencyUnits(value?: number | null): string {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n)) return '0';
+  return String(Math.round(n));
+}
+
+/**
+ * 获取账号卡片并发显示文本。
+ * @param account 账号对象
+ */
+function concurrencyLabel(account: Account): string {
+  return `${formatConcurrencySlots(account.current_concurrency)}/${formatConcurrencySlots(account.concurrency)}`;
+}
+
+/**
+ * 获取账号卡片并发文本颜色。
+ * @param account 账号对象
+ */
+function concurrencyClass(account: Account): string {
+  return (account.current_concurrency ?? 0) >= account.concurrency
+    ? 'text-red-500'
+    : 'text-[#29261e]';
+}
+
+/**
  * 获取当前账号显示的凭证摘要
  * @param account 账号对象
  */
@@ -717,10 +773,12 @@ async function copyText(text: string) {
                   {{ a.scheduling_score?.toFixed(2) ?? '0.00' }}
                 </p>
               </div>
-              <div class="text-center">
+              <div class="text-center relative cursor-help"
+                   @mouseenter="showConcurrencyTooltip($event, a)"
+                   @mouseleave="hideConcurrencyTooltip">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">并发</p>
-                <p class="text-sm font-medium" :class="(a.current_concurrency ?? 0) >= a.concurrency ? 'text-red-500' : 'text-[#29261e]'">
-                  {{ a.current_concurrency ?? 0 }}/{{ a.concurrency }}
+                <p class="text-sm font-medium" :class="concurrencyClass(a)">
+                  {{ concurrencyLabel(a) }}
                 </p>
               </div>
               <div class="text-center">
@@ -1541,6 +1599,20 @@ async function copyText(text: string) {
     </Dialog>
   </div>
 
+  <!-- 并发详情 Tooltip（Teleport 到 body，不受卡片 overflow-hidden 影响） -->
+  <Teleport to="body">
+    <div v-if="concurrencyTooltip.visible && concurrencyTooltip.account"
+         class="fixed z-50 bg-[#29261e] text-white text-xs rounded-lg px-3 py-2 whitespace-nowrap shadow-lg leading-relaxed pointer-events-none"
+         :style="{ top: concurrencyTooltip.y + 'px', left: concurrencyTooltip.x + 'px', transform: 'translate(-50%, -100%)' }">
+      <div>当前标准槽位: {{ formatConcurrencySlots(concurrencyTooltip.account.current_concurrency) }} / {{ formatConcurrencySlots(concurrencyTooltip.account.concurrency) }}</div>
+      <div>内部单位: {{ formatConcurrencyUnits(concurrencyTooltip.account.current_concurrency_units) }} / {{ formatConcurrencyUnits(concurrencyTooltip.account.max_concurrency_units) }}</div>
+      <div>活跃请求数: {{ concurrencyTooltip.account.active_requests ?? 0 }}</div>
+      <div>排队请求数: {{ concurrencyTooltip.account.queued_requests ?? 0 }}</div>
+      <div>排队单位: {{ formatConcurrencyUnits(concurrencyTooltip.account.queued_request_units) }}</div>
+      <div class="border-t border-white/20 mt-1 pt-1 text-white/70">普通请求 = 1 并发，Haiku = 0.5 并发</div>
+    </div>
+  </Teleport>
+
   <!-- 评分详情 Tooltip（Teleport 到 body，不受卡片 overflow-hidden 影响） -->
   <Teleport to="body">
     <div v-if="scoreTooltip.visible && scoreTooltip.account?.scheduling_detail"
@@ -1548,7 +1620,7 @@ async function copyText(text: string) {
          :style="{ top: scoreTooltip.y + 'px', left: scoreTooltip.x + 'px', transform: 'translateY(-100%)' }">
       <div>7d: {{ scoreTooltip.account.scheduling_detail.detail_7d?.utilization?.toFixed(2) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_7d?.decay?.toFixed(2) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_7d.toFixed(2) }} × {{ scoreTooltip.account.scheduling_detail.weights?.w7d ?? 0.5 }} = <span class="text-amber-300">{{ (scoreTooltip.account.scheduling_detail.eff_7d * (scoreTooltip.account.scheduling_detail.weights?.w7d ?? 0.5)).toFixed(2) }}</span></div>
       <div>5h: {{ scoreTooltip.account.scheduling_detail.detail_5h?.utilization?.toFixed(2) ?? '0' }}% × {{ scoreTooltip.account.scheduling_detail.detail_5h?.decay?.toFixed(2) ?? '1' }} = {{ scoreTooltip.account.scheduling_detail.eff_5h.toFixed(2) }} × {{ scoreTooltip.account.scheduling_detail.weights?.w5h ?? 0.3 }} = <span class="text-amber-300">{{ (scoreTooltip.account.scheduling_detail.eff_5h * (scoreTooltip.account.scheduling_detail.weights?.w5h ?? 0.3)).toFixed(2) }}</span></div>
-      <div>负载: {{ scoreTooltip.account.scheduling_detail.concurrency_pct.toFixed(2) }}% × {{ scoreTooltip.account.scheduling_detail.weights?.wconc ?? 0.2 }} = <span class="text-amber-300">{{ (scoreTooltip.account.scheduling_detail.concurrency_pct * (scoreTooltip.account.scheduling_detail.weights?.wconc ?? 0.2)).toFixed(2) }}</span> <span class="text-white/50">（活跃+排队）/并发</span></div>
+      <div>负载: {{ scoreTooltip.account.scheduling_detail.concurrency_pct.toFixed(2) }}% × {{ scoreTooltip.account.scheduling_detail.weights?.wconc ?? 0.2 }} = <span class="text-amber-300">{{ (scoreTooltip.account.scheduling_detail.concurrency_pct * (scoreTooltip.account.scheduling_detail.weights?.wconc ?? 0.2)).toFixed(2) }}</span> <span class="text-white/50">（活跃标准槽位+排队预计槽位）/并发</span></div>
       <div class="border-t border-white/20 mt-1 pt-1 font-medium">= {{ scoreTooltip.account.scheduling_score?.toFixed(2) }}　<span class="text-white/50">越小越优先</span></div>
     </div>
   </Teleport>

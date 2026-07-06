@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use claude_code_gateway::error::AppError;
 use claude_code_gateway::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
-use claude_code_gateway::service::account::AccountService;
+use claude_code_gateway::service::account::{AccountService, DEFAULT_REQUEST_SLOT_UNITS};
 use claude_code_gateway::store::account_store::AccountStore;
 use claude_code_gateway::store::memory::MemoryStore;
 use claude_code_gateway::store::settings_store::SettingsStore;
@@ -243,20 +243,29 @@ async fn test_slot_can_be_reacquired_after_release() {
     // 模拟重试循环中获取槽位 → 收到 429 → 释放槽位
     let queue = svc.get_or_create_queue(a1.id, a1.concurrency).await;
     let permit = queue
-        .acquire(std::time::Duration::from_secs(1))
+        .acquire(
+            std::time::Duration::from_secs(1),
+            DEFAULT_REQUEST_SLOT_UNITS,
+        )
         .await
         .expect("first acquire should succeed");
-    assert_eq!(queue.active_count(), 1);
+    assert_eq!(queue.active_standard_slots(), 1.0);
+    assert_eq!(queue.active_request_count(), 1);
 
     // 释放（模拟 429 重试时手动释放）
     drop(permit);
-    assert_eq!(queue.active_count(), 0);
+    assert_eq!(queue.active_units(), 0);
+    assert_eq!(queue.active_request_count(), 0);
 
     // 槽位应可再次获取（下一个账号或后续请求）
     let permit_again = queue
-        .acquire(std::time::Duration::from_secs(1))
+        .acquire(
+            std::time::Duration::from_secs(1),
+            DEFAULT_REQUEST_SLOT_UNITS,
+        )
         .await
         .expect("second acquire after release should succeed");
-    assert_eq!(queue.active_count(), 1);
+    assert_eq!(queue.active_standard_slots(), 1.0);
+    assert_eq!(queue.active_request_count(), 1);
     drop(permit_again);
 }

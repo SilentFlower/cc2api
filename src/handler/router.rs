@@ -245,7 +245,11 @@ async fn list_accounts(
             },
         });
         obj["current_concurrency"] = serde_json::json!(si.current_concurrency);
+        obj["current_concurrency_units"] = serde_json::json!(si.current_concurrency_units);
+        obj["max_concurrency_units"] = serde_json::json!(si.max_concurrency_units);
+        obj["active_requests"] = serde_json::json!(si.active_requests);
         obj["queued_requests"] = serde_json::json!(si.queued);
+        obj["queued_request_units"] = serde_json::json!(si.queued_request_units);
         obj["transient_backoff_waiting"] = serde_json::json!(si.transient_backoff_waiting);
         obj["transient_backoff_remaining_ms"] =
             serde_json::json!(si.transient_backoff_remaining_ms);
