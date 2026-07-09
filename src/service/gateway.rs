@@ -24,8 +24,8 @@ use crate::service::access_policy::{
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, access_policy_error_response,
 };
 use crate::service::account::{
-    AccountService, AccountSlotPermit, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS,
-    QueueWaitError, RateLimitDecision,
+    AccountSelectionContext, AccountService, AccountSlotPermit, DEFAULT_REQUEST_SLOT_UNITS,
+    HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, account_fable_quota_exhausted,
 };
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
@@ -41,8 +41,9 @@ use crate::service::version_profile::{COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
-    DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -371,6 +372,7 @@ pub struct GatewayService {
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
     message_body_order_fingerprint_enabled: RwLock<bool>,
+    fable_sticky_quota_fallback_enabled: RwLock<bool>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
@@ -410,6 +412,9 @@ impl GatewayService {
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
             message_body_order_fingerprint_enabled: RwLock::new(
                 default_message_body_order_fingerprint_enabled(),
+            ),
+            fable_sticky_quota_fallback_enabled: RwLock::new(
+                default_fable_sticky_quota_fallback_enabled(),
             ),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
             disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
@@ -553,6 +558,23 @@ impl GatewayService {
             )
             .await?;
         *self.message_body_order_fingerprint_enabled.write().await = parse_setting_flag(&raw);
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Fable sticky 配额切换开关。
+    ///
+    /// 配置缓存到内存,避免 `/v1/messages` 热路径每次查询 settings 表。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_fable_sticky_quota_fallback_enabled(&self) -> Result<(), AppError> {
+        let raw = self
+            .settings_store
+            .get_value(
+                "fable_sticky_quota_fallback_enabled",
+                DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
+            )
+            .await?;
+        *self.fable_sticky_quota_fallback_enabled.write().await = parse_setting_flag(&raw);
         Ok(())
     }
 
@@ -1196,6 +1218,16 @@ impl GatewayService {
         } else {
             (vec![], vec![])
         };
+        let request_model = body_map
+            .get("model")
+            .and_then(|model| model.as_str())
+            .map(str::to_string);
+        let fable_quota_fallback_enabled =
+            path == "/v1/messages" && *self.fable_sticky_quota_fallback_enabled.read().await;
+        let account_selection_context = AccountSelectionContext {
+            fable_quota_fallback_enabled,
+            request_model,
+        };
 
         // 429 自动换号 / 并发降级重试循环
         let mut exclude_ids = blocked_ids.clone();
@@ -1208,7 +1240,12 @@ impl GatewayService {
             let t0 = std::time::Instant::now();
             let selected = match self
                 .account_svc
-                .select_account_with_context(&session_hash, &exclude_ids, &allowed_ids)
+                .select_account_with_selection_context(
+                    &session_hash,
+                    &exclude_ids,
+                    &allowed_ids,
+                    &account_selection_context,
+                )
                 .await
             {
                 Ok(selected) => {
@@ -1223,6 +1260,7 @@ impl GatewayService {
                     // 无可用账号但有上一次的 429 响应，返回给客户端
                     return Ok(last_resp.unwrap());
                 }
+                Err(e @ AppError::TooManyRequests(_)) => return Err(e),
                 Err(e) => {
                     // 仅当是"无可用账号"且有运行时排除的账号时，返回 429
                     if exclude_ids.len() > blocked_ids.len() {
@@ -1543,6 +1581,7 @@ impl GatewayService {
                     &final_headers,
                     &final_body,
                     &account,
+                    &account_selection_context,
                 )
                 .await
             {
@@ -1579,6 +1618,7 @@ impl GatewayService {
                     &final_body,
                     &account,
                     client_type,
+                    &account_selection_context,
                     resp,
                 )
                 .await?;
@@ -1726,6 +1766,7 @@ impl GatewayService {
     /// @param body 已改写后的原始上游请求体。
     /// @param account 当前已选账号，重试必须复用该账号。
     /// @param client_type 原始客户端类型，用于判断 API mimicry 生成的 CCH 是否需要刷新。
+    /// @param account_selection_context 当前请求模型与 Fable 配额 fallback 开关上下文。
     /// @param resp 首次上游响应。
     /// @return 返回最终响应和最后执行的 signature retry 阶段。
     async fn maybe_retry_signature_error(
@@ -1737,6 +1778,7 @@ impl GatewayService {
         body: &[u8],
         account: &Account,
         client_type: ClientType,
+        account_selection_context: &AccountSelectionContext,
         resp: Response,
     ) -> Result<(Response, Option<SignatureRetryStage>), AppError> {
         if path != "/v1/messages" || resp.status() != StatusCode::BAD_REQUEST {
@@ -1773,7 +1815,15 @@ impl GatewayService {
             );
 
             let retry_resp = match self
-                .forward_request(method, path, query, &retry_headers, &retry_body, account)
+                .forward_request(
+                    method,
+                    path,
+                    query,
+                    &retry_headers,
+                    &retry_body,
+                    account,
+                    account_selection_context,
+                )
                 .await
             {
                 Ok(resp) => resp,
@@ -1820,6 +1870,7 @@ impl GatewayService {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
         account: &Account,
+        account_selection_context: &AccountSelectionContext,
     ) -> Result<Response, AppError> {
         let target_url = upstream_url(path, query);
 
@@ -1888,7 +1939,13 @@ impl GatewayService {
 
             let rate_limit_decision = match self
                 .account_svc
-                .handle_rate_limit(account, retry_after, &body_snippet, usage_from_headers)
+                .handle_rate_limit_with_context(
+                    account,
+                    retry_after,
+                    &body_snippet,
+                    usage_from_headers,
+                    account_selection_context,
+                )
                 .await
             {
                 Ok(decision) => Some(decision),
@@ -1900,6 +1957,15 @@ impl GatewayService {
                     None
                 }
             };
+            if account_selection_context.is_fable_quota_fallback_active()
+                && account.auth_type == AccountAuthType::Oauth
+                && !account_fable_quota_exhausted(account)
+            {
+                spawn_fable_usage_refresh(Some(FableUsageRefreshContext {
+                    account_svc: self.account_svc.clone(),
+                    account_id: account.id,
+                }));
+            }
 
             let (downstream_body, remove_transport_headers) =
                 buffered_error_body_for_downstream(body_bytes.clone(), &headers_429);
@@ -4363,6 +4429,11 @@ fn default_message_cache_control_rewrite() -> MessageCacheControlRewrite {
 /// 构造 `/v1/messages` 顶层字段顺序指纹对齐开关初始值。
 fn default_message_body_order_fingerprint_enabled() -> bool {
     parse_setting_flag(DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED)
+}
+
+/// 构造 Fable sticky 配额切换开关初始值。
+fn default_fable_sticky_quota_fallback_enabled() -> bool {
+    parse_setting_flag(DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED)
 }
 
 /// 构造预热请求拦截配置初始值(reload 之前的兜底,与设置默认值保持一致)。

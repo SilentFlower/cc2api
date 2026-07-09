@@ -35,6 +35,8 @@ pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
 pub const DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE: &str = "off";
 /// API mimicry `/v1/messages` 顶层字段顺序指纹对齐默认开启,用于贴近 2.1.195 抓包。
 pub const DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED: &str = "true";
+/// Fable 周用量明确耗尽时,粘性会话默认允许切换到其他可用账号。
+pub const DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED: &str = "true";
 /// 代理 HTTP 客户端连接池默认开启,用于复用同一代理下的底层连接。
 pub const DEFAULT_PROXY_CLIENT_POOL_ENABLED: &str = "true";
 /// 标题/`Warmup` 预热请求本地拦截默认关闭,避免升级后改变请求行为。

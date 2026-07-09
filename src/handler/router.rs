@@ -35,8 +35,9 @@ use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
-    DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -769,6 +770,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("message_body_order_fingerprint_enabled".into())
         .or_insert_with(|| DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED.to_string());
     settings
+        .entry("fable_sticky_quota_fallback_enabled".into())
+        .or_insert_with(|| DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED.to_string());
+    settings
         .entry("proxy_client_pool_enabled".into())
         .or_insert_with(|| DEFAULT_PROXY_CLIENT_POOL_ENABLED.to_string());
     settings
@@ -968,6 +972,7 @@ async fn update_settings(
         "non_stream_probe_cache_enabled",
         "stream_keepalive_enabled",
         "message_body_order_fingerprint_enabled",
+        "fable_sticky_quota_fallback_enabled",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -1047,6 +1052,12 @@ async fn update_settings(
         state
             .gateway_svc
             .reload_message_body_order_fingerprint_enabled()
+            .await?;
+    }
+    if body.contains_key("fable_sticky_quota_fallback_enabled") {
+        state
+            .gateway_svc
+            .reload_fable_sticky_quota_fallback_enabled()
             .await?;
     }
     if body.contains_key("claude_code_context_sanitizer_mode") {

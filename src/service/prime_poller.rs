@@ -309,7 +309,11 @@ impl PrimePollerService {
                         delay.as_secs()
                     );
                 }
-                Ok(RateLimitDecision::Quarantined | RateLimitDecision::PassThrough) => {}
+                Ok(
+                    RateLimitDecision::Quarantined
+                    | RateLimitDecision::RetryOtherAccount
+                    | RateLimitDecision::PassThrough,
+                ) => {}
                 Err(e) => warn!(
                     "prime poller: handle_rate_limit failed for account {}: {}",
                     account.id, e

@@ -24,6 +24,7 @@ const { show: toast } = useToast();
 const w7d = ref('0.5');
 const w5h = ref('0.3');
 const wconc = ref('0.2');
+const fableStickyQuotaFallbackEnabled = ref(true);
 
 /** 峰值预热表单 */
 const primeEnabled = ref(true);
@@ -350,6 +351,7 @@ async function loadSettings() {
     w7d.value = data.score_weight_7d ?? '0.5';
     w5h.value = data.score_weight_5h ?? '0.3';
     wconc.value = data.score_weight_concurrency ?? '0.2';
+    fableStickyQuotaFallbackEnabled.value = (data.fable_sticky_quota_fallback_enabled ?? 'true') === 'true';
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
@@ -473,6 +475,7 @@ async function saveSettings() {
       score_weight_7d: String(w7d.value),
       score_weight_5h: String(w5h.value),
       score_weight_concurrency: String(wconc.value),
+      fable_sticky_quota_fallback_enabled: fableStickyQuotaFallbackEnabled.value ? 'true' : 'false',
       peak_prime_enabled: primeEnabled.value ? 'true' : 'false',
       peak_prime_hours: primeHours.value.trim(),
       peak_prime_model: primeModel.value.trim(),
@@ -601,6 +604,23 @@ onMounted(async () => {
             权重总和: {{ totalWeight.toFixed(2) }}
             <span v-if="!isValidTotal"> (建议为 1.0)</span>
           </p>
+        </div>
+
+        <div class="border-t border-[#eee7dc] pt-4 space-y-2">
+          <div>
+            <h4 class="text-sm font-semibold text-[#29261e]">Fable 配额切换</h4>
+            <p class="text-xs text-[#8c8475] mt-1">
+              Fable 周用量明确耗尽时，允许打破粘性会话并切换到其他可用账号；RPM 饱和仍保持粘性等待。
+            </p>
+          </div>
+          <label class="inline-flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="fableStickyQuotaFallbackEnabled"
+              type="checkbox"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">{{ fableStickyQuotaFallbackEnabled ? '已启用' : '保持粘性' }}</span>
+          </label>
         </div>
       </div>
     </Card>

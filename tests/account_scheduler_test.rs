@@ -3,8 +3,8 @@ use sqlx::AnyPool;
 use std::sync::Arc;
 
 use claude_code_gateway::error::AppError;
-use claude_code_gateway::model::account::{Account, AccountStatus};
-use claude_code_gateway::service::account::AccountService;
+use claude_code_gateway::model::account::{Account, AccountAuthType, AccountStatus};
+use claude_code_gateway::service::account::{AccountSelectionContext, AccountService};
 use claude_code_gateway::store::account_store::AccountStore;
 use claude_code_gateway::store::memory::MemoryStore;
 use claude_code_gateway::store::settings_store::SettingsStore;
@@ -73,12 +73,39 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
     account
 }
 
+async fn mark_oauth_account(svc: &AccountService, account: &mut Account) {
+    account.auth_type = AccountAuthType::Oauth;
+    account.setup_token.clear();
+    account.access_token = "access-token".into();
+    account.refresh_token = "refresh-token".into();
+    account.expires_at = Some(Utc::now() + Duration::hours(1));
+    svc.update_account(account)
+        .await
+        .expect("failed to mark account as OAuth");
+}
+
 /// 避开 RPM 分钟窗口末尾，防止粘性等待测试在等待期间跨入下一分钟。
 async fn wait_for_stable_rpm_window() {
     let second = Utc::now().second();
     if second >= 52 {
         tokio::time::sleep(std::time::Duration::from_secs((61 - second) as u64)).await;
     }
+}
+
+fn fable_selection_context(enabled: bool, model: &str) -> AccountSelectionContext {
+    AccountSelectionContext {
+        fable_quota_fallback_enabled: enabled,
+        request_model: Some(model.into()),
+    }
+}
+
+fn fable_usage_window(utilization: i64, reset_offset: Duration) -> serde_json::Value {
+    serde_json::json!({
+        "seven_day_fable": {
+            "utilization": utilization,
+            "resets_at": (Utc::now() + reset_offset).to_rfc3339(),
+        }
+    })
 }
 
 // ─── 429 限流测试 ────────────────────────────────────────────
@@ -343,6 +370,222 @@ async fn test_non_sticky_selection_skips_rpm_saturated_account() {
 
     let selected = svc.select_account("", &[], &[]).await.unwrap();
     assert_eq!(selected.id, a2.id);
+}
+
+#[tokio::test]
+async fn test_fable_sticky_exhausted_selects_alternative_account() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-sticky-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "fable-sticky-free@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
+        .await
+        .unwrap();
+
+    let session_hash = "fable-sticky-full-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(selected.account.id, a2.id);
+    assert!(!selected.sticky);
+    assert!(selected.should_bind_session);
+
+    svc.bind_selected_session(session_hash, selected.account.id)
+        .await
+        .unwrap();
+    let rebound = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5[1m]"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rebound.account.id, a2.id);
+    assert!(rebound.sticky);
+}
+
+#[tokio::test]
+async fn test_fable_sticky_exhausted_without_alternative_keeps_binding() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-sticky-only@example.com").await;
+    mark_oauth_account(&svc, &mut a1).await;
+    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
+        .await
+        .unwrap();
+
+    let session_hash = "fable-sticky-only-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let result = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5"),
+        )
+        .await;
+    match result.unwrap_err() {
+        AppError::TooManyRequests(_) => {}
+        e => panic!("expected TooManyRequests, got: {:?}", e),
+    }
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(false, "claude-fable-5"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
+}
+
+#[tokio::test]
+async fn test_fable_sticky_fallback_disabled_keeps_original_sticky() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-disabled-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "fable-disabled-free@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
+        .await
+        .unwrap();
+
+    let session_hash = "fable-disabled-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(false, "claude-fable-5"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
+}
+
+#[tokio::test]
+async fn test_non_fable_sticky_ignores_fable_quota_exhaustion() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "non-fable-sticky-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "non-fable-sticky-free@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
+        .await
+        .unwrap();
+
+    let session_hash = "non-fable-sticky-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-opus-4-8"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
+}
+
+#[tokio::test]
+async fn test_setup_token_sticky_ignores_fable_quota_usage_data() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "setup-token-sticky-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "setup-token-sticky-free@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
+        .await
+        .unwrap();
+
+    let session_hash = "setup-token-sticky-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
+}
+
+#[tokio::test]
+async fn test_non_sticky_fable_selection_filters_exhausted_accounts() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-non-sticky-full@example.com").await;
+    let mut a2 = create_test_account(&svc, "fable-non-sticky-free@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            "",
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.account.id, a2.id);
+    assert!(!selected.sticky);
+    assert!(!selected.should_bind_session);
 }
 
 #[tokio::test]

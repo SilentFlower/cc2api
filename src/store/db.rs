@@ -218,6 +218,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "message_body_order_fingerprint_enabled",
             crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
         ),
+        // Fable 周用量明确耗尽时默认允许打破 sticky,避免有可用账号却持续命中满额账号。
+        (
+            "fable_sticky_quota_fallback_enabled",
+            crate::store::settings_store::DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
+        ),
         // 代理 reqwest Client 连接池默认开启,可通过设置页关闭用于排查连接复用问题。
         (
             "proxy_client_pool_enabled",
@@ -924,6 +929,23 @@ mod tests {
         assert_eq!(
             enabled,
             crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_fable_sticky_quota_fallback_default() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let enabled: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("fable_sticky_quota_fallback_enabled")
+            .fetch_one(&pool)
+            .await
+            .expect("fable sticky quota fallback setting");
+
+        assert_eq!(
+            enabled,
+            crate::store::settings_store::DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED
         );
     }
 

@@ -136,6 +136,10 @@ async fn main() {
         .await
         .expect("load message body order fingerprint setting failed");
     gateway_svc
+        .reload_fable_sticky_quota_fallback_enabled()
+        .await
+        .expect("load fable sticky quota fallback setting failed");
+    gateway_svc
         .reload_warmup_intercept_config()
         .await
         .expect("load warmup intercept config failed");

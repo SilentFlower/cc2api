@@ -38,6 +38,8 @@ pub const HAIKU_REQUEST_SLOT_UNITS: u32 = 1;
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
+/// Fable 模型级周配额只有明确达到 100% 才视为耗尽。
+const FABLE_QUOTA_EXHAUSTED_THRESHOLD: f64 = 100.0;
 /// 撞墙之外的纯速率限制请求级等待时间。瞬时 429 很快即过，只让当前请求等一小段时间再重试，
 /// 不写入账号级冷却,避免把仍可服务其他请求的账号从调度池里摘掉。
 const PURE_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -98,10 +100,44 @@ pub struct AccountRpmStatus {
 }
 
 /// 账号选择结果，携带是否命中粘性会话。
+#[derive(Debug)]
 pub struct SelectedAccount {
     pub account: Account,
     pub sticky: bool,
     pub should_bind_session: bool,
+}
+
+/// 账号选择和 429 分类需要的请求模型上下文。
+#[derive(Debug, Clone)]
+pub struct AccountSelectionContext {
+    /// 是否启用 Fable 周配额耗尽后的 sticky fallback 策略。
+    pub fable_quota_fallback_enabled: bool,
+    /// 当前请求体里的模型 ID；非 `/v1/messages` 或未解析到模型时为空。
+    pub request_model: Option<String>,
+}
+
+impl AccountSelectionContext {
+    /// 构造不启用任何模型级 fallback 的兼容上下文。
+    ///
+    /// @return 返回保持旧账号选择与 429 分类行为的上下文。
+    pub fn disabled() -> Self {
+        Self {
+            fable_quota_fallback_enabled: false,
+            request_model: None,
+        }
+    }
+
+    /// 判断当前请求是否启用 Fable 配额 fallback。
+    ///
+    /// @return 开关开启且模型 ID 属于 Fable 5 时返回 `true`。
+    pub fn is_fable_quota_fallback_active(&self) -> bool {
+        self.fable_quota_fallback_enabled
+            && self
+                .request_model
+                .as_deref()
+                .map(is_fable_quota_model_id)
+                .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +152,8 @@ enum RpmAdmissionAction {
 pub enum RateLimitDecision {
     /// 已写入账号级冷却窗口。
     Quarantined,
+    /// 当前账号对本请求模型不可用,调用方可在本轮排除该账号后尝试其他账号。
+    RetryOtherAccount,
     /// 使用进程内账号级软退避等待指定时间,账号仍保持可调度。
     RequestBackoff(Duration),
     /// 单请求级拒绝,不应隔离账号或自动重试。
@@ -130,6 +168,7 @@ struct TransientRateLimitBackoff {
 
 enum RateLimitWindowDecision {
     Quarantine(&'static str, chrono::DateTime<Utc>),
+    RetryOtherAccount(&'static str, Option<chrono::DateTime<Utc>>),
     RequestBackoff(Duration),
     PassThrough,
 }
@@ -708,6 +747,33 @@ impl AccountService {
         exclude_ids: &[i64],
         allowed_ids: &[i64],
     ) -> Result<SelectedAccount, AppError> {
+        self.select_account_with_selection_context(
+            session_hash,
+            exclude_ids,
+            allowed_ids,
+            &AccountSelectionContext::disabled(),
+        )
+        .await
+    }
+
+    /// 使用粘性会话和请求模型上下文为请求选择账号。
+    ///
+    /// @param session_hash 会话哈希；为空时不读取或写入 sticky 绑定。
+    /// @param exclude_ids 本轮需要排除的账号 ID。
+    /// @param allowed_ids 令牌允许使用的账号 ID；为空表示不限制。
+    /// @param context 当前请求模型与功能开关上下文。
+    /// @return 返回所选账号、是否命中 sticky 以及是否应在真实承载请求后绑定 session。
+    pub async fn select_account_with_selection_context(
+        &self,
+        session_hash: &str,
+        exclude_ids: &[i64],
+        allowed_ids: &[i64],
+        context: &AccountSelectionContext,
+    ) -> Result<SelectedAccount, AppError> {
+        let mut runtime_exclude_ids = exclude_ids.to_vec();
+        let fable_quota_fallback_active = context.is_fable_quota_fallback_active();
+        let mut skipped_sticky_for_fable_quota = false;
+
         // 检查粘性会话
         if !session_hash.is_empty() {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
@@ -719,24 +785,44 @@ impl AccountService {
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
                         {
-                            // 粘性命中：刷新 TTL，保持活跃会话不过期
-                            let _ = self
-                                .cache
-                                .set_session_account_id(
-                                    session_hash,
-                                    account_id,
-                                    STICKY_SESSION_TTL,
-                                )
-                                .await;
-                            return Ok(SelectedAccount {
-                                account,
-                                sticky: true,
-                                should_bind_session: false,
-                            });
+                            if fable_quota_fallback_active
+                                && account_fable_quota_exhausted(&account)
+                            {
+                                // Fable 模型级周配额耗尽只影响本轮选号；没有替代账号时保留旧 sticky。
+                                if !runtime_exclude_ids.contains(&account_id) {
+                                    runtime_exclude_ids.push(account_id);
+                                }
+                                let _ = self
+                                    .cache
+                                    .set_session_account_id(
+                                        session_hash,
+                                        account_id,
+                                        STICKY_SESSION_TTL,
+                                    )
+                                    .await;
+                                skipped_sticky_for_fable_quota = true;
+                            } else {
+                                // 粘性命中：刷新 TTL，保持活跃会话不过期
+                                let _ = self
+                                    .cache
+                                    .set_session_account_id(
+                                        session_hash,
+                                        account_id,
+                                        STICKY_SESSION_TTL,
+                                    )
+                                    .await;
+                                return Ok(SelectedAccount {
+                                    account,
+                                    sticky: true,
+                                    should_bind_session: false,
+                                });
+                            }
                         }
                     }
-                    // 过期绑定，删除
-                    let _ = self.cache.delete_session(session_hash).await;
+                    if !skipped_sticky_for_fable_quota {
+                        // 过期绑定，删除
+                        let _ = self.cache.delete_session(session_hash).await;
+                    }
                 }
             }
         }
@@ -748,10 +834,25 @@ impl AccountService {
         let mut candidates: Vec<Account> = accounts
             .into_iter()
             .filter(|a| {
-                !exclude_ids.contains(&a.id)
+                !runtime_exclude_ids.contains(&a.id)
                     && (allowed_ids.is_empty() || allowed_ids.contains(&a.id))
             })
             .collect();
+
+        if fable_quota_fallback_active {
+            let fable_available: Vec<Account> = candidates
+                .iter()
+                .filter(|account| !account_fable_quota_exhausted(account))
+                .cloned()
+                .collect();
+            if !fable_available.is_empty() {
+                candidates = fable_available;
+            } else if !candidates.is_empty() || skipped_sticky_for_fable_quota {
+                return Err(AppError::TooManyRequests(
+                    "所有可用账号的 Fable 周用量均已耗尽".into(),
+                ));
+            }
+        }
 
         // 新会话优先避开当前分钟 RPM 已满账号；若全部已满，保留候选交给后续 admission 等待/拒绝。
         let rpm_available = self.filter_rpm_available(&candidates).await;
@@ -760,6 +861,11 @@ impl AccountService {
         }
 
         if candidates.is_empty() {
+            if skipped_sticky_for_fable_quota {
+                return Err(AppError::TooManyRequests(
+                    "Fable 周用量已耗尽,暂无可切换账号".into(),
+                ));
+            }
             return Err(AppError::ServiceUnavailable("no available accounts".into()));
         }
 
@@ -1211,7 +1317,33 @@ impl AccountService {
         body: &str,
         usage: Option<serde_json::Value>,
     ) -> Result<RateLimitDecision, AppError> {
-        match Self::determine_rate_limit_window(account, retry_after_secs, body, usage) {
+        self.handle_rate_limit_with_context(
+            account,
+            retry_after_secs,
+            body,
+            usage,
+            &AccountSelectionContext::disabled(),
+        )
+        .await
+    }
+
+    /// 按请求模型上下文处理上游返回 429 的情况。
+    ///
+    /// @param account 当前请求使用的账号。
+    /// @param retry_after_secs 上游 `retry-after` 秒数。
+    /// @param body 上游 429 响应体文本。
+    /// @param usage 从响应头被动提取的用量窗口。
+    /// @param context 当前请求模型与功能开关上下文。
+    /// @return 返回账号级隔离、模型级换号、请求级软退避或透传决策。
+    pub async fn handle_rate_limit_with_context(
+        &self,
+        account: &Account,
+        retry_after_secs: Option<i64>,
+        body: &str,
+        usage: Option<serde_json::Value>,
+        context: &AccountSelectionContext,
+    ) -> Result<RateLimitDecision, AppError> {
+        match Self::determine_rate_limit_window(account, retry_after_secs, body, usage, context) {
             RateLimitWindowDecision::Quarantine(reason, reset_at) => {
                 warn!(
                     "account {} rate limited ({}) until {}",
@@ -1228,6 +1360,22 @@ impl AccountService {
                     )
                     .await?;
                 Ok(RateLimitDecision::Quarantined)
+            }
+            RateLimitWindowDecision::RetryOtherAccount(reason, reset_at) => {
+                if let Some(reset_at) = reset_at {
+                    warn!(
+                        "account {} unavailable for current model ({} until {}), retrying another account without global quarantine",
+                        account.id,
+                        reason,
+                        reset_at.to_rfc3339()
+                    );
+                } else {
+                    warn!(
+                        "account {} unavailable for current model ({}), retrying another account without global quarantine",
+                        account.id, reason
+                    );
+                }
+                Ok(RateLimitDecision::RetryOtherAccount)
             }
             RateLimitWindowDecision::RequestBackoff(delay) => {
                 warn!(
@@ -1260,6 +1408,7 @@ impl AccountService {
         retry_after_secs: Option<i64>,
         body: &str,
         usage: Option<serde_json::Value>,
+        context: &AccountSelectionContext,
     ) -> RateLimitWindowDecision {
         let now = Utc::now();
 
@@ -1272,6 +1421,25 @@ impl AccountService {
                 "429 速率限制（retry-after）",
                 now + chrono::Duration::seconds(capped),
             );
+        }
+
+        if context.is_fable_quota_fallback_active() && account.auth_type == AccountAuthType::Oauth {
+            let usage_for_common = usage.clone().unwrap_or_else(|| account.usage_data.clone());
+            match classify_rate_limit(&usage_for_common, USAGE_HIT_THRESHOLD) {
+                Some(RateLimitWindow::SevenDay(reset_at)) => {
+                    return RateLimitWindowDecision::Quarantine("周限额已满", reset_at);
+                }
+                Some(RateLimitWindow::FiveHour(reset_at)) => {
+                    return RateLimitWindowDecision::Quarantine("5 小时限额已满", reset_at);
+                }
+                None => {}
+            }
+
+            let fable_reset_at = usage
+                .as_ref()
+                .and_then(fable_quota_reset_at)
+                .or_else(|| fable_quota_reset_at(&account.usage_data));
+            return RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", fable_reset_at);
         }
 
         // 2) 计费/权限类拒绝（无 retry-after）:长上下文需 usage credits、额度不足等。
@@ -1556,6 +1724,24 @@ fn check_usage_window(
         return None;
     }
     Some(dt)
+}
+
+fn is_fable_quota_model_id(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model == "claude-fable-5" || model.starts_with("claude-fable-5[")
+}
+
+/// 判断账号缓存中的 Fable 周配额是否明确耗尽。
+///
+/// @param account 待判断的账号。
+/// @return `seven_day_fable.utilization >= 100` 且 `resets_at` 在未来时返回 `true`。
+pub(crate) fn account_fable_quota_exhausted(account: &Account) -> bool {
+    account.auth_type == AccountAuthType::Oauth
+        && fable_quota_reset_at(&account.usage_data).is_some()
+}
+
+fn fable_quota_reset_at(usage: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
+    check_usage_window(usage, "seven_day_fable", FABLE_QUOTA_EXHAUSTED_THRESHOLD)
 }
 
 fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
@@ -2304,7 +2490,13 @@ mod tests {
     fn transient_429_uses_request_backoff_without_account_quarantine() {
         let account = test_account_with_usage(json!({}));
 
-        match AccountService::determine_rate_limit_window(&account, None, "rate limited", None) {
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "rate limited",
+            None,
+            &AccountSelectionContext::disabled(),
+        ) {
             RateLimitWindowDecision::RequestBackoff(delay) => {
                 assert_eq!(delay, PURE_RATE_LIMIT_RETRY_DELAY);
             }
@@ -2321,9 +2513,100 @@ mod tests {
             None,
             "This request requires long context usage credits",
             None,
+            &AccountSelectionContext::disabled(),
         ) {
             RateLimitWindowDecision::PassThrough => {}
             _ => panic!("expected pass-through decision"),
+        }
+    }
+
+    #[test]
+    fn fable_429_with_cached_fable_quota_hit_retries_other_account_before_credit_passthrough() {
+        let account = test_account_with_usage(json!({
+            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+        }));
+        let context = AccountSelectionContext {
+            fable_quota_fallback_enabled: true,
+            request_model: Some("claude-fable-5".into()),
+        };
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "This request requires fallback credits",
+            None,
+            &context,
+        ) {
+            RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", Some(_)) => {}
+            _ => panic!("expected fable model-level retry decision"),
+        }
+    }
+
+    #[test]
+    fn fable_429_without_cached_quota_hit_still_retries_other_account() {
+        let account = test_account_with_usage(json!({
+            "seven_day_fable": make_window(json!(99), &rfc3339_at(ChronoDuration::days(3))),
+        }));
+        let context = AccountSelectionContext {
+            fable_quota_fallback_enabled: true,
+            request_model: Some("claude-fable-5[1m]".into()),
+        };
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "rate limited",
+            None,
+            &context,
+        ) {
+            RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", None) => {}
+            _ => panic!("expected fable retry decision without cached reset"),
+        }
+    }
+
+    #[test]
+    fn fable_429_keeps_common_usage_quarantine_when_common_window_hit() {
+        let account = test_account_with_usage(json!({
+            "seven_day": make_window(json!(100), &rfc3339_at(ChronoDuration::days(5))),
+            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+        }));
+        let context = AccountSelectionContext {
+            fable_quota_fallback_enabled: true,
+            request_model: Some("claude-fable-5".into()),
+        };
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "rate limited",
+            None,
+            &context,
+        ) {
+            RateLimitWindowDecision::Quarantine("周限额已满", _) => {}
+            _ => panic!("expected common seven-day quarantine"),
+        }
+    }
+
+    #[test]
+    fn setup_token_fable_429_keeps_legacy_credit_passthrough() {
+        let mut account = test_account_with_usage(json!({
+            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+        }));
+        account.auth_type = AccountAuthType::SetupToken;
+        let context = AccountSelectionContext {
+            fable_quota_fallback_enabled: true,
+            request_model: Some("claude-fable-5".into()),
+        };
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "This request requires fallback credits",
+            None,
+            &context,
+        ) {
+            RateLimitWindowDecision::PassThrough => {}
+            _ => panic!("expected setup token credit pass-through"),
         }
     }
 
