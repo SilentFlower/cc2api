@@ -19,6 +19,7 @@ use crate::service::version_profile::{
     STAINLESS_PACKAGE_VERSION, TelemetryShape, claude_cli_user_agent, claude_code_user_agent,
     is_event_logging_path, normalize_version, profile_for_version,
 };
+use crate::store::cache::UpstreamSessionPoolResolve;
 
 /// header wire 大小写映射。
 /// Go 的 HTTP 服务器规范化 header，此映射还原 Claude CLI 抓包原始大小写。
@@ -86,6 +87,15 @@ impl ClientType {
             Self::API => "api",
         }
     }
+}
+
+/// 上游 session 改写上下文。
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamSessionRewrite {
+    /// `/v1/messages` 主请求的 session 改写结果。
+    pub message: Option<UpstreamSessionPoolResolve>,
+    /// event_logging 等遥测请求的只读 session 映射表。
+    pub telemetry_session_map: HashMap<String, String>,
 }
 
 const API_MAX_TOKENS_LIMIT: u64 = 64000;
@@ -1194,6 +1204,7 @@ impl Rewriter {
             message_cache_rewrite,
             message_body_order_fingerprint_enabled,
             &DisabledThinkingRewrite::off(),
+            &UpstreamSessionRewrite::default(),
             ClaudeCodeContextSanitizerConfig::off(),
         );
         self.complete_stateful_cache(completion);
@@ -1211,6 +1222,7 @@ impl Rewriter {
     /// @param message_cache_rewrite message cache_control 断点改写配置。
     /// @param message_body_order_fingerprint_enabled 是否对 API mimicry 生成的 `/v1/messages` 顶层字段按 Claude Code 画像排序。
     /// @param disabled_thinking_rewrite `thinking.type=disabled` 兼容改写配置。
+    /// @param upstream_session_rewrite 上游 session 改写上下文。
     /// @return 改写后的 body 与可选 stateful 延迟提交句柄。
     pub fn rewrite_body_with_stateful_completion(
         &self,
@@ -1223,6 +1235,7 @@ impl Rewriter {
         message_cache_rewrite: MessageCacheControlRewrite,
         message_body_order_fingerprint_enabled: bool,
         disabled_thinking_rewrite: &DisabledThinkingRewrite,
+        upstream_session_rewrite: &UpstreamSessionRewrite,
         context_sanitizer_config: ClaudeCodeContextSanitizerConfig,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         self.rewrite_body_inner(
@@ -1235,6 +1248,7 @@ impl Rewriter {
             message_cache_rewrite,
             message_body_order_fingerprint_enabled,
             disabled_thinking_rewrite,
+            upstream_session_rewrite,
             context_sanitizer_config,
         )
     }
@@ -1301,6 +1315,7 @@ impl Rewriter {
         message_cache_rewrite: MessageCacheControlRewrite,
         message_body_order_fingerprint_enabled: bool,
         disabled_thinking_rewrite: &DisabledThinkingRewrite,
+        upstream_session_rewrite: &UpstreamSessionRewrite,
         context_sanitizer_config: ClaudeCodeContextSanitizerConfig,
     ) -> (Vec<u8>, Option<StatefulCacheCompletion>) {
         if body.is_empty() {
@@ -1320,6 +1335,7 @@ impl Rewriter {
                 account,
                 client_type,
                 env_pt,
+                upstream_session_rewrite,
                 context_sanitizer_config,
             );
             stateful_completion = self.rewrite_message_cache_control(
@@ -1327,6 +1343,10 @@ impl Rewriter {
                 account,
                 client_type,
                 message_cache_rewrite,
+                upstream_session_rewrite
+                    .message
+                    .as_ref()
+                    .map(|resolved| resolved.real_session_id.as_str()),
             );
             rewrite_existing_ephemeral_cache_control_ttl(&mut parsed, cache_ttl_rewrite);
             rewrite_disabled_thinking_to_adaptive(&mut parsed, disabled_thinking_rewrite);
@@ -1335,7 +1355,11 @@ impl Rewriter {
                 order_message_body_top_level_fields(&mut parsed);
             }
         } else if is_event_logging_path(path) {
-            self.rewrite_event_batch(&mut parsed, account);
+            self.rewrite_event_batch(
+                &mut parsed,
+                account,
+                &upstream_session_rewrite.telemetry_session_map,
+            );
         } else if path.starts_with("/api/eval/") {
             self.rewrite_growthbook_eval(&mut parsed, account);
         } else {
@@ -1385,13 +1409,18 @@ impl Rewriter {
         account: &Account,
         client_type: ClientType,
         env_pt: EnvPassthrough,
+        upstream_session_rewrite: &UpstreamSessionRewrite,
         context_sanitizer_config: ClaudeCodeContextSanitizerConfig,
     ) {
         let profile = device_profile(account);
 
         if client_type == ClientType::ClaudeCode {
             // 替换模式
-            self.rewrite_metadata_user_id(body, &profile);
+            self.rewrite_metadata_user_id(
+                body,
+                &profile,
+                upstream_session_rewrite.message.as_ref(),
+            );
             self.rewrite_system_prompt(
                 body,
                 &profile.prompt,
@@ -1432,7 +1461,12 @@ impl Rewriter {
     }
 
     /// 替换已有 metadata.user_id 中的设备与账号身份（CC 客户端模式）。
-    fn rewrite_metadata_user_id(&self, body: &mut serde_json::Value, profile: &DeviceProfile) {
+    fn rewrite_metadata_user_id(
+        &self,
+        body: &mut serde_json::Value,
+        profile: &DeviceProfile,
+        upstream_session: Option<&UpstreamSessionPoolResolve>,
+    ) {
         let user_id_str = {
             let metadata = match body.get("metadata").and_then(|m| m.as_object()) {
                 Some(m) => m,
@@ -1455,6 +1489,14 @@ impl Rewriter {
                     "account_uuid".into(),
                     serde_json::Value::String(profile.account_uuid.clone()),
                 );
+                if let Some(upstream_session_id) =
+                    upstream_session.and_then(|resolved| resolved.upstream_session_id.as_ref())
+                {
+                    obj.insert(
+                        "session_id".into(),
+                        serde_json::Value::String(upstream_session_id.clone()),
+                    );
+                }
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                     metadata.insert("user_id".into(), serde_json::Value::String(new_str));
@@ -1467,11 +1509,12 @@ impl Rewriter {
         if let Some(account_idx) = user_id_str.find("_account_") {
             let account_tail = &user_id_str[account_idx + 9..];
             let new_val = if let Some(session_idx) = account_tail.find("_session_") {
+                let session_id = upstream_session
+                    .and_then(|resolved| resolved.upstream_session_id.as_deref())
+                    .unwrap_or(&account_tail[session_idx + 9..]);
                 format!(
                     "user_{}_account_{}_session_{}",
-                    profile.device_id,
-                    profile.account_uuid,
-                    &account_tail[session_idx + 9..]
+                    profile.device_id, profile.account_uuid, session_id
                 )
             } else {
                 format!("user_{}_account_{}", profile.device_id, account_tail)
@@ -1681,13 +1724,18 @@ impl Rewriter {
 
     // --- 事件日志批量改写 ---
 
-    fn rewrite_event_batch(&self, body: &mut serde_json::Value, account: &Account) {
+    fn rewrite_event_batch(
+        &self,
+        body: &mut serde_json::Value,
+        account: &Account,
+        telemetry_session_map: &HashMap<String, String>,
+    ) {
         let profile = device_profile(account);
         let telemetry_shape = profile_for_version(&profile.env.version).telemetry.shape;
 
-        let events = match body.get_mut("events").and_then(|e| e.as_array_mut()) {
-            Some(e) => e,
-            None => return,
+        let Some(events) = body.get_mut("events").and_then(|e| e.as_array_mut()) else {
+            rewrite_session_fields_recursive(body, telemetry_session_map);
+            return;
         };
 
         let canonical_env = build_event_env_map(&profile, telemetry_shape);
@@ -1701,8 +1749,13 @@ impl Rewriter {
             rewrite_event_fields(e, &profile, telemetry_shape, &canonical_env);
             if let Some(event_data) = e.get_mut("event_data").and_then(|v| v.as_object_mut()) {
                 rewrite_event_fields(event_data, &profile, telemetry_shape, &canonical_env);
+                rewrite_session_fields_in_map(event_data, telemetry_session_map);
             }
+            rewrite_session_fields_in_map(e, telemetry_session_map);
         }
+        // 部分 event_logging 变体会把 session 字段放在 batch 根级或更深层结构里；
+        // 最后做一次全量递归，只替换明确命名的 session 字段，避免遥测绕过池映射。
+        rewrite_session_fields_recursive(body, telemetry_session_map);
     }
 
     // --- GrowthBook remoteEval 改写 (POST /api/eval/{clientKey}) ---
@@ -2208,6 +2261,81 @@ fn build_event_env_map(profile: &DeviceProfile, shape: TelemetryShape) -> serde_
     env_obj
 }
 
+/// 收集遥测 payload 中明确的 session 字段值。
+///
+/// @param body 已解析的 event_logging 请求体。
+/// @return 去重后的 session id 列表。
+pub fn collect_telemetry_session_ids(body: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_telemetry_session_ids_inner(body, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_telemetry_session_ids_inner(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if is_explicit_session_field(key) {
+                    if let Some(session_id) =
+                        child.as_str().filter(|session_id| !session_id.is_empty())
+                    {
+                        out.push(session_id.to_string());
+                    }
+                }
+                collect_telemetry_session_ids_inner(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_telemetry_session_ids_inner(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_session_fields_in_map(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    telemetry_session_map: &HashMap<String, String>,
+) {
+    if telemetry_session_map.is_empty() {
+        return;
+    }
+    for (key, value) in map.iter_mut() {
+        if is_explicit_session_field(key) {
+            if let Some(current) = value.as_str() {
+                if let Some(mapped) = telemetry_session_map.get(current) {
+                    *value = serde_json::Value::String(mapped.clone());
+                    continue;
+                }
+            }
+        }
+        rewrite_session_fields_recursive(value, telemetry_session_map);
+    }
+}
+
+fn rewrite_session_fields_recursive(
+    value: &mut serde_json::Value,
+    telemetry_session_map: &HashMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => rewrite_session_fields_in_map(map, telemetry_session_map),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_session_fields_recursive(item, telemetry_session_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_explicit_session_field(key: &str) -> bool {
+    let normalized = key.replace(['-', '_'], "").to_ascii_lowercase();
+    matches!(normalized.as_str(), "sessionid" | "parentsessionid")
+}
+
 /// 改写 event_logging 事件字段，兼容旧顶层结构和 2.1.156 的 event_data 结构。
 fn rewrite_event_fields(
     map: &mut serde_json::Map<String, serde_json::Value>,
@@ -2496,6 +2624,7 @@ impl Rewriter {
         account: &Account,
         client_type: ClientType,
         mode: MessageCacheControlRewrite,
+        real_session_id_override: Option<&str>,
     ) -> Option<StatefulCacheCompletion> {
         if client_type == ClientType::API {
             match mode {
@@ -2526,7 +2655,11 @@ impl Rewriter {
             MessageCacheControlRewrite::Stateful => {
                 stabilize_claude_code_cache_prefix(body);
                 strip_cache_control_for_message_rewrite(body, client_type);
-                return self.add_stateful_message_cache_control(body, account);
+                return self.add_stateful_message_cache_control(
+                    body,
+                    account,
+                    real_session_id_override,
+                );
             }
             MessageCacheControlRewrite::Sub2api => {
                 strip_message_cache_control(body);
@@ -2544,8 +2677,9 @@ impl Rewriter {
         &self,
         body: &mut serde_json::Value,
         account: &Account,
+        real_session_id_override: Option<&str>,
     ) -> Option<StatefulCacheCompletion> {
-        let session_key = stateful_session_key(account, body);
+        let session_key = stateful_session_key(account, body, real_session_id_override);
         let profile = compute_stateful_request_profile(body);
         let snapshot = session_key.as_ref().and_then(|key| {
             self.stateful_cache
@@ -2575,10 +2709,14 @@ impl Rewriter {
         let selected_diagnostics =
             stateful_selected_cache_diagnostics(body, &outcome, snapshot.as_ref());
         let prefix_diagnostics = cache_prefix_diagnostics(body);
+        let session_key_log = session_key
+            .as_deref()
+            .map(|key| short_hash(&hash_text(key)))
+            .unwrap_or_else(|| "missing".to_string());
         info!(
             target: "cc2api::cache",
             mode = "stateful",
-            session = session_key.as_deref().unwrap_or("missing"),
+            session = session_key_log.as_str(),
             request_class = outcome.request_class.as_str(),
             available_slots = outcome.available_slots,
             block_count = outcome.message_content_blocks,
@@ -4155,8 +4293,14 @@ fn hash_text(text: &str) -> String {
 }
 
 /// 提取 stateful 会话缓存 key。
-fn stateful_session_key(account: &Account, body: &serde_json::Value) -> Option<String> {
-    let session_id = extract_claude_code_session_id(body)?;
+fn stateful_session_key(
+    account: &Account,
+    body: &serde_json::Value,
+    real_session_id_override: Option<&str>,
+) -> Option<String> {
+    let session_id = real_session_id_override
+        .map(str::to_string)
+        .or_else(|| extract_claude_code_session_id(body))?;
     Some(format!("{}:{}", account.id, session_id))
 }
 
@@ -5233,13 +5377,15 @@ mod tests {
     use super::{
         CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClaudeCodeContextSanitizerMode,
         ClientType, DisabledThinkingRewrite, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
-        cch_attestation_input, cch_attestation_seed, compute_cc_version_suffix,
-        compute_cch_attestation, extract_first_user_message, matches_1m_whitelist,
-        ordered_anthropic_headers, strip_beta_token,
+        UpstreamSessionRewrite, cch_attestation_input, cch_attestation_seed,
+        compute_cc_version_suffix, compute_cch_attestation, extract_first_user_message,
+        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
         CanonicalProcessData, CanonicalPromptEnvData, DEFAULT_ALLOW_1M_MODELS,
+        DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+        DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
@@ -5249,9 +5395,11 @@ mod tests {
         STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json, claude_cli_user_agent,
         claude_code_user_agent, profile_for_key,
     };
+    use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
+    use std::collections::HashMap;
 
     const CTX_1M: &str = "context-1m-2025-08-07";
 
@@ -5316,6 +5464,10 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            upstream_session_pool_enabled: false,
+            upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+            upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+            upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,
@@ -5329,6 +5481,23 @@ mod tests {
         let profile = profile_for_key(key).expect("profile");
         apply_identity_to_env_json(&mut account.canonical_env, &profile.identity);
         account
+    }
+
+    fn upstream_session_rewrite(
+        real_session_id: &str,
+        upstream_session_id: &str,
+    ) -> UpstreamSessionRewrite {
+        UpstreamSessionRewrite {
+            message: Some(UpstreamSessionPoolResolve {
+                real_session_id: real_session_id.to_string(),
+                upstream_session_id: Some(upstream_session_id.to_string()),
+                action: UpstreamSessionPoolAction::Mapped,
+                active_count: 1,
+                oldest_last_seen_ms: None,
+                newest_last_seen_ms: None,
+            }),
+            telemetry_session_map: HashMap::new(),
+        }
     }
 
     fn rewrite_messages_body(
@@ -5393,6 +5562,7 @@ mod tests {
             MessageCacheControlRewrite::Off,
             true,
             &disabled_thinking_rewrite,
+            &UpstreamSessionRewrite::default(),
             ClaudeCodeContextSanitizerConfig::off(),
         );
         serde_json::from_slice(&out).unwrap()
@@ -5415,6 +5585,7 @@ mod tests {
             MessageCacheControlRewrite::Off,
             true,
             &DisabledThinkingRewrite::off(),
+            &UpstreamSessionRewrite::default(),
             ClaudeCodeContextSanitizerConfig { mode },
         );
         serde_json::from_slice(&out).unwrap()
@@ -5456,6 +5627,7 @@ mod tests {
             MessageCacheControlRewrite::Stateful,
             true,
             &DisabledThinkingRewrite::off(),
+            &UpstreamSessionRewrite::default(),
             ClaudeCodeContextSanitizerConfig::off(),
         );
         (serde_json::from_slice(&out).unwrap(), completion)
@@ -5708,6 +5880,7 @@ mod tests {
                 enabled: true,
                 models: vec!["claude-fable-5".into()],
             },
+            &UpstreamSessionRewrite::default(),
             ClaudeCodeContextSanitizerConfig::off(),
         );
         let text = String::from_utf8(out.clone()).unwrap();
@@ -8834,6 +9007,197 @@ mod tests {
         assert_eq!(
             super::extract_session_id_from_body(&parsed).as_deref(),
             Some("session-keep")
+        );
+    }
+
+    #[test]
+    fn upstream_session_override_rewrites_json_metadata_session() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "client-device",
+                    "account_uuid": "client-account",
+                    "session_id": "real-session"
+                }).to_string()
+            },
+            "messages": []
+        });
+
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+            &DisabledThinkingRewrite::off(),
+            &upstream_session_rewrite("real-session", "upstream-session"),
+            ClaudeCodeContextSanitizerConfig::off(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            super::extract_session_id_from_body(&parsed).as_deref(),
+            Some("upstream-session")
+        );
+    }
+
+    #[test]
+    fn upstream_session_override_rewrites_legacy_metadata_session() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "metadata": {
+                "user_id": "user_client-device_account_client-account_session_real-session"
+            },
+            "messages": []
+        });
+
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+            &DisabledThinkingRewrite::off(),
+            &upstream_session_rewrite("real-session", "upstream-session"),
+            ClaudeCodeContextSanitizerConfig::off(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            super::extract_session_id_from_body(&parsed).as_deref(),
+            Some("upstream-session")
+        );
+    }
+
+    #[test]
+    fn upstream_session_override_keeps_stateful_cache_key_on_real_session() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = stateful_session_body("real-session", 60);
+
+        let (out, completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Stateful,
+            true,
+            &DisabledThinkingRewrite::off(),
+            &upstream_session_rewrite("real-session", "upstream-session"),
+            ClaudeCodeContextSanitizerConfig::off(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let completion = completion.expect("stateful completion");
+
+        assert_eq!(
+            super::extract_session_id_from_body(&parsed).as_deref(),
+            Some("upstream-session")
+        );
+        assert_eq!(completion.key, format!("{}:real-session", account.id));
+    }
+
+    #[test]
+    fn event_logging_session_fields_use_read_only_upstream_mapping() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut session_map = HashMap::new();
+        session_map.insert("real-session".to_string(), "upstream-session".to_string());
+        let rewrite = UpstreamSessionRewrite {
+            message: None,
+            telemetry_session_map: session_map,
+        };
+        let body = json!({
+            "session_id": "real-session",
+            "metadata": {
+                "parentSessionId": "real-session"
+            },
+            "events": [{
+                "session_id": "real-session",
+                "event_data": {
+                    "parent_session_id": "real-session",
+                    "nested": { "sessionId": "real-session" }
+                }
+            }]
+        });
+
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+            &DisabledThinkingRewrite::off(),
+            &rewrite,
+            ClaudeCodeContextSanitizerConfig::off(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed["session_id"], json!("upstream-session"));
+        assert_eq!(
+            parsed["metadata"]["parentSessionId"],
+            json!("upstream-session")
+        );
+        assert_eq!(parsed["events"][0]["session_id"], json!("upstream-session"));
+        assert_eq!(
+            parsed["events"][0]["event_data"]["parent_session_id"],
+            json!("upstream-session")
+        );
+        assert_eq!(
+            parsed["events"][0]["event_data"]["nested"]["sessionId"],
+            json!("upstream-session")
+        );
+    }
+
+    #[test]
+    fn event_logging_session_fields_rewrite_without_events_array() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut session_map = HashMap::new();
+        session_map.insert("real-session".to_string(), "upstream-session".to_string());
+        let rewrite = UpstreamSessionRewrite {
+            message: None,
+            telemetry_session_map: session_map,
+        };
+        let body = json!({
+            "session_id": "real-session",
+            "metadata": {
+                "parentSessionId": "real-session"
+            }
+        });
+
+        let (out, _completion) = rewriter.rewrite_body_with_stateful_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+            &DisabledThinkingRewrite::off(),
+            &rewrite,
+            ClaudeCodeContextSanitizerConfig::off(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed["session_id"], json!("upstream-session"));
+        assert_eq!(
+            parsed["metadata"]["parentSessionId"],
+            json!("upstream-session")
         );
     }
 

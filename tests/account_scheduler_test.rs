@@ -3,7 +3,10 @@ use sqlx::AnyPool;
 use std::sync::Arc;
 
 use claude_code_gateway::error::AppError;
-use claude_code_gateway::model::account::{Account, AccountAuthType, AccountStatus};
+use claude_code_gateway::model::account::{
+    Account, AccountAuthType, AccountStatus, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+};
 use claude_code_gateway::service::account::{AccountSelectionContext, AccountService};
 use claude_code_gateway::store::account_store::AccountStore;
 use claude_code_gateway::store::memory::MemoryStore;
@@ -61,6 +64,10 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
         auto_telemetry: false,
         auto_poll_usage: false,
         allow_1m_models: "opus".into(),
+        upstream_session_pool_enabled: false,
+        upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+        upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+        upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,

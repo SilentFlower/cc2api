@@ -5,7 +5,10 @@ use sqlx::Row;
 use sqlx::any::AnyRow;
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountStatus, DEFAULT_ALLOW_1M_MODELS};
+use crate::model::account::{
+    Account, AccountStatus, DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+};
 use crate::service::version_profile::IdentityProfile;
 
 pub struct AccountStore {
@@ -126,6 +129,19 @@ impl AccountStore {
             allow_1m_models: row
                 .try_get::<String, _>("allow_1m_models")
                 .unwrap_or_else(|_| DEFAULT_ALLOW_1M_MODELS.into()),
+            upstream_session_pool_enabled: row
+                .try_get::<i32, _>("upstream_session_pool_enabled")
+                .unwrap_or(0)
+                != 0,
+            upstream_session_pool_size: row
+                .try_get::<i32, _>("upstream_session_pool_size")
+                .unwrap_or(DEFAULT_UPSTREAM_SESSION_POOL_SIZE),
+            upstream_session_ttl_minutes: row
+                .try_get::<i32, _>("upstream_session_ttl_minutes")
+                .unwrap_or(DEFAULT_UPSTREAM_SESSION_TTL_MINUTES),
+            upstream_session_refresh_policy: row
+                .try_get::<String, _>("upstream_session_refresh_policy")
+                .unwrap_or_else(|_| DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into()),
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),
@@ -157,13 +173,20 @@ impl AccountStore {
 
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let auto_poll_usage_int: i32 = if a.auto_poll_usage { 1 } else { 0 };
+        let upstream_session_pool_enabled_int: i32 = if a.upstream_session_pool_enabled {
+            1
+        } else {
+            0
+        };
         let q = format!(
             r#"INSERT INTO accounts (name, email, status, token, proxy_url,
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
-                concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+                concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models,
+                upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
+                upstream_session_refresh_policy)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
             RETURNING id, created_at, updated_at"#,
             self.ts(9),
             self.ts(10),
@@ -195,6 +218,10 @@ impl AccountStore {
             .bind(auto_telemetry_int)
             .bind(auto_poll_usage_int)
             .bind(&a.allow_1m_models)
+            .bind(upstream_session_pool_enabled_int)
+            .bind(a.upstream_session_pool_size)
+            .bind(a.upstream_session_ttl_minutes)
+            .bind(&a.upstream_session_refresh_policy)
             .fetch_one(&self.pool)
             .await?;
 
@@ -209,13 +236,20 @@ impl AccountStore {
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let auto_poll_usage_int: i32 = if a.auto_poll_usage { 1 } else { 0 };
+        let upstream_session_pool_enabled_int: i32 = if a.upstream_session_pool_enabled {
+            1
+        } else {
+            0
+        };
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid=$13, organization_uuid=$14, subscription_type=$15,
-                concurrency=$16, priority=$17, rpm_limit=$18, auto_telemetry=$19, auto_poll_usage=$20, allow_1m_models=$21, updated_at={}
-            WHERE id=$22"#,
+                concurrency=$16, priority=$17, rpm_limit=$18, auto_telemetry=$19, auto_poll_usage=$20,
+                allow_1m_models=$21, upstream_session_pool_enabled=$22, upstream_session_pool_size=$23,
+                upstream_session_ttl_minutes=$24, upstream_session_refresh_policy=$25, updated_at={}
+            WHERE id=$26"#,
             self.ts(8),
             self.ts(9),
             self.now_expr()
@@ -242,6 +276,10 @@ impl AccountStore {
             .bind(auto_telemetry_int)
             .bind(auto_poll_usage_int)
             .bind(&a.allow_1m_models)
+            .bind(upstream_session_pool_enabled_int)
+            .bind(a.upstream_session_pool_size)
+            .bind(a.upstream_session_ttl_minutes)
+            .bind(&a.upstream_session_refresh_policy)
             .bind(a.id)
             .execute(&self.pool)
             .await?;
@@ -517,7 +555,9 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rpm_limit, rate_limited_at, rate_limit_reset_at,
-    disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models, telemetry_count,
+    disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models,
+    upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
+    upstream_session_refresh_policy, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
 
 #[cfg(test)]

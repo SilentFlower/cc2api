@@ -1992,6 +1992,8 @@ mod tests {
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
         CanonicalProcessData, CanonicalPromptEnvData, DEFAULT_ALLOW_1M_MODELS,
+        DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+        DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
     use crate::model::identity::run_profile;
     use crate::service::rewriter::ordered_anthropic_headers;
@@ -2056,6 +2058,10 @@ mod tests {
             auto_telemetry: true,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            upstream_session_pool_enabled: false,
+            upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+            upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+            upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,

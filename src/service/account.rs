@@ -11,13 +11,19 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountAuthType};
+use crate::model::account::{
+    Account, AccountAuthType, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, MAX_UPSTREAM_SESSION_POOL_SIZE,
+    MAX_UPSTREAM_SESSION_TTL_MINUTES, MIN_UPSTREAM_SESSION_TTL_MINUTES,
+};
 use crate::service::rewriter::ClientType;
 use crate::service::version_profile::{
     apply_identity_to_env_json, default_profile, profile_for_key,
 };
 use crate::store::account_store::AccountStore;
-use crate::store::cache::CacheStore;
+use crate::store::cache::{
+    CacheStore, UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
+};
 
 const STICKY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
@@ -554,6 +560,7 @@ impl AccountService {
         }
 
         normalize_account_auth(a)?;
+        normalize_upstream_session_pool_config(a)?;
 
         self.store.create(a).await
     }
@@ -581,6 +588,7 @@ impl AccountService {
     pub async fn update_account(&self, a: &Account) -> Result<(), AppError> {
         let mut normalized = a.clone();
         normalize_account_auth(&mut normalized)?;
+        normalize_upstream_session_pool_config(&mut normalized)?;
         self.store.update(&normalized).await
     }
 
@@ -604,6 +612,71 @@ impl AccountService {
         let total = self.store.count().await?;
         let accounts = self.store.list_paged(page, page_size).await?;
         Ok((accounts, total))
+    }
+
+    /// 解析账号级上游 session 池。
+    ///
+    /// @param account 当前账号配置。
+    /// @param real_session_id 真实下游 Claude Code session。
+    /// @param allow_insert 是否允许主请求创建新池成员；遥测路径必须传 `false`。
+    /// @return 功能关闭或 session 为空时返回 `Ok(None)`；否则返回池解析结果。
+    pub async fn resolve_upstream_session_pool(
+        &self,
+        account: &Account,
+        real_session_id: &str,
+        allow_insert: bool,
+    ) -> Result<Option<UpstreamSessionPoolResolve>, AppError> {
+        if real_session_id.trim().is_empty()
+            || !account.upstream_session_pool_enabled
+            || account.upstream_session_pool_size <= 0
+        {
+            return Ok(None);
+        }
+        let policy = UpstreamSessionRefreshPolicy::parse(&account.upstream_session_refresh_policy)
+            .unwrap_or(UpstreamSessionRefreshPolicy::MappedRequest);
+        let ttl_minutes = account.upstream_session_ttl_minutes.clamp(
+            MIN_UPSTREAM_SESSION_TTL_MINUTES,
+            MAX_UPSTREAM_SESSION_TTL_MINUTES,
+        );
+        let ttl = Duration::from_secs((ttl_minutes as u64) * 60);
+        self.cache
+            .resolve_upstream_session_pool(
+                account.id,
+                real_session_id,
+                account.upstream_session_pool_size,
+                ttl,
+                policy,
+                allow_insert,
+            )
+            .await
+            .map(Some)
+    }
+
+    /// 读取账号级上游 session 池展示状态。
+    ///
+    /// @param account 当前账号配置。
+    /// @return 返回活跃池状态；功能关闭时活跃数为 0。
+    pub async fn get_upstream_session_pool_status(
+        &self,
+        account: &Account,
+    ) -> Result<UpstreamSessionPoolStatus, AppError> {
+        if !account.upstream_session_pool_enabled || account.upstream_session_pool_size <= 0 {
+            return Ok(UpstreamSessionPoolStatus {
+                active_count: 0,
+                oldest_last_seen_ms: None,
+                newest_last_seen_ms: None,
+            });
+        }
+        let ttl_minutes = account.upstream_session_ttl_minutes.clamp(
+            MIN_UPSTREAM_SESSION_TTL_MINUTES,
+            MAX_UPSTREAM_SESSION_TTL_MINUTES,
+        );
+        self.cache
+            .get_upstream_session_pool_status(
+                account.id,
+                Duration::from_secs((ttl_minutes as u64) * 60),
+            )
+            .await
     }
 
     /// 设置纯瞬时 429 的进程内软退避窗口。
@@ -1771,6 +1844,40 @@ fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
     Ok(())
 }
 
+fn normalize_upstream_session_pool_config(account: &mut Account) -> Result<(), AppError> {
+    if account.upstream_session_pool_size == 0 {
+        account.upstream_session_pool_enabled = false;
+    } else if !(1..=MAX_UPSTREAM_SESSION_POOL_SIZE).contains(&account.upstream_session_pool_size) {
+        return Err(AppError::BadRequest(format!(
+            "upstream_session_pool_size 必须为 0 或 1-{}",
+            MAX_UPSTREAM_SESSION_POOL_SIZE
+        )));
+    }
+
+    if account.upstream_session_ttl_minutes == 0 {
+        account.upstream_session_ttl_minutes = DEFAULT_UPSTREAM_SESSION_TTL_MINUTES;
+    }
+    if !(MIN_UPSTREAM_SESSION_TTL_MINUTES..=MAX_UPSTREAM_SESSION_TTL_MINUTES)
+        .contains(&account.upstream_session_ttl_minutes)
+    {
+        return Err(AppError::BadRequest(format!(
+            "upstream_session_ttl_minutes 必须为 {}-{}",
+            MIN_UPSTREAM_SESSION_TTL_MINUTES, MAX_UPSTREAM_SESSION_TTL_MINUTES
+        )));
+    }
+
+    if account.upstream_session_refresh_policy.trim().is_empty() {
+        account.upstream_session_refresh_policy =
+            DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.to_string();
+    }
+    if UpstreamSessionRefreshPolicy::parse(&account.upstream_session_refresh_policy).is_none() {
+        return Err(AppError::BadRequest(
+            "upstream_session_refresh_policy 必须是 mapped_request 或 owner_only".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// 根据客户端类型创建会话哈希。
 /// CC 客户端：使用 metadata.user_id 中的 session_id。
 /// API 客户端：使用 sha256(UA + 系统提示词/首条消息 + 小时窗口)。
@@ -1848,7 +1955,10 @@ pub fn generate_session_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::account::{AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS};
+    use crate::model::account::{
+        AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+        DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    };
     use crate::store::account_store::AccountStore;
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::SettingsStore;
@@ -1935,6 +2045,10 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            upstream_session_pool_enabled: false,
+            upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+            upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+            upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
             telemetry_count: 0,
             usage_data,
             usage_fetched_at: None,
@@ -1974,6 +2088,10 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            upstream_session_pool_enabled: false,
+            upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+            upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+            upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,

@@ -127,6 +127,33 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    sqlx::query(
+        "ALTER TABLE accounts ADD COLUMN upstream_session_pool_enabled INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(&format!(
+        "ALTER TABLE accounts ADD COLUMN upstream_session_pool_size INTEGER NOT NULL DEFAULT {}",
+        crate::model::account::DEFAULT_UPSTREAM_SESSION_POOL_SIZE
+    ))
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(&format!(
+        "ALTER TABLE accounts ADD COLUMN upstream_session_ttl_minutes INTEGER NOT NULL DEFAULT {}",
+        crate::model::account::DEFAULT_UPSTREAM_SESSION_TTL_MINUTES
+    ))
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(&format!(
+        "ALTER TABLE accounts ADD COLUMN upstream_session_refresh_policy TEXT NOT NULL DEFAULT '{}'",
+        crate::model::account::DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY
+    ))
+    .execute(pool)
+    .await
+    .ok();
 
     // api_tokens 表
     let token_schema = if driver == "sqlite" {
@@ -506,6 +533,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     concurrency     INTEGER NOT NULL DEFAULT 3,
     priority        INTEGER NOT NULL DEFAULT 50,
     rpm_limit       INTEGER NOT NULL DEFAULT 0,
+    upstream_session_pool_enabled INTEGER NOT NULL DEFAULT 0,
+    upstream_session_pool_size INTEGER NOT NULL DEFAULT 3,
+    upstream_session_ttl_minutes INTEGER NOT NULL DEFAULT 60,
+    upstream_session_refresh_policy TEXT NOT NULL DEFAULT 'mapped_request',
     rate_limited_at      TEXT,
     rate_limit_reset_at  TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -536,6 +567,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     concurrency     INT NOT NULL DEFAULT 3,
     priority        INT NOT NULL DEFAULT 50,
     rpm_limit       INT NOT NULL DEFAULT 0,
+    upstream_session_pool_enabled INT NOT NULL DEFAULT 0,
+    upstream_session_pool_size INT NOT NULL DEFAULT 3,
+    upstream_session_ttl_minutes INT NOT NULL DEFAULT 60,
+    upstream_session_refresh_policy TEXT NOT NULL DEFAULT 'mapped_request',
     rate_limited_at      TIMESTAMPTZ,
     rate_limit_reset_at  TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),

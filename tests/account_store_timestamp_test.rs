@@ -2,7 +2,10 @@ use chrono::{Duration, Utc};
 use sqlx::AnyPool;
 use std::sync::Arc;
 
-use claude_code_gateway::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
+use claude_code_gateway::model::account::{
+    Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+};
 use claude_code_gateway::store::account_store::AccountStore;
 
 async fn setup() -> Arc<AccountStore> {
@@ -49,6 +52,10 @@ fn new_account(email: &str) -> Account {
         auto_telemetry: false,
         auto_poll_usage: false,
         allow_1m_models: "opus".into(),
+        upstream_session_pool_enabled: false,
+        upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+        upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+        upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
@@ -82,6 +89,32 @@ async fn test_create_account_with_null_timestamps() {
     let fetched = store.get_by_id(a.id).await.expect("get_by_id failed");
     assert!(fetched.expires_at.is_none());
     assert!(fetched.oauth_refreshed_at.is_none());
+}
+
+#[tokio::test]
+async fn test_account_upstream_session_pool_fields_round_trip() {
+    let store = setup().await;
+    let mut a = new_account("upstream-session-pool@example.com");
+    a.upstream_session_pool_enabled = true;
+    a.upstream_session_pool_size = 4;
+    a.upstream_session_ttl_minutes = 120;
+    a.upstream_session_refresh_policy = "owner_only".into();
+    store.create(&mut a).await.expect("create failed");
+
+    let mut fetched = store.get_by_id(a.id).await.expect("get_by_id failed");
+    assert!(fetched.upstream_session_pool_enabled);
+    assert_eq!(fetched.upstream_session_pool_size, 4);
+    assert_eq!(fetched.upstream_session_ttl_minutes, 120);
+    assert_eq!(fetched.upstream_session_refresh_policy, "owner_only");
+
+    fetched.upstream_session_pool_enabled = false;
+    fetched.upstream_session_pool_size = 0;
+    fetched.upstream_session_refresh_policy = "mapped_request".into();
+    store.update(&fetched).await.expect("update failed");
+    let updated = store.get_by_id(a.id).await.expect("get updated failed");
+    assert!(!updated.upstream_session_pool_enabled);
+    assert_eq!(updated.upstream_session_pool_size, 0);
+    assert_eq!(updated.upstream_session_refresh_policy, "mapped_request");
 }
 
 // ─── UPDATE: oauth_expires_at and oauth_refreshed_at ───

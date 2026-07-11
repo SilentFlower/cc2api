@@ -4,6 +4,18 @@ use serde_json::Value;
 
 /// 新账号默认允许透传 `context-1m-2025-08-07` 的模型白名单。
 pub const DEFAULT_ALLOW_1M_MODELS: &str = "opus,claude-sonnet-5";
+/// 上游 session 池默认容量；只有账号显式开启时生效。
+pub const DEFAULT_UPSTREAM_SESSION_POOL_SIZE: i32 = 3;
+/// 上游 session 池容量上限。
+pub const MAX_UPSTREAM_SESSION_POOL_SIZE: i32 = 20;
+/// 上游 session 池默认活跃 TTL（分钟）。
+pub const DEFAULT_UPSTREAM_SESSION_TTL_MINUTES: i32 = 60;
+/// 上游 session 池最小活跃 TTL（分钟）。
+pub const MIN_UPSTREAM_SESSION_TTL_MINUTES: i32 = 5;
+/// 上游 session 池最大活跃 TTL（分钟）。
+pub const MAX_UPSTREAM_SESSION_TTL_MINUTES: i32 = 1440;
+/// 上游 session 池默认 TTL 刷新策略。
+pub const DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY: &str = "mapped_request";
 
 mod optional_timestamp_millis {
     use chrono::{DateTime, TimeZone, Utc};
@@ -193,6 +205,18 @@ pub struct Account {
     /// 不使用宽泛 `"sonnet"`，避免误放行 Sonnet 4.6。
     #[serde(default = "default_allow_1m_models")]
     pub allow_1m_models: String,
+    /// 是否启用账号级上游 session 池；默认关闭，保持旧协议行为。
+    #[serde(default)]
+    pub upstream_session_pool_enabled: bool,
+    /// 上游 session 池容量；`0` 等价关闭，启用时有效范围为 `1..=20`。
+    #[serde(default = "default_upstream_session_pool_size")]
+    pub upstream_session_pool_size: i32,
+    /// 上游 session 池活跃 TTL（分钟），有效范围为 `5..=1440`。
+    #[serde(default = "default_upstream_session_ttl_minutes")]
+    pub upstream_session_ttl_minutes: i32,
+    /// 上游 session 池 TTL 刷新策略：`mapped_request` 或 `owner_only`。
+    #[serde(default = "default_upstream_session_refresh_policy")]
+    pub upstream_session_refresh_policy: String,
     /// 累计发送的遥测请求次数。
     #[serde(default)]
     pub telemetry_count: i64,
@@ -212,6 +236,15 @@ fn default_priority() -> i32 {
 }
 fn default_allow_1m_models() -> String {
     DEFAULT_ALLOW_1M_MODELS.to_string()
+}
+fn default_upstream_session_pool_size() -> i32 {
+    DEFAULT_UPSTREAM_SESSION_POOL_SIZE
+}
+fn default_upstream_session_ttl_minutes() -> i32 {
+    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES
+}
+fn default_upstream_session_refresh_policy() -> String {
+    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.to_string()
 }
 
 impl Account {

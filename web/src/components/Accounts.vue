@@ -13,6 +13,9 @@ import {
 import { useToast } from '../composables/useToast';
 
 const DEFAULT_ALLOW_1M_MODELS = 'opus,claude-sonnet-5';
+const DEFAULT_UPSTREAM_SESSION_POOL_SIZE = 3;
+const DEFAULT_UPSTREAM_SESSION_TTL_MINUTES = 60;
+const DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY = 'mapped_request';
 
 const emit = defineEmits<{ refresh: [] }>();
 const { show: toast } = useToast();
@@ -89,6 +92,10 @@ const form = ref({
   auto_telemetry: false,
   auto_poll_usage: false,
   allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
+  upstream_session_pool_enabled: false,
+  upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+  upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+  upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -169,6 +176,10 @@ function openCreate() {
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
+    upstream_session_pool_enabled: false,
+    upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
   };
   showForm.value = true;
 }
@@ -198,6 +209,10 @@ function openEdit(a: Account) {
     auto_telemetry: a.auto_telemetry ?? false,
     auto_poll_usage: a.auto_poll_usage ?? false,
     allow_1m_models: a.allow_1m_models ?? DEFAULT_ALLOW_1M_MODELS,
+    upstream_session_pool_enabled: a.upstream_session_pool_enabled ?? false,
+    upstream_session_pool_size: a.upstream_session_pool_size ?? DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    upstream_session_ttl_minutes: a.upstream_session_ttl_minutes ?? DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    upstream_session_refresh_policy: a.upstream_session_refresh_policy ?? DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
   };
   showForm.value = true;
 }
@@ -206,6 +221,15 @@ function openEdit(a: Account) {
 async function save() {
   try {
     const expiresAt = form.value.expires_at.trim();
+    if (form.value.upstream_session_pool_size < 0 || form.value.upstream_session_pool_size > 20) {
+      throw new Error('上游 session 池容量必须为 0 或 1-20');
+    }
+    if (form.value.upstream_session_pool_size !== 0 && form.value.upstream_session_pool_size < 1) {
+      throw new Error('上游 session 池容量必须为 0 或 1-20');
+    }
+    if (form.value.upstream_session_ttl_minutes < 5 || form.value.upstream_session_ttl_minutes > 1440) {
+      throw new Error('上游 session TTL 必须为 5-1440 分钟');
+    }
     if (editing.value) {
       if (form.value.auth_type === 'setup_token'
         && !form.value.setup_token.trim()
@@ -236,6 +260,10 @@ async function save() {
       updates.auto_telemetry = form.value.auto_telemetry;
       updates.auto_poll_usage = form.value.auto_poll_usage;
       updates.allow_1m_models = form.value.allow_1m_models;
+      updates.upstream_session_pool_enabled = form.value.upstream_session_pool_enabled;
+      updates.upstream_session_pool_size = form.value.upstream_session_pool_size;
+      updates.upstream_session_ttl_minutes = form.value.upstream_session_ttl_minutes;
+      updates.upstream_session_refresh_policy = form.value.upstream_session_refresh_policy;
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -262,6 +290,10 @@ async function save() {
         auto_telemetry: form.value.auto_telemetry,
         auto_poll_usage: form.value.auto_poll_usage,
         allow_1m_models: form.value.allow_1m_models,
+        upstream_session_pool_enabled: form.value.upstream_session_pool_enabled,
+        upstream_session_pool_size: form.value.upstream_session_pool_size,
+        upstream_session_ttl_minutes: form.value.upstream_session_ttl_minutes,
+        upstream_session_refresh_policy: form.value.upstream_session_refresh_policy,
       };
       if (expiresAt) payload.expires_at = Number(expiresAt);
       await api.createAccount(payload);
@@ -491,6 +523,35 @@ function rpmClass(account: Account): string {
 }
 
 /**
+ * 格式化上游 session 池状态。
+ * @param account 账号对象
+ */
+function upstreamSessionPoolLabel(account: Account): string {
+  if (!account.upstream_session_pool_enabled || account.upstream_session_pool_size <= 0) return '关闭';
+  const active = account.upstream_session_pool_active_count ?? 0;
+  const capacity = account.upstream_session_pool_capacity ?? account.upstream_session_pool_size;
+  return `${active}/${capacity}`;
+}
+
+/**
+ * 获取上游 session 池文本颜色。
+ * @param account 账号对象
+ */
+function upstreamSessionPoolClass(account: Account): string {
+  if (!account.upstream_session_pool_enabled || account.upstream_session_pool_size <= 0) return 'text-[#8c8475]';
+  const active = account.upstream_session_pool_active_count ?? 0;
+  return active >= account.upstream_session_pool_size ? 'text-amber-600' : 'text-emerald-600';
+}
+
+/**
+ * 获取上游 session 池刷新策略显示名。
+ * @param policy 刷新策略值
+ */
+function upstreamSessionPolicyLabel(policy?: string): string {
+  return policy === 'owner_only' ? '仅属主刷新' : '映射请求刷新';
+}
+
+/**
  * 格式化瞬时 429 软退避剩余时间。
  * @param account 账号对象
  */
@@ -673,6 +734,10 @@ function applyOAuthResult() {
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
+    upstream_session_pool_enabled: false,
+    upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
   };
   showForm.value = true;
 }
@@ -811,6 +876,12 @@ async function copyText(text: string) {
                   {{ a.billing_mode === 'rewrite' ? '重写' : '清除' }}
                 </p>
               </div>
+              <div class="text-center">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">上游 Session</p>
+                <p class="text-sm font-medium" :class="upstreamSessionPoolClass(a)">
+                  {{ upstreamSessionPoolLabel(a) }}
+                </p>
+              </div>
             </div>
             <div class="space-y-3">
               <div>
@@ -829,6 +900,12 @@ async function copyText(text: string) {
                 </p>
                 <p v-if="a.telemetry_expires_at" class="text-xs text-amber-500 mt-0.5">
                   遥测中 · 停止于 {{ new Date(a.telemetry_expires_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}
+                </p>
+              </div>
+              <div v-if="a.upstream_session_pool_enabled && a.upstream_session_pool_size > 0">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">上游 Session 池</p>
+                <p class="text-sm text-[#8c8475] truncate">
+                  TTL {{ a.upstream_session_ttl_minutes }} 分钟 · {{ upstreamSessionPolicyLabel(a.upstream_session_refresh_policy) }}
                 </p>
               </div>
               <div v-if="a.auth_type === 'oauth'">
@@ -1292,6 +1369,83 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后后台定时拉取该账号的用量数据</p>
+          </div>
+          <div class="space-y-3 rounded-lg border border-[#e8e2d9] bg-[#f9f6f1] p-3">
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">上游 Session 池</Label>
+              <div class="flex gap-2">
+                <button
+                  type="button"
+                  @click="form.upstream_session_pool_enabled = false"
+                  class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="!form.upstream_session_pool_enabled
+                    ? 'bg-white border-[#8c8475] text-[#5c5647]'
+                    : 'bg-white border-[#e8e2d9] text-[#8c8475] hover:border-[#8c8475]/40'"
+                >
+                  关闭
+                </button>
+                <button
+                  type="button"
+                  @click="form.upstream_session_pool_enabled = true"
+                  class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="form.upstream_session_pool_enabled
+                    ? 'bg-emerald-50 border-emerald-400 text-emerald-600'
+                    : 'bg-white border-[#e8e2d9] text-[#8c8475] hover:border-emerald-300'"
+                >
+                  开启
+                </button>
+              </div>
+              <p class="text-xs text-[#b5b0a6]">只改写发往上游的 Claude Code session；内部 sticky、RPM 和本地缓存仍按真实 session 隔离。</p>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">池容量</Label>
+                <Input
+                  v-model.number="form.upstream_session_pool_size"
+                  type="number"
+                  min="0"
+                  max="20"
+                  class="bg-white border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+                />
+                <p class="text-xs text-[#b5b0a6]">0 表示关闭；开启时建议 3。</p>
+              </div>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">活跃 TTL（分钟）</Label>
+                <Input
+                  v-model.number="form.upstream_session_ttl_minutes"
+                  type="number"
+                  min="5"
+                  max="1440"
+                  class="bg-white border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+                />
+                <p class="text-xs text-[#b5b0a6]">允许 5-1440，默认 60。</p>
+              </div>
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">TTL 刷新策略</Label>
+              <div class="flex gap-2">
+                <button
+                  type="button"
+                  @click="form.upstream_session_refresh_policy = 'mapped_request'"
+                  class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="form.upstream_session_refresh_policy === 'mapped_request'
+                    ? 'bg-emerald-50 border-emerald-400 text-emerald-600'
+                    : 'bg-white border-[#e8e2d9] text-[#8c8475] hover:border-emerald-300'"
+                >
+                  映射请求刷新
+                </button>
+                <button
+                  type="button"
+                  @click="form.upstream_session_refresh_policy = 'owner_only'"
+                  class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="form.upstream_session_refresh_policy === 'owner_only'
+                    ? 'bg-amber-50 border-amber-400 text-amber-600'
+                    : 'bg-white border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+                >
+                  仅属主刷新
+                </button>
+              </div>
+            </div>
           </div>
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">允许 1M 上下文的模型</Label>

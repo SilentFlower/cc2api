@@ -8,11 +8,16 @@ use chrono::TimeZone;
 use rust_embed::Embed;
 use serde::Deserialize;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
-use crate::model::account::{Account, AccountAuthType, AccountStatus, DEFAULT_ALLOW_1M_MODELS};
+use crate::model::account::{
+    Account, AccountAuthType, AccountStatus, DEFAULT_ALLOW_1M_MODELS,
+    DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+};
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -260,6 +265,26 @@ async fn list_accounts(
             obj["rpm_window_reset_at"] = serde_json::json!(rpm.window_reset_at.to_rfc3339());
             obj["rpm_saturated"] = serde_json::json!(rpm.saturated);
         }
+        match state.account_svc.get_upstream_session_pool_status(a).await {
+            Ok(pool) => {
+                obj["upstream_session_pool_active_count"] = serde_json::json!(pool.active_count);
+                obj["upstream_session_pool_capacity"] =
+                    serde_json::json!(a.upstream_session_pool_size.max(0));
+                obj["upstream_session_pool_oldest_last_seen_ms"] =
+                    serde_json::json!(pool.oldest_last_seen_ms);
+                obj["upstream_session_pool_newest_last_seen_ms"] =
+                    serde_json::json!(pool.newest_last_seen_ms);
+            }
+            Err(e) => {
+                warn!(
+                    "upstream session pool status read failed: account={} error={}",
+                    a.id, e
+                );
+                obj["upstream_session_pool_active_count"] = serde_json::json!(0);
+                obj["upstream_session_pool_capacity"] =
+                    serde_json::json!(a.upstream_session_pool_size.max(0));
+            }
+        }
         data.push(obj);
     }
 
@@ -293,6 +318,10 @@ struct CreateAccountRequest {
     auto_telemetry: Option<bool>,
     auto_poll_usage: Option<bool>,
     allow_1m_models: Option<String>,
+    upstream_session_pool_enabled: Option<bool>,
+    upstream_session_pool_size: Option<i32>,
+    upstream_session_ttl_minutes: Option<i32>,
+    upstream_session_refresh_policy: Option<String>,
 }
 
 async fn create_account(
@@ -336,6 +365,16 @@ async fn create_account(
         allow_1m_models: req
             .allow_1m_models
             .unwrap_or_else(|| DEFAULT_ALLOW_1M_MODELS.to_string()),
+        upstream_session_pool_enabled: req.upstream_session_pool_enabled.unwrap_or(false),
+        upstream_session_pool_size: req
+            .upstream_session_pool_size
+            .unwrap_or(DEFAULT_UPSTREAM_SESSION_POOL_SIZE),
+        upstream_session_ttl_minutes: req
+            .upstream_session_ttl_minutes
+            .unwrap_or(DEFAULT_UPSTREAM_SESSION_TTL_MINUTES),
+        upstream_session_refresh_policy: req
+            .upstream_session_refresh_policy
+            .unwrap_or_else(|| DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.to_string()),
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
@@ -462,8 +501,33 @@ async fn update_account(
     if let Some(allow_1m_models) = updates.get("allow_1m_models").and_then(|v| v.as_str()) {
         existing.allow_1m_models = allow_1m_models.to_string();
     }
+    if let Some(enabled) = updates
+        .get("upstream_session_pool_enabled")
+        .and_then(|v| v.as_bool())
+    {
+        existing.upstream_session_pool_enabled = enabled;
+    }
+    if let Some(size) = updates
+        .get("upstream_session_pool_size")
+        .and_then(|v| v.as_i64())
+    {
+        existing.upstream_session_pool_size = i32::try_from(size).unwrap_or(i32::MIN);
+    }
+    if let Some(ttl_minutes) = updates
+        .get("upstream_session_ttl_minutes")
+        .and_then(|v| v.as_i64())
+    {
+        existing.upstream_session_ttl_minutes = i32::try_from(ttl_minutes).unwrap_or(i32::MIN);
+    }
+    if let Some(policy) = updates
+        .get("upstream_session_refresh_policy")
+        .and_then(|v| v.as_str())
+    {
+        existing.upstream_session_refresh_policy = policy.to_string();
+    }
 
     state.account_svc.update_account(&existing).await?;
+    existing = state.account_svc.get_account(id).await?;
     Ok(Json(existing))
 }
 

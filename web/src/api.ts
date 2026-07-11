@@ -58,6 +58,14 @@ export interface Account {
   auto_telemetry: boolean
   auto_poll_usage: boolean
   allow_1m_models: string
+  upstream_session_pool_enabled: boolean
+  upstream_session_pool_size: number
+  upstream_session_ttl_minutes: number
+  upstream_session_refresh_policy: 'mapped_request' | 'owner_only' | string
+  upstream_session_pool_active_count?: number
+  upstream_session_pool_capacity?: number
+  upstream_session_pool_oldest_last_seen_ms?: number | null
+  upstream_session_pool_newest_last_seen_ms?: number | null
   telemetry_count: number
   telemetry_expires_at?: string
   scheduling_score?: number

@@ -2,7 +2,10 @@ use redis::AsyncCommands;
 use std::time::Duration;
 
 use crate::error::AppError;
-use crate::store::cache::{CacheStore, RpmAcquire};
+use crate::store::cache::{
+    CacheStore, RpmAcquire, UpstreamSessionPoolAction, UpstreamSessionPoolResolve,
+    UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy, stable_upstream_session_hash,
+};
 
 pub struct RedisStore {
     client: redis::aio::ConnectionManager,
@@ -34,6 +37,32 @@ impl RedisStore {
 
 fn rpm_key(account_id: i64, minute_ts: i64) -> String {
     format!("rpm:{}:{}", account_id, minute_ts)
+}
+
+fn upstream_session_pool_key(account_id: i64) -> String {
+    format!("upstream_session_pool:{}", account_id)
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn parse_optional_i64(value: Option<&String>) -> Option<i64> {
+    value.and_then(|value| value.parse::<i64>().ok())
+}
+
+fn parse_upstream_session_action(action: &str) -> UpstreamSessionPoolAction {
+    match action {
+        "owner_hit" => UpstreamSessionPoolAction::OwnerHit,
+        "admitted" => UpstreamSessionPoolAction::Admitted,
+        "mapped" => UpstreamSessionPoolAction::Mapped,
+        "lookup_owner_hit" => UpstreamSessionPoolAction::LookupOwnerHit,
+        "lookup_mapped" => UpstreamSessionPoolAction::LookupMapped,
+        _ => UpstreamSessionPoolAction::Empty,
+    }
 }
 
 #[axum::async_trait]
@@ -162,6 +191,172 @@ impl CacheStore for RedisStore {
         Ok(RpmAcquire {
             acquired: true,
             current: val,
+        })
+    }
+
+    async fn resolve_upstream_session_pool(
+        &self,
+        account_id: i64,
+        real_session_id: &str,
+        pool_size: i32,
+        ttl: Duration,
+        refresh_policy: UpstreamSessionRefreshPolicy,
+        allow_insert: bool,
+    ) -> Result<UpstreamSessionPoolResolve, AppError> {
+        let key = upstream_session_pool_key(account_id);
+        let now_ms = now_millis();
+        let ttl_ms = ttl.as_millis().max(1).min(i64::MAX as u128) as i64;
+        let expire_ms = ttl_ms.saturating_mul(2).max(1000);
+        let hash = stable_upstream_session_hash(real_session_id);
+        let mut conn = self.client.clone();
+        let script = redis::Script::new(
+            r#"
+            local key = KEYS[1]
+            local real = ARGV[1]
+            local pool_size = tonumber(ARGV[2])
+            local now_ms = tonumber(ARGV[3])
+            local ttl_ms = tonumber(ARGV[4])
+            local policy = ARGV[5]
+            local allow_insert = ARGV[6] == "1"
+            local hash_value = tonumber(ARGV[7])
+            local expire_ms = tonumber(ARGV[8])
+            local cutoff = now_ms - ttl_ms
+
+            redis.call("ZREMRANGEBYSCORE", key, "-inf", cutoff)
+
+            local function stats()
+                local with_scores = redis.call("ZRANGE", key, 0, -1, "WITHSCORES")
+                local count = #with_scores / 2
+                local oldest = ""
+                local newest = ""
+                for i = 2, #with_scores, 2 do
+                    local score = tonumber(with_scores[i])
+                    if oldest == "" or score < tonumber(oldest) then
+                        oldest = tostring(score)
+                    end
+                    if newest == "" or score > tonumber(newest) then
+                        newest = tostring(score)
+                    end
+                end
+                return tostring(count), oldest, newest
+            end
+
+            local action = "empty"
+            local upstream = ""
+            local exists = redis.call("ZSCORE", key, real)
+            local count = redis.call("ZCARD", key)
+            if exists then
+                upstream = real
+                if allow_insert then
+                    redis.call("ZADD", key, now_ms, real)
+                    action = "owner_hit"
+                else
+                    action = "lookup_owner_hit"
+                end
+            elseif allow_insert and pool_size > 0 and count < pool_size then
+                redis.call("ZADD", key, now_ms, real)
+                upstream = real
+                action = "admitted"
+            elseif count > 0 then
+                local members = redis.call("ZRANGE", key, 0, -1)
+                table.sort(members)
+                local idx = (hash_value % #members) + 1
+                upstream = members[idx]
+                if allow_insert and policy == "mapped_request" then
+                    redis.call("ZADD", key, now_ms, upstream)
+                end
+                if allow_insert then
+                    action = "mapped"
+                else
+                    action = "lookup_mapped"
+                end
+            end
+
+            if redis.call("ZCARD", key) > 0 then
+                redis.call("PEXPIRE", key, expire_ms)
+            else
+                redis.call("DEL", key)
+            end
+
+            local active_count, oldest, newest = stats()
+            return {upstream, action, active_count, oldest, newest}
+            "#,
+        );
+        let values: Vec<String> = script
+            .key(&key)
+            .arg(real_session_id)
+            .arg(pool_size.max(0))
+            .arg(now_ms)
+            .arg(ttl_ms)
+            .arg(refresh_policy.as_str())
+            .arg(if allow_insert { "1" } else { "0" })
+            .arg(hash)
+            .arg(expire_ms)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("redis upstream session pool: {}", e)))?;
+
+        let upstream = values.first().filter(|value| !value.is_empty()).cloned();
+        let action = values
+            .get(1)
+            .map(|value| parse_upstream_session_action(value))
+            .unwrap_or(UpstreamSessionPoolAction::Empty);
+        Ok(UpstreamSessionPoolResolve {
+            real_session_id: real_session_id.to_string(),
+            upstream_session_id: upstream,
+            action,
+            active_count: parse_optional_i64(values.get(2)).unwrap_or(0),
+            oldest_last_seen_ms: parse_optional_i64(values.get(3)),
+            newest_last_seen_ms: parse_optional_i64(values.get(4)),
+        })
+    }
+
+    async fn get_upstream_session_pool_status(
+        &self,
+        account_id: i64,
+        ttl: Duration,
+    ) -> Result<UpstreamSessionPoolStatus, AppError> {
+        let key = upstream_session_pool_key(account_id);
+        let now_ms = now_millis();
+        let ttl_ms = ttl.as_millis().max(1).min(i64::MAX as u128) as i64;
+        let mut conn = self.client.clone();
+        let script = redis::Script::new(
+            r#"
+            local key = KEYS[1]
+            local cutoff = tonumber(ARGV[1]) - tonumber(ARGV[2])
+            redis.call("ZREMRANGEBYSCORE", key, "-inf", cutoff)
+            local with_scores = redis.call("ZRANGE", key, 0, -1, "WITHSCORES")
+            local count = #with_scores / 2
+            local oldest = ""
+            local newest = ""
+            for i = 2, #with_scores, 2 do
+                local score = tonumber(with_scores[i])
+                if oldest == "" or score < tonumber(oldest) then
+                    oldest = tostring(score)
+                end
+                if newest == "" or score > tonumber(newest) then
+                    newest = tostring(score)
+                end
+            end
+            if count == 0 then
+                redis.call("DEL", key)
+            end
+            return {tostring(count), oldest, newest}
+            "#,
+        );
+        let values: Vec<String> = script
+            .key(&key)
+            .arg(now_ms)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("redis upstream session pool status: {}", e))
+            })?;
+        Ok(UpstreamSessionPoolStatus {
+            active_count: parse_optional_i64(values.first()).unwrap_or(0),
+            oldest_last_seen_ms: parse_optional_i64(values.get(1)),
+            newest_last_seen_ms: parse_optional_i64(values.get(2)),
         })
     }
 

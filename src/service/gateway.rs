@@ -30,14 +30,16 @@ use crate::service::account::{
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
-    StatefulCacheUsage, detect_client_type, matches_1m_whitelist, merge_anthropic_beta,
-    order_context_1m_after_oauth, ordered_anthropic_headers, strip_beta_token,
-    strip_empty_text_blocks,
+    StatefulCacheUsage, UpstreamSessionRewrite, collect_telemetry_session_ids, detect_client_type,
+    matches_1m_whitelist, merge_anthropic_beta, order_context_1m_after_oauth,
+    ordered_anthropic_headers, strip_beta_token, strip_empty_text_blocks,
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
 };
-use crate::service::version_profile::{COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS};
+use crate::service::version_profile::{
+    COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, is_event_logging_path,
+};
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
@@ -428,6 +430,97 @@ impl GatewayService {
             bootstrap_profile_config: RwLock::new(default_bootstrap_profile_config()),
             context_sanitizer_config: RwLock::new(default_context_sanitizer_config()),
         }
+    }
+
+    /// 构造本次请求的上游 session 改写上下文。
+    ///
+    /// @param account 已选定且通过 admission 的账号。
+    /// @param path 当前请求路径。
+    /// @param body_map 原始下游请求体。
+    /// @param client_type 当前客户端类型。
+    /// @return 返回主请求 override 和 telemetry 只读映射表。
+    async fn build_upstream_session_rewrite(
+        &self,
+        account: &Account,
+        path: &str,
+        body_map: &serde_json::Value,
+        client_type: ClientType,
+    ) -> UpstreamSessionRewrite {
+        let mut rewrite = UpstreamSessionRewrite::default();
+        if path == "/v1/messages" && client_type == ClientType::ClaudeCode {
+            if let Some(real_session_id) =
+                crate::service::rewriter::extract_session_id_from_body(body_map)
+            {
+                match self
+                    .account_svc
+                    .resolve_upstream_session_pool(account, &real_session_id, true)
+                    .await
+                {
+                    Ok(Some(resolved)) => {
+                        let upstream_log = resolved
+                            .upstream_session_id
+                            .as_ref()
+                            .map(|session| short_hash_for_log(session.as_bytes()))
+                            .unwrap_or_else(|| "none".into());
+                        info!(
+                            "upstream session pool account={} capacity={} action={} active={} real={} upstream={}",
+                            account.id,
+                            account.upstream_session_pool_size,
+                            resolved.action.as_str(),
+                            resolved.active_count,
+                            short_hash_for_log(real_session_id.as_bytes()),
+                            upstream_log
+                        );
+                        rewrite.message = Some(resolved);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "upstream session pool failed open: account={} real={} error={}",
+                            account.id,
+                            short_hash_for_log(real_session_id.as_bytes()),
+                            e
+                        );
+                    }
+                }
+            }
+        } else if is_event_logging_path(path)
+            && account.upstream_session_pool_enabled
+            && account.upstream_session_pool_size > 0
+        {
+            for real_session_id in collect_telemetry_session_ids(body_map) {
+                match self
+                    .account_svc
+                    .resolve_upstream_session_pool(account, &real_session_id, false)
+                    .await
+                {
+                    Ok(Some(resolved)) => {
+                        if let Some(upstream_session_id) = resolved.upstream_session_id {
+                            rewrite
+                                .telemetry_session_map
+                                .insert(real_session_id, upstream_session_id);
+                        } else {
+                            warn!(
+                                "upstream session pool telemetry map skipped: account={} real={} reason={}",
+                                account.id,
+                                short_hash_for_log(real_session_id.as_bytes()),
+                                resolved.action.as_str()
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "upstream session pool telemetry map failed open: account={} real={} error={}",
+                            account.id,
+                            short_hash_for_log(real_session_id.as_bytes()),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        rewrite
     }
 
     /// 获取账号执行槽位，并在槽位到手后才预占 RPM。
@@ -1426,6 +1519,9 @@ impl GatewayService {
                 *self.message_body_order_fingerprint_enabled.read().await;
             let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
             let context_sanitizer_config = *self.context_sanitizer_config.read().await;
+            let upstream_session_rewrite = self
+                .build_upstream_session_rewrite(&account, &path, &body_map, client_type)
+                .await;
             let (rewritten_body, stateful_cache_completion) =
                 self.rewriter.rewrite_body_with_stateful_completion(
                     &body_bytes,
@@ -1437,6 +1533,7 @@ impl GatewayService {
                     message_cache,
                     message_body_order_fingerprint_enabled,
                     &disabled_thinking,
+                    &upstream_session_rewrite,
                     context_sanitizer_config,
                 );
             debug!(
@@ -5738,6 +5835,8 @@ mod tests {
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
+        DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+        DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
     use crate::service::account::{
         AccountService, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
@@ -5879,6 +5978,10 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            upstream_session_pool_enabled: false,
+            upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+            upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+            upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,
