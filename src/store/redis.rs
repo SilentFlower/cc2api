@@ -43,6 +43,14 @@ fn upstream_session_pool_key(account_id: i64) -> String {
     format!("upstream_session_pool:{}", account_id)
 }
 
+fn upstream_session_pool_mapping_key(account_id: i64) -> String {
+    format!("upstream_session_pool_mapping:{}", account_id)
+}
+
+fn upstream_session_pool_mapping_seen_key(account_id: i64) -> String {
+    format!("upstream_session_pool_mapping_seen:{}", account_id)
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -204,6 +212,8 @@ impl CacheStore for RedisStore {
         allow_insert: bool,
     ) -> Result<UpstreamSessionPoolResolve, AppError> {
         let key = upstream_session_pool_key(account_id);
+        let mapping_key = upstream_session_pool_mapping_key(account_id);
+        let mapping_seen_key = upstream_session_pool_mapping_seen_key(account_id);
         let now_ms = now_millis();
         let ttl_ms = ttl.as_millis().max(1).min(i64::MAX as u128) as i64;
         let expire_ms = ttl_ms.saturating_mul(2).max(1000);
@@ -212,6 +222,8 @@ impl CacheStore for RedisStore {
         let script = redis::Script::new(
             r#"
             local key = KEYS[1]
+            local mapping_key = KEYS[2]
+            local mapping_seen_key = KEYS[3]
             local real = ARGV[1]
             local pool_size = tonumber(ARGV[2])
             local now_ms = tonumber(ARGV[3])
@@ -223,6 +235,20 @@ impl CacheStore for RedisStore {
             local cutoff = now_ms - ttl_ms
 
             redis.call("ZREMRANGEBYSCORE", key, "-inf", cutoff)
+            local expired_mappings = redis.call("ZRANGEBYSCORE", mapping_seen_key, "-inf", cutoff)
+            for _, expired_real in ipairs(expired_mappings) do
+                redis.call("HDEL", mapping_key, expired_real)
+            end
+            redis.call("ZREMRANGEBYSCORE", mapping_seen_key, "-inf", cutoff)
+
+            local count = redis.call("ZCARD", key)
+            local excess = count - pool_size
+            if excess > 0 then
+                local evicted = redis.call("ZRANGE", key, 0, excess - 1)
+                for _, evicted_session in ipairs(evicted) do
+                    redis.call("ZREM", key, evicted_session)
+                end
+            end
 
             local function stats()
                 local with_scores = redis.call("ZRANGE", key, 0, -1, "WITHSCORES")
@@ -244,38 +270,60 @@ impl CacheStore for RedisStore {
             local action = "empty"
             local upstream = ""
             local exists = redis.call("ZSCORE", key, real)
-            local count = redis.call("ZCARD", key)
+            local mapped = redis.call("HGET", mapping_key, real)
+            local mapped_seen = redis.call("ZSCORE", mapping_seen_key, real)
+            if mapped and (not mapped_seen or not redis.call("ZSCORE", key, mapped)) then
+                redis.call("HDEL", mapping_key, real)
+                redis.call("ZREM", mapping_seen_key, real)
+                mapped = false
+            end
+            count = redis.call("ZCARD", key)
             if exists then
                 upstream = real
                 if allow_insert then
                     redis.call("ZADD", key, now_ms, real)
+                    redis.call("HSET", mapping_key, real, real)
+                    redis.call("ZADD", mapping_seen_key, now_ms, real)
                     action = "owner_hit"
                 else
                     action = "lookup_owner_hit"
                 end
-            elseif allow_insert and pool_size > 0 and count < pool_size then
-                redis.call("ZADD", key, now_ms, real)
-                upstream = real
-                action = "admitted"
-            elseif count > 0 then
-                local members = redis.call("ZRANGE", key, 0, -1)
-                table.sort(members)
-                local idx = (hash_value % #members) + 1
-                upstream = members[idx]
-                if allow_insert and policy == "mapped_request" then
-                    redis.call("ZADD", key, now_ms, upstream)
-                end
+            elseif mapped then
+                upstream = mapped
                 if allow_insert then
+                    if policy == "mapped_request" then
+                        redis.call("ZADD", key, now_ms, upstream)
+                    end
+                    redis.call("ZADD", mapping_seen_key, now_ms, real)
                     action = "mapped"
                 else
                     action = "lookup_mapped"
                 end
+            elseif allow_insert and pool_size > 0 and count < pool_size then
+                redis.call("ZADD", key, now_ms, real)
+                redis.call("HSET", mapping_key, real, real)
+                redis.call("ZADD", mapping_seen_key, now_ms, real)
+                upstream = real
+                action = "admitted"
+            elseif allow_insert and count > 0 then
+                local members = redis.call("ZRANGE", key, 0, -1)
+                table.sort(members)
+                local idx = (hash_value % #members) + 1
+                upstream = members[idx]
+                if policy == "mapped_request" then
+                    redis.call("ZADD", key, now_ms, upstream)
+                end
+                redis.call("HSET", mapping_key, real, upstream)
+                redis.call("ZADD", mapping_seen_key, now_ms, real)
+                action = "mapped"
             end
 
             if redis.call("ZCARD", key) > 0 then
                 redis.call("PEXPIRE", key, expire_ms)
+                redis.call("PEXPIRE", mapping_key, expire_ms)
+                redis.call("PEXPIRE", mapping_seen_key, expire_ms)
             else
-                redis.call("DEL", key)
+                redis.call("DEL", key, mapping_key, mapping_seen_key)
             end
 
             local active_count, oldest, newest = stats()
@@ -284,6 +332,8 @@ impl CacheStore for RedisStore {
         );
         let values: Vec<String> = script
             .key(&key)
+            .key(&mapping_key)
+            .key(&mapping_seen_key)
             .arg(real_session_id)
             .arg(pool_size.max(0))
             .arg(now_ms)
@@ -314,17 +364,38 @@ impl CacheStore for RedisStore {
     async fn get_upstream_session_pool_status(
         &self,
         account_id: i64,
+        pool_size: i32,
         ttl: Duration,
     ) -> Result<UpstreamSessionPoolStatus, AppError> {
         let key = upstream_session_pool_key(account_id);
+        let mapping_key = upstream_session_pool_mapping_key(account_id);
+        let mapping_seen_key = upstream_session_pool_mapping_seen_key(account_id);
         let now_ms = now_millis();
         let ttl_ms = ttl.as_millis().max(1).min(i64::MAX as u128) as i64;
+        let expire_ms = ttl_ms.saturating_mul(2).max(1000);
         let mut conn = self.client.clone();
         let script = redis::Script::new(
             r#"
             local key = KEYS[1]
+            local mapping_key = KEYS[2]
+            local mapping_seen_key = KEYS[3]
             local cutoff = tonumber(ARGV[1]) - tonumber(ARGV[2])
+            local pool_size = tonumber(ARGV[3])
+            local expire_ms = tonumber(ARGV[4])
             redis.call("ZREMRANGEBYSCORE", key, "-inf", cutoff)
+            local expired_mappings = redis.call("ZRANGEBYSCORE", mapping_seen_key, "-inf", cutoff)
+            for _, expired_real in ipairs(expired_mappings) do
+                redis.call("HDEL", mapping_key, expired_real)
+            end
+            redis.call("ZREMRANGEBYSCORE", mapping_seen_key, "-inf", cutoff)
+            local current_count = redis.call("ZCARD", key)
+            local excess = current_count - pool_size
+            if excess > 0 then
+                local evicted = redis.call("ZRANGE", key, 0, excess - 1)
+                for _, evicted_session in ipairs(evicted) do
+                    redis.call("ZREM", key, evicted_session)
+                end
+            end
             local with_scores = redis.call("ZRANGE", key, 0, -1, "WITHSCORES")
             local count = #with_scores / 2
             local oldest = ""
@@ -339,15 +410,23 @@ impl CacheStore for RedisStore {
                 end
             end
             if count == 0 then
-                redis.call("DEL", key)
+                redis.call("DEL", key, mapping_key, mapping_seen_key)
+            else
+                redis.call("PEXPIRE", key, expire_ms)
+                redis.call("PEXPIRE", mapping_key, expire_ms)
+                redis.call("PEXPIRE", mapping_seen_key, expire_ms)
             end
             return {tostring(count), oldest, newest}
             "#,
         );
         let values: Vec<String> = script
             .key(&key)
+            .key(&mapping_key)
+            .key(&mapping_seen_key)
             .arg(now_ms)
             .arg(ttl_ms)
+            .arg(pool_size.max(0))
+            .arg(expire_ms)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| {

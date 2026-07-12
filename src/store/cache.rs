@@ -156,11 +156,13 @@ pub trait CacheStore: Send + Sync {
     /// 读取账号级上游 session 池状态，并在读取前按 TTL 懒清理。
     ///
     /// @param account_id 账号 ID。
+    /// @param pool_size 当前池容量，用于配置缩小时立即收敛。
     /// @param ttl 活跃 TTL。
     /// @return 返回当前活跃成员数量和时间范围。
     async fn get_upstream_session_pool_status(
         &self,
         account_id: i64,
+        pool_size: i32,
         ttl: Duration,
     ) -> Result<UpstreamSessionPoolStatus, AppError>;
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError>;

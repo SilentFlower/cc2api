@@ -85,6 +85,27 @@ const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
 const NON_STREAM_PROBE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Fable 请求结束后稍等再查 usage，避免刚 EOF 时上游计量还没落到 usage API。
 const FABLE_USAGE_REFRESH_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn align_mapped_upstream_session_header(
+    headers: &mut HashMap<String, String>,
+    upstream_session_rewrite: &UpstreamSessionRewrite,
+) {
+    let Some(resolved) = upstream_session_rewrite.message.as_ref() else {
+        return;
+    };
+    let Some(upstream_session_id) = resolved.upstream_session_id.as_deref() else {
+        return;
+    };
+    // 抓包中的 warmup probe 允许 header/body 不同；这里只修复池实际改变 body session 的请求。
+    if upstream_session_id == resolved.real_session_id {
+        return;
+    }
+    headers.insert(
+        "X-Claude-Code-Session-Id".into(),
+        upstream_session_id.to_string(),
+    );
+}
+
 #[derive(Clone, Copy)]
 struct RateLimitResponseDecision {
     delay: std::time::Duration,
@@ -1559,7 +1580,7 @@ impl GatewayService {
 
             // 改写 header
             let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
-            let rewritten_headers = self.rewriter.rewrite_headers(
+            let mut rewritten_headers = self.rewriter.rewrite_headers(
                 &headers,
                 &path,
                 &account,
@@ -1567,6 +1588,7 @@ impl GatewayService {
                 model_id,
                 &rewritten_body_map,
             );
+            align_mapped_upstream_session_header(&mut rewritten_headers, &upstream_session_rewrite);
 
             let telemetry_context = if account.auto_telemetry && path.starts_with("/v1/messages") {
                 Some(build_message_telemetry_context(
@@ -5812,13 +5834,14 @@ mod tests {
         NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
         RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES,
         SignatureRetryStage, StreamStabilityConfig, WarmupInterceptConfig, WarmupInterceptType,
-        assistant_prefill_intercept_body, auto_mode_classifier_response,
-        buffered_error_body_for_downstream, buffered_response_body_for_downstream,
-        build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
-        cached_non_stream_probe_response, classify_non_stream_probe_text,
-        detect_auto_mode_classifier_request, detect_non_stream_probe_type, detect_warmup_intercept,
-        extract_message_session_id, flush_stateful_cache_usage_buffer, format_request_capture,
-        format_response_capture, has_system_role_message, is_cacheable_non_stream_probe_response,
+        align_mapped_upstream_session_header, assistant_prefill_intercept_body,
+        auto_mode_classifier_response, buffered_error_body_for_downstream,
+        buffered_response_body_for_downstream, build_message_telemetry_context,
+        build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
+        classify_non_stream_probe_text, detect_auto_mode_classifier_request,
+        detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
+        flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
+        has_system_role_message, is_cacheable_non_stream_probe_response,
         is_signature_related_error_body, is_signature_related_error_response_body,
         is_system_role_model_allowed, mock_warmup_intercept_json_response,
         non_stream_probe_cache_create_log_payload, non_stream_probe_cache_hit_log_payload,
@@ -5841,13 +5864,14 @@ mod tests {
     use crate::service::account::{
         AccountService, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
     };
-    use crate::service::rewriter::{ClientType, StatefulCacheUsage};
+    use crate::service::rewriter::{ClientType, StatefulCacheUsage, UpstreamSessionRewrite};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_VERSION, STAINLESS_PACKAGE_VERSION, claude_code_user_agent,
     };
     use crate::store::account_store::AccountStore;
+    use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::SettingsStore;
     use axum::body;
@@ -8254,6 +8278,77 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
         assert_eq!(context.client_type, "claude_code");
         assert_eq!(context.attempt, 1);
         assert_eq!(context.betas, "claude-code-20250219");
+    }
+
+    #[test]
+    fn mapped_upstream_session_overrides_client_session_header() {
+        let mut headers = HashMap::from([(
+            "X-Claude-Code-Session-Id".to_string(),
+            "real-session".to_string(),
+        )]);
+        let rewrite = UpstreamSessionRewrite {
+            message: Some(UpstreamSessionPoolResolve {
+                real_session_id: "real-session".into(),
+                upstream_session_id: Some("upstream-session".into()),
+                action: UpstreamSessionPoolAction::Mapped,
+                active_count: 1,
+                oldest_last_seen_ms: None,
+                newest_last_seen_ms: None,
+            }),
+            telemetry_session_map: HashMap::new(),
+        };
+        let original_body = json!({"model": "claude-sonnet-4-6", "messages": []});
+        let rewritten_body = json!({
+            "metadata": {
+                "user_id": json!({"session_id": "upstream-session"}).to_string()
+            }
+        });
+
+        align_mapped_upstream_session_header(&mut headers, &rewrite);
+        let telemetry_context = build_message_telemetry_context(
+            &original_body,
+            &rewritten_body,
+            10,
+            20,
+            ClientType::ClaudeCode,
+            0,
+            String::new(),
+        );
+
+        assert_eq!(
+            headers.get("X-Claude-Code-Session-Id").map(String::as_str),
+            Some("upstream-session")
+        );
+        assert_eq!(
+            telemetry_context.session_id.as_deref(),
+            Some("upstream-session")
+        );
+    }
+
+    #[test]
+    fn unchanged_upstream_session_preserves_client_session_header() {
+        let mut headers = HashMap::from([(
+            "X-Claude-Code-Session-Id".to_string(),
+            "warmup-header-session".to_string(),
+        )]);
+        let rewrite = UpstreamSessionRewrite {
+            message: Some(UpstreamSessionPoolResolve {
+                real_session_id: "body-session".into(),
+                upstream_session_id: Some("body-session".into()),
+                action: UpstreamSessionPoolAction::OwnerHit,
+                active_count: 1,
+                oldest_last_seen_ms: None,
+                newest_last_seen_ms: None,
+            }),
+            telemetry_session_map: HashMap::new(),
+        };
+
+        align_mapped_upstream_session_header(&mut headers, &rewrite);
+
+        assert_eq!(
+            headers.get("X-Claude-Code-Session-Id").map(String::as_str),
+            Some("warmup-header-session")
+        );
     }
 
     #[test]

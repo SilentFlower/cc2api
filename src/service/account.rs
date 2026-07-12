@@ -674,6 +674,7 @@ impl AccountService {
         self.cache
             .get_upstream_session_pool_status(
                 account.id,
+                account.upstream_session_pool_size,
                 Duration::from_secs((ttl_minutes as u64) * 60),
             )
             .await
