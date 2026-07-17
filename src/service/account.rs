@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::{
-    Account, AccountAuthType, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+    Account, AccountAuthType, AccountStatus, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
     DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, MAX_UPSTREAM_SESSION_POOL_SIZE,
     MAX_UPSTREAM_SESSION_TTL_MINUTES, MIN_UPSTREAM_SESSION_TTL_MINUTES,
 };
@@ -490,6 +490,65 @@ pub struct AccountService {
     transient_rate_limit_backoffs: RwLock<HashMap<i64, TransientRateLimitBackoff>>,
     /// 请求完成后顺手触发的 usage 刷新节流:account_id → 上次预留刷新时间。
     opportunistic_usage_refreshes: RwLock<HashMap<i64, Instant>>,
+}
+
+/// 提供给受信任管理端消费者的 OAuth 凭据快照。
+///
+/// 快照只在 `AccountService` 完成账号锁内的有效期检查或刷新后返回，调用方不得
+/// 自行使用其中的 refresh token 发起第二条刷新链路。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthCredentialSnapshot {
+    pub account_id: i64,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OAuthResolvePolicy {
+    min_validity_seconds: i64,
+    force_refresh: bool,
+    allow_still_valid_fallback: bool,
+}
+
+fn validate_managed_oauth_account(account: &Account) -> Result<(), AppError> {
+    if account.status != AccountStatus::Active {
+        return Err(AppError::BadRequest("账号不是 active 状态".into()));
+    }
+    if account.auth_type != AccountAuthType::Oauth {
+        return Err(AppError::BadRequest("账号不是 OAuth 类型".into()));
+    }
+    Ok(())
+}
+
+/// 从最终重读的账号构造满足最小有效期要求的 OAuth 凭据快照。
+///
+/// @param account 已在账号锁内最终重读的 OAuth 账号。
+/// @param min_validity_seconds access token 必须继续有效的最小秒数。
+/// @return 完整且满足有效期要求的 AT、RT 与过期时间快照。
+fn build_oauth_credential_snapshot(
+    account: &Account,
+    min_validity_seconds: i64,
+) -> Result<OAuthCredentialSnapshot, AppError> {
+    validate_managed_oauth_account(account)?;
+    let expires_at = account
+        .expires_at
+        .ok_or_else(|| AppError::ServiceUnavailable("OAuth expires_at 为空".into()))?;
+    if account.access_token.is_empty() || account.refresh_token.is_empty() {
+        return Err(AppError::ServiceUnavailable("OAuth 凭据不完整".into()));
+    }
+    if !account.has_valid_oauth_access_token(min_validity_seconds) {
+        return Err(AppError::ServiceUnavailable(format!(
+            "OAuth access token 无法满足 {} 秒最小有效期",
+            min_validity_seconds
+        )));
+    }
+    Ok(OAuthCredentialSnapshot {
+        account_id: account.id,
+        access_token: account.access_token.clone(),
+        refresh_token: account.refresh_token.clone(),
+        expires_at: expires_at.timestamp_millis(),
+    })
 }
 
 impl AccountService {
@@ -1181,7 +1240,7 @@ impl AccountService {
                 "usage query is only supported for OAuth accounts, SetupToken accounts cannot query usage via this endpoint".into(),
             ));
         }
-        let token = self.resolve_oauth_access_token(&account).await?;
+        let token = self.resolve_upstream_token(id).await?;
         let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url).await?;
         let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(id, &usage_str).await?;
@@ -1253,13 +1312,98 @@ impl AccountService {
                 }
                 Ok(account.setup_token)
             }
-            AccountAuthType::Oauth => self.resolve_oauth_access_token(&account).await,
+            AccountAuthType::Oauth => {
+                let resolved = self
+                    .resolve_oauth_account(
+                        &account,
+                        OAuthResolvePolicy {
+                            min_validity_seconds: OAUTH_REFRESH_BUFFER_SECONDS,
+                            force_refresh: false,
+                            allow_still_valid_fallback: true,
+                        },
+                    )
+                    .await?;
+                Ok(resolved.access_token)
+            }
         }
     }
 
-    async fn resolve_oauth_access_token(&self, account: &Account) -> Result<String, AppError> {
-        if account.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
-            return Ok(account.access_token.clone());
+    /// 在账号级刷新锁内解析一份满足有效期要求的 OAuth 凭据。
+    ///
+    /// @param id 账号 ID。
+    /// @param min_validity_seconds 返回时 access token 至少还需有效的秒数。
+    /// @param force_refresh 是否忽略当前有效期并强制刷新一次。
+    /// @return 同一账号最终落库的 AT、RT 和过期时间快照。
+    pub async fn resolve_oauth_credentials(
+        &self,
+        id: i64,
+        min_validity_seconds: i64,
+        force_refresh: bool,
+    ) -> Result<OAuthCredentialSnapshot, AppError> {
+        if min_validity_seconds < 0 {
+            return Err(AppError::BadRequest(
+                "min_validity_seconds 不能小于 0".into(),
+            ));
+        }
+
+        let lock_key = format!("oauth:refresh:account:{}", id);
+        let lock_owner = Uuid::new_v4().to_string();
+        for attempt in 0..=OAUTH_WAIT_ATTEMPTS {
+            let acquired = self
+                .cache
+                .acquire_lock(&lock_key, &lock_owner, OAUTH_LOCK_TTL)
+                .await?;
+            if acquired {
+                let result = self
+                    .resolve_oauth_credentials_locked(
+                        id,
+                        OAuthResolvePolicy {
+                            min_validity_seconds,
+                            force_refresh,
+                            allow_still_valid_fallback: false,
+                        },
+                    )
+                    .await;
+                self.cache.release_lock(&lock_key, &lock_owner).await;
+                return result;
+            }
+            if attempt < OAUTH_WAIT_ATTEMPTS {
+                sleep(OAUTH_WAIT_RETRY).await;
+            }
+        }
+
+        Err(AppError::ServiceUnavailable(
+            "OAuth 凭据解析等待超时".into(),
+        ))
+    }
+
+    async fn resolve_oauth_credentials_locked(
+        &self,
+        id: i64,
+        policy: OAuthResolvePolicy,
+    ) -> Result<OAuthCredentialSnapshot, AppError> {
+        let account = self.store.get_by_id(id).await?;
+        validate_managed_oauth_account(&account)?;
+        if policy.force_refresh
+            || !account.has_valid_oauth_access_token(policy.min_validity_seconds)
+        {
+            self.refresh_oauth_account(id, policy).await?;
+        }
+
+        // 即使无需刷新也要在账号锁内最终重读，避免把并发刷新前的旧 RT 返回给 bench。
+        let resolved = self.store.get_by_id(id).await?;
+        build_oauth_credential_snapshot(&resolved, policy.min_validity_seconds)
+    }
+
+    async fn resolve_oauth_account(
+        &self,
+        account: &Account,
+        policy: OAuthResolvePolicy,
+    ) -> Result<Account, AppError> {
+        if !policy.force_refresh
+            && account.has_valid_oauth_access_token(policy.min_validity_seconds)
+        {
+            return Ok(account.clone());
         }
         if account.refresh_token.is_empty() {
             let _ = self
@@ -1279,16 +1423,21 @@ impl AccountService {
             .await?;
 
         if acquired {
-            let result = self.refresh_oauth_access_token(account.id).await;
+            let result = self.refresh_oauth_account(account.id, policy).await;
             self.cache.release_lock(&lock_key, &lock_owner).await;
             return result;
         }
 
+        let initial_access_token = account.access_token.clone();
         for _ in 0..OAUTH_WAIT_ATTEMPTS {
             sleep(OAUTH_WAIT_RETRY).await;
             let latest = self.store.get_by_id(account.id).await?;
-            if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
-                return Ok(latest.access_token);
+            let refreshed_by_owner =
+                !policy.force_refresh || latest.access_token != initial_access_token;
+            if refreshed_by_owner
+                && latest.has_valid_oauth_access_token(policy.min_validity_seconds)
+            {
+                return Ok(latest);
             }
         }
 
@@ -1297,18 +1446,21 @@ impl AccountService {
         ))
     }
 
-    async fn refresh_oauth_access_token(&self, id: i64) -> Result<String, AppError> {
+    async fn refresh_oauth_account(
+        &self,
+        id: i64,
+        policy: OAuthResolvePolicy,
+    ) -> Result<Account, AppError> {
         let latest = self.store.get_by_id(id).await?;
-        if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
-            return Ok(latest.access_token);
+        validate_managed_oauth_account(&latest)?;
+        if !policy.force_refresh && latest.has_valid_oauth_access_token(policy.min_validity_seconds)
+        {
+            return Ok(latest);
         }
         if latest.refresh_token.is_empty() {
-            let _ = self
-                .store
-                .update_auth_error(id, "missing refresh token")
-                .await;
+            let _ = self.store.update_auth_error(id, "缺少 refresh token").await;
             return Err(AppError::ServiceUnavailable(
-                "oauth refresh token is empty".into(),
+                "OAuth refresh token 为空".into(),
             ));
         }
 
@@ -1330,20 +1482,23 @@ impl AccountService {
                         tokens.expires_at,
                     )
                     .await?;
-                Ok(tokens.access_token)
+                self.store.get_by_id(id).await
             }
             Err(err) => {
                 let msg = err.to_string();
                 let _ = self.store.update_auth_error(id, &msg).await;
-                if fallback_is_still_valid && !fallback_access_token.is_empty() {
+                if policy.allow_still_valid_fallback
+                    && fallback_is_still_valid
+                    && !fallback_access_token.is_empty()
+                {
                     warn!(
                         "oauth refresh failed for account {}, using current access token until expiry: {}",
                         id, msg
                     );
-                    return Ok(fallback_access_token);
+                    return Ok(latest);
                 }
                 Err(AppError::ServiceUnavailable(format!(
-                    "oauth refresh failed: {}",
+                    "OAuth 刷新失败: {}",
                     msg
                 )))
             }
@@ -2766,6 +2921,116 @@ mod tests {
         let (waiting, remaining_ms) = svc.transient_rate_limit_backoff_status(account.id).await;
         assert_eq!(waiting, 0);
         assert_eq!(remaining_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_credentials_returns_valid_snapshot_without_refresh() {
+        let (_store, svc) = setup_account_service().await;
+        let mut account = new_account_request("snapshot@example.com");
+        account.access_token = "access-snapshot".into();
+        account.refresh_token = "refresh-snapshot".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        svc.create_account(&mut account).await.unwrap();
+
+        let snapshot = svc
+            .resolve_oauth_credentials(account.id, 600, false)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.account_id, account.id);
+        assert_eq!(snapshot.access_token, "access-snapshot");
+        assert_eq!(snapshot.refresh_token, "refresh-snapshot");
+        assert!(snapshot.expires_at > Utc::now().timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_credentials_waits_for_lock_and_returns_latest_snapshot() {
+        let (store, svc) = setup_account_service().await;
+        let mut account = new_account_request("locked-snapshot@example.com");
+        account.access_token = "access-old".into();
+        account.refresh_token = "refresh-old".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        svc.create_account(&mut account).await.unwrap();
+
+        let lock_key = format!("oauth:refresh:account:{}", account.id);
+        let lock_owner = "test-lock-owner";
+        assert!(
+            svc.cache
+                .acquire_lock(&lock_key, lock_owner, OAUTH_LOCK_TTL)
+                .await
+                .unwrap()
+        );
+
+        let resolving = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.resolve_oauth_credentials(account.id, 600, false).await })
+        };
+        sleep(Duration::from_millis(100)).await;
+        assert!(!resolving.is_finished());
+
+        store
+            .update_oauth_tokens(
+                account.id,
+                "access-new",
+                "refresh-new",
+                Utc::now() + ChronoDuration::hours(2),
+            )
+            .await
+            .unwrap();
+        svc.cache.release_lock(&lock_key, lock_owner).await;
+
+        let snapshot = resolving.await.unwrap().unwrap();
+        assert_eq!(snapshot.access_token, "access-new");
+        assert_eq!(snapshot.refresh_token, "refresh-new");
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_credentials_rejects_non_oauth_account() {
+        let (_store, svc) = setup_account_service().await;
+        let mut account = new_account_request("setup@example.com");
+        account.auth_type = AccountAuthType::SetupToken;
+        account.setup_token = "setup-token".into();
+        account.access_token.clear();
+        account.refresh_token.clear();
+        account.expires_at = None;
+        svc.create_account(&mut account).await.unwrap();
+
+        let error = svc
+            .resolve_oauth_credentials(account.id, 600, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("不是 OAuth 类型"));
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_credentials_rejects_disabled_account() {
+        let (_store, svc) = setup_account_service().await;
+        let mut account = new_account_request("disabled@example.com");
+        account.access_token = "access-disabled".into();
+        account.refresh_token = "refresh-disabled".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        account.status = AccountStatus::Disabled;
+        svc.create_account(&mut account).await.unwrap();
+
+        let error = svc
+            .resolve_oauth_credentials(account.id, 600, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("不是 active 状态"));
+    }
+
+    #[test]
+    fn oauth_credential_snapshot_rejects_insufficient_final_validity() {
+        let mut account = new_account_request("short-lived@example.com");
+        account.access_token = "access-short-lived".into();
+        account.refresh_token = "refresh-short-lived".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::minutes(5));
+
+        let error = build_oauth_credential_snapshot(&account, 600).unwrap_err();
+
+        assert!(error.to_string().contains("无法满足 600 秒最小有效期"));
     }
 
     // ---- tiered_decay ----

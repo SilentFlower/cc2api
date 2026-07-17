@@ -6,7 +6,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::TimeZone;
 use rust_embed::Embed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -119,6 +119,10 @@ pub fn build_router(
         )
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
+        .route(
+            "/admin/accounts/:id/oauth-credentials/resolve",
+            post(resolve_oauth_credentials),
+        )
         .route("/admin/tokens", get(list_tokens).post(create_token))
         .route(
             "/admin/tokens/:id",
@@ -322,6 +326,39 @@ struct CreateAccountRequest {
     upstream_session_pool_size: Option<i32>,
     upstream_session_ttl_minutes: Option<i32>,
     upstream_session_refresh_policy: Option<String>,
+}
+
+const DEFAULT_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 2400;
+const MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 60;
+const MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 7200;
+
+/// 管理端解析 OAuth 凭据的请求体。
+#[derive(Deserialize)]
+struct ResolveOAuthCredentialsRequest {
+    min_validity_seconds: Option<i64>,
+    force_refresh: Option<bool>,
+}
+
+/// 管理端返回给受信任消费者的最小 OAuth 凭据快照。
+#[derive(Serialize)]
+struct ResolveOAuthCredentialsResponse {
+    account_id: i64,
+    access_token: String,
+    refresh_token: String,
+    expires_at: i64,
+}
+
+fn normalize_oauth_credential_validity_seconds(value: Option<i64>) -> Result<i64, AppError> {
+    let value = value.unwrap_or(DEFAULT_OAUTH_CREDENTIAL_VALIDITY_SECONDS);
+    if !(MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS..=MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS)
+        .contains(&value)
+    {
+        return Err(AppError::BadRequest(format!(
+            "min_validity_seconds 必须为 {}-{}",
+            MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS
+        )));
+    }
+    Ok(value)
 }
 
 async fn create_account(
@@ -529,6 +566,31 @@ async fn update_account(
     state.account_svc.update_account(&existing).await?;
     existing = state.account_svc.get_account(id).await?;
     Ok(Json(existing))
+}
+
+/// 在 cc2api 账号锁内解析满足有效期要求的 OAuth 凭据。
+///
+/// @param state 应用状态。
+/// @param id cc2api 账号 ID。
+/// @param req 最小有效期和强制刷新选项。
+/// @return 同一次最终落库状态中的 AT、RT 和过期时间。
+async fn resolve_oauth_credentials(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<ResolveOAuthCredentialsRequest>,
+) -> Result<Json<ResolveOAuthCredentialsResponse>, AppError> {
+    let min_validity_seconds =
+        normalize_oauth_credential_validity_seconds(req.min_validity_seconds)?;
+    let snapshot = state
+        .account_svc
+        .resolve_oauth_credentials(id, min_validity_seconds, req.force_refresh.unwrap_or(false))
+        .await?;
+    Ok(Json(ResolveOAuthCredentialsResponse {
+        account_id: snapshot.account_id,
+        access_token: snapshot.access_token,
+        refresh_token: snapshot.refresh_token,
+        expires_at: snapshot.expires_at,
+    }))
 }
 
 async fn delete_account(
@@ -1226,7 +1288,11 @@ async fn get_prime_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeCodeContextSanitizerMode, validate_model_id_list};
+    use super::{
+        ClaudeCodeContextSanitizerMode, MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS,
+        MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, normalize_oauth_credential_validity_seconds,
+        validate_model_id_list,
+    };
 
     #[test]
     fn model_id_list_allows_empty_and_valid_ids() {
@@ -1259,5 +1325,25 @@ mod tests {
             ClaudeCodeContextSanitizerMode::Normalize
         );
         assert!(ClaudeCodeContextSanitizerMode::parse("rewrite").is_err());
+    }
+
+    #[test]
+    fn oauth_credential_validity_uses_default_and_rejects_out_of_range() {
+        assert_eq!(
+            normalize_oauth_credential_validity_seconds(None).unwrap(),
+            2400
+        );
+        assert!(
+            normalize_oauth_credential_validity_seconds(Some(
+                MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS - 1
+            ))
+            .is_err()
+        );
+        assert!(
+            normalize_oauth_credential_validity_seconds(Some(
+                MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS + 1
+            ))
+            .is_err()
+        );
     }
 }
