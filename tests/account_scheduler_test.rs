@@ -7,7 +7,9 @@ use claude_code_gateway::model::account::{
     Account, AccountAuthType, AccountStatus, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
 };
-use claude_code_gateway::service::account::{AccountSelectionContext, AccountService};
+use claude_code_gateway::service::account::{
+    AccountSelectionContext, AccountService, UsageObservationKind,
+};
 use claude_code_gateway::store::account_store::AccountStore;
 use claude_code_gateway::store::memory::MemoryStore;
 use claude_code_gateway::store::settings_store::SettingsStore;
@@ -390,9 +392,13 @@ async fn test_fable_sticky_exhausted_selects_alternative_account() {
     svc.update_account(&a2).await.unwrap();
     mark_oauth_account(&svc, &mut a1).await;
     mark_oauth_account(&svc, &mut a2).await;
-    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
-        .await
-        .unwrap();
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(100, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
 
     let session_hash = "fable-sticky-full-session";
     svc.bind_selected_session(session_hash, a1.id)
@@ -434,9 +440,13 @@ async fn test_fable_sticky_exhausted_without_alternative_keeps_binding() {
     let (_store, svc) = setup().await;
     let mut a1 = create_test_account(&svc, "fable-sticky-only@example.com").await;
     mark_oauth_account(&svc, &mut a1).await;
-    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
-        .await
-        .unwrap();
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(100, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
 
     let session_hash = "fable-sticky-only-session";
     svc.bind_selected_session(session_hash, a1.id)
@@ -480,9 +490,13 @@ async fn test_fable_sticky_fallback_disabled_keeps_original_sticky() {
     svc.update_account(&a2).await.unwrap();
     mark_oauth_account(&svc, &mut a1).await;
     mark_oauth_account(&svc, &mut a2).await;
-    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
-        .await
-        .unwrap();
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(100, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
 
     let session_hash = "fable-disabled-session";
     svc.bind_selected_session(session_hash, a1.id)
@@ -513,9 +527,13 @@ async fn test_non_fable_sticky_ignores_fable_quota_exhaustion() {
     svc.update_account(&a2).await.unwrap();
     mark_oauth_account(&svc, &mut a1).await;
     mark_oauth_account(&svc, &mut a2).await;
-    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
-        .await
-        .unwrap();
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(100, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
 
     let session_hash = "non-fable-sticky-session";
     svc.bind_selected_session(session_hash, a1.id)
@@ -544,9 +562,13 @@ async fn test_setup_token_sticky_ignores_fable_quota_usage_data() {
     a2.priority = 20;
     svc.update_account(&a1).await.unwrap();
     svc.update_account(&a2).await.unwrap();
-    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
-        .await
-        .unwrap();
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(100, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
 
     let session_hash = "setup-token-sticky-session";
     svc.bind_selected_session(session_hash, a1.id)
@@ -577,9 +599,13 @@ async fn test_non_sticky_fable_selection_filters_exhausted_accounts() {
     svc.update_account(&a2).await.unwrap();
     mark_oauth_account(&svc, &mut a1).await;
     mark_oauth_account(&svc, &mut a2).await;
-    svc.update_passive_usage(a1.id, fable_usage_window(100, Duration::days(3)))
-        .await
-        .unwrap();
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(100, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
 
     let selected = svc
         .select_account_with_selection_context(

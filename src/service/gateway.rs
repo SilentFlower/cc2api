@@ -13,11 +13,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountAuthType, AccountStatus};
+use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -25,7 +24,7 @@ use crate::service::access_policy::{
 };
 use crate::service::account::{
     AccountSelectionContext, AccountService, AccountSlotPermit, DEFAULT_REQUEST_SLOT_UNITS,
-    HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, account_fable_quota_exhausted,
+    HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, UsageObservationKind,
 };
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
@@ -83,9 +82,6 @@ const STATEFUL_USAGE_BUFFER_LIMIT: usize = 64 * 1024;
 const STATEFUL_USAGE_SIDE_TAP_LIMIT: usize = 16 * 1024 * 1024;
 /// 非流式单消息探针缓存固定 TTL。只缓存强特征探针,避免误缓存真实业务请求。
 const NON_STREAM_PROBE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-/// Fable 请求结束后稍等再查 usage，避免刚 EOF 时上游计量还没落到 usage API。
-const FABLE_USAGE_REFRESH_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
-
 fn align_mapped_upstream_session_header(
     headers: &mut HashMap<String, String>,
     upstream_session_rewrite: &UpstreamSessionRewrite,
@@ -114,35 +110,6 @@ struct RateLimitResponseDecision {
 struct GatewayAccountAdmission {
     permit: AccountSlotPermit,
     slot_wait: std::time::Duration,
-}
-
-#[derive(Clone)]
-struct FableUsageRefreshContext {
-    account_svc: Arc<AccountService>,
-    account_id: i64,
-}
-
-impl FableUsageRefreshContext {
-    fn spawn_delayed(self) {
-        tokio::spawn(async move {
-            sleep(FABLE_USAGE_REFRESH_DELAY).await;
-            match self
-                .account_svc
-                .refresh_usage_after_fable_request(self.account_id)
-                .await
-            {
-                Ok(true) => debug!("fable usage refreshed for account {}", self.account_id),
-                Ok(false) => debug!(
-                    "fable usage refresh skipped by throttle for account {}",
-                    self.account_id
-                ),
-                Err(e) => warn!(
-                    "fable usage refresh failed for account {}: {}",
-                    self.account_id, e
-                ),
-            }
-        });
-    }
 }
 
 #[derive(Debug)]
@@ -1756,13 +1723,6 @@ impl GatewayService {
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 if let Some(lookup) = non_stream_probe_cache_lookup {
                     if resp.status().is_success() && signature_retry_stage.is_none() {
-                        let fable_usage_refresh = fable_usage_refresh_context(
-                            self.account_svc.clone(),
-                            &account,
-                            &path,
-                            model_id,
-                            resp.status(),
-                        );
                         let (parts, body_bytes) = buffer_response_body(resp).await?;
                         if let Some(context) = telemetry_context.clone() {
                             self.telemetry_svc
@@ -1784,7 +1744,6 @@ impl GatewayService {
                                 &lookup, &account, &parts, body_bytes,
                             )
                             .await?;
-                        spawn_fable_usage_refresh(fable_usage_refresh);
                         return Ok(cached_response);
                     }
                 }
@@ -1799,13 +1758,6 @@ impl GatewayService {
                 };
                 let permit = slot_guard.defuse();
                 let content_codings = response_content_codings(resp.headers());
-                let fable_usage_refresh = fable_usage_refresh_context(
-                    self.account_svc.clone(),
-                    &account,
-                    &path,
-                    model_id,
-                    resp.status(),
-                );
                 let (parts, body) = resp.into_parts();
                 let guarded_body = Body::new(SlotGuardBody::new(
                     body,
@@ -1822,7 +1774,6 @@ impl GatewayService {
                     telemetry_status_code,
                     telemetry_ttft_ms,
                     telemetry_error_kind.clone(),
-                    fable_usage_refresh,
                 ));
                 return Ok(Response::from_parts(parts, guarded_body));
             }
@@ -2037,6 +1988,28 @@ impl GatewayService {
             let retry_after = parse_retry_after(&headers_429);
             // 用这条 429 响应自带的 ratelimit 头做撞墙判断(被动,不再主动查 usage 接口)
             let usage_from_headers = extract_passive_usage(&headers_429);
+            let usage_kind = UsageObservationKind::RejectedWindows(
+                extract_rejected_passive_usage_windows(&headers_429),
+            );
+            let rate_limit_usage = usage_from_headers
+                .as_ref()
+                .and_then(|usage| usage_kind.rejected_usage(usage));
+            if let Some(usage_json) = usage_from_headers.clone() {
+                let svc = self.account_svc.clone();
+                let account_id = account.id;
+                let usage_kind = usage_kind.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = svc
+                        .update_passive_usage(account_id, usage_json, usage_kind)
+                        .await
+                    {
+                        debug!(
+                            "passive 429 usage update failed for account {}: {}",
+                            account_id, e
+                        );
+                    }
+                });
+            }
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let request_log_config = *self.rate_limit_request_log_config.read().await;
             if request_log_config.enabled {
@@ -2062,7 +2035,7 @@ impl GatewayService {
                     account,
                     retry_after,
                     &body_snippet,
-                    usage_from_headers,
+                    rate_limit_usage,
                     account_selection_context,
                 )
                 .await
@@ -2076,16 +2049,6 @@ impl GatewayService {
                     None
                 }
             };
-            if account_selection_context.is_fable_quota_fallback_active()
-                && account.auth_type == AccountAuthType::Oauth
-                && !account_fable_quota_exhausted(account)
-            {
-                spawn_fable_usage_refresh(Some(FableUsageRefreshContext {
-                    account_svc: self.account_svc.clone(),
-                    account_id: account.id,
-                }));
-            }
-
             let (downstream_body, remove_transport_headers) =
                 buffered_error_body_for_downstream(body_bytes.clone(), &headers_429);
 
@@ -2130,14 +2093,16 @@ impl GatewayService {
             }
         }
 
-        // 被动采集：从上游响应头提取用量数据，异步合并到数据库。
-        // 429 时跳过，因为 handle_rate_limit 已通过 API 获取了完整数据，异步写入会覆盖。
-        if status_code != 429 {
+        // 成功响应只做被动采集，不触发 usage API；429 已在上方按拒绝样本持久化。
+        if resp.status().is_success() {
             if let Some(usage_json) = extract_passive_usage(resp.headers()) {
                 let svc = self.account_svc.clone();
                 let aid = account.id;
                 tokio::spawn(async move {
-                    if let Err(e) = svc.update_passive_usage(aid, usage_json).await {
+                    if let Err(e) = svc
+                        .update_passive_usage(aid, usage_json, UsageObservationKind::Allowed)
+                        .await
+                    {
                         debug!("passive usage update failed for account {}: {}", aid, e);
                     }
                 });
@@ -3129,39 +3094,6 @@ fn query_model_is_fable(query: &str) -> bool {
             .map(|model| model.starts_with("claude-fable-5"))
             .unwrap_or(false)
     })
-}
-
-fn should_refresh_fable_usage_after_response(
-    account: &Account,
-    path: &str,
-    model_id: &str,
-    status: StatusCode,
-) -> bool {
-    status.is_success()
-        && path == "/v1/messages"
-        && account.auth_type == AccountAuthType::Oauth
-        && is_fable_model_id(model_id)
-}
-
-fn fable_usage_refresh_context(
-    account_svc: Arc<AccountService>,
-    account: &Account,
-    path: &str,
-    model_id: &str,
-    status: StatusCode,
-) -> Option<FableUsageRefreshContext> {
-    should_refresh_fable_usage_after_response(account, path, model_id, status).then_some(
-        FableUsageRefreshContext {
-            account_svc,
-            account_id: account.id,
-        },
-    )
-}
-
-fn spawn_fable_usage_refresh(context: Option<FableUsageRefreshContext>) {
-    if let Some(context) = context {
-        context.spawn_delayed();
-    }
 }
 
 fn is_fable_model_id(model: &str) -> bool {
@@ -5068,65 +5000,139 @@ fn text_char_length_value(value: &serde_json::Value) -> usize {
 /// 从上游响应头中提取 ratelimit 用量信息，构建与 OAuth usage API 格式一致的 JSON。
 /// 仅保留 utilization 和 resets_at 都存在且可解析的完整窗口，避免不完整数据导致前端异常。
 /// 没有任何完整窗口时返回 None。
+///
+/// @param headers Anthropic 上游响应头。
+/// @return 至少包含一个完整窗口时返回归一化用量，否则返回 `None`。
 pub(crate) fn extract_passive_usage(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<serde_json::Value> {
-    let get_str = |name: &str| -> Option<String> {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    };
-
     let mut usage = serde_json::json!({});
-    let mut has_window = false;
 
-    // 5 小时窗口：utilization 和 resets_at 必须同时存在且可解析
-    if let (Some(util_str), Some(reset_raw)) = (
-        get_str("anthropic-ratelimit-unified-5h-utilization"),
-        get_str("anthropic-ratelimit-unified-5h-reset"),
-    ) {
-        if let (Ok(util), Some(reset)) = (
-            util_str.parse::<f64>(),
-            normalize_reset_timestamp(&reset_raw),
-        ) {
-            // 响应头返回 0~1 的比例，乘以 100 转为百分比，与 OAuth usage API 格式一致
-            usage["five_hour"] =
-                serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
-            has_window = true;
+    for (usage_key, header_window) in PASSIVE_USAGE_WINDOWS {
+        let max_ahead = if header_window == "5h" {
+            chrono::Duration::hours(6)
+        } else {
+            chrono::Duration::days(8)
+        };
+        if let Some(window) = extract_passive_usage_window(headers, header_window, max_ahead) {
+            usage[usage_key] = window;
         }
     }
 
-    // 7 天窗口：同上
-    if let (Some(util_str), Some(reset_raw)) = (
-        get_str("anthropic-ratelimit-unified-7d-utilization"),
-        get_str("anthropic-ratelimit-unified-7d-reset"),
-    ) {
-        if let (Ok(util), Some(reset)) = (
-            util_str.parse::<f64>(),
-            normalize_reset_timestamp(&reset_raw),
-        ) {
-            usage["seven_day"] =
-                serde_json::json!({ "utilization": util * 100.0, "resets_at": reset });
-            has_window = true;
-        }
-    }
-
-    if has_window { Some(usage) } else { None }
+    usage.as_object().filter(|value| !value.is_empty())?;
+    Some(usage)
 }
 
-/// 将响应头中的重置时间统一转为 RFC3339 格式。
-/// 响应头可能是 Unix 时间戳（秒）或已经是 ISO8601/RFC3339 字符串。
-fn normalize_reset_timestamp(raw: &str) -> Option<String> {
-    // 尝试解析为 Unix 时间戳（秒）
-    if let Ok(ts) = raw.parse::<i64>() {
-        return chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339());
+const PASSIVE_USAGE_WINDOWS: [(&str, &str); 3] = [
+    ("five_hour", "5h"),
+    ("seven_day", "7d"),
+    ("seven_day_fable", "7d_oi"),
+];
+
+/// 从 429 响应头中识别实际拒绝请求的用量窗口。
+///
+/// `status` 是窗口级权威信号；仅在缺少明确状态时，才使用
+/// `surpassed-threshold` 或 `utilization >= 1.0` 兼容旧响应。
+///
+/// @param headers Anthropic 上游响应头。
+/// @return cc2api 稳定字段名组成的拒绝窗口列表。
+pub(crate) fn extract_rejected_passive_usage_windows(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<String> {
+    PASSIVE_USAGE_WINDOWS
+        .iter()
+        .filter_map(|(usage_key, header_window)| {
+            passive_usage_window_rejected(headers, header_window).then(|| (*usage_key).to_string())
+        })
+        .collect()
+}
+
+fn passive_usage_window_rejected(
+    headers: &reqwest::header::HeaderMap,
+    header_window: &str,
+) -> bool {
+    let prefix = format!("anthropic-ratelimit-unified-{}-", header_window);
+    let status_name = format!("{}status", prefix);
+    if let Some(status) = headers
+        .get(status_name.as_str())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        if status.eq_ignore_ascii_case("rejected") {
+            return true;
+        }
+        if status.eq_ignore_ascii_case("allowed") {
+            // 429 属于整条响应，但窗口自身允许时，高位 utilization 可能仍是跨周期残留。
+            return false;
+        }
     }
-    // 尝试解析为 RFC3339，验证合法性
-    if chrono::DateTime::parse_from_rfc3339(raw).is_ok() {
-        return Some(raw.to_string());
+
+    let surpassed_name = format!("{}surpassed-threshold", prefix);
+    if let Some(surpassed) = headers
+        .get(surpassed_name.as_str())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        if surpassed.eq_ignore_ascii_case("true")
+            || surpassed
+                .parse::<f64>()
+                .is_ok_and(|value| value.is_finite() && value > 0.0)
+        {
+            return true;
+        }
     }
-    None
+
+    let utilization_name = format!("{}utilization", prefix);
+    headers
+        .get(utilization_name.as_str())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<f64>().ok())
+        .is_some_and(|value| value.is_finite() && value >= 1.0 - 1e-9)
+}
+
+fn extract_passive_usage_window(
+    headers: &reqwest::header::HeaderMap,
+    header_window: &str,
+    max_ahead: chrono::Duration,
+) -> Option<serde_json::Value> {
+    let utilization_name = format!("anthropic-ratelimit-unified-{}-utilization", header_window);
+    let reset_name = format!("anthropic-ratelimit-unified-{}-reset", header_window);
+    let utilization = headers
+        .get(utilization_name.as_str())
+        .and_then(|value| value.to_str().ok())?
+        .parse::<f64>()
+        .ok()?;
+    if !utilization.is_finite() || utilization < 0.0 {
+        return None;
+    }
+    let reset_raw = headers.get(reset_name.as_str())?.to_str().ok()?;
+    let reset = normalize_passive_reset_timestamp(reset_raw, max_ahead)?;
+
+    // 响应头返回比例，乘以 100 后与 OAuth usage API 的百分比格式保持一致。
+    Some(serde_json::json!({
+        "utilization": utilization * 100.0,
+        "resets_at": reset,
+    }))
+}
+
+/// 将响应头中的重置时间统一为 RFC3339，并拒绝明显异常的窗口时间。
+fn normalize_passive_reset_timestamp(raw: &str, max_ahead: chrono::Duration) -> Option<String> {
+    let reset = if let Ok(mut timestamp) = raw.parse::<i64>() {
+        // 某些兼容实现会回传毫秒时间戳，统一降为秒。
+        if timestamp > 100_000_000_000 {
+            timestamp /= 1000;
+        }
+        chrono::DateTime::from_timestamp(timestamp, 0)?
+    } else {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()?
+            .with_timezone(&Utc)
+    };
+    let now = Utc::now();
+    if reset <= now || reset > now + max_ahead {
+        return None;
+    }
+    Some(reset.to_rfc3339())
 }
 
 /// 并发槽位释放守卫：drop permit 时自动归还 semaphore，防止错误路径或 panic 导致泄漏。
@@ -5205,8 +5211,6 @@ struct SlotGuardBody {
     message_telemetry_buffer: String,
     /// 上游响应 stop_reason。
     message_telemetry_stop_reason: Option<String>,
-    /// Fable 请求成功传输完成后触发的 usage 刷新上下文。
-    fable_usage_refresh: Option<FableUsageRefreshContext>,
     /// 是否已收到第一个 frame。
     first_frame_logged: bool,
 }
@@ -5298,7 +5302,6 @@ impl SlotGuardBody {
         telemetry_status_code: u16,
         telemetry_ttft_ms: u64,
         telemetry_error_kind: Option<String>,
-        fable_usage_refresh: Option<FableUsageRefreshContext>,
     ) -> Self {
         Self {
             inner,
@@ -5323,7 +5326,6 @@ impl SlotGuardBody {
             message_telemetry_usage: MessageTelemetryUsage::default(),
             message_telemetry_buffer: String::new(),
             message_telemetry_stop_reason: None,
-            fable_usage_refresh,
             first_frame_logged: false,
         }
     }
@@ -5432,7 +5434,6 @@ impl http_body::Body for SlotGuardBody {
             self.message_telemetry_stop_reason = stop_reason;
             self.message_telemetry_buffer = message_buffer;
             self.record_message_telemetry_result(None);
-            spawn_fable_usage_refresh(self.fable_usage_refresh.take());
         } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
             // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
             log_prompt_cache_usage_read_error(self.cache_usage_context.as_ref());
@@ -5840,6 +5841,7 @@ mod tests {
         build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
         classify_non_stream_probe_text, detect_auto_mode_classifier_request,
         detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
+        extract_passive_usage, extract_rejected_passive_usage_windows,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
         is_signature_related_error_body, is_signature_related_error_response_body,
@@ -5850,8 +5852,7 @@ mod tests {
         redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
         request_slot_units, rewrite_bootstrap_response, safe_body_summary,
         safe_non_stream_probe_response_headers, sanitize_count_tokens_body,
-        should_intercept_assistant_prefill, should_refresh_fable_usage_after_response,
-        signature_retry_body_for_stage, stable_upstream_stream,
+        should_intercept_assistant_prefill, signature_retry_body_for_stage, stable_upstream_stream,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
@@ -6015,48 +6016,113 @@ mod tests {
     }
 
     #[test]
-    fn fable_usage_refresh_only_triggers_for_successful_oauth_fable_messages() {
-        let mut account = test_account();
-        account.auth_type = AccountAuthType::Oauth;
+    fn passive_usage_extracts_common_and_fable_windows() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let five_hour_reset = (Utc::now() + chrono::Duration::hours(5)).timestamp();
+        let seven_day_reset = (Utc::now() + chrono::Duration::days(7)).timestamp_millis();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            reqwest::header::HeaderValue::from_static("0.25"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reqwest::header::HeaderValue::from_str(&five_hour_reset.to_string()).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            reqwest::header::HeaderValue::from_static("0.60"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            reqwest::header::HeaderValue::from_str(&seven_day_reset.to_string()).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            reqwest::header::HeaderValue::from_static("0.87"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            reqwest::header::HeaderValue::from_str(&seven_day_reset.to_string()).unwrap(),
+        );
 
-        assert!(should_refresh_fable_usage_after_response(
-            &account,
-            "/v1/messages",
-            "claude-fable-5",
-            StatusCode::OK
-        ));
-        assert!(should_refresh_fable_usage_after_response(
-            &account,
-            "/v1/messages",
-            "claude-fable-5[1m]",
-            StatusCode::CREATED
-        ));
-        assert!(!should_refresh_fable_usage_after_response(
-            &account,
-            "/v1/messages/count_tokens",
-            "claude-fable-5",
-            StatusCode::OK
-        ));
-        assert!(!should_refresh_fable_usage_after_response(
-            &account,
-            "/v1/messages",
-            "claude-sonnet-4-6",
-            StatusCode::OK
-        ));
-        assert!(!should_refresh_fable_usage_after_response(
-            &account,
-            "/v1/messages",
-            "claude-fable-5",
-            StatusCode::TOO_MANY_REQUESTS
-        ));
+        let usage = extract_passive_usage(&headers).expect("完整窗口应被解析");
 
-        account.auth_type = AccountAuthType::SetupToken;
-        assert!(!should_refresh_fable_usage_after_response(
-            &account,
-            "/v1/messages",
-            "claude-fable-5",
-            StatusCode::OK
-        ));
+        assert_eq!(usage["five_hour"]["utilization"], json!(25.0));
+        assert_eq!(usage["seven_day"]["utilization"], json!(60.0));
+        assert_eq!(usage["seven_day_fable"]["utilization"], json!(87.0));
+    }
+
+    #[test]
+    fn passive_usage_ignores_incomplete_or_invalid_windows() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let expired_reset = (Utc::now() - chrono::Duration::minutes(1)).timestamp();
+        let too_far_reset = (Utc::now() + chrono::Duration::days(9)).timestamp();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            reqwest::header::HeaderValue::from_static("NaN"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reqwest::header::HeaderValue::from_str(&expired_reset.to_string()).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            reqwest::header::HeaderValue::from_static("0.50"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            reqwest::header::HeaderValue::from_str(&too_far_reset.to_string()).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            reqwest::header::HeaderValue::from_static("-0.1"),
+        );
+
+        assert!(extract_passive_usage(&headers).is_none());
+    }
+
+    #[test]
+    fn rejected_passive_usage_windows_respect_explicit_window_status() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for window in ["5h", "7d", "7d_oi"] {
+            headers.insert(
+                format!("anthropic-ratelimit-unified-{}-utilization", window)
+                    .parse::<reqwest::header::HeaderName>()
+                    .unwrap(),
+                reqwest::header::HeaderValue::from_static("1.0"),
+            );
+        }
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            reqwest::header::HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            reqwest::header::HeaderValue::from_static("allowed"),
+        );
+
+        assert_eq!(
+            extract_rejected_passive_usage_windows(&headers),
+            vec!["five_hour".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejected_passive_usage_windows_support_numeric_surpassed_threshold() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-surpassed-threshold",
+            reqwest::header::HeaderValue::from_static("1.0"),
+        );
+
+        assert_eq!(
+            extract_rejected_passive_usage_windows(&headers),
+            vec!["seven_day_fable".to_string()]
+        );
     }
 
     #[test]

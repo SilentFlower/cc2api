@@ -6,8 +6,8 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::model::account::{Account, AccountStatus};
-use crate::service::account::{AccountService, RateLimitDecision};
-use crate::service::gateway::extract_passive_usage;
+use crate::service::account::{AccountService, RateLimitDecision, UsageObservationKind};
+use crate::service::gateway::{extract_passive_usage, extract_rejected_passive_usage_windows};
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
     ordered_anthropic_headers,
@@ -52,6 +52,7 @@ struct PrimeOutcome {
     error_message: String,
     duration_ms: i64,
     passive_usage: Option<serde_json::Value>,
+    usage_observation_kind: UsageObservationKind,
     /// 上游 HTTP 状态码,None 表示请求没到达上游(如 token 解析失败、序列化失败)。
     /// 用于后续按状态码做 429/403 处理。
     status: Option<u16>,
@@ -220,6 +221,7 @@ impl PrimePollerService {
                     error_message: format!("skipped: rate-limited until {}", reset),
                     duration_ms: 0,
                     passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
                 }
             };
@@ -264,16 +266,27 @@ impl PrimePollerService {
             // - 429: 调用 handle_rate_limit,按账号类型/用量设置冷却窗口。
             // - 403: 若未处于 429 冷却期则永久停用,避免坏账号继续被真实流量选中。
             if let Some(code) = outcome.status {
-                self.apply_status_side_effects(&account, code).await;
+                let rate_limit_usage = outcome
+                    .passive_usage
+                    .as_ref()
+                    .and_then(|usage| outcome.usage_observation_kind.rejected_usage(usage));
+                self.apply_status_side_effects(&account, code, rate_limit_usage)
+                    .await;
             }
 
-            // 合并响应头中的 ratelimit 数据,刷新账号窗口信息,供调度/展示使用。
-            // 429 场景不覆盖,因为 handle_rate_limit 已写入更完整的数据(可能从 OAuth usage API)。
-            if outcome.status != Some(429) {
-                if let Some(usage) = outcome.passive_usage {
+            // 成功和 429 都只使用响应头被动采集；普通错误不更新窗口。
+            if let (Some(status), Some(usage)) = (outcome.status, outcome.passive_usage) {
+                let kind = if status == 429 {
+                    Some(outcome.usage_observation_kind)
+                } else if (200..300).contains(&status) {
+                    Some(UsageObservationKind::Allowed)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
                     if let Err(e) = self
                         .account_svc
-                        .update_passive_usage(account.id, usage)
+                        .update_passive_usage(account.id, usage, kind)
                         .await
                     {
                         warn!(
@@ -293,13 +306,17 @@ impl PrimePollerService {
     /// 与 `src/service/gateway.rs:359/369` 的处理保持一致:
     /// - 429 → `handle_rate_limit` 按类型/用量设置冷却;
     /// - 403 且未处于 429 冷却期 → `disable_account` 永久停用,防止真实流量继续选中。
-    async fn apply_status_side_effects(&self, account: &Account, status: u16) {
+    async fn apply_status_side_effects(
+        &self,
+        account: &Account,
+        status: u16,
+        passive_usage: Option<serde_json::Value>,
+    ) {
         if status == 429 {
-            // 预热请求体极小,不会触发长上下文计费类 429;此处无 retry-after/响应体/被动用量,
-            // 走「用已存 usage_data 判断撞墙 + 短冷却」的常规逻辑即可。
+            // 预热请求体极小,不会触发长上下文计费类 429；直接使用本次响应头判断窗口。
             match self
                 .account_svc
-                .handle_rate_limit(account, None, "", None)
+                .handle_rate_limit(account, None, "", passive_usage)
                 .await
             {
                 Ok(RateLimitDecision::RequestBackoff(delay)) => {
@@ -374,6 +391,7 @@ impl PrimePollerService {
                     ),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
                 };
             }
@@ -401,6 +419,7 @@ impl PrimePollerService {
                     ),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
                 };
             }
@@ -450,6 +469,7 @@ impl PrimePollerService {
                     ),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
                 };
             }
@@ -459,6 +479,7 @@ impl PrimePollerService {
                     error_message: "upstream TTFB timeout".into(),
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
                 };
             }
@@ -466,6 +487,13 @@ impl PrimePollerService {
 
         let status_code = resp.status().as_u16();
         let passive_usage = extract_passive_usage(resp.headers());
+        let usage_observation_kind = if status_code == 429 {
+            UsageObservationKind::RejectedWindows(extract_rejected_passive_usage_windows(
+                resp.headers(),
+            ))
+        } else {
+            UsageObservationKind::Allowed
+        };
 
         // 调试日志：打印预热响应中的 rate limit header 和解析结果，
         // 用于排查"预热成功但账号未进入 5h 窗口"问题。
@@ -480,9 +508,12 @@ impl PrimePollerService {
             let h5r = get_hdr("anthropic-ratelimit-unified-5h-reset");
             let h7u = get_hdr("anthropic-ratelimit-unified-7d-utilization");
             let h7r = get_hdr("anthropic-ratelimit-unified-7d-reset");
+            let h7fu = get_hdr("anthropic-ratelimit-unified-7d_oi-utilization");
+            let h7fr = get_hdr("anthropic-ratelimit-unified-7d_oi-reset");
             info!(
                 "prime: account={} http={} passive_captured={} \
-                 5h_util={:?} 5h_reset={:?} 7d_util={:?} 7d_reset={:?}",
+                 5h_util={:?} 5h_reset={:?} 7d_util={:?} 7d_reset={:?} \
+                 7d_oi_util={:?} 7d_oi_reset={:?}",
                 account.id,
                 status_code,
                 passive_usage.is_some(),
@@ -490,6 +521,8 @@ impl PrimePollerService {
                 h5r,
                 h7u,
                 h7r,
+                h7fu,
+                h7fr,
             );
         }
 
@@ -515,6 +548,7 @@ impl PrimePollerService {
                 error_message: String::new(),
                 duration_ms: started.elapsed().as_millis() as i64,
                 passive_usage,
+                usage_observation_kind,
                 status: Some(status_code),
             }
         } else {
@@ -528,6 +562,7 @@ impl PrimePollerService {
                 error_message: format!("http {}: {}", status_code, snippet),
                 duration_ms: started.elapsed().as_millis() as i64,
                 passive_usage,
+                usage_observation_kind,
                 status: Some(status_code),
             }
         }

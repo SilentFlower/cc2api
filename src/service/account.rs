@@ -33,8 +33,6 @@ const OAUTH_WAIT_ATTEMPTS: usize = 20;
 const RPM_KEY_TTL: Duration = Duration::from_secs(120);
 const RPM_WAIT_MAX: Duration = Duration::from_secs(5);
 const RPM_WAIT_STEP: Duration = Duration::from_millis(250);
-/// Fable 请求完成后自动刷新 usage 的账号级最小间隔，避免高并发请求打爆 usage 端点。
-const OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// 一个标准并发槽对应的内部信号量单位数。
 pub const SLOT_UNIT_SCALE: i32 = 2;
 /// 普通请求占用的内部单位数。
@@ -44,6 +42,8 @@ pub const HAIKU_REQUEST_SLOT_UNITS: u32 = 1;
 
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
+/// rollover 后仍处于该高位的成功样本视为上一周期残留值。
+const USAGE_ROLLOVER_STALE_THRESHOLD: f64 = USAGE_HIT_THRESHOLD;
 /// Fable 模型级周配额只有明确达到 100% 才视为耗尽。
 const FABLE_QUOTA_EXHAUSTED_THRESHOLD: f64 = 100.0;
 /// 撞墙之外的纯速率限制请求级等待时间。瞬时 429 很快即过，只让当前请求等一小段时间再重试，
@@ -164,6 +164,47 @@ pub enum RateLimitDecision {
     RequestBackoff(Duration),
     /// 单请求级拒绝,不应隔离账号或自动重试。
     PassThrough,
+}
+
+/// 上游用量观察的语义，用于决定 rollover 时是否信任各窗口的高位利用率。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageObservationKind {
+    /// 请求被上游允许，跨周期高位值可能是上一周期残留。
+    Allowed,
+    /// 请求被上游以 429 拒绝，仅列出的窗口可把高位值视为真实耗尽。
+    RejectedWindows(Vec<String>),
+}
+
+impl UsageObservationKind {
+    /// 从完整被动用量中筛出本次 429 明确拒绝的窗口。
+    ///
+    /// @param usage 本次响应头归一化后的完整窗口集合。
+    /// @return 至少存在一个明确拒绝窗口时返回过滤后的用量，否则返回 `None`。
+    pub(crate) fn rejected_usage(&self, usage: &serde_json::Value) -> Option<serde_json::Value> {
+        let UsageObservationKind::RejectedWindows(rejected_windows) = self else {
+            return None;
+        };
+        let source = usage.as_object()?;
+        let mut filtered = serde_json::Map::new();
+        for window in rejected_windows {
+            if let Some(value) = source.get(window) {
+                filtered.insert(window.clone(), value.clone());
+            }
+        }
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(filtered))
+        }
+    }
+
+    fn rejects_window(&self, window: &str) -> bool {
+        matches!(
+            self,
+            UsageObservationKind::RejectedWindows(rejected_windows)
+                if rejected_windows.iter().any(|candidate| candidate == window)
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -488,8 +529,6 @@ pub struct AccountService {
     ///
     /// 这里不写数据库、不改变账号状态。它只阻止当前进程在上游临时锁定窗口内继续打同一账号。
     transient_rate_limit_backoffs: RwLock<HashMap<i64, TransientRateLimitBackoff>>,
-    /// 请求完成后顺手触发的 usage 刷新节流:account_id → 上次预留刷新时间。
-    opportunistic_usage_refreshes: RwLock<HashMap<i64, Instant>>,
 }
 
 /// 提供给受信任管理端消费者的 OAuth 凭据快照。
@@ -564,7 +603,6 @@ impl AccountService {
             settings_store,
             queues: RwLock::new(HashMap::new()),
             transient_rate_limit_backoffs: RwLock::new(HashMap::new()),
-            opportunistic_usage_refreshes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1231,8 +1269,10 @@ impl AccountService {
         q
     }
 
-    /// 从 Anthropic API 获取账号用量并缓存到数据库。
-    /// 仅支持 OAuth 账号，SetupToken 账号无法查询用量。
+    /// 从 Anthropic API 获取账号用量并按 rollover 规则缓存到数据库。
+    ///
+    /// @param id 账号 ID，仅支持 OAuth 账号。
+    /// @return 返回最终持久化的完整用量对象。
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
         let account = self.store.get_by_id(id).await?;
         if account.auth_type != crate::model::account::AccountAuthType::Oauth {
@@ -1242,65 +1282,39 @@ impl AccountService {
         }
         let token = self.resolve_upstream_token(id).await?;
         let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url).await?;
-        let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
-        self.store.update_usage(id, &usage_str).await?;
-        Ok(usage)
-    }
-
-    /// Fable 请求完成后异步刷新账号 usage。
-    ///
-    /// @param id 账号 ID。
-    /// @return `true` 表示本次实际发起 usage API 刷新，`false` 表示命中节流并跳过。
-    pub async fn refresh_usage_after_fable_request(&self, id: i64) -> Result<bool, AppError> {
-        if !self.reserve_opportunistic_usage_refresh(id).await {
-            return Ok(false);
-        }
-        self.refresh_usage(id).await?;
-        Ok(true)
-    }
-
-    async fn reserve_opportunistic_usage_refresh(&self, id: i64) -> bool {
-        let now = Instant::now();
-        let stale_after =
-            OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL + OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL;
-        let mut refreshes = self.opportunistic_usage_refreshes.write().await;
-        refreshes
-            .retain(|_, reserved_at| now.saturating_duration_since(*reserved_at) <= stale_after);
-        if refreshes
-            .get(&id)
-            .map(|reserved_at| {
-                now.saturating_duration_since(*reserved_at)
-                    < OPPORTUNISTIC_USAGE_REFRESH_MIN_INTERVAL
-            })
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        refreshes.insert(id, now);
-        true
+        self.persist_usage_observation(id, usage, UsageObservationKind::Allowed)
+            .await
     }
 
     /// 从上游响应头被动采集的用量数据合并到数据库。
-    /// 不发起任何 API 请求。与已有 usage_data 做 merge，不会丢失响应头中未包含的窗口（如 seven_day_sonnet）。
+    /// 不发起任何 API 请求，也不会丢失响应头中未包含的窗口。
+    ///
+    /// @param id 账号 ID。
+    /// @param partial 响应头归一化后的完整窗口集合。
+    /// @param kind 本次观察是允许响应还是 429 拒绝响应。
+    /// @return 写入成功时返回空值。
     pub async fn update_passive_usage(
         &self,
         id: i64,
         partial: serde_json::Value,
+        kind: UsageObservationKind,
     ) -> Result<(), AppError> {
+        self.persist_usage_observation(id, partial, kind)
+            .await
+            .map(|_| ())
+    }
+
+    async fn persist_usage_observation(
+        &self,
+        id: i64,
+        incoming: serde_json::Value,
+        kind: UsageObservationKind,
+    ) -> Result<serde_json::Value, AppError> {
         let account = self.store.get_by_id(id).await?;
-        let mut existing = if account.usage_data.is_object() {
-            account.usage_data
-        } else {
-            serde_json::json!({})
-        };
-        // 将被动采集的窗口逐一合并到已有数据
-        if let (Some(target), Some(src)) = (existing.as_object_mut(), partial.as_object()) {
-            for (k, v) in src {
-                target.insert(k.clone(), v.clone());
-            }
-        }
-        let merged_str = serde_json::to_string(&existing).unwrap_or_else(|_| "{}".into());
-        self.store.update_usage(id, &merged_str).await
+        let merged = merge_usage_observation(account.usage_data, incoming, kind, Utc::now());
+        let merged_str = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into());
+        self.store.update_usage(id, &merged_str).await?;
+        Ok(merged)
     }
 
     pub async fn resolve_upstream_token(&self, id: i64) -> Result<String, AppError> {
@@ -1825,6 +1839,75 @@ impl AccountService {
     }
 }
 
+const ROLLOVER_USAGE_WINDOWS: [&str; 3] = ["five_hour", "seven_day", "seven_day_fable"];
+
+fn merge_usage_observation(
+    existing: serde_json::Value,
+    incoming: serde_json::Value,
+    kind: UsageObservationKind,
+    now: chrono::DateTime<Utc>,
+) -> serde_json::Value {
+    let mut merged = if existing.is_object() {
+        existing
+    } else {
+        serde_json::json!({})
+    };
+    let (Some(target), Some(source)) = (merged.as_object_mut(), incoming.as_object()) else {
+        return merged;
+    };
+
+    for (key, value) in source {
+        let value = if ROLLOVER_USAGE_WINDOWS.contains(&key.as_str())
+            && should_zero_stale_rollover_window(target.get(key), value, key, &kind, now)
+        {
+            let mut normalized = value.clone();
+            if let Some(window) = normalized.as_object_mut() {
+                // 成功请求已经证明新周期可用；高位值未下降时只能来自上一周期。
+                window.insert("utilization".into(), serde_json::json!(0.0));
+            }
+            normalized
+        } else {
+            value.clone()
+        };
+        target.insert(key.clone(), value);
+    }
+
+    merged
+}
+
+fn should_zero_stale_rollover_window(
+    existing: Option<&serde_json::Value>,
+    incoming: &serde_json::Value,
+    window: &str,
+    kind: &UsageObservationKind,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if kind.rejects_window(window) {
+        return false;
+    }
+    let Some((existing_utilization, existing_reset)) = existing.and_then(usage_window_values)
+    else {
+        return false;
+    };
+    let Some((incoming_utilization, incoming_reset)) = usage_window_values(incoming) else {
+        return false;
+    };
+
+    existing_utilization >= USAGE_ROLLOVER_STALE_THRESHOLD
+        && incoming_utilization >= USAGE_ROLLOVER_STALE_THRESHOLD
+        && existing_reset <= now
+        && incoming_reset > now
+        && incoming_reset > existing_reset
+}
+
+fn usage_window_values(window: &serde_json::Value) -> Option<(f64, chrono::DateTime<Utc>)> {
+    let utilization = window.get("utilization")?.as_f64()?;
+    let reset = chrono::DateTime::parse_from_rfc3339(window.get("resets_at")?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    Some((utilization, reset))
+}
+
 fn current_rpm_window() -> (i64, chrono::DateTime<Utc>) {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2170,6 +2253,115 @@ mod tests {
         json!({ "utilization": util, "resets_at": resets_at })
     }
 
+    #[test]
+    fn allowed_rollover_clears_stale_high_usage_for_all_passive_windows() {
+        let now = Utc::now();
+        let expired = (now - ChronoDuration::minutes(1)).to_rfc3339();
+        let next_five_hour = (now + ChronoDuration::hours(5)).to_rfc3339();
+        let next_week = (now + ChronoDuration::days(7)).to_rfc3339();
+        let existing = json!({
+            "five_hour": make_window(json!(100), &expired),
+            "seven_day": make_window(json!(99), &expired),
+            "seven_day_fable": make_window(json!(100), &expired),
+            "seven_day_sonnet": make_window(json!(42), &next_week),
+            "limits": [{"kind": "weekly_scoped"}]
+        });
+        let incoming = json!({
+            "five_hour": make_window(json!(100), &next_five_hour),
+            "seven_day": make_window(json!(99), &next_week),
+            "seven_day_fable": make_window(json!(100), &next_week)
+        });
+
+        let merged =
+            merge_usage_observation(existing, incoming, UsageObservationKind::Allowed, now);
+
+        assert_eq!(merged["five_hour"]["utilization"], json!(0.0));
+        assert_eq!(merged["seven_day"]["utilization"], json!(0.0));
+        assert_eq!(merged["seven_day_fable"]["utilization"], json!(0.0));
+        assert_eq!(merged["seven_day_sonnet"]["utilization"], json!(42));
+        assert_eq!(merged["limits"][0]["kind"], json!("weekly_scoped"));
+    }
+
+    #[test]
+    fn allowed_rollover_accepts_usage_that_dropped_in_new_period() {
+        let now = Utc::now();
+        let expired = (now - ChronoDuration::minutes(1)).to_rfc3339();
+        let next_week = (now + ChronoDuration::days(7)).to_rfc3339();
+        let existing = json!({
+            "seven_day": make_window(json!(99), &expired)
+        });
+        let incoming = json!({
+            "seven_day": make_window(json!(1.5), &next_week)
+        });
+
+        let merged =
+            merge_usage_observation(existing, incoming, UsageObservationKind::Allowed, now);
+
+        assert_eq!(merged["seven_day"]["utilization"], json!(1.5));
+    }
+
+    #[test]
+    fn same_period_follow_up_usage_is_accepted() {
+        let now = Utc::now();
+        let next_week = (now + ChronoDuration::days(7)).to_rfc3339();
+        let existing = json!({
+            "seven_day": make_window(json!(0), &next_week)
+        });
+        let incoming = json!({
+            "seven_day": make_window(json!(2.5), &next_week)
+        });
+
+        let merged =
+            merge_usage_observation(existing, incoming, UsageObservationKind::Allowed, now);
+
+        assert_eq!(merged["seven_day"]["utilization"], json!(2.5));
+    }
+
+    #[test]
+    fn rejected_rollover_only_keeps_explicitly_rejected_windows() {
+        let now = Utc::now();
+        let expired = (now - ChronoDuration::minutes(1)).to_rfc3339();
+        let next_five_hour = (now + ChronoDuration::hours(5)).to_rfc3339();
+        let next_week = (now + ChronoDuration::days(7)).to_rfc3339();
+        let existing = json!({
+            "five_hour": make_window(json!(100), &expired),
+            "seven_day": make_window(json!(100), &expired),
+            "seven_day_fable": make_window(json!(100), &expired)
+        });
+        let incoming = json!({
+            "five_hour": make_window(json!(100), &next_five_hour),
+            "seven_day": make_window(json!(100), &next_week),
+            "seven_day_fable": make_window(json!(100), &next_week)
+        });
+
+        let merged = merge_usage_observation(
+            existing,
+            incoming,
+            UsageObservationKind::RejectedWindows(vec!["five_hour".into()]),
+            now,
+        );
+
+        assert_eq!(merged["five_hour"]["utilization"], json!(100));
+        assert_eq!(merged["seven_day"]["utilization"], json!(0.0));
+        assert_eq!(merged["seven_day_fable"]["utilization"], json!(0.0));
+    }
+
+    #[test]
+    fn rejected_usage_filters_allowed_windows_for_rate_limit_classification() {
+        let usage = json!({
+            "five_hour": { "utilization": 100, "resets_at": rfc3339_at(ChronoDuration::hours(5)) },
+            "seven_day": { "utilization": 100, "resets_at": rfc3339_at(ChronoDuration::days(7)) },
+            "seven_day_fable": { "utilization": 100, "resets_at": rfc3339_at(ChronoDuration::days(7)) }
+        });
+        let kind = UsageObservationKind::RejectedWindows(vec!["five_hour".into()]);
+
+        let rejected = kind.rejected_usage(&usage).expect("应保留拒绝窗口");
+
+        assert!(rejected.get("five_hour").is_some());
+        assert!(rejected.get("seven_day").is_none());
+        assert!(rejected.get("seven_day_fable").is_none());
+    }
+
     fn test_account_with_usage(usage_data: serde_json::Value) -> Account {
         Account {
             id: 1,
@@ -2511,15 +2703,6 @@ mod tests {
         assert_eq!(info.queued, 0);
         assert_eq!(info.queued_request_units, 0);
         assert_eq!(info.concurrency_pct, 25.0);
-    }
-
-    #[tokio::test]
-    async fn opportunistic_usage_refresh_reservation_is_throttled_per_account() {
-        let (_store, svc) = setup_account_service().await;
-
-        assert!(svc.reserve_opportunistic_usage_refresh(1).await);
-        assert!(!svc.reserve_opportunistic_usage_refresh(1).await);
-        assert!(svc.reserve_opportunistic_usage_refresh(2).await);
     }
 
     #[tokio::test]
