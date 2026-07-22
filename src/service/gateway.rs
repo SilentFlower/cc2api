@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountStatus};
+use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -356,6 +356,7 @@ pub struct GatewayService {
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
     settings_store: Arc<SettingsStore>,
+    upstream_base: String,
     system_role_models: RwLock<Vec<String>>,
     access_policy: RwLock<AccessPolicy>,
     env_passthrough: RwLock<EnvPassthrough>,
@@ -386,6 +387,7 @@ impl GatewayService {
             rewriter,
             telemetry_svc,
             settings_store,
+            upstream_base: UPSTREAM_BASE.to_string(),
             system_role_models: RwLock::new(parse_system_role_model_list(
                 DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
             )),
@@ -1153,23 +1155,6 @@ impl GatewayService {
             (vec![], vec![])
         };
 
-        let selected = match self
-            .account_svc
-            .select_account_with_context(&session_hash, &blocked_ids, &allowed_ids)
-            .await
-        {
-            Ok(selected) => selected,
-            Err(e) => {
-                warn!("count_tokens account selection failed: {}", e);
-                return Ok(anthropic_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "Service temporarily unavailable",
-                ));
-            }
-        };
-        let account = selected.account;
-
         strip_empty_text_blocks(&mut body_map);
         sanitize_count_tokens_body(&mut body_map);
         if let Some(mapped_model) = normalize_count_tokens_model_id(&model_id) {
@@ -1183,43 +1168,86 @@ impl GatewayService {
         }
         let final_body = serde_json::to_vec(&body_map)
             .map_err(|e| AppError::Internal(format!("serialize count_tokens body: {}", e)))?;
+        let mut exclude_ids = blocked_ids.clone();
 
-        let mut final_headers = self.rewriter.rewrite_headers(
-            &headers,
-            COUNT_TOKENS_PATH,
-            &account,
-            client_type,
-            &model_id,
-            &body_map,
-        );
-        apply_count_tokens_beta_header(&mut final_headers, &headers, &account, &model_id);
+        loop {
+            let selected = match self
+                .account_svc
+                .select_account_with_context(&session_hash, &exclude_ids, &allowed_ids)
+                .await
+            {
+                Ok(selected) => selected,
+                Err(e) => {
+                    warn!("count_tokens account selection failed: {}", e);
+                    return Ok(anthropic_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "Service temporarily unavailable",
+                    ));
+                }
+            };
+            let account = selected.account;
+            let mut final_headers = self.rewriter.rewrite_headers(
+                &headers,
+                COUNT_TOKENS_PATH,
+                &account,
+                client_type,
+                &model_id,
+                &body_map,
+            );
+            apply_count_tokens_beta_header(&mut final_headers, &headers, &account, &model_id);
 
-        let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
-            Ok(token) => token,
-            Err(e) => {
-                warn!(
-                    "count_tokens upstream token resolve failed: account={} error={}",
-                    account.id, e
-                );
-                return Ok(anthropic_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_error",
-                    "Failed to get access token",
-                ));
+            let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!(
+                        "count_tokens upstream token resolve failed: account={} error={}",
+                        account.id, e
+                    );
+                    return Ok(anthropic_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "Failed to get access token",
+                    ));
+                }
+            };
+            final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+            final_headers = headers_without_content_length(&final_headers);
+
+            info!(
+                "count_tokens_forward account={} model={} body={}",
+                account.id,
+                model_id,
+                safe_body_summary(&final_body)
+            );
+
+            let mut resp = self
+                .forward_count_tokens_request(&final_headers, &final_body, &account)
+                .await?;
+            if resp.status() != StatusCode::UNAUTHORIZED {
+                return Ok(resp);
             }
-        };
-        final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
-        final_headers = headers_without_content_length(&final_headers);
 
-        info!(
-            "count_tokens_forward account={} model={} body={}",
-            account.id,
-            model_id,
-            safe_body_summary(&final_body)
-        );
+            if let Some(refreshed_token) = self
+                .recover_account_after_unauthorized(&account, &upstream_token, "count_tokens")
+                .await?
+            {
+                final_headers.insert(
+                    "authorization".into(),
+                    format!("Bearer {}", refreshed_token),
+                );
+                resp = self
+                    .forward_count_tokens_request(&final_headers, &final_body, &account)
+                    .await?;
+                if resp.status() != StatusCode::UNAUTHORIZED {
+                    return Ok(resp);
+                }
+                self.disable_account_after_repeated_unauthorized(&account, "count_tokens")
+                    .await?;
+            }
 
-        self.forward_count_tokens_request(&final_headers, &final_body, &account)
-            .await
+            exclude_ids.push(account.id);
+        }
     }
 
     async fn handle_request_inner(
@@ -1314,6 +1342,7 @@ impl GatewayService {
         let mut exclude_ids = blocked_ids.clone();
         let mut backoff_retry_ids: Vec<i64> = Vec::new();
         let mut last_resp: Option<Response> = None;
+        let mut auth_failure_excluded = false;
 
         loop {
             let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
@@ -1343,6 +1372,11 @@ impl GatewayService {
                 }
                 Err(e @ AppError::TooManyRequests(_)) => return Err(e),
                 Err(e) => {
+                    if auth_failure_excluded {
+                        return Err(AppError::ServiceUnavailable(
+                            "no accounts with valid upstream credentials".into(),
+                        ));
+                    }
                     // 仅当是"无可用账号"且有运行时排除的账号时，返回 429
                     if exclude_ids.len() > blocked_ids.len() {
                         if matches!(&e, AppError::ServiceUnavailable(_)) {
@@ -1360,7 +1394,10 @@ impl GatewayService {
             let should_bind_session = selected.should_bind_session;
 
             if attempt > 0 {
-                warn!("429 retry attempt {} with account {}", attempt, account.id);
+                warn!(
+                    "upstream retry attempt {} with account {}",
+                    attempt, account.id
+                );
             }
 
             if path.starts_with("/v1/messages") {
@@ -1589,7 +1626,7 @@ impl GatewayService {
                 t_rewrite.elapsed().as_millis()
             );
             let mut final_headers = rewritten_headers;
-            if let Some(upstream_token) = upstream_token {
+            if let Some(upstream_token) = upstream_token.as_ref() {
                 final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
             }
 
@@ -1659,7 +1696,7 @@ impl GatewayService {
 
             // 转发到上游
             let t_upstream = std::time::Instant::now();
-            let resp = match self
+            let mut resp = match self
                 .forward_request(
                     &method.to_string(),
                     &path,
@@ -1695,6 +1732,46 @@ impl GatewayService {
                     return Err(e);
                 }
             };
+            if resp.status() == StatusCode::UNAUTHORIZED
+                && let Some(failed_access_token) = upstream_token.as_deref()
+            {
+                match self
+                    .recover_account_after_unauthorized(&account, failed_access_token, "gateway")
+                    .await?
+                {
+                    Some(refreshed_token) => {
+                        final_headers.insert(
+                            "authorization".into(),
+                            format!("Bearer {}", refreshed_token),
+                        );
+                        resp = self
+                            .forward_request(
+                                method.as_ref(),
+                                &path,
+                                &query,
+                                &final_headers,
+                                &final_body,
+                                &account,
+                                &account_selection_context,
+                            )
+                            .await?;
+                        if resp.status() == StatusCode::UNAUTHORIZED {
+                            self.disable_account_after_repeated_unauthorized(&account, "gateway")
+                                .await?;
+                            auth_failure_excluded = true;
+                            exclude_ids.push(account.id);
+                            drop(slot_guard);
+                            continue;
+                        }
+                    }
+                    None => {
+                        auth_failure_excluded = true;
+                        exclude_ids.push(account.id);
+                        drop(slot_guard);
+                        continue;
+                    }
+                }
+            }
             let (resp, signature_retry_stage) = self
                 .maybe_retry_signature_error(
                     &method.to_string(),
@@ -1942,7 +2019,7 @@ impl GatewayService {
         account: &Account,
         account_selection_context: &AccountSelectionContext,
     ) -> Result<Response, AppError> {
-        let target_url = upstream_url(path, query);
+        let target_url = upstream_url_with_base(&self.upstream_base, path, query);
 
         debug!("upstream URL: {}", target_url);
 
@@ -1991,9 +2068,11 @@ impl GatewayService {
             let usage_kind = UsageObservationKind::RejectedWindows(
                 extract_rejected_passive_usage_windows(&headers_429),
             );
-            let rate_limit_usage = usage_from_headers
-                .as_ref()
-                .and_then(|usage| usage_kind.rejected_usage(usage));
+            let rate_limit_usage = usage_from_headers.as_ref().map(|usage| {
+                usage_kind
+                    .rejected_usage(usage)
+                    .unwrap_or_else(|| serde_json::json!({}))
+            });
             if let Some(usage_json) = usage_from_headers.clone() {
                 let svc = self.account_svc.clone();
                 let account_id = account.id;
@@ -2231,7 +2310,7 @@ impl GatewayService {
         body: &[u8],
         account: &Account,
     ) -> Result<Response, AppError> {
-        let target_url = count_tokens_upstream_url();
+        let target_url = count_tokens_upstream_url_with_base(&self.upstream_base);
         debug!("count_tokens upstream URL: {}", target_url);
 
         let client = crate::tlsfp::get_request_client(&account.proxy_url);
@@ -2283,6 +2362,65 @@ impl GatewayService {
             remove_transport_headers,
         )
     }
+
+    async fn recover_account_after_unauthorized(
+        &self,
+        account: &Account,
+        failed_access_token: &str,
+        request_kind: &str,
+    ) -> Result<Option<String>, AppError> {
+        match account.auth_type {
+            AccountAuthType::Oauth => {
+                match self
+                    .account_svc
+                    .recover_upstream_token_after_unauthorized(account.id, failed_access_token)
+                    .await
+                {
+                    Ok(token) => {
+                        warn!(
+                            "account {} recovered OAuth token after upstream 401, retrying {} once",
+                            account.id, request_kind
+                        );
+                        Ok(Some(token))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "account {} OAuth recovery failed after upstream 401 for {}: {}",
+                            account.id, request_kind, e
+                        );
+                        self.account_svc
+                            .disable_for_auth_failure(account.id, "401 OAuth 认证恢复失败")
+                            .await?;
+                        Ok(None)
+                    }
+                }
+            }
+            AccountAuthType::SetupToken => {
+                warn!(
+                    "account {} SetupToken rejected with upstream 401 for {}",
+                    account.id, request_kind
+                );
+                self.account_svc
+                    .disable_for_auth_failure(account.id, "401 SetupToken 认证失败")
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn disable_account_after_repeated_unauthorized(
+        &self,
+        account: &Account,
+        request_kind: &str,
+    ) -> Result<(), AppError> {
+        warn!(
+            "account {} still returned upstream 401 after OAuth recovery for {}",
+            account.id, request_kind
+        );
+        self.account_svc
+            .disable_for_auth_failure(account.id, "401 OAuth 刷新后仍认证失败")
+            .await
+    }
 }
 
 fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
@@ -2304,7 +2442,11 @@ fn requires_upstream_beta_query(path: &str) -> bool {
 }
 
 fn upstream_url(path: &str, query: &str) -> String {
-    let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
+    upstream_url_with_base(UPSTREAM_BASE, path, query)
+}
+
+fn upstream_url_with_base(upstream_base: &str, path: &str, query: &str) -> String {
+    let mut target_url = format!("{}{}", upstream_base, path);
     let mut query = query.to_string();
     if requires_upstream_beta_query(path) && !query_contains_beta_true(&query) {
         if query.is_empty() {
@@ -2326,7 +2468,11 @@ fn query_contains_beta_true(query: &str) -> bool {
 }
 
 fn count_tokens_upstream_url() -> String {
-    format!("{}{}?beta=true", UPSTREAM_BASE, COUNT_TOKENS_PATH)
+    count_tokens_upstream_url_with_base(UPSTREAM_BASE)
+}
+
+fn count_tokens_upstream_url_with_base(upstream_base: &str) -> String {
+    format!("{}{}?beta=true", upstream_base, COUNT_TOKENS_PATH)
 }
 
 fn sanitize_count_tokens_body(body: &mut serde_json::Value) {
@@ -5831,17 +5977,17 @@ impl Drop for SlotGuardBody {
 mod tests {
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, BootstrapModelOptionsMode,
-        BootstrapProfileConfig, CachedProbeResponse, GatewayAdmissionError, GatewayService,
-        NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
+        BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse, GatewayAdmissionError,
+        GatewayService, NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
         RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES,
-        SignatureRetryStage, StreamStabilityConfig, WarmupInterceptConfig, WarmupInterceptType,
-        align_mapped_upstream_session_header, assistant_prefill_intercept_body,
-        auto_mode_classifier_response, buffered_error_body_for_downstream,
-        buffered_response_body_for_downstream, build_message_telemetry_context,
-        build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
-        classify_non_stream_probe_text, detect_auto_mode_classifier_request,
-        detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
-        extract_passive_usage, extract_rejected_passive_usage_windows,
+        SignatureRetryStage, StreamStabilityConfig, UPSTREAM_BASE, WarmupInterceptConfig,
+        WarmupInterceptType, align_mapped_upstream_session_header,
+        assistant_prefill_intercept_body, auto_mode_classifier_response,
+        buffered_error_body_for_downstream, buffered_response_body_for_downstream,
+        build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
+        cached_non_stream_probe_response, classify_non_stream_probe_text,
+        detect_auto_mode_classifier_request, detect_non_stream_probe_type, detect_warmup_intercept,
+        extract_message_session_id, extract_passive_usage, extract_rejected_passive_usage_windows,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
         is_signature_related_error_body, is_signature_related_error_response_body,
@@ -5875,11 +6021,15 @@ mod tests {
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::SettingsStore;
-    use axum::body;
+    use axum::body::{self, Body};
+    use axum::extract::{Request, State};
     use axum::http::{
         HeaderMap, StatusCode,
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
     };
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use axum::{Json, Router};
     use bytes::Bytes;
     use chrono::Utc;
     use serde_json::json;
@@ -5888,6 +6038,7 @@ mod tests {
     use std::convert::Infallible;
     use std::io::Write;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
@@ -6196,7 +6347,92 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct AuthMockState {
+        authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
+        refresh_calls: Arc<AtomicUsize>,
+    }
+
+    async fn mock_upstream_response(
+        State(state): State<AuthMockState>,
+        headers: HeaderMap,
+    ) -> Response {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        state
+            .authorization_headers
+            .lock()
+            .await
+            .push(authorization.clone());
+
+        if matches!(
+            authorization.as_str(),
+            "Bearer access-old" | "Bearer setup-bad" | "Bearer setup-bad-only"
+        ) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"type":"error","error":{"type":"authentication_error","message":"invalid token"}})),
+            )
+                .into_response();
+        }
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id": "msg_mock",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"text","text":"ok"}],
+                "stop_reason": "end_turn",
+                "input_tokens": 42
+            })),
+        )
+            .into_response()
+    }
+
+    async fn mock_oauth_refresh(State(state): State<AuthMockState>) -> Json<serde_json::Value> {
+        state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "access_token": "access-refreshed",
+            "refresh_token": "refresh-refreshed",
+            "expires_in": 3600
+        }))
+    }
+
+    async fn spawn_auth_mock_server() -> (String, AuthMockState, tokio::task::JoinHandle<()>) {
+        let state = AuthMockState::default();
+        let app = Router::new()
+            .route("/v1/messages", post(mock_upstream_response))
+            .route("/v1/messages/count_tokens", post(mock_upstream_response))
+            .route("/oauth/token", post(mock_oauth_refresh))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock upstream");
+        });
+        (format!("http://{}", address), state, server)
+    }
+
     async fn test_gateway_service() -> GatewayService {
+        test_gateway_service_with_urls(
+            UPSTREAM_BASE.to_string(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await
+    }
+
+    async fn test_gateway_service_with_urls(
+        upstream_base: String,
+        oauth_token_url: String,
+    ) -> GatewayService {
         sqlx::any::install_default_drivers();
         let tmp =
             std::env::temp_dir().join(format!("ccgw_gateway_unit_{}.db", rand::random::<u64>()));
@@ -6207,18 +6443,21 @@ mod tests {
             .expect("migrate");
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let settings_store = Arc::new(SettingsStore::new(pool));
-        let account_svc = Arc::new(AccountService::new(
+        let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
             account_store.clone(),
             Arc::new(MemoryStore::new()),
             settings_store.clone(),
+            oauth_token_url,
         ));
         let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
-        GatewayService::new(
+        let mut service = GatewayService::new(
             account_svc,
             Arc::new(crate::service::rewriter::Rewriter::new()),
             telemetry_svc,
             settings_store,
-        )
+        );
+        service.upstream_base = upstream_base;
+        service
     }
 
     async fn create_gateway_account(
@@ -6240,6 +6479,294 @@ mod tests {
             .await
             .expect("create account");
         account
+    }
+
+    async fn create_setup_gateway_account(
+        service: &GatewayService,
+        email: &str,
+        setup_token: &str,
+        priority: i32,
+    ) -> Account {
+        let mut account = create_gateway_account(service, email, 1, 0).await;
+        account.setup_token = setup_token.into();
+        account.priority = priority;
+        service.account_svc.update_account(&account).await.unwrap();
+        account
+    }
+
+    async fn create_oauth_gateway_account(
+        service: &GatewayService,
+        email: &str,
+        access_token: &str,
+    ) -> Account {
+        let mut account = create_gateway_account(service, email, 1, 0).await;
+        account.auth_type = AccountAuthType::Oauth;
+        account.setup_token.clear();
+        account.access_token = access_token.into();
+        account.refresh_token = "refresh-old".into();
+        account.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        service.account_svc.update_account(&account).await.unwrap();
+        account
+    }
+
+    fn messages_request() -> Request {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("user-agent", "AI-Hub-Monitor/1.0")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-8",
+                    "messages": [{"role":"user","content":"hi"}],
+                    "max_tokens": 16,
+                    "stream": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn count_tokens_request() -> Request {
+        Request::builder()
+            .method("POST")
+            .uri(COUNT_TOKENS_PATH)
+            .header("content-type", "application/json")
+            .header("user-agent", "AI-Hub-Monitor/1.0")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-8",
+                    "messages": [{"role":"user","content":"hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth_unauthorized_refreshes_and_retries_same_gateway_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let account =
+            create_oauth_gateway_account(&service, "oauth-retry@example.com", "access-old").await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer access-old", "Bearer access-refreshed"]
+        );
+        let stored = service.account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Active);
+        assert_eq!(stored.access_token, "access-refreshed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn count_tokens_unauthorized_disables_and_switches_setup_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            base_url,
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        let rejected =
+            create_setup_gateway_account(&service, "count-bad@example.com", "setup-bad", 10).await;
+        let accepted =
+            create_setup_gateway_account(&service, "count-good@example.com", "setup-good", 20)
+                .await;
+
+        let response = service
+            .handle_count_tokens_request(count_tokens_request(), None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap()["input_tokens"],
+            42
+        );
+
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-bad", "Bearer setup-good"]
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(rejected.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(accepted.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Active
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_unauthorized_disables_and_switches_setup_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            base_url,
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        let rejected =
+            create_setup_gateway_account(&service, "gateway-bad@example.com", "setup-bad", 10)
+                .await;
+        let accepted =
+            create_setup_gateway_account(&service, "gateway-good@example.com", "setup-good", 20)
+                .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-bad", "Bearer setup-good"]
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(rejected.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(accepted.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Active
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_returns_service_unavailable_when_all_accounts_fail_authentication() {
+        let (base_url, _state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            base_url,
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        let account = create_setup_gateway_account(
+            &service,
+            "gateway-all-bad@example.com",
+            "setup-bad-only",
+            10,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(account.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn count_tokens_returns_service_unavailable_when_all_accounts_fail_authentication() {
+        let (base_url, _state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            base_url,
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        let account = create_setup_gateway_account(
+            &service,
+            "count-all-bad@example.com",
+            "setup-bad-only",
+            10,
+        )
+        .await;
+
+        let response = service
+            .handle_count_tokens_request(count_tokens_request(), None)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(account.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn setup_token_unauthorized_disables_account() {
+        let service = test_gateway_service().await;
+        let account = create_gateway_account(&service, "setup-401@example.com", 1, 0).await;
+
+        let recovered = service
+            .recover_account_after_unauthorized(&account, &account.setup_token, "test")
+            .await
+            .unwrap();
+
+        assert!(recovered.is_none());
+        let stored = service.account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Disabled);
+        assert_eq!(stored.auth_error, "401 SetupToken 认证失败");
+        assert_eq!(stored.disable_reason, "401 SetupToken 认证失败");
+    }
+
+    #[tokio::test]
+    async fn repeated_oauth_unauthorized_disables_account() {
+        let service = test_gateway_service().await;
+        let mut account = create_gateway_account(&service, "oauth-401@example.com", 1, 0).await;
+        account.auth_type = AccountAuthType::Oauth;
+        account.setup_token.clear();
+        account.access_token = "access-refreshed".into();
+        account.refresh_token = "refresh-token".into();
+        account.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        service.account_svc.update_account(&account).await.unwrap();
+
+        service
+            .disable_account_after_repeated_unauthorized(&account, "test")
+            .await
+            .unwrap();
+
+        let stored = service.account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Disabled);
+        assert_eq!(stored.auth_error, "401 OAuth 刷新后仍认证失败");
+        assert_eq!(stored.disable_reason, "401 OAuth 刷新后仍认证失败");
     }
 
     async fn wait_until_queue_waiting(service: &GatewayService, account: &Account, expected: i64) {

@@ -437,6 +437,26 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 因上游认证失败停用账号，并原子记录认证错误。
+    ///
+    /// @param id 账号 ID。
+    /// @param reason 不包含凭据内容的认证失败原因。
+    /// @return 更新成功时返回空值。
+    pub async fn disable_for_auth_failure(&self, id: i64, reason: &str) -> Result<(), AppError> {
+        let q = format!(
+            r#"UPDATE accounts SET status='disabled', auth_error=$1, disable_reason=$1,
+                rate_limited_at=NULL, rate_limit_reset_at=NULL, updated_at={}
+            WHERE id=$2"#,
+            self.now_expr()
+        );
+        sqlx::query(&q)
+            .bind(reason)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
         let q = format!(
             r#"UPDATE accounts SET status='active', disable_reason='',

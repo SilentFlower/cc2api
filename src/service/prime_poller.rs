@@ -5,7 +5,7 @@ use chrono::{NaiveDate, Timelike, Utc};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use crate::model::account::{Account, AccountStatus};
+use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::service::account::{AccountService, RateLimitDecision, UsageObservationKind};
 use crate::service::gateway::{extract_passive_usage, extract_rejected_passive_usage_windows};
 use crate::service::rewriter::{
@@ -54,7 +54,7 @@ struct PrimeOutcome {
     passive_usage: Option<serde_json::Value>,
     usage_observation_kind: UsageObservationKind,
     /// 上游 HTTP 状态码,None 表示请求没到达上游(如 token 解析失败、序列化失败)。
-    /// 用于后续按状态码做 429/403 处理。
+    /// 用于后续按状态码做 401/429/403 处理。
     status: Option<u16>,
 }
 
@@ -64,14 +64,16 @@ struct PrimeOutcome {
 /// 期的账号逐一发送一次 Haiku `/v1/messages` 请求,借此主动启动 Anthropic 侧的 5h 速率
 /// 限制窗口,让窗口重置点落在下午用户高峰之前或之中。
 ///
-/// 失败不重试,每次调用(含成功/失败/跳过)都会写入 `prime_logs` 表,供设置页展示。
-/// 429 / 403 会联动 `AccountService` 的状态处理,和主链路行为保持一致,防止预热探测到
-/// 坏账号却让真实流量继续选中它。
+/// OAuth 账号首次收到 401 时会刷新凭据并原账号重试一次，其他失败不重试。每次调用
+/// （含成功/失败/跳过）都会写入 `prime_logs` 表,供设置页展示。最终 401 / 429 / 403 会联动
+/// `AccountService` 的状态处理,和主链路行为保持一致,防止预热探测到坏账号却让真实流量
+/// 继续选中它。
 pub struct PrimePollerService {
     account_svc: Arc<AccountService>,
     settings_store: Arc<SettingsStore>,
     log_store: Arc<PrimeLogStore>,
     rewriter: Arc<Rewriter>,
+    upstream_url: String,
 }
 
 impl PrimePollerService {
@@ -87,6 +89,7 @@ impl PrimePollerService {
             settings_store,
             log_store,
             rewriter,
+            upstream_url: UPSTREAM_URL.to_string(),
         }
     }
 
@@ -263,13 +266,16 @@ impl PrimePollerService {
             }
 
             // 根据上游状态码联动账号状态,保持与主链路 gateway 一致:
+            // - 401: OAuth 已在 prime_one 内尝试恢复一次,最终仍失败则停用账号。
             // - 429: 调用 handle_rate_limit,按账号类型/用量设置冷却窗口。
             // - 403: 若未处于 429 冷却期则永久停用,避免坏账号继续被真实流量选中。
             if let Some(code) = outcome.status {
-                let rate_limit_usage = outcome
-                    .passive_usage
-                    .as_ref()
-                    .and_then(|usage| outcome.usage_observation_kind.rejected_usage(usage));
+                let rate_limit_usage = outcome.passive_usage.as_ref().map(|usage| {
+                    outcome
+                        .usage_observation_kind
+                        .rejected_usage(usage)
+                        .unwrap_or_else(|| serde_json::json!({}))
+                });
                 self.apply_status_side_effects(&account, code, rate_limit_usage)
                     .await;
             }
@@ -304,6 +310,7 @@ impl PrimePollerService {
     /// 根据上游 HTTP 状态码联动账号状态。
     ///
     /// 与 `src/service/gateway.rs:359/369` 的处理保持一致:
+    /// - 401 → 停用凭据已失效的账号;
     /// - 429 → `handle_rate_limit` 按类型/用量设置冷却;
     /// - 403 且未处于 429 冷却期 → `disable_account` 永久停用,防止真实流量继续选中。
     async fn apply_status_side_effects(
@@ -312,6 +319,28 @@ impl PrimePollerService {
         status: u16,
         passive_usage: Option<serde_json::Value>,
     ) {
+        if status == 401 {
+            let reason = match account.auth_type {
+                AccountAuthType::Oauth => "401 OAuth 认证失败",
+                AccountAuthType::SetupToken => "401 SetupToken 认证失败",
+            };
+            if let Err(e) = self
+                .account_svc
+                .disable_for_auth_failure(account.id, reason)
+                .await
+            {
+                warn!(
+                    "prime poller: disable_for_auth_failure failed for account {}: {}",
+                    account.id, e
+                );
+            } else {
+                warn!(
+                    "prime poller: account {} disabled after upstream 401",
+                    account.id
+                );
+            }
+            return;
+        }
         if status == 429 {
             // 预热请求体极小,不会触发长上下文计费类 429；直接使用本次响应头判断窗口。
             match self
@@ -451,32 +480,15 @@ impl PrimePollerService {
         );
         headers.insert("authorization".into(), format!("Bearer {}", token));
 
-        // 走定制 tlsfp 客户端,复用账号的 proxy_url。
-        let client = crate::tlsfp::get_request_client(&account.proxy_url);
-        let mut req = client.post(UPSTREAM_URL).body(rewritten_bytes);
-        for (k, v) in ordered_anthropic_headers("/v1/messages", &headers) {
-            req = req.header(k, v);
-        }
-
-        let resp = match tokio::time::timeout(PRIME_TTFB_TIMEOUT, req.send()).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+        let mut resp = match self
+            .send_prime_upstream(account, &headers, &rewritten_bytes)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error_message) => {
                 return PrimeOutcome {
                     success: false,
-                    error_message: truncate_chars(
-                        &format!("request failed: {}", e),
-                        ERROR_SNIPPET_CHARS,
-                    ),
-                    duration_ms: started.elapsed().as_millis() as i64,
-                    passive_usage: None,
-                    usage_observation_kind: UsageObservationKind::Allowed,
-                    status: None,
-                };
-            }
-            Err(_) => {
-                return PrimeOutcome {
-                    success: false,
-                    error_message: "upstream TTFB timeout".into(),
+                    error_message,
                     duration_ms: started.elapsed().as_millis() as i64,
                     passive_usage: None,
                     usage_observation_kind: UsageObservationKind::Allowed,
@@ -484,6 +496,51 @@ impl PrimePollerService {
                 };
             }
         };
+
+        if resp.status().as_u16() == 401 && account.auth_type == AccountAuthType::Oauth {
+            drop(resp);
+            let refreshed_token = match self
+                .account_svc
+                .recover_upstream_token_after_unauthorized(account.id, &token)
+                .await
+            {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!(
+                        "prime poller: OAuth recovery failed for account {} after 401: {}",
+                        account.id, e
+                    );
+                    return PrimeOutcome {
+                        success: false,
+                        error_message: "http 401: OAuth 认证恢复失败".into(),
+                        duration_ms: started.elapsed().as_millis() as i64,
+                        passive_usage: None,
+                        usage_observation_kind: UsageObservationKind::Allowed,
+                        status: Some(401),
+                    };
+                }
+            };
+            headers.insert(
+                "authorization".into(),
+                format!("Bearer {}", refreshed_token),
+            );
+            resp = match self
+                .send_prime_upstream(account, &headers, &rewritten_bytes)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error_message) => {
+                    return PrimeOutcome {
+                        success: false,
+                        error_message,
+                        duration_ms: started.elapsed().as_millis() as i64,
+                        passive_usage: None,
+                        usage_observation_kind: UsageObservationKind::Allowed,
+                        status: None,
+                    };
+                }
+            };
+        }
 
         let status_code = resp.status().as_u16();
         let passive_usage = extract_passive_usage(resp.headers());
@@ -567,6 +624,28 @@ impl PrimePollerService {
             }
         }
     }
+
+    async fn send_prime_upstream(
+        &self,
+        account: &Account,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> Result<reqwest::Response, String> {
+        let client = crate::tlsfp::get_request_client(&account.proxy_url);
+        let mut req = client.post(&self.upstream_url).body(body.to_vec());
+        for (k, v) in ordered_anthropic_headers("/v1/messages", headers) {
+            req = req.header(k, v);
+        }
+
+        match tokio::time::timeout(PRIME_TTFB_TIMEOUT, req.send()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(truncate_chars(
+                &format!("request failed: {}", e),
+                ERROR_SNIPPET_CHARS,
+            )),
+            Err(_) => Err("upstream TTFB timeout".into()),
+        }
+    }
 }
 
 /// 按字符截断字符串,避免直接字节切片在多字节字符上 panic。
@@ -575,4 +654,303 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max_chars).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::account::{
+        AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+        DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    };
+    use crate::store::account_store::AccountStore;
+    use crate::store::memory::MemoryStore;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use sqlx::AnyPool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn setup_prime_poller() -> (PrimePollerService, Arc<AccountService>) {
+        setup_prime_poller_with_urls(
+            UPSTREAM_URL.to_string(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await
+    }
+
+    async fn setup_prime_poller_with_urls(
+        upstream_url: String,
+        oauth_token_url: String,
+    ) -> (PrimePollerService, Arc<AccountService>) {
+        sqlx::any::install_default_drivers();
+        let tmp =
+            std::env::temp_dir().join(format!("ccgw_prime_poller_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("migrate");
+
+        let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let settings_store = Arc::new(SettingsStore::new(pool.clone()));
+        let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
+            account_store,
+            Arc::new(MemoryStore::new()),
+            settings_store.clone(),
+            oauth_token_url,
+        ));
+        let mut service = PrimePollerService::new(
+            account_svc.clone(),
+            settings_store,
+            Arc::new(PrimeLogStore::new(pool)),
+            Arc::new(Rewriter::new()),
+        );
+        service.upstream_url = upstream_url;
+        (service, account_svc)
+    }
+
+    #[derive(Clone)]
+    struct PrimeAuthMockState {
+        accept_refreshed: bool,
+        authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
+        refresh_calls: Arc<AtomicUsize>,
+    }
+
+    async fn mock_prime_response(
+        State(state): State<PrimeAuthMockState>,
+        headers: HeaderMap,
+    ) -> Response {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        state
+            .authorization_headers
+            .lock()
+            .await
+            .push(authorization.clone());
+
+        if authorization == "Bearer access-refreshed" && state.accept_refreshed {
+            return (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "id": "msg_prime",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type":"text","text":"ok"}],
+                    "stop_reason": "end_turn"
+                })),
+            )
+                .into_response();
+        }
+
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"type":"error","error":{"type":"authentication_error","message":"invalid token"}})),
+        )
+            .into_response()
+    }
+
+    async fn mock_prime_oauth_refresh(
+        State(state): State<PrimeAuthMockState>,
+    ) -> Json<serde_json::Value> {
+        state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "access_token": "access-refreshed",
+            "refresh_token": "refresh-refreshed",
+            "expires_in": 3600
+        }))
+    }
+
+    async fn spawn_prime_auth_mock_server(
+        accept_refreshed: bool,
+    ) -> (String, PrimeAuthMockState, tokio::task::JoinHandle<()>) {
+        let state = PrimeAuthMockState {
+            accept_refreshed,
+            authorization_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            refresh_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(mock_prime_response))
+            .route("/oauth/token", post(mock_prime_oauth_refresh))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind prime mock server");
+        let address = listener.local_addr().expect("prime mock server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve prime mock");
+        });
+        (format!("http://{}", address), state, server)
+    }
+
+    fn setup_token_account(email: &str) -> Account {
+        Account {
+            id: 0,
+            name: "Prime 测试账号".into(),
+            email: email.into(),
+            status: AccountStatus::Active,
+            auth_type: AccountAuthType::SetupToken,
+            setup_token: "sk-ant-oat01-test-token-placeholder-value".into(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: None,
+            oauth_refreshed_at: None,
+            auth_error: String::new(),
+            proxy_url: String::new(),
+            device_id: String::new(),
+            canonical_env: json!({}),
+            canonical_prompt: json!({}),
+            canonical_process: json!({}),
+            billing_mode: BillingMode::Strip,
+            account_uuid: None,
+            organization_uuid: None,
+            subscription_type: None,
+            concurrency: 3,
+            priority: 50,
+            rpm_limit: 0,
+            rate_limited_at: Some(Utc::now()),
+            rate_limit_reset_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            disable_reason: String::new(),
+            auto_telemetry: false,
+            auto_poll_usage: false,
+            allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            upstream_session_pool_enabled: false,
+            upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+            upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+            upstream_session_refresh_policy: DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY.into(),
+            telemetry_count: 0,
+            usage_data: json!({}),
+            usage_fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn oauth_account(email: &str) -> Account {
+        let mut account = setup_token_account(email);
+        account.auth_type = AccountAuthType::Oauth;
+        account.setup_token.clear();
+        account.access_token = "access-old".into();
+        account.refresh_token = "refresh-old".into();
+        account.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        account.rate_limited_at = None;
+        account.rate_limit_reset_at = None;
+        account
+    }
+
+    #[tokio::test]
+    async fn oauth_unauthorized_refreshes_and_retries_prime_request() {
+        let (base_url, state, server) = spawn_prime_auth_mock_server(true).await;
+        let (service, account_svc) = setup_prime_poller_with_urls(
+            format!("{}/v1/messages?beta=true", base_url),
+            format!("{}/oauth/token", base_url),
+        )
+        .await;
+        let mut account = oauth_account("prime-oauth-retry@example.com");
+        account_svc.create_account(&mut account).await.unwrap();
+
+        let outcome = service
+            .prime_one(&account, "claude-haiku-4-5-20251001", true)
+            .await;
+
+        assert!(outcome.success);
+        assert_eq!(outcome.status, Some(200));
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer access-old", "Bearer access-refreshed"]
+        );
+        let stored = account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Active);
+        assert_eq!(stored.access_token, "access-refreshed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_oauth_unauthorized_disables_prime_account() {
+        let (base_url, state, server) = spawn_prime_auth_mock_server(false).await;
+        let (service, account_svc) = setup_prime_poller_with_urls(
+            format!("{}/v1/messages?beta=true", base_url),
+            format!("{}/oauth/token", base_url),
+        )
+        .await;
+        let mut account = oauth_account("prime-oauth-rejected@example.com");
+        account_svc.create_account(&mut account).await.unwrap();
+
+        let outcome = service
+            .prime_one(&account, "claude-haiku-4-5-20251001", true)
+            .await;
+        assert_eq!(outcome.status, Some(401));
+        service.apply_status_side_effects(&account, 401, None).await;
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.authorization_headers.lock().await.len(), 2);
+        let stored = account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Disabled);
+        assert_eq!(stored.auth_error, "401 OAuth 认证失败");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prime_status_side_effects_preserve_forbidden_and_rate_limit_behavior() {
+        let (service, account_svc) = setup_prime_poller().await;
+        let mut forbidden = setup_token_account("prime-403@example.com");
+        forbidden.rate_limited_at = None;
+        forbidden.rate_limit_reset_at = None;
+        account_svc.create_account(&mut forbidden).await.unwrap();
+
+        service
+            .apply_status_side_effects(&forbidden, 403, None)
+            .await;
+        assert_eq!(
+            account_svc.get_account(forbidden.id).await.unwrap().status,
+            AccountStatus::Disabled
+        );
+
+        let reset_at = Utc::now() + chrono::Duration::hours(4);
+        let usage = json!({
+            "five_hour": {
+                "utilization": 100,
+                "resets_at": reset_at.to_rfc3339()
+            }
+        });
+        let mut rate_limited = setup_token_account("prime-429@example.com");
+        rate_limited.rate_limited_at = None;
+        rate_limited.rate_limit_reset_at = None;
+        rate_limited.usage_data = usage.clone();
+        account_svc.create_account(&mut rate_limited).await.unwrap();
+
+        service
+            .apply_status_side_effects(&rate_limited, 429, Some(usage))
+            .await;
+        let stored = account_svc.get_account(rate_limited.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Active);
+        assert!(
+            stored
+                .rate_limit_reset_at
+                .is_some_and(|reset| reset > Utc::now())
+        );
+    }
+
+    #[tokio::test]
+    async fn final_unauthorized_disables_account_and_clears_rate_limit() {
+        let (service, account_svc) = setup_prime_poller().await;
+        let mut account = setup_token_account("prime-401@example.com");
+        account_svc.create_account(&mut account).await.unwrap();
+
+        service.apply_status_side_effects(&account, 401, None).await;
+
+        let stored = account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Disabled);
+        assert_eq!(stored.auth_error, "401 SetupToken 认证失败");
+        assert_eq!(stored.disable_reason, "401 SetupToken 认证失败");
+        assert!(stored.rate_limited_at.is_none());
+        assert!(stored.rate_limit_reset_at.is_none());
+    }
 }

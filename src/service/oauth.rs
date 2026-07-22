@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+pub(crate) const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_SCOPES: &[&str] = &[
     "user:profile",
@@ -108,6 +108,20 @@ pub async fn refresh_oauth_token(
     refresh_token: &str,
     proxy_url: &str,
 ) -> Result<RefreshedOAuthTokens, AppError> {
+    refresh_oauth_token_at(refresh_token, proxy_url, OAUTH_TOKEN_URL).await
+}
+
+/// 使用指定端点刷新 OAuth access token。
+///
+/// @param refresh_token OAuth refresh token。
+/// @param proxy_url 账号代理地址，空字符串表示直连。
+/// @param token_url OAuth token 端点。
+/// @return 返回刷新后的 access token、refresh token 和过期时间。
+pub(crate) async fn refresh_oauth_token_at(
+    refresh_token: &str,
+    proxy_url: &str,
+    token_url: &str,
+) -> Result<RefreshedOAuthTokens, AppError> {
     let client = get_request_client(proxy_url);
     let body = serde_json::json!({
         "grant_type": "refresh_token",
@@ -117,7 +131,7 @@ pub async fn refresh_oauth_token(
     });
 
     let resp = client
-        .post(OAUTH_TOKEN_URL)
+        .post(token_url)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()

@@ -516,6 +516,7 @@ impl AccountQueue {
 pub struct AccountService {
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
+    oauth_token_url: String,
     /// 评分权重缓存 (w7d, w5h, w_concurrency)，更新设置后刷新。
     score_weights: RwLock<(f64, f64, f64)>,
     settings_store: Arc<crate::store::settings_store::SettingsStore>,
@@ -596,9 +597,31 @@ impl AccountService {
         cache: Arc<dyn CacheStore>,
         settings_store: Arc<crate::store::settings_store::SettingsStore>,
     ) -> Self {
+        Self::new_with_oauth_token_url(
+            store,
+            cache,
+            settings_store,
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+    }
+
+    /// 使用指定 OAuth token 端点构造账号服务。
+    ///
+    /// @param store 账号持久化存储。
+    /// @param cache 分布式或内存缓存实现。
+    /// @param settings_store 全局设置存储。
+    /// @param oauth_token_url OAuth token 刷新端点。
+    /// @return 返回账号服务实例。
+    pub(crate) fn new_with_oauth_token_url(
+        store: Arc<AccountStore>,
+        cache: Arc<dyn CacheStore>,
+        settings_store: Arc<crate::store::settings_store::SettingsStore>,
+        oauth_token_url: String,
+    ) -> Self {
         Self {
             store,
             cache,
+            oauth_token_url,
             score_weights: RwLock::new((DEFAULT_W7D, DEFAULT_W5H, DEFAULT_WCONC)),
             settings_store,
             queues: RwLock::new(HashMap::new()),
@@ -1342,6 +1365,80 @@ impl AccountService {
         }
     }
 
+    /// 在上游返回 401 后恢复 OAuth Access Token。
+    ///
+    /// 同一账号的并发 401 会复用账号级刷新锁。锁内若发现其他请求已替换失败 Token，
+    /// 直接返回新 Token；否则强制刷新且不允许回退旧 Token。
+    ///
+    /// @param id OAuth 账号 ID。
+    /// @param failed_access_token 本次被上游拒绝的 Access Token。
+    /// @return 返回可用于同账号单次重试的 Access Token。
+    pub async fn recover_upstream_token_after_unauthorized(
+        &self,
+        id: i64,
+        failed_access_token: &str,
+    ) -> Result<String, AppError> {
+        if failed_access_token.is_empty() {
+            return Err(AppError::BadRequest(
+                "失败的 OAuth access token 为空".into(),
+            ));
+        }
+
+        let lock_key = format!("oauth:refresh:account:{}", id);
+        let lock_owner = Uuid::new_v4().to_string();
+        for attempt in 0..=OAUTH_WAIT_ATTEMPTS {
+            let acquired = self
+                .cache
+                .acquire_lock(&lock_key, &lock_owner, OAUTH_LOCK_TTL)
+                .await?;
+            if acquired {
+                let result = self
+                    .recover_upstream_token_after_unauthorized_locked(id, failed_access_token)
+                    .await;
+                self.cache.release_lock(&lock_key, &lock_owner).await;
+                return result;
+            }
+            if attempt < OAUTH_WAIT_ATTEMPTS {
+                sleep(OAUTH_WAIT_RETRY).await;
+            }
+        }
+
+        Err(AppError::ServiceUnavailable(
+            "OAuth 401 恢复等待超时".into(),
+        ))
+    }
+
+    async fn recover_upstream_token_after_unauthorized_locked(
+        &self,
+        id: i64,
+        failed_access_token: &str,
+    ) -> Result<String, AppError> {
+        let latest = self.store.get_by_id(id).await?;
+        validate_managed_oauth_account(&latest)?;
+
+        // 并发请求可能已在等待期间完成刷新。复用新 Token，避免每个等待者依次强刷。
+        if latest.access_token != failed_access_token && latest.has_valid_oauth_access_token(0) {
+            return Ok(latest.access_token);
+        }
+
+        let refreshed = self
+            .refresh_oauth_account(
+                id,
+                OAuthResolvePolicy {
+                    min_validity_seconds: 0,
+                    force_refresh: true,
+                    allow_still_valid_fallback: false,
+                },
+            )
+            .await?;
+        if refreshed.access_token.is_empty() {
+            return Err(AppError::ServiceUnavailable(
+                "OAuth 刷新后 access token 为空".into(),
+            ));
+        }
+        Ok(refreshed.access_token)
+    }
+
     /// 在账号级刷新锁内解析一份满足有效期要求的 OAuth 凭据。
     ///
     /// @param id 账号 ID。
@@ -1484,8 +1581,12 @@ impl AccountService {
             .map(|expires_at| expires_at > Utc::now())
             .unwrap_or(false);
 
-        match crate::service::oauth::refresh_oauth_token(&latest.refresh_token, &latest.proxy_url)
-            .await
+        match crate::service::oauth::refresh_oauth_token_at(
+            &latest.refresh_token,
+            &latest.proxy_url,
+            &self.oauth_token_url,
+        )
+        .await
         {
             Ok(tokens) => {
                 self.store
@@ -1539,6 +1640,15 @@ impl AccountService {
             .await
     }
 
+    /// 因上游认证失败永久停用账号。
+    ///
+    /// @param id 账号 ID。
+    /// @param reason 不包含凭据内容的认证失败原因。
+    /// @return 更新成功时返回空值。
+    pub async fn disable_for_auth_failure(&self, id: i64, reason: &str) -> Result<(), AppError> {
+        self.store.disable_for_auth_failure(id, reason).await
+    }
+
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
         self.store.enable_account(id).await
     }
@@ -1548,8 +1658,9 @@ impl AccountService {
     /// 先区分这条 429 是「单请求级拒绝」还是「账号级限流」:
     /// - **计费/权限类**（响应体含 long context / credit,如 Sonnet 1M 上下文但账号未开
     ///   按量付费）：属这条请求自身的问题,**不隔离账号**,直接放行(由上层把 429 透传回客户端)。
-    /// - **有 `retry-after`**：按上游指定时长冷却(封顶 [`MAX_RETRY_AFTER_SECS`]),最稳。
-    /// - **OAuth 撞墙（5h/7d）**：隔离到对应窗口重置时间。
+    /// - **OAuth 撞墙（5h/7d）**：隔离到真实窗口重置时间，不受 5 小时封顶截断。
+    /// - **Fable 模型级 429**：只切换当前请求账号，不设置全账号冷却。
+    /// - **无法识别窗口但有 `retry-after`**：按指定时长冷却，封顶 [`MAX_RETRY_AFTER_SECS`]。
     /// - **其余**（未撞墙 / 无法查 usage / SetupToken）：返回请求级等待,由当前请求释放槽位后重试。
     ///
     /// Sonnet 7 天墙暂不纳入判断（上游可能只对 Sonnet 请求返回 429,不影响其他模型）。
@@ -1575,7 +1686,7 @@ impl AccountService {
     /// @param account 当前请求使用的账号。
     /// @param retry_after_secs 上游 `retry-after` 秒数。
     /// @param body 上游 429 响应体文本。
-    /// @param usage 从响应头被动提取的用量窗口。
+    /// @param usage 当前响应明确拒绝的被动用量窗口；`Some({})` 表示当前头存在但无窗口拒绝。
     /// @param context 当前请求模型与功能开关上下文。
     /// @return 返回账号级隔离、模型级换号、请求级软退避或透传决策。
     pub async fn handle_rate_limit_with_context(
@@ -1654,30 +1765,29 @@ impl AccountService {
         context: &AccountSelectionContext,
     ) -> RateLimitWindowDecision {
         let now = Utc::now();
+        let retry_after_reset_at = retry_after_secs
+            .map(|secs| now + chrono::Duration::seconds(secs.min(MAX_RETRY_AFTER_SECS)));
+        let usage_for_common = usage.as_ref().unwrap_or(&account.usage_data);
 
-        // 1) 上游明确给了 retry-after → 这是最权威的退避信号,优先按它精确冷却
-        //    (封顶防御异常值)。真·速率限制通常带此头;计费/长上下文类拒绝通常不带,
-        //    会落到下面第 2 步。先判它,避免真限流文案里偶含 "credit" 被误当成不隔离。
-        if let Some(secs) = retry_after_secs {
-            let capped = secs.min(MAX_RETRY_AFTER_SECS);
-            return RateLimitWindowDecision::Quarantine(
-                "429 速率限制（retry-after）",
-                now + chrono::Duration::seconds(capped),
-            );
+        // 当前 429 明确拒绝的普通窗口，或无当前证据时的缓存窗口，比通用 retry-after
+        // 更能说明真实隔离周期。特别是 7 天墙不能被 5 小时防御上限提前截断。
+        match classify_rate_limit(usage_for_common, USAGE_HIT_THRESHOLD) {
+            Some(RateLimitWindow::SevenDay(reset_at)) => {
+                return RateLimitWindowDecision::Quarantine(
+                    "周限额已满",
+                    later_reset_at(reset_at, retry_after_reset_at),
+                );
+            }
+            Some(RateLimitWindow::FiveHour(reset_at)) => {
+                return RateLimitWindowDecision::Quarantine(
+                    "5 小时限额已满",
+                    later_reset_at(reset_at, retry_after_reset_at),
+                );
+            }
+            None => {}
         }
 
         if context.is_fable_quota_fallback_active() && account.auth_type == AccountAuthType::Oauth {
-            let usage_for_common = usage.clone().unwrap_or_else(|| account.usage_data.clone());
-            match classify_rate_limit(&usage_for_common, USAGE_HIT_THRESHOLD) {
-                Some(RateLimitWindow::SevenDay(reset_at)) => {
-                    return RateLimitWindowDecision::Quarantine("周限额已满", reset_at);
-                }
-                Some(RateLimitWindow::FiveHour(reset_at)) => {
-                    return RateLimitWindowDecision::Quarantine("5 小时限额已满", reset_at);
-                }
-                None => {}
-            }
-
             let fable_reset_at = usage
                 .as_ref()
                 .and_then(fable_quota_reset_at)
@@ -1685,7 +1795,12 @@ impl AccountService {
             return RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", fable_reset_at);
         }
 
-        // 2) 计费/权限类拒绝（无 retry-after）:长上下文需 usage credits、额度不足等。
+        // 无法识别具体窗口时，retry-after 才作为账号级冷却依据，并保留 5 小时防御上限。
+        if let Some(reset_at) = retry_after_reset_at {
+            return RateLimitWindowDecision::Quarantine("429 速率限制（retry-after）", reset_at);
+        }
+
+        // 计费/权限类拒绝（无 retry-after）:长上下文需 usage credits、额度不足等。
         //    这是「这条请求」的问题(如 Sonnet 1M 上下文 + 账号没开按量付费),
         //    与账号容量无关,绝不隔离账号。
         let body_lc = body.to_lowercase();
@@ -1693,20 +1808,7 @@ impl AccountService {
             return RateLimitWindowDecision::PassThrough;
         }
 
-        // 3) 撞墙判断:完全不主动查 usage 接口,改用被动用量数据。
-        //    优先用这条 429 响应自带的 ratelimit 头(usage 入参,最新),
-        //    取不到再退回账号已存的 usage_data;两者都无有效窗口 → 短冷却。
-        //    用 429 自带头还能在风暴中正确识别真撞墙(此时 usage_data 因无 200 响应而不更新)。
-        let usage = usage.unwrap_or_else(|| account.usage_data.clone());
-        match classify_rate_limit(&usage, USAGE_HIT_THRESHOLD) {
-            Some(RateLimitWindow::SevenDay(reset_at)) => {
-                RateLimitWindowDecision::Quarantine("周限额已满", reset_at)
-            }
-            Some(RateLimitWindow::FiveHour(reset_at)) => {
-                RateLimitWindowDecision::Quarantine("5 小时限额已满", reset_at)
-            }
-            None => RateLimitWindowDecision::RequestBackoff(PURE_RATE_LIMIT_RETRY_DELAY),
-        }
+        RateLimitWindowDecision::RequestBackoff(PURE_RATE_LIMIT_RETRY_DELAY)
     }
 
     /// 综合评分选择账号：同优先级内按 7d/5h 有效用量和并发负载加权评分，分数越低越优先。
@@ -2002,6 +2104,15 @@ enum RateLimitWindow {
     SevenDay(chrono::DateTime<Utc>),
     /// 5 小时窗口命中，携带其 resets_at。
     FiveHour(chrono::DateTime<Utc>),
+}
+
+fn later_reset_at(
+    window_reset_at: chrono::DateTime<Utc>,
+    retry_after_reset_at: Option<chrono::DateTime<Utc>>,
+) -> chrono::DateTime<Utc> {
+    retry_after_reset_at
+        .filter(|retry_reset_at| retry_reset_at > &window_reset_at)
+        .unwrap_or(window_reset_at)
 }
 
 /// 根据 usage_data JSON 判断哪个窗口撞墙。
@@ -2962,6 +3073,92 @@ mod tests {
     }
 
     #[test]
+    fn seven_day_window_is_not_truncated_by_retry_after_cap() {
+        let seven_day_reset = Utc::now() + ChronoDuration::days(4);
+        let account = test_account_with_usage(json!({
+            "seven_day": make_window(json!(100), &seven_day_reset.to_rfc3339()),
+        }));
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            Some(60 * 60),
+            "rate limited",
+            None,
+            &AccountSelectionContext::disabled(),
+        ) {
+            RateLimitWindowDecision::Quarantine("周限额已满", reset_at) => {
+                assert_eq!(reset_at.timestamp(), seven_day_reset.timestamp());
+            }
+            _ => panic!("expected seven-day quarantine"),
+        }
+    }
+
+    #[test]
+    fn five_hour_window_uses_later_retry_after_deadline() {
+        let account = test_account_with_usage(json!({
+            "five_hour": make_window(
+                json!(100),
+                &rfc3339_at(ChronoDuration::hours(1)),
+            ),
+        }));
+        let before = Utc::now();
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            Some(4 * 60 * 60),
+            "rate limited",
+            None,
+            &AccountSelectionContext::disabled(),
+        ) {
+            RateLimitWindowDecision::Quarantine("5 小时限额已满", reset_at) => {
+                assert!(reset_at >= before + ChronoDuration::hours(4));
+                assert!(reset_at <= Utc::now() + ChronoDuration::hours(4));
+            }
+            _ => panic!("expected five-hour quarantine"),
+        }
+    }
+
+    #[test]
+    fn unknown_retry_after_remains_capped_at_five_hours() {
+        let account = test_account_with_usage(json!({}));
+        let before = Utc::now();
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            Some(ChronoDuration::days(2).num_seconds()),
+            "rate limited",
+            None,
+            &AccountSelectionContext::disabled(),
+        ) {
+            RateLimitWindowDecision::Quarantine("429 速率限制（retry-after）", reset_at) => {
+                assert!(reset_at >= before + ChronoDuration::hours(5));
+                assert!(reset_at <= Utc::now() + ChronoDuration::hours(5));
+            }
+            _ => panic!("expected capped retry-after quarantine"),
+        }
+    }
+
+    #[test]
+    fn current_allowed_windows_do_not_fall_back_to_stale_cached_quota() {
+        let account = test_account_with_usage(json!({
+            "seven_day": make_window(json!(100), &rfc3339_at(ChronoDuration::days(4))),
+        }));
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            None,
+            "rate limited",
+            Some(json!({})),
+            &AccountSelectionContext::disabled(),
+        ) {
+            RateLimitWindowDecision::RequestBackoff(delay) => {
+                assert_eq!(delay, PURE_RATE_LIMIT_RETRY_DELAY);
+            }
+            _ => panic!("current response should suppress stale cached quota"),
+        }
+    }
+
+    #[test]
     fn credit_429_passes_through_without_backoff_or_quarantine() {
         let account = test_account_with_usage(json!({}));
 
@@ -3018,6 +3215,28 @@ mod tests {
         ) {
             RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", None) => {}
             _ => panic!("expected fable retry decision without cached reset"),
+        }
+    }
+
+    #[test]
+    fn fable_429_with_retry_after_stays_model_scoped() {
+        let account = test_account_with_usage(json!({
+            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+        }));
+        let context = AccountSelectionContext {
+            fable_quota_fallback_enabled: true,
+            request_model: Some("claude-fable-5".into()),
+        };
+
+        match AccountService::determine_rate_limit_window(
+            &account,
+            Some(5 * 60 * 60),
+            "rate limited",
+            None,
+            &context,
+        ) {
+            RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", Some(_)) => {}
+            _ => panic!("expected fable model-level retry"),
         }
     }
 
@@ -3124,6 +3343,77 @@ mod tests {
         assert_eq!(snapshot.access_token, "access-snapshot");
         assert_eq!(snapshot.refresh_token, "refresh-snapshot");
         assert!(snapshot.expires_at > Utc::now().timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_recovery_reuses_token_updated_by_lock_owner() {
+        let (store, svc) = setup_account_service().await;
+        let mut account = new_account_request("unauthorized-lock@example.com");
+        account.access_token = "access-rejected".into();
+        account.refresh_token = "refresh-old".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        svc.create_account(&mut account).await.unwrap();
+
+        let lock_key = format!("oauth:refresh:account:{}", account.id);
+        let lock_owner = "unauthorized-test-owner";
+        assert!(
+            svc.cache
+                .acquire_lock(&lock_key, lock_owner, OAUTH_LOCK_TTL)
+                .await
+                .unwrap()
+        );
+
+        let recovering = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.recover_upstream_token_after_unauthorized(account.id, "access-rejected")
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(100)).await;
+        assert!(!recovering.is_finished());
+
+        store
+            .update_oauth_tokens(
+                account.id,
+                "access-refreshed",
+                "refresh-refreshed",
+                Utc::now() + ChronoDuration::hours(2),
+            )
+            .await
+            .unwrap();
+        svc.cache.release_lock(&lock_key, lock_owner).await;
+
+        assert_eq!(recovering.await.unwrap().unwrap(), "access-refreshed");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_recovery_does_not_fallback_without_refresh_token() {
+        let (store, svc) = setup_account_service().await;
+        let mut account = new_account_request("unauthorized-no-refresh@example.com");
+        account.access_token = "access-still-locally-valid".into();
+        account.refresh_token = "refresh-initial".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        svc.create_account(&mut account).await.unwrap();
+        store
+            .update_oauth_tokens(
+                account.id,
+                "access-still-locally-valid",
+                "",
+                Utc::now() + ChronoDuration::hours(1),
+            )
+            .await
+            .unwrap();
+
+        let error = svc
+            .recover_upstream_token_after_unauthorized(account.id, "access-still-locally-valid")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("refresh token"));
+        let stored = svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.access_token, "access-still-locally-valid");
+        assert!(!stored.auth_error.is_empty());
     }
 
     #[tokio::test]

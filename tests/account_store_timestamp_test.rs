@@ -214,6 +214,40 @@ async fn test_disable_account_without_rate_limit() {
     assert_eq!(fetched.status, AccountStatus::Disabled);
 }
 
+#[tokio::test]
+async fn test_disable_for_auth_failure_updates_reason_and_clears_rate_limit() {
+    let store = setup().await;
+    let mut account = new_account("auth-failure@example.com");
+    let usage_data = serde_json::json!({
+        "seven_day": {
+            "utilization": 42,
+            "resets_at": (Utc::now() + Duration::days(3)).to_rfc3339()
+        }
+    });
+    store.create(&mut account).await.unwrap();
+    store
+        .update_usage(account.id, &serde_json::to_string(&usage_data).unwrap())
+        .await
+        .unwrap();
+    store
+        .set_rate_limit(account.id, Utc::now() + Duration::hours(5))
+        .await
+        .unwrap();
+
+    store
+        .disable_for_auth_failure(account.id, "401 认证失败")
+        .await
+        .unwrap();
+
+    let fetched = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(fetched.status, AccountStatus::Disabled);
+    assert_eq!(fetched.auth_error, "401 认证失败");
+    assert_eq!(fetched.disable_reason, "401 认证失败");
+    assert!(fetched.rate_limited_at.is_none());
+    assert!(fetched.rate_limit_reset_at.is_none());
+    assert_eq!(fetched.usage_data, usage_data);
+}
+
 // ─── UPDATE_USAGE: usage_fetched_at ───
 
 #[tokio::test]
