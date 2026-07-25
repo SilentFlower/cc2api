@@ -8,6 +8,43 @@ pub struct RpmAcquire {
     pub current: i64,
 }
 
+/// 下游 Session 首次 Hello 代理探测状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHelloProbeState {
+    /// 最近一次探测成功。
+    Success,
+    /// 最近一次探测发生网络错误或返回非 200。
+    Failure,
+    /// 最近一次探测超过配置的总超时。
+    Timeout,
+}
+
+impl SessionHelloProbeState {
+    /// 返回缓存持久化使用的稳定字符串。
+    ///
+    /// @return 当前状态的字符串表示。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// 从缓存字符串解析探测状态。
+    ///
+    /// @param value 缓存中读取的原始字符串。
+    /// @return 合法状态返回枚举，未知值返回 `None`。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "success" => Some(Self::Success),
+            "failure" => Some(Self::Failure),
+            "timeout" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+}
+
 /// 上游 session 池 TTL 刷新策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamSessionRefreshPolicy {
@@ -165,6 +202,28 @@ pub trait CacheStore: Send + Sync {
         pool_size: i32,
         ttl: Duration,
     ) -> Result<UpstreamSessionPoolStatus, AppError>;
+    /// 读取 Session Hello 探测状态；成功命中时原子续期形成滑动 TTL。
+    ///
+    /// @param key 已脱敏的探测状态 key。
+    /// @param success_ttl 成功状态命中后续期的时长。
+    /// @return 返回仍在有效期内的状态；不存在或已过期时返回 `None`。
+    async fn get_session_hello_probe_state(
+        &self,
+        key: &str,
+        success_ttl: Duration,
+    ) -> Result<Option<SessionHelloProbeState>, AppError>;
+    /// 写入 Session Hello 探测状态和固定有效期。
+    ///
+    /// @param key 已脱敏的探测状态 key。
+    /// @param state 本次探测状态。
+    /// @param ttl 状态有效期；成功和失败分别由调用方传入不同配置。
+    /// @return 写入成功返回 `Ok(())`。
+    async fn set_session_hello_probe_state(
+        &self,
+        key: &str,
+        state: SessionHelloProbeState,
+        ttl: Duration,
+    ) -> Result<(), AppError>;
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError>;
     async fn release_lock(&self, key: &str, owner: &str);
 }

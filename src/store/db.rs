@@ -341,6 +341,27 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "bootstrap_additional_model_options",
             crate::store::settings_store::DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
         ),
+        // Session 首次 Hello 代理探测默认关闭；旧库只补缺失键，不覆盖管理员配置。
+        (
+            "session_hello_probe_enabled",
+            crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_ENABLED,
+        ),
+        (
+            "session_hello_probe_strict",
+            crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_STRICT,
+        ),
+        (
+            "session_hello_probe_timeout_secs",
+            crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
+        ),
+        (
+            "session_hello_probe_success_ttl_secs",
+            crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
+        ),
+        (
+            "session_hello_probe_failure_cooldown_secs",
+            crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
+        ),
     ] {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"

@@ -83,6 +83,13 @@ type AutoModeClassifierMode = 'passthrough' | 'mock_allow' | 'mock_block' | 'err
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
 
+/** Session 首次 Hello 代理探测配置 */
+const sessionHelloProbeEnabled = ref(false);
+const sessionHelloProbeStrict = ref(false);
+const sessionHelloProbeTimeoutSecs = ref('5');
+const sessionHelloProbeSuccessTtlSecs = ref('3600');
+const sessionHelloProbeFailureCooldownSecs = ref('300');
+
 /** 预热与 Auto Mode classifier 本地处理开关 */
 const interceptWarmupTitleEnabled = ref(false);
 const interceptWarmupSuggestionEnabled = ref(false);
@@ -336,6 +343,30 @@ const isValidStreamUpstreamIdleTimeoutSecs = computed(() => {
   return Number.isSafeInteger(n) && n >= 30 && n <= 1800;
 });
 
+/** Session Hello 探测超时是否合法 */
+const isValidSessionHelloProbeTimeoutSecs = computed(() => {
+  const raw = sessionHelloProbeTimeoutSecs.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 1 && n <= 30;
+});
+
+/** Session Hello 成功状态 TTL 是否合法 */
+const isValidSessionHelloProbeSuccessTtlSecs = computed(() => {
+  const raw = sessionHelloProbeSuccessTtlSecs.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 60 && n <= 86400;
+});
+
+/** Session Hello 失败冷却是否设置在支持范围内 */
+const isValidSessionHelloProbeFailureCooldownSecs = computed(() => {
+  const raw = sessionHelloProbeFailureCooldownSecs.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 10 && n <= 3600;
+});
+
 /** bootstrap 模型选项 JSON 是否合法 */
 const isValidBootstrapAdditionalModelOptions = computed(() => {
   const raw = bootstrapAdditionalModelOptions.value.trim();
@@ -387,6 +418,11 @@ async function loadSettings() {
     }
     messageBodyOrderFingerprintEnabled.value = (data.message_body_order_fingerprint_enabled ?? 'true') === 'true';
     proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
+    sessionHelloProbeEnabled.value = (data.session_hello_probe_enabled ?? 'false') === 'true';
+    sessionHelloProbeStrict.value = (data.session_hello_probe_strict ?? 'false') === 'true';
+    sessionHelloProbeTimeoutSecs.value = data.session_hello_probe_timeout_secs ?? '5';
+    sessionHelloProbeSuccessTtlSecs.value = data.session_hello_probe_success_ttl_secs ?? '3600';
+    sessionHelloProbeFailureCooldownSecs.value = data.session_hello_probe_failure_cooldown_secs ?? '300';
     rewriteDisabledThinkingEnabled.value = (data.rewrite_disabled_thinking_enabled ?? 'false') === 'true';
     rewriteDisabledThinkingModels.value = data.rewrite_disabled_thinking_models ?? 'claude-fable-5';
     interceptAssistantPrefillEnabled.value = (data.intercept_assistant_prefill_enabled ?? 'false') === 'true';
@@ -474,6 +510,18 @@ async function saveSettings() {
     toast('上游流静默超时必须是 30 到 1800 秒的整数');
     return;
   }
+  if (!isValidSessionHelloProbeTimeoutSecs.value) {
+    toast('Session Hello 探测超时必须是 1 到 30 秒的整数');
+    return;
+  }
+  if (!isValidSessionHelloProbeSuccessTtlSecs.value) {
+    toast('Session Hello 成功 TTL 必须是 60 到 86400 秒的整数');
+    return;
+  }
+  if (!isValidSessionHelloProbeFailureCooldownSecs.value) {
+    toast('Session Hello 失败冷却必须是 10 到 3600 秒的整数');
+    return;
+  }
   if (!isValidBootstrapAdditionalModelOptions.value) {
     toast('bootstrap 模型选项必须是 JSON 数组,且每项包含合法 model');
     return;
@@ -501,6 +549,11 @@ async function saveSettings() {
       message_cache_control_rewrite: messageCacheControlRewrite.value,
       message_body_order_fingerprint_enabled: messageBodyOrderFingerprintEnabled.value ? 'true' : 'false',
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
+      session_hello_probe_enabled: sessionHelloProbeEnabled.value ? 'true' : 'false',
+      session_hello_probe_strict: sessionHelloProbeStrict.value ? 'true' : 'false',
+      session_hello_probe_timeout_secs: sessionHelloProbeTimeoutSecs.value.trim(),
+      session_hello_probe_success_ttl_secs: sessionHelloProbeSuccessTtlSecs.value.trim(),
+      session_hello_probe_failure_cooldown_secs: sessionHelloProbeFailureCooldownSecs.value.trim(),
       rewrite_disabled_thinking_enabled: rewriteDisabledThinkingEnabled.value ? 'true' : 'false',
       rewrite_disabled_thinking_models: rewriteDisabledThinkingModels.value.trim(),
       intercept_assistant_prefill_enabled: interceptAssistantPrefillEnabled.value ? 'true' : 'false',
@@ -936,6 +989,89 @@ onMounted(async () => {
               />
               <span class="text-sm text-[#29261e]">{{ proxyClientPoolEnabled ? '已启用' : '已关闭' }}</span>
             </label>
+          </div>
+        </div>
+      </div>
+    </Card>
+
+    <!-- Session 首次 Hello 代理探测 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-sm font-semibold text-[#29261e]">Session 首次 Hello 代理探测</h3>
+          <p class="text-xs text-[#8c8475] mt-1">
+            新 Claude Code session 首次转发前，通过最终账号的代理路径检查 Anthropic Hello 连通性。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">功能开关</Label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="sessionHelloProbeEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ sessionHelloProbeEnabled ? '已启用' : '已关闭' }}</span>
+            </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">严格模式</Label>
+            <label
+              class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] select-none"
+              :class="sessionHelloProbeEnabled ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'"
+            >
+              <input
+                v-model="sessionHelloProbeStrict"
+                type="checkbox"
+                :disabled="!sessionHelloProbeEnabled"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ sessionHelloProbeStrict ? '失败阻断' : '失败放行' }}</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">探测超时（秒）</Label>
+            <Input
+              v-model="sessionHelloProbeTimeoutSecs"
+              type="number"
+              min="1"
+              max="30"
+              step="1"
+              :disabled="!sessionHelloProbeEnabled"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+              :class="isValidSessionHelloProbeTimeoutSecs ? '' : 'border-red-400'"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">成功 TTL（秒）</Label>
+            <Input
+              v-model="sessionHelloProbeSuccessTtlSecs"
+              type="number"
+              min="60"
+              max="86400"
+              step="1"
+              :disabled="!sessionHelloProbeEnabled"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+              :class="isValidSessionHelloProbeSuccessTtlSecs ? '' : 'border-red-400'"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">失败冷却（秒）</Label>
+            <Input
+              v-model="sessionHelloProbeFailureCooldownSecs"
+              type="number"
+              min="10"
+              max="3600"
+              step="1"
+              :disabled="!sessionHelloProbeEnabled"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+              :class="isValidSessionHelloProbeFailureCooldownSecs ? '' : 'border-red-400'"
+            />
           </div>
         </div>
       </div>
@@ -1390,7 +1526,7 @@ onMounted(async () => {
     <div class="flex justify-end">
       <Button
         @click="saveSettings"
-        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidBlockedClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidStreamKeepaliveIntervalSecs || !isValidStreamUpstreamIdleTimeoutSecs || !isValidBootstrapAdditionalModelOptions"
+        :disabled="saving || !allValid || !isValidHours || !isValidModel || !isValidSystemRoleModels || !isValidClaudeCodeVersions || !isValidBlockedClaudeCodeVersions || !isValidAllowedUserAgents || !isValidRewriteDisabledThinkingModels || !isValidInterceptAssistantPrefillModels || !isValidLog429RequestBodyLimit || !isValidStreamKeepaliveIntervalSecs || !isValidStreamUpstreamIdleTimeoutSecs || !isValidSessionHelloProbeTimeoutSecs || !isValidSessionHelloProbeSuccessTtlSecs || !isValidSessionHelloProbeFailureCooldownSecs || !isValidBootstrapAdditionalModelOptions"
         class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 px-6"
       >
         {{ saving ? '保存中...' : '保存' }}

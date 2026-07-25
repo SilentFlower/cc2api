@@ -4,8 +4,9 @@ use tokio::sync::Mutex;
 
 use crate::error::AppError;
 use crate::store::cache::{
-    CacheStore, RpmAcquire, UpstreamSessionPoolAction, UpstreamSessionPoolResolve,
-    UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy, stable_upstream_session_hash,
+    CacheStore, RpmAcquire, SessionHelloProbeState, UpstreamSessionPoolAction,
+    UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
+    stable_upstream_session_hash,
 };
 
 struct SessionEntry {
@@ -20,6 +21,11 @@ struct LockEntry {
 
 struct RpmEntry {
     count: i64,
+    expires_at: tokio::time::Instant,
+}
+
+struct SessionHelloProbeEntry {
+    state: SessionHelloProbeState,
     expires_at: tokio::time::Instant,
 }
 
@@ -40,6 +46,7 @@ pub struct MemoryStore {
     locks: Mutex<HashMap<String, LockEntry>>,
     rpm: Mutex<HashMap<String, RpmEntry>>,
     upstream_session_pools: Mutex<HashMap<i64, UpstreamSessionPoolState>>,
+    session_hello_probes: Mutex<HashMap<String, SessionHelloProbeEntry>>,
 }
 
 impl MemoryStore {
@@ -50,6 +57,7 @@ impl MemoryStore {
             locks: Mutex::new(HashMap::new()),
             rpm: Mutex::new(HashMap::new()),
             upstream_session_pools: Mutex::new(HashMap::new()),
+            session_hello_probes: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -340,6 +348,42 @@ impl CacheStore for MemoryStore {
         })
     }
 
+    async fn get_session_hello_probe_state(
+        &self,
+        key: &str,
+        success_ttl: Duration,
+    ) -> Result<Option<SessionHelloProbeState>, AppError> {
+        let mut probes = self.session_hello_probes.lock().await;
+        let now = tokio::time::Instant::now();
+        let Some(entry) = probes.get_mut(key) else {
+            return Ok(None);
+        };
+        if now > entry.expires_at {
+            probes.remove(key);
+            return Ok(None);
+        }
+        if entry.state == SessionHelloProbeState::Success {
+            entry.expires_at = now + success_ttl;
+        }
+        Ok(Some(entry.state))
+    }
+
+    async fn set_session_hello_probe_state(
+        &self,
+        key: &str,
+        state: SessionHelloProbeState,
+        ttl: Duration,
+    ) -> Result<(), AppError> {
+        self.session_hello_probes.lock().await.insert(
+            key.to_string(),
+            SessionHelloProbeEntry {
+                state,
+                expires_at: tokio::time::Instant::now() + ttl,
+            },
+        );
+        Ok(())
+    }
+
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut locks = self.locks.lock().await;
         let now = tokio::time::Instant::now();
@@ -371,6 +415,61 @@ impl CacheStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_hello_probe_success_renews_but_failure_does_not() {
+        let store = MemoryStore::new();
+        let success_key = "probe-success";
+        let failure_key = "probe-failure";
+        store
+            .set_session_hello_probe_state(
+                success_key,
+                SessionHelloProbeState::Success,
+                Duration::from_millis(40),
+            )
+            .await
+            .expect("写入成功状态");
+        store
+            .set_session_hello_probe_state(
+                failure_key,
+                SessionHelloProbeState::Failure,
+                Duration::from_millis(40),
+            )
+            .await
+            .expect("写入失败状态");
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(success_key, Duration::from_millis(60))
+                .await
+                .expect("读取成功状态"),
+            Some(SessionHelloProbeState::Success)
+        );
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(failure_key, Duration::from_millis(60))
+                .await
+                .expect("读取失败状态"),
+            Some(SessionHelloProbeState::Failure)
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(success_key, Duration::from_millis(60))
+                .await
+                .expect("再次读取成功状态"),
+            Some(SessionHelloProbeState::Success)
+        );
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(failure_key, Duration::from_millis(60))
+                .await
+                .expect("再次读取失败状态"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn upstream_session_pool_caps_and_maps_stably() {

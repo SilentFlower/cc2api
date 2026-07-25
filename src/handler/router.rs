@@ -50,8 +50,11 @@ use crate::store::settings_store::{
     DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
     DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
-    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
+    DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
+    DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
+    DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
+    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
+    SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -981,6 +984,21 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("bootstrap_additional_model_options".into())
         .or_insert_with(|| DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS.to_string());
+    settings
+        .entry("session_hello_probe_enabled".into())
+        .or_insert_with(|| DEFAULT_SESSION_HELLO_PROBE_ENABLED.to_string());
+    settings
+        .entry("session_hello_probe_strict".into())
+        .or_insert_with(|| DEFAULT_SESSION_HELLO_PROBE_STRICT.to_string());
+    settings
+        .entry("session_hello_probe_timeout_secs".into())
+        .or_insert_with(|| DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS.to_string());
+    settings
+        .entry("session_hello_probe_success_ttl_secs".into())
+        .or_insert_with(|| DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS.to_string());
+    settings
+        .entry("session_hello_probe_failure_cooldown_secs".into())
+        .or_insert_with(|| DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS.to_string());
     Ok(Json(serde_json::json!(settings)))
 }
 
@@ -1125,6 +1143,8 @@ async fn update_settings(
         "stream_keepalive_enabled",
         "message_body_order_fingerprint_enabled",
         "fable_sticky_quota_fallback_enabled",
+        "session_hello_probe_enabled",
+        "session_hello_probe_strict",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -1149,6 +1169,15 @@ async fn update_settings(
     }
     if let Some(val) = body.get("stream_upstream_idle_timeout_secs") {
         validate_usize_range("stream_upstream_idle_timeout_secs", val, 30, 1800)?;
+    }
+    if let Some(val) = body.get("session_hello_probe_timeout_secs") {
+        validate_usize_range("session_hello_probe_timeout_secs", val, 1, 30)?;
+    }
+    if let Some(val) = body.get("session_hello_probe_success_ttl_secs") {
+        validate_usize_range("session_hello_probe_success_ttl_secs", val, 60, 86_400)?;
+    }
+    if let Some(val) = body.get("session_hello_probe_failure_cooldown_secs") {
+        validate_usize_range("session_hello_probe_failure_cooldown_secs", val, 10, 3_600)?;
     }
     if let Some(val) = body.get("intercept_auto_mode_classifier_stage1_mode") {
         AutoModeClassifierMode::parse(val)?;
@@ -1262,6 +1291,17 @@ async fn update_settings(
     {
         state.gateway_svc.reload_bootstrap_profile_config().await?;
     }
+    if body.contains_key("session_hello_probe_enabled")
+        || body.contains_key("session_hello_probe_strict")
+        || body.contains_key("session_hello_probe_timeout_secs")
+        || body.contains_key("session_hello_probe_success_ttl_secs")
+        || body.contains_key("session_hello_probe_failure_cooldown_secs")
+    {
+        state
+            .gateway_svc
+            .reload_session_hello_probe_config()
+            .await?;
+    }
     // 通知 AccountService 刷新缓存
     state.account_svc.reload_score_weights().await;
     Ok(Json(serde_json::json!({"ok": true})))
@@ -1351,9 +1391,10 @@ mod tests {
             .expect("初始化测试数据库");
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let settings_store = Arc::new(SettingsStore::new(pool.clone()));
+        let cache = Arc::new(MemoryStore::new());
         let account_svc = Arc::new(AccountService::new(
             account_store.clone(),
-            Arc::new(MemoryStore::new()),
+            cache.clone(),
             settings_store.clone(),
         ));
         let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
@@ -1362,6 +1403,7 @@ mod tests {
             Arc::new(Rewriter::new()),
             telemetry_svc.clone(),
             settings_store.clone(),
+            cache,
         ));
         let cfg = Config {
             server: ServerConfig {
@@ -1470,6 +1512,57 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fallback_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn settings_return_session_hello_probe_defaults() {
+        let response = test_router()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["session_hello_probe_enabled"], "false");
+        assert_eq!(value["session_hello_probe_strict"], "false");
+        assert_eq!(value["session_hello_probe_timeout_secs"], "5");
+        assert_eq!(value["session_hello_probe_success_ttl_secs"], "3600");
+        assert_eq!(value["session_hello_probe_failure_cooldown_secs"], "300");
+    }
+
+    #[tokio::test]
+    async fn settings_reject_session_hello_probe_ranges() {
+        for (key, value) in [
+            ("session_hello_probe_timeout_secs", "0"),
+            ("session_hello_probe_success_ttl_secs", "59"),
+            ("session_hello_probe_failure_cooldown_secs", "3601"),
+        ] {
+            let response = test_router()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::json!({key: value}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "key={key}");
+        }
     }
 
     #[test]

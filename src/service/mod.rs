@@ -5,6 +5,7 @@ pub mod oauth;
 pub mod oauth_flow;
 pub mod prime_poller;
 pub mod rewriter;
+pub mod session_hello_probe;
 pub mod telemetry;
 pub mod usage_poller;
 pub mod version_profile;

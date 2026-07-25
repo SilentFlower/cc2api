@@ -110,6 +110,7 @@ async fn main() {
         rewriter.clone(),
         telemetry_svc.clone(),
         settings_store.clone(),
+        cache.clone(),
     ));
     gateway_svc
         .reload_system_role_models()
@@ -171,6 +172,10 @@ async fn main() {
         .reload_context_sanitizer_config()
         .await
         .expect("load context sanitizer config failed");
+    gateway_svc
+        .reload_session_hello_probe_config()
+        .await
+        .expect("load session hello probe config failed");
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 

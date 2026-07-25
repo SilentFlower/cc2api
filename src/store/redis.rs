@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use crate::error::AppError;
 use crate::store::cache::{
-    CacheStore, RpmAcquire, UpstreamSessionPoolAction, UpstreamSessionPoolResolve,
-    UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy, stable_upstream_session_hash,
+    CacheStore, RpmAcquire, SessionHelloProbeState, UpstreamSessionPoolAction,
+    UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
+    stable_upstream_session_hash,
 };
 
 pub struct RedisStore {
@@ -439,6 +440,45 @@ impl CacheStore for RedisStore {
         })
     }
 
+    async fn get_session_hello_probe_state(
+        &self,
+        key: &str,
+        success_ttl: Duration,
+    ) -> Result<Option<SessionHelloProbeState>, AppError> {
+        let mut conn = self.client.clone();
+        let script = redis::Script::new(
+            r#"
+            local value = redis.call("GET", KEYS[1])
+            if value == "success" then
+                redis.call("EXPIRE", KEYS[1], ARGV[1])
+            end
+            return value
+            "#,
+        );
+        let value: Option<String> = script
+            .key(key)
+            .arg(success_ttl.as_secs().max(1))
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("redis hello probe get: {}", e)))?;
+        Ok(value.and_then(|raw| SessionHelloProbeState::parse(&raw)))
+    }
+
+    async fn set_session_hello_probe_state(
+        &self,
+        key: &str,
+        state: SessionHelloProbeState,
+        ttl: Duration,
+    ) -> Result<(), AppError> {
+        let _: () = self
+            .client
+            .clone()
+            .set_ex(key, state.as_str(), ttl.as_secs().max(1))
+            .await
+            .map_err(|e| AppError::Internal(format!("redis hello probe set: {}", e)))?;
+        Ok(())
+    }
+
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut conn = self.client.clone();
         let result: Option<String> = redis::cmd("SET")
@@ -464,5 +504,76 @@ impl CacheStore for RedisStore {
             "#,
         );
         let _: Result<i32, _> = script.key(key).arg(owner).invoke_async(&mut conn).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_hello_probe_success_renews_but_failure_does_not_when_redis_available() {
+        let Ok(port) = std::env::var("CC2API_TEST_REDIS_PORT") else {
+            return;
+        };
+        let port = port.parse::<u16>().expect("解析测试 Redis 端口");
+        let store = RedisStore::new("127.0.0.1", port, "", 15)
+            .await
+            .expect("连接测试 Redis");
+        let success_key = format!("test:hello:success:{}", uuid::Uuid::new_v4());
+        let failure_key = format!("test:hello:failure:{}", uuid::Uuid::new_v4());
+
+        store
+            .set_session_hello_probe_state(
+                &success_key,
+                SessionHelloProbeState::Success,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("写入成功状态");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(&success_key, Duration::from_secs(2))
+                .await
+                .expect("续期成功状态"),
+            Some(SessionHelloProbeState::Success)
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(&success_key, Duration::from_secs(2))
+                .await
+                .expect("读取续期后的成功状态"),
+            Some(SessionHelloProbeState::Success)
+        );
+
+        store
+            .set_session_hello_probe_state(
+                &failure_key,
+                SessionHelloProbeState::Failure,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("写入失败状态");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(&failure_key, Duration::from_secs(2))
+                .await
+                .expect("读取失败状态"),
+            Some(SessionHelloProbeState::Failure)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            store
+                .get_session_hello_probe_state(&failure_key, Duration::from_secs(2))
+                .await
+                .expect("确认失败状态未续期"),
+            None
+        );
+
+        let _: Result<(), _> = store.client.clone().del(&success_key).await;
+        let _: Result<(), _> = store.client.clone().del(&failure_key).await;
     }
 }

@@ -34,6 +34,9 @@ use crate::service::rewriter::{
     matches_1m_whitelist, merge_anthropic_beta, order_context_1m_after_oauth,
     ordered_anthropic_headers, strip_beta_token, strip_empty_text_blocks,
 };
+use crate::service::session_hello_probe::{
+    SessionHelloProbeConfig, SessionHelloProbeDecision, SessionHelloProbeService,
+};
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
 };
@@ -41,6 +44,7 @@ use crate::service::version_profile::{
     COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile, is_event_logging_path,
     profile_for_version,
 };
+use crate::store::cache::CacheStore;
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
@@ -55,8 +59,11 @@ use crate::store::settings_store::{
     DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PASSTHROUGH_OS_VERSION,
     DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
-    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
+    DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
+    DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
+    DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
+    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
+    SettingsStore,
 };
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -102,6 +109,39 @@ fn align_mapped_upstream_session_header(
         "X-Claude-Code-Session-Id".into(),
         upstream_session_id.to_string(),
     );
+}
+
+fn session_hello_probe_session_id(
+    path: &str,
+    client_type: ClientType,
+    body: &serde_json::Value,
+) -> Option<String> {
+    if path != "/v1/messages" || client_type != ClientType::ClaudeCode {
+        return None;
+    }
+    crate::service::rewriter::extract_session_id_from_body(body)
+        .filter(|session| !session.trim().is_empty())
+}
+
+fn session_hello_probe_block_response(decision: SessionHelloProbeDecision) -> Option<Response> {
+    match decision {
+        SessionHelloProbeDecision::Proceed => None,
+        SessionHelloProbeDecision::BlockFailure => Some(anthropic_error_response(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "session hello proxy probe failed",
+        )),
+        SessionHelloProbeDecision::BlockTimeout => Some(anthropic_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            "session hello proxy probe timed out",
+        )),
+        SessionHelloProbeDecision::BlockUnavailable => Some(anthropic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "session hello proxy probe unavailable",
+        )),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -375,14 +415,25 @@ pub struct GatewayService {
     stream_stability_config: RwLock<StreamStabilityConfig>,
     bootstrap_profile_config: RwLock<BootstrapProfileConfig>,
     context_sanitizer_config: RwLock<ClaudeCodeContextSanitizerConfig>,
+    session_hello_probe_svc: SessionHelloProbeService,
+    session_hello_probe_config: RwLock<SessionHelloProbeConfig>,
 }
 
 impl GatewayService {
+    /// 构造 Gateway 服务及其 Session Hello 探测依赖。
+    ///
+    /// @param account_svc 账号调度服务。
+    /// @param rewriter 请求改写服务。
+    /// @param telemetry_svc 遥测服务。
+    /// @param settings_store 全局设置存储。
+    /// @param cache Memory 或 Redis 缓存实现。
+    /// @return Gateway 服务实例。
     pub fn new(
         account_svc: Arc<AccountService>,
         rewriter: Arc<Rewriter>,
         telemetry_svc: Arc<TelemetryService>,
         settings_store: Arc<SettingsStore>,
+        cache: Arc<dyn CacheStore>,
     ) -> Self {
         Self {
             account_svc,
@@ -421,6 +472,8 @@ impl GatewayService {
             stream_stability_config: RwLock::new(default_stream_stability_config()),
             bootstrap_profile_config: RwLock::new(default_bootstrap_profile_config()),
             context_sanitizer_config: RwLock::new(default_context_sanitizer_config()),
+            session_hello_probe_svc: SessionHelloProbeService::new(cache),
+            session_hello_probe_config: RwLock::new(SessionHelloProbeConfig::default()),
         }
     }
 
@@ -913,6 +966,55 @@ impl GatewayService {
             .await?;
         *self.context_sanitizer_config.write().await =
             ClaudeCodeContextSanitizerConfig::parse(&raw)?;
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Session 首次 Hello 代理探测配置。
+    ///
+    /// @return 刷新成功返回 `Ok(())`，读取或解析失败时返回业务错误。
+    pub async fn reload_session_hello_probe_config(&self) -> Result<(), AppError> {
+        let enabled = self
+            .settings_store
+            .get_value(
+                "session_hello_probe_enabled",
+                DEFAULT_SESSION_HELLO_PROBE_ENABLED,
+            )
+            .await?;
+        let strict = self
+            .settings_store
+            .get_value(
+                "session_hello_probe_strict",
+                DEFAULT_SESSION_HELLO_PROBE_STRICT,
+            )
+            .await?;
+        let timeout_secs = self
+            .settings_store
+            .get_value(
+                "session_hello_probe_timeout_secs",
+                DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
+            )
+            .await?;
+        let success_ttl_secs = self
+            .settings_store
+            .get_value(
+                "session_hello_probe_success_ttl_secs",
+                DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
+            )
+            .await?;
+        let failure_cooldown_secs = self
+            .settings_store
+            .get_value(
+                "session_hello_probe_failure_cooldown_secs",
+                DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
+            )
+            .await?;
+        *self.session_hello_probe_config.write().await = SessionHelloProbeConfig::parse(
+            &enabled,
+            &strict,
+            &timeout_secs,
+            &success_ttl_secs,
+            &failure_cooldown_secs,
+        )?;
         Ok(())
     }
 
@@ -1531,6 +1633,19 @@ impl GatewayService {
                 info!("[耗时] 槽位获取: {:.0}ms", slot_ms);
             }
             let mut slot_guard = SlotReleaseGuard::new(admission.permit);
+
+            if let Some(real_session_id) =
+                session_hello_probe_session_id(&path, client_type, &body_map)
+            {
+                let hello_config = *self.session_hello_probe_config.read().await;
+                let hello_decision = self
+                    .session_hello_probe_svc
+                    .ensure_ready(&account, &real_session_id, hello_config)
+                    .await;
+                if let Some(response) = session_hello_probe_block_response(hello_decision) {
+                    return Ok(response);
+                }
+            }
 
             // 改写请求体
             let t_rewrite = std::time::Instant::now();
@@ -6032,6 +6147,7 @@ mod tests {
         redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
         request_slot_units, rewrite_bootstrap_response, safe_body_summary,
         safe_non_stream_probe_response_headers, sanitize_count_tokens_body,
+        session_hello_probe_block_response, session_hello_probe_session_id,
         should_intercept_assistant_prefill, signature_retry_body_for_stage, stable_upstream_stream,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
@@ -6046,6 +6162,7 @@ mod tests {
         AccountService, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
     };
     use crate::service::rewriter::{ClientType, StatefulCacheUsage, UpstreamSessionRewrite};
+    use crate::service::session_hello_probe::{SessionHelloProbeConfig, SessionHelloProbeDecision};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
@@ -6199,6 +6316,102 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn session_hello_probe_only_accepts_real_claude_code_messages_session() {
+        let user_id = json!({
+            "device_id": "device-1",
+            "account_uuid": "550e8400-e29b-41d4-a716-446655440000",
+            "session_id": "123e4567-e89b-12d3-a456-426614174000"
+        })
+        .to_string();
+        let body = json!({"metadata": {"user_id": user_id}});
+
+        assert_eq!(
+            session_hello_probe_session_id("/v1/messages", ClientType::ClaudeCode, &body),
+            Some("123e4567-e89b-12d3-a456-426614174000".into())
+        );
+        assert_eq!(
+            session_hello_probe_session_id(
+                "/v1/messages/count_tokens",
+                ClientType::ClaudeCode,
+                &body
+            ),
+            None
+        );
+        assert_eq!(
+            session_hello_probe_session_id("/v1/messages", ClientType::API, &body),
+            None
+        );
+        assert_eq!(
+            session_hello_probe_session_id(
+                "/v1/messages",
+                ClientType::ClaudeCode,
+                &json!({"metadata": {}})
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn session_hello_probe_settings_reload_into_gateway_cache() {
+        let service = test_gateway_service().await;
+        let settings = std::collections::HashMap::from([
+            ("session_hello_probe_enabled".into(), "true".into()),
+            ("session_hello_probe_strict".into(), "true".into()),
+            ("session_hello_probe_timeout_secs".into(), "7".into()),
+            ("session_hello_probe_success_ttl_secs".into(), "7200".into()),
+            (
+                "session_hello_probe_failure_cooldown_secs".into(),
+                "600".into(),
+            ),
+        ]);
+        service
+            .settings_store
+            .upsert_many(&settings)
+            .await
+            .expect("写入探测配置");
+
+        service
+            .reload_session_hello_probe_config()
+            .await
+            .expect("热加载探测配置");
+
+        let config = *service.session_hello_probe_config.read().await;
+        assert!(config.enabled);
+        assert!(config.strict);
+        assert_eq!(config.timeout, std::time::Duration::from_secs(7));
+        assert_eq!(config.success_ttl, std::time::Duration::from_secs(7200));
+        assert_eq!(config.failure_cooldown, std::time::Duration::from_secs(600));
+    }
+
+    #[tokio::test]
+    async fn session_hello_probe_strict_decisions_use_anthropic_error_statuses() {
+        for (decision, expected_status) in [
+            (
+                SessionHelloProbeDecision::BlockFailure,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                SessionHelloProbeDecision::BlockUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SessionHelloProbeDecision::BlockTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+        ] {
+            let response = session_hello_probe_block_response(decision).expect("返回阻断响应");
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("读取错误响应");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("解析错误响应");
+            assert_eq!(value["type"], "error");
+            assert_eq!(value["error"]["type"], "api_error");
+        }
+        assert!(session_hello_probe_block_response(SessionHelloProbeDecision::Proceed).is_none());
     }
 
     #[test]
@@ -6386,6 +6599,7 @@ mod tests {
     struct AuthMockState {
         authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
         refresh_calls: Arc<AtomicUsize>,
+        hello_calls: Arc<AtomicUsize>,
     }
 
     async fn mock_upstream_response(
@@ -6437,12 +6651,18 @@ mod tests {
         }))
     }
 
+    async fn mock_hello_response(State(state): State<AuthMockState>) -> StatusCode {
+        state.hello_calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::OK
+    }
+
     async fn spawn_auth_mock_server() -> (String, AuthMockState, tokio::task::JoinHandle<()>) {
         let state = AuthMockState::default();
         let app = Router::new()
             .route("/v1/messages", post(mock_upstream_response))
             .route("/v1/messages/count_tokens", post(mock_upstream_response))
             .route("/oauth/token", post(mock_oauth_refresh))
+            .route("/api/hello", axum::routing::head(mock_hello_response))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -6478,9 +6698,10 @@ mod tests {
             .expect("migrate");
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let settings_store = Arc::new(SettingsStore::new(pool));
+        let cache = Arc::new(MemoryStore::new());
         let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
             account_store.clone(),
-            Arc::new(MemoryStore::new()),
+            cache.clone(),
             settings_store.clone(),
             oauth_token_url,
         ));
@@ -6490,6 +6711,7 @@ mod tests {
             Arc::new(crate::service::rewriter::Rewriter::new()),
             telemetry_svc,
             settings_store,
+            cache,
         );
         service.upstream_base = upstream_base;
         service
@@ -6554,6 +6776,31 @@ mod tests {
                 serde_json::to_vec(&json!({
                     "model": "claude-opus-4-8",
                     "messages": [{"role":"user","content":"hi"}],
+                    "max_tokens": 16,
+                    "stream": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn claude_code_messages_request(session_id: &str) -> Request {
+        let user_id = json!({
+            "device_id": "123e4567-e89b-12d3-a456-426614174001",
+            "account_uuid": "123e4567-e89b-12d3-a456-426614174002",
+            "session_id": session_id
+        })
+        .to_string();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("user-agent", "claude-code/2.1.220")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-8",
+                    "messages": [{"role":"user","content":"hi"}],
+                    "metadata": {"user_id": user_id},
                     "max_tokens": 16,
                     "stream": false
                 }))
@@ -6697,6 +6944,79 @@ mod tests {
                 .unwrap()
                 .status,
             AccountStatus::Active
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_account_retry_probes_each_account_once_without_extra_rpm() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let mut service = test_gateway_service_with_urls(
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: true,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        let mut rejected =
+            create_setup_gateway_account(&service, "hello-bad@example.com", "setup-bad", 10).await;
+        rejected.rpm_limit = 10;
+        service
+            .account_svc
+            .update_account(&rejected)
+            .await
+            .expect("更新首个账号 RPM");
+        let mut accepted =
+            create_setup_gateway_account(&service, "hello-good@example.com", "setup-good", 20)
+                .await;
+        accepted.rpm_limit = 10;
+        service
+            .account_svc
+            .update_account(&accepted)
+            .await
+            .expect("更新第二个账号 RPM");
+
+        let response = service
+            .handle_request(
+                claude_code_messages_request("123e4567-e89b-12d3-a456-426614174003"),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-bad", "Bearer setup-good"]
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account_rpm_status(&rejected)
+                .await
+                .expect("读取首个账号 RPM")
+                .current,
+            1
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account_rpm_status(&accepted)
+                .await
+                .expect("读取第二个账号 RPM")
+                .current,
+            1
         );
         server.abort();
     }
