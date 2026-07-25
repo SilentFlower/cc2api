@@ -76,15 +76,15 @@ pub const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS: &str = "120";
 pub const DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE: &str = "passthrough";
 /// bootstrap 自定义模型选项默认保留当前抓包中出现的 Fable 入口。
 pub const DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
-/// Session 首次 Hello 代理探测默认关闭，保持升级前转发行为。
+/// 有效上游 Session 首次 Hello 代理探测默认关闭，保持升级前转发行为。
 pub const DEFAULT_SESSION_HELLO_PROBE_ENABLED: &str = "false";
-/// Session 首次 Hello 代理探测严格模式默认关闭，失败时继续业务请求。
+/// 有效上游 Session 首次 Hello 代理探测严格模式默认关闭，失败时继续业务请求。
 pub const DEFAULT_SESSION_HELLO_PROBE_STRICT: &str = "false";
-/// Session 首次 Hello 代理探测默认总超时秒数。
+/// 有效上游 Session 首次 Hello 代理探测默认总超时秒数。
 pub const DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS: &str = "5";
-/// Session 首次 Hello 成功状态默认滑动空闲 TTL 秒数。
+/// 有效上游 Session 首次 Hello 成功状态默认滑动空闲 TTL 秒数。
 pub const DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS: &str = "3600";
-/// Session 首次 Hello 失败状态默认固定冷却秒数。
+/// 有效上游 Session 首次 Hello 失败状态默认固定冷却秒数。
 pub const DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS: &str = "300";
 
 /// 全局设置存储，key-value 结构。

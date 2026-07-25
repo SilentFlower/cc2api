@@ -969,7 +969,7 @@ impl GatewayService {
         Ok(())
     }
 
-    /// 从全局设置刷新 Session 首次 Hello 代理探测配置。
+    /// 从全局设置刷新有效上游 Session 首次 Hello 代理探测配置。
     ///
     /// @return 刷新成功返回 `Ok(())`，读取或解析失败时返回业务错误。
     pub async fn reload_session_hello_probe_config(&self) -> Result<(), AppError> {
@@ -1016,6 +1016,14 @@ impl GatewayService {
             &failure_cooldown_secs,
         )?;
         Ok(())
+    }
+
+    /// 返回测试使用的 Session Hello 探测运行配置快照。
+    ///
+    /// @return 当前热加载配置。
+    #[cfg(test)]
+    pub(crate) async fn session_hello_probe_config_for_test(&self) -> SessionHelloProbeConfig {
+        *self.session_hello_probe_config.read().await
     }
 
     /// 从全局设置刷新客户端访问策略。
@@ -1634,13 +1642,28 @@ impl GatewayService {
             }
             let mut slot_guard = SlotReleaseGuard::new(admission.permit);
 
+            // Hello 必须按最终上游 session 去重，因此先解析账号级 session 池，
+            // 但 sticky、RPM 与本地缓存仍继续使用未经改写的真实下游 session。
+            let upstream_session_rewrite = self
+                .build_upstream_session_rewrite(&account, &path, &body_map, client_type)
+                .await;
             if let Some(real_session_id) =
                 session_hello_probe_session_id(&path, client_type, &body_map)
             {
+                let upstream_session_id = upstream_session_rewrite
+                    .message
+                    .as_ref()
+                    .and_then(|resolved| resolved.upstream_session_id.as_deref())
+                    .unwrap_or(&real_session_id);
                 let hello_config = *self.session_hello_probe_config.read().await;
                 let hello_decision = self
                     .session_hello_probe_svc
-                    .ensure_ready(&account, &real_session_id, hello_config)
+                    .ensure_ready(
+                        &account,
+                        &real_session_id,
+                        upstream_session_id,
+                        hello_config,
+                    )
                     .await;
                 if let Some(response) = session_hello_probe_block_response(hello_decision) {
                     return Ok(response);
@@ -1661,9 +1684,6 @@ impl GatewayService {
                 *self.message_body_order_fingerprint_enabled.read().await;
             let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
             let context_sanitizer_config = *self.context_sanitizer_config.read().await;
-            let upstream_session_rewrite = self
-                .build_upstream_session_rewrite(&account, &path, &body_map, client_type)
-                .await;
             let (rewritten_body, stateful_cache_completion) =
                 self.rewriter.rewrite_body_with_stateful_completion(
                     &body_bytes,
@@ -6153,6 +6173,7 @@ mod tests {
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
     };
+    use crate::error::AppError;
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
         DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
@@ -6170,7 +6191,10 @@ mod tests {
         profile_for_key,
     };
     use crate::store::account_store::AccountStore;
-    use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
+    use crate::store::cache::{
+        CacheStore, RpmAcquire, SessionHelloProbeState, UpstreamSessionPoolAction,
+        UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
+    };
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::SettingsStore;
     use axum::body::{self, Body};
@@ -6190,7 +6214,7 @@ mod tests {
     use std::convert::Infallible;
     use std::io::Write;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
@@ -6600,6 +6624,129 @@ mod tests {
         authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
         refresh_calls: Arc<AtomicUsize>,
         hello_calls: Arc<AtomicUsize>,
+        hello_status: Arc<AtomicU16>,
+    }
+
+    struct PoolResolveFailureCache {
+        inner: MemoryStore,
+    }
+
+    impl PoolResolveFailureCache {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+            }
+        }
+    }
+
+    #[axum::async_trait]
+    impl CacheStore for PoolResolveFailureCache {
+        async fn get_session_account_id(
+            &self,
+            session_hash: &str,
+        ) -> Result<Option<i64>, AppError> {
+            self.inner.get_session_account_id(session_hash).await
+        }
+
+        async fn set_session_account_id(
+            &self,
+            session_hash: &str,
+            account_id: i64,
+            ttl: Duration,
+        ) -> Result<(), AppError> {
+            self.inner
+                .set_session_account_id(session_hash, account_id, ttl)
+                .await
+        }
+
+        async fn delete_session(&self, session_hash: &str) -> Result<(), AppError> {
+            self.inner.delete_session(session_hash).await
+        }
+
+        async fn acquire_slot(&self, key: &str, max: i32, ttl: Duration) -> Result<bool, AppError> {
+            self.inner.acquire_slot(key, max, ttl).await
+        }
+
+        async fn release_slot(&self, key: &str) {
+            self.inner.release_slot(key).await;
+        }
+
+        async fn get_slot_count(&self, key: &str) -> i64 {
+            self.inner.get_slot_count(key).await
+        }
+
+        async fn get_account_rpm(&self, account_id: i64, minute_ts: i64) -> Result<i64, AppError> {
+            self.inner.get_account_rpm(account_id, minute_ts).await
+        }
+
+        async fn try_acquire_account_rpm(
+            &self,
+            account_id: i64,
+            minute_ts: i64,
+            limit: i32,
+            ttl: Duration,
+        ) -> Result<RpmAcquire, AppError> {
+            self.inner
+                .try_acquire_account_rpm(account_id, minute_ts, limit, ttl)
+                .await
+        }
+
+        async fn resolve_upstream_session_pool(
+            &self,
+            _account_id: i64,
+            _real_session_id: &str,
+            _pool_size: i32,
+            _ttl: Duration,
+            _refresh_policy: UpstreamSessionRefreshPolicy,
+            _allow_insert: bool,
+        ) -> Result<UpstreamSessionPoolResolve, AppError> {
+            Err(AppError::Internal("测试上游 session 池不可用".into()))
+        }
+
+        async fn get_upstream_session_pool_status(
+            &self,
+            account_id: i64,
+            pool_size: i32,
+            ttl: Duration,
+        ) -> Result<UpstreamSessionPoolStatus, AppError> {
+            self.inner
+                .get_upstream_session_pool_status(account_id, pool_size, ttl)
+                .await
+        }
+
+        async fn get_session_hello_probe_state(
+            &self,
+            key: &str,
+            success_ttl: Duration,
+        ) -> Result<Option<SessionHelloProbeState>, AppError> {
+            self.inner
+                .get_session_hello_probe_state(key, success_ttl)
+                .await
+        }
+
+        async fn set_session_hello_probe_state(
+            &self,
+            key: &str,
+            state: SessionHelloProbeState,
+            ttl: Duration,
+        ) -> Result<(), AppError> {
+            self.inner
+                .set_session_hello_probe_state(key, state, ttl)
+                .await
+        }
+
+        async fn acquire_lock(
+            &self,
+            key: &str,
+            owner: &str,
+            ttl: Duration,
+        ) -> Result<bool, AppError> {
+            self.inner.acquire_lock(key, owner, ttl).await
+        }
+
+        async fn release_lock(&self, key: &str, owner: &str) {
+            self.inner.release_lock(key, owner).await;
+        }
     }
 
     async fn mock_upstream_response(
@@ -6653,7 +6800,7 @@ mod tests {
 
     async fn mock_hello_response(State(state): State<AuthMockState>) -> StatusCode {
         state.hello_calls.fetch_add(1, Ordering::SeqCst);
-        StatusCode::OK
+        StatusCode::from_u16(state.hello_status.load(Ordering::SeqCst)).unwrap_or(StatusCode::OK)
     }
 
     async fn spawn_auth_mock_server() -> (String, AuthMockState, tokio::task::JoinHandle<()>) {
@@ -6688,6 +6835,19 @@ mod tests {
         upstream_base: String,
         oauth_token_url: String,
     ) -> GatewayService {
+        test_gateway_service_with_cache_and_urls(
+            Arc::new(MemoryStore::new()),
+            upstream_base,
+            oauth_token_url,
+        )
+        .await
+    }
+
+    async fn test_gateway_service_with_cache_and_urls(
+        cache: Arc<dyn CacheStore>,
+        upstream_base: String,
+        oauth_token_url: String,
+    ) -> GatewayService {
         sqlx::any::install_default_drivers();
         let tmp =
             std::env::temp_dir().join(format!("ccgw_gateway_unit_{}.db", rand::random::<u64>()));
@@ -6698,7 +6858,6 @@ mod tests {
             .expect("migrate");
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let settings_store = Arc::new(SettingsStore::new(pool));
-        let cache = Arc::new(MemoryStore::new());
         let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
             account_store.clone(),
             cache.clone(),
@@ -6800,6 +6959,34 @@ mod tests {
                 serde_json::to_vec(&json!({
                     "model": "claude-opus-4-8",
                     "messages": [{"role":"user","content":"hi"}],
+                    "metadata": {"user_id": user_id},
+                    "max_tokens": 16,
+                    "stream": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn claude_code_assistant_prefill_request(session_id: &str) -> Request {
+        let user_id = json!({
+            "device_id": "123e4567-e89b-12d3-a456-426614174001",
+            "account_uuid": "123e4567-e89b-12d3-a456-426614174002",
+            "session_id": session_id
+        })
+        .to_string();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("user-agent", "claude-code/2.1.220")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-8",
+                    "messages": [
+                        {"role":"user","content":"hi"},
+                        {"role":"assistant","content":"prefill"}
+                    ],
                     "metadata": {"user_id": user_id},
                     "max_tokens": 16,
                     "stream": false
@@ -7018,6 +7205,232 @@ mod tests {
                 .current,
             1
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_hello_probe_reuses_resolved_upstream_session() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let mut service = test_gateway_service_with_urls(
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: true,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        let mut account =
+            create_setup_gateway_account(&service, "hello-pool@example.com", "setup-good", 10)
+                .await;
+        account.upstream_session_pool_enabled = true;
+        account.upstream_session_pool_size = 1;
+        account.upstream_session_ttl_minutes = 60;
+        account.upstream_session_refresh_policy = "owner_only".into();
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("启用上游 session 池");
+
+        let first_session = "123e4567-e89b-12d3-a456-426614174101";
+        let second_session = "123e4567-e89b-12d3-a456-426614174102";
+        for session_id in [first_session, second_session] {
+            let response = service
+                .handle_request(claude_code_messages_request(session_id), None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("读取模拟响应");
+        }
+
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 1);
+        let resolved = service
+            .account_svc
+            .resolve_upstream_session_pool(&account, second_session, false)
+            .await
+            .expect("读取第二个下游 session 映射")
+            .expect("上游 session 池已启用");
+        assert_eq!(resolved.upstream_session_id.as_deref(), Some(first_session));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_hello_probe_falls_back_to_real_session_when_pool_is_disabled() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let mut service = test_gateway_service_with_urls(
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: true,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        create_setup_gateway_account(&service, "hello-no-pool@example.com", "setup-good", 10).await;
+
+        for session_id in [
+            "123e4567-e89b-12d3-a456-426614174201",
+            "123e4567-e89b-12d3-a456-426614174202",
+        ] {
+            let response = service
+                .handle_request(claude_code_messages_request(session_id), None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("读取模拟响应");
+        }
+
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_hello_probe_falls_back_to_real_session_when_pool_resolution_fails() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let mut service = test_gateway_service_with_cache_and_urls(
+            Arc::new(PoolResolveFailureCache::new()),
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: true,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        let mut account = create_setup_gateway_account(
+            &service,
+            "hello-pool-error@example.com",
+            "setup-good",
+            10,
+        )
+        .await;
+        account.upstream_session_pool_enabled = true;
+        account.upstream_session_pool_size = 1;
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("启用上游 session 池");
+
+        for session_id in [
+            "123e4567-e89b-12d3-a456-426614174301",
+            "123e4567-e89b-12d3-a456-426614174302",
+        ] {
+            let response = service
+                .handle_request(claude_code_messages_request(session_id), None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("读取模拟响应");
+        }
+
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.authorization_headers.lock().await.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_hello_probe_fail_open_and_strict_block_business_forwarding() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        state
+            .hello_status
+            .store(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Ordering::SeqCst);
+        let mut service = test_gateway_service_with_urls(
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: false,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        create_setup_gateway_account(&service, "hello-strict@example.com", "setup-good", 10).await;
+
+        let open_response = service
+            .handle_request(
+                claude_code_messages_request("123e4567-e89b-12d3-a456-426614174401"),
+                None,
+            )
+            .await;
+        assert_eq!(open_response.status(), StatusCode::OK);
+        let _ = body::to_bytes(open_response.into_body(), 1024 * 1024)
+            .await
+            .expect("读取非严格模式响应");
+        assert_eq!(state.authorization_headers.lock().await.len(), 1);
+
+        service.session_hello_probe_config.write().await.strict = true;
+        let strict_response = service
+            .handle_request(
+                claude_code_messages_request("123e4567-e89b-12d3-a456-426614174402"),
+                None,
+            )
+            .await;
+        assert_eq!(strict_response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.authorization_headers.lock().await.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_local_assistant_prefill_intercept_skips_hello_and_business_forwarding() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let mut service = test_gateway_service_with_urls(
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: true,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        *service.assistant_prefill_intercept_config.write().await = assistant_prefill_config(true);
+        create_setup_gateway_account(&service, "hello-intercept@example.com", "setup-good", 10)
+            .await;
+
+        let response = service
+            .handle_request(
+                claude_code_assistant_prefill_request("123e4567-e89b-12d3-a456-426614174501"),
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 0);
+        assert!(state.authorization_headers.lock().await.is_empty());
         server.abort();
     }
 

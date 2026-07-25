@@ -8,7 +8,7 @@ pub struct RpmAcquire {
     pub current: i64,
 }
 
-/// 下游 Session 首次 Hello 代理探测状态。
+/// 有效上游 Session 首次 Hello 代理探测状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionHelloProbeState {
     /// 最近一次探测成功。

@@ -341,7 +341,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "bootstrap_additional_model_options",
             crate::store::settings_store::DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
         ),
-        // Session 首次 Hello 代理探测默认关闭；旧库只补缺失键，不覆盖管理员配置。
+        // 有效上游 Session 首次 Hello 代理探测默认关闭；旧库只补缺失键，不覆盖管理员配置。
         (
             "session_hello_probe_enabled",
             crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_ENABLED,
@@ -1084,6 +1084,55 @@ mod tests {
             enabled,
             crate::store::settings_store::DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED
         );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_session_hello_probe_defaults_without_overwriting_custom_value() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        for (key, expected) in [
+            (
+                "session_hello_probe_enabled",
+                crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_ENABLED,
+            ),
+            (
+                "session_hello_probe_strict",
+                crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_STRICT,
+            ),
+            (
+                "session_hello_probe_timeout_secs",
+                crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
+            ),
+            (
+                "session_hello_probe_success_ttl_secs",
+                crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
+            ),
+            (
+                "session_hello_probe_failure_cooldown_secs",
+                crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
+            ),
+        ] {
+            let value: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .expect("session hello probe default");
+            assert_eq!(value, expected, "key={key}");
+        }
+
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("true")
+            .bind("session_hello_probe_enabled")
+            .execute(&pool)
+            .await
+            .expect("设置管理员自定义值");
+        migrate(&pool, "sqlite").await.expect("second migrate");
+        let retained: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("session_hello_probe_enabled")
+            .fetch_one(&pool)
+            .await
+            .expect("读取管理员自定义值");
+        assert_eq!(retained, "true");
     }
 
     #[tokio::test]

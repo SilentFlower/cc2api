@@ -1379,7 +1379,7 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    async fn test_router() -> Router {
+    async fn test_router_with_gateway() -> (Router, Arc<GatewayService>) {
         sqlx::any::install_default_drivers();
         let pool = AnyPoolOptions::new()
             .max_connections(1)
@@ -1429,9 +1429,9 @@ mod tests {
             usage_poll_interval: Duration::from_secs(300),
         };
 
-        build_router(
+        let router = build_router(
             &cfg,
-            gateway_svc,
+            gateway_svc.clone(),
             account_svc,
             Arc::new(TokenTester::new()),
             Arc::new(TokenStore::new(pool.clone(), "sqlite".into())),
@@ -1439,7 +1439,12 @@ mod tests {
             Arc::new(PrimeLogStore::new(pool)),
             Arc::new(OAuthFlowService::new()),
             telemetry_svc,
-        )
+        );
+        (router, gateway_svc)
+    }
+
+    async fn test_router() -> Router {
+        test_router_with_gateway().await.0
     }
 
     #[tokio::test]
@@ -1563,6 +1568,40 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "key={key}");
         }
+    }
+
+    #[tokio::test]
+    async fn settings_update_hot_reloads_session_hello_probe_config() {
+        let (app, gateway_svc) = test_router_with_gateway().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_hello_probe_enabled": "true",
+                            "session_hello_probe_strict": "true",
+                            "session_hello_probe_timeout_secs": "7",
+                            "session_hello_probe_success_ttl_secs": "7200",
+                            "session_hello_probe_failure_cooldown_secs": "600"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = gateway_svc.session_hello_probe_config_for_test().await;
+        assert!(config.enabled);
+        assert!(config.strict);
+        assert_eq!(config.timeout, Duration::from_secs(7));
+        assert_eq!(config.success_ttl, Duration::from_secs(7200));
+        assert_eq!(config.failure_cooldown, Duration::from_secs(600));
     }
 
     #[test]

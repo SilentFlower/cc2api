@@ -83,7 +83,7 @@ type AutoModeClassifierMode = 'passthrough' | 'mock_allow' | 'mock_block' | 'err
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
 
-/** Session 首次 Hello 代理探测配置 */
+/** 有效上游 Session 首次 Hello 代理探测配置 */
 const sessionHelloProbeEnabled = ref(false);
 const sessionHelloProbeStrict = ref(false);
 const sessionHelloProbeTimeoutSecs = ref('5');
@@ -994,13 +994,13 @@ onMounted(async () => {
       </div>
     </Card>
 
-    <!-- Session 首次 Hello 代理探测 -->
+    <!-- 有效上游 Session 首次 Hello 代理探测 -->
     <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
       <div class="p-6 space-y-4">
         <div>
-          <h3 class="text-sm font-semibold text-[#29261e]">Session 首次 Hello 代理探测</h3>
+          <h3 class="text-sm font-semibold text-[#29261e]">有效上游 Session 首次 Hello 代理探测</h3>
           <p class="text-xs text-[#8c8475] mt-1">
-            新 Claude Code session 首次转发前，通过最终账号的代理路径检查 Anthropic Hello 连通性。
+            新的有效上游 Session 首次承载请求前，通过最终账号的代理路径检查 Anthropic Hello 连通性。
           </p>
         </div>
 

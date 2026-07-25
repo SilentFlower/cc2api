@@ -17,7 +17,7 @@ const HELLO_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 const FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LOCK_SAFETY_MARGIN: Duration = Duration::from_secs(2);
 
-/// Session 首次 Hello 代理探测运行配置。
+/// 有效上游 Session 首次 Hello 代理探测运行配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHelloProbeConfig {
     /// 是否启用探测。
@@ -98,10 +98,24 @@ pub enum SessionHelloProbeDecision {
     BlockUnavailable,
 }
 
-/// 负责 Session 首次 Hello 请求、缓存去重和失败模式判定的服务。
+/// 负责有效上游 Session 首次 Hello 请求、缓存去重和失败模式判定的服务。
 pub struct SessionHelloProbeService {
     cache: Arc<dyn CacheStore>,
     endpoint: String,
+}
+
+struct ProbeSessionLogs {
+    downstream: String,
+    upstream: String,
+}
+
+impl ProbeSessionLogs {
+    fn new(real_session_id: &str, upstream_session_id: &str) -> Self {
+        Self {
+            downstream: short_hash(real_session_id.as_bytes()),
+            upstream: short_hash(upstream_session_id.as_bytes()),
+        }
+    }
 }
 
 impl SessionHelloProbeService {
@@ -116,24 +130,26 @@ impl SessionHelloProbeService {
         }
     }
 
-    /// 确保当前 session、账号与代理路径已经完成 Hello 探测。
+    /// 确保当前上游 session、账号与代理路径已经完成 Hello 探测。
     ///
     /// @param account 最终选中且已经通过业务 admission 的账号。
     /// @param real_session_id 未经上游 session 池改写的真实下游 session。
+    /// @param upstream_session_id 最终发往上游的有效 session；池关闭时等于真实 session。
     /// @param config 当前热加载配置。
     /// @return 返回继续业务请求或严格模式阻断原因。
     pub async fn ensure_ready(
         &self,
         account: &Account,
         real_session_id: &str,
+        upstream_session_id: &str,
         config: SessionHelloProbeConfig,
     ) -> SessionHelloProbeDecision {
         if !config.enabled {
             return SessionHelloProbeDecision::Proceed;
         }
 
-        let state_key = probe_state_key(account.id, real_session_id, &account.proxy_url);
-        let session_log = short_hash(real_session_id.as_bytes());
+        let state_key = probe_state_key(account.id, upstream_session_id, &account.proxy_url);
+        let session_logs = ProbeSessionLogs::new(real_session_id, upstream_session_id);
         let lock_key = format!("{}:lock", state_key);
         let owner = Uuid::new_v4().to_string();
         let lock_ttl = config.timeout.saturating_add(LOCK_SAFETY_MARGIN);
@@ -153,9 +169,10 @@ impl SessionHelloProbeService {
                         "cache"
                     };
                     info!(
-                        "session hello probe cache hit: account={} session={} proxy_configured={} source={} result={}",
+                        "session hello probe cache hit: account={} downstream_session={} upstream_session={} proxy_configured={} source={} result={}",
                         account.id,
-                        session_log,
+                        session_logs.downstream,
+                        session_logs.upstream,
                         !account.proxy_url.is_empty(),
                         source,
                         state.as_str()
@@ -166,7 +183,7 @@ impl SessionHelloProbeService {
                 Err(error) => {
                     return cache_failure_decision(
                         account,
-                        &session_log,
+                        &session_logs,
                         config.strict,
                         "read",
                         &error,
@@ -184,9 +201,10 @@ impl SessionHelloProbeService {
                     {
                         Ok(Some(state)) => {
                             info!(
-                                "session hello probe cache hit after lock: account={} session={} proxy_configured={} source=cache result={}",
+                                "session hello probe cache hit after lock: account={} downstream_session={} upstream_session={} proxy_configured={} source=cache result={}",
                                 account.id,
-                                session_log,
+                                session_logs.downstream,
+                                session_logs.upstream,
                                 !account.proxy_url.is_empty(),
                                 state.as_str()
                             );
@@ -194,10 +212,26 @@ impl SessionHelloProbeService {
                             return decision_for_state(state, config.strict);
                         }
                         Ok(None) => {
+                            if waited_for_leader {
+                                // follower 已经见证过本轮 leader；拿到过期锁仅表示结果未落盘，不能放大为重复发包。
+                                self.cache.release_lock(&lock_key, &owner).await;
+                                warn!(
+                                    "session hello probe leader result unavailable: account={} downstream_session={} upstream_session={} proxy_configured={} source=follower",
+                                    account.id,
+                                    session_logs.downstream,
+                                    session_logs.upstream,
+                                    !account.proxy_url.is_empty()
+                                );
+                                return if config.strict {
+                                    SessionHelloProbeDecision::BlockUnavailable
+                                } else {
+                                    SessionHelloProbeDecision::Proceed
+                                };
+                            }
                             return self
                                 .run_leader_probe(
                                     account,
-                                    &session_log,
+                                    &session_logs,
                                     &state_key,
                                     &lock_key,
                                     &owner,
@@ -209,7 +243,7 @@ impl SessionHelloProbeService {
                             self.cache.release_lock(&lock_key, &owner).await;
                             return cache_failure_decision(
                                 account,
-                                &session_log,
+                                &session_logs,
                                 config.strict,
                                 "leader_recheck",
                                 &error,
@@ -221,9 +255,10 @@ impl SessionHelloProbeService {
                     waited_for_leader = true;
                     if Instant::now() >= follower_deadline {
                         warn!(
-                            "session hello probe follower timed out: account={} session={} proxy_configured={} source=follower",
+                            "session hello probe follower timed out: account={} downstream_session={} upstream_session={} proxy_configured={} source=follower",
                             account.id,
-                            session_log,
+                            session_logs.downstream,
+                            session_logs.upstream,
                             !account.proxy_url.is_empty()
                         );
                         return if config.strict {
@@ -237,7 +272,7 @@ impl SessionHelloProbeService {
                 Err(error) => {
                     return cache_failure_decision(
                         account,
-                        &session_log,
+                        &session_logs,
                         config.strict,
                         "lock",
                         &error,
@@ -250,7 +285,7 @@ impl SessionHelloProbeService {
     async fn run_leader_probe(
         &self,
         account: &Account,
-        session_log: &str,
+        session_logs: &ProbeSessionLogs,
         state_key: &str,
         lock_key: &str,
         owner: &str,
@@ -291,12 +326,15 @@ impl SessionHelloProbeService {
             .cache
             .set_session_hello_probe_state(state_key, state, ttl)
             .await;
-        self.cache.release_lock(lock_key, owner).await;
+        if cache_result.is_ok() {
+            self.cache.release_lock(lock_key, owner).await;
+        }
 
         info!(
-            "session hello probe completed: account={} session={} proxy_configured={} source=network duration_ms={} http_status={:?} result={}",
+            "session hello probe completed: account={} downstream_session={} upstream_session={} proxy_configured={} source=network duration_ms={} http_status={:?} result={}",
             account.id,
-            session_log,
+            session_logs.downstream,
+            session_logs.upstream,
             !account.proxy_url.is_empty(),
             started_at.elapsed().as_millis(),
             http_status,
@@ -304,7 +342,8 @@ impl SessionHelloProbeService {
         );
 
         if let Err(error) = cache_result {
-            return cache_failure_decision(account, session_log, config.strict, "write", &error);
+            // 写入失败时让锁自然过期，以阻止当前并发波次的 follower 重复探测。
+            return cache_failure_decision(account, session_logs, config.strict, "write", &error);
         }
         decision_for_state(state, config.strict)
     }
@@ -349,11 +388,11 @@ fn parse_u64_range(key: &str, raw: &str, min: u64, max: u64) -> Result<u64, AppE
     }
 }
 
-fn probe_state_key(account_id: i64, real_session_id: &str, proxy_url: &str) -> String {
+fn probe_state_key(account_id: i64, upstream_session_id: &str, proxy_url: &str) -> String {
     format!(
         "session_hello_probe:v1:{}:{}:{}",
         account_id,
-        hex::encode(Sha256::digest(real_session_id.as_bytes())),
+        hex::encode(Sha256::digest(upstream_session_id.as_bytes())),
         hex::encode(Sha256::digest(proxy_url.as_bytes()))
     )
 }
@@ -375,15 +414,16 @@ fn decision_for_state(state: SessionHelloProbeState, strict: bool) -> SessionHel
 
 fn cache_failure_decision(
     account: &Account,
-    session_log: &str,
+    session_logs: &ProbeSessionLogs,
     strict: bool,
     operation: &str,
     error: &AppError,
 ) -> SessionHelloProbeDecision {
     warn!(
-        "session hello probe cache failed: account={} session={} proxy_configured={} source=cache operation={} error={}",
+        "session hello probe cache failed: account={} downstream_session={} upstream_session={} proxy_configured={} source=cache operation={} error={}",
         account.id,
-        session_log,
+        session_logs.downstream,
+        session_logs.upstream,
         !account.proxy_url.is_empty(),
         operation,
         error
@@ -422,20 +462,32 @@ mod tests {
     use crate::store::memory::MemoryStore;
     use crate::store::redis::RedisStore;
 
-    struct UnavailableProbeCache {
+    struct FaultInjectingProbeCache {
         inner: MemoryStore,
+        fail_reads: bool,
+        write_failures_remaining: AtomicUsize,
     }
 
-    impl UnavailableProbeCache {
-        fn new() -> Self {
+    impl FaultInjectingProbeCache {
+        fn with_read_failure() -> Self {
             Self {
                 inner: MemoryStore::new(),
+                fail_reads: true,
+                write_failures_remaining: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_write_failures(count: usize) -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_reads: false,
+                write_failures_remaining: AtomicUsize::new(count),
             }
         }
     }
 
     #[axum::async_trait]
-    impl CacheStore for UnavailableProbeCache {
+    impl CacheStore for FaultInjectingProbeCache {
         async fn get_session_account_id(
             &self,
             session_hash: &str,
@@ -520,10 +572,15 @@ mod tests {
 
         async fn get_session_hello_probe_state(
             &self,
-            _key: &str,
-            _success_ttl: Duration,
+            key: &str,
+            success_ttl: Duration,
         ) -> Result<Option<SessionHelloProbeState>, AppError> {
-            Err(AppError::Internal("测试缓存不可用".into()))
+            if self.fail_reads {
+                return Err(AppError::Internal("测试缓存读取不可用".into()));
+            }
+            self.inner
+                .get_session_hello_probe_state(key, success_ttl)
+                .await
         }
 
         async fn set_session_hello_probe_state(
@@ -532,6 +589,15 @@ mod tests {
             state: SessionHelloProbeState,
             ttl: Duration,
         ) -> Result<(), AppError> {
+            if self
+                .write_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(AppError::Internal("测试缓存写入不可用".into()));
+            }
             self.inner
                 .set_session_hello_probe_state(key, state, ttl)
                 .await
@@ -630,11 +696,15 @@ mod tests {
         let account = test_account();
 
         assert_eq!(
-            service.ensure_ready(&account, "session-a", config).await,
+            service
+                .ensure_ready(&account, "session-a", "session-a", config)
+                .await,
             SessionHelloProbeDecision::Proceed
         );
         assert_eq!(
-            service.ensure_ready(&account, "session-a", config).await,
+            service
+                .ensure_ready(&account, "session-a", "session-a", config)
+                .await,
             SessionHelloProbeDecision::Proceed
         );
 
@@ -684,12 +754,20 @@ mod tests {
         let first = {
             let service = service.clone();
             let account = account.clone();
-            tokio::spawn(async move { service.ensure_ready(&account, "session-a", config).await })
+            tokio::spawn(async move {
+                service
+                    .ensure_ready(&account, "session-a", "session-a", config)
+                    .await
+            })
         };
         let second = {
             let service = service.clone();
             let account = account.clone();
-            tokio::spawn(async move { service.ensure_ready(&account, "session-a", config).await })
+            tokio::spawn(async move {
+                service
+                    .ensure_ready(&account, "session-a", "session-a", config)
+                    .await
+            })
         };
 
         assert_eq!(
@@ -701,6 +779,82 @@ mod tests {
             SessionHelloProbeDecision::Proceed
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn write_failure_does_not_trigger_follower_probe_and_recovers_after_lock_expiry() {
+        async fn delayed_ok(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            StatusCode::OK
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/hello", head(delayed_ok))
+            .with_state(count.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口");
+        let address = listener.local_addr().expect("读取测试地址");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("运行测试服务");
+        });
+
+        let service = Arc::new(SessionHelloProbeService::with_endpoint(
+            Arc::new(FaultInjectingProbeCache::with_write_failures(1)),
+            format!("http://{}/api/hello", address),
+        ));
+        let config = SessionHelloProbeConfig {
+            enabled: true,
+            strict: false,
+            timeout: Duration::from_millis(100),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        let account = Arc::new(test_account());
+        let first = {
+            let service = service.clone();
+            let account = account.clone();
+            tokio::spawn(async move {
+                service
+                    .ensure_ready(&account, "session-write", "session-write", config)
+                    .await
+            })
+        };
+        let second = {
+            let service = service.clone();
+            let account = account.clone();
+            tokio::spawn(async move {
+                service
+                    .ensure_ready(&account, "session-write", "session-write", config)
+                    .await
+            })
+        };
+
+        assert_eq!(
+            first.await.expect("leader 请求完成"),
+            SessionHelloProbeDecision::Proceed
+        );
+        assert_eq!(
+            second.await.expect("follower 请求完成"),
+            SessionHelloProbeDecision::Proceed
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            service
+                .ensure_ready(&account, "session-write", "session-write", config)
+                .await,
+            SessionHelloProbeDecision::Proceed
+        );
+        assert_eq!(
+            service
+                .ensure_ready(&account, "session-write", "session-write", config)
+                .await,
+            SessionHelloProbeDecision::Proceed
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -736,12 +890,16 @@ mod tests {
         let account = test_account();
 
         assert_eq!(
-            service.ensure_ready(&account, "session-a", config).await,
+            service
+                .ensure_ready(&account, "session-a", "session-a", config)
+                .await,
             SessionHelloProbeDecision::Proceed
         );
         config.strict = true;
         assert_eq!(
-            service.ensure_ready(&account, "session-a", config).await,
+            service
+                .ensure_ready(&account, "session-a", "session-a", config)
+                .await,
             SessionHelloProbeDecision::BlockFailure
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -781,7 +939,9 @@ mod tests {
         };
 
         assert_eq!(
-            service.ensure_ready(&account, "session-a", config).await,
+            service
+                .ensure_ready(&account, "session-a", "session-a", config)
+                .await,
             SessionHelloProbeDecision::BlockFailure
         );
         assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -833,7 +993,7 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-proxy", config)
+                .ensure_ready(&account, "session-proxy", "session-proxy", config)
                 .await,
             SessionHelloProbeDecision::Proceed
         );
@@ -877,13 +1037,13 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-timeout", config)
+                .ensure_ready(&account, "session-timeout", "session-timeout", config)
                 .await,
             SessionHelloProbeDecision::BlockTimeout
         );
         assert_eq!(
             service
-                .ensure_ready(&account, "session-timeout", config)
+                .ensure_ready(&account, "session-timeout", "session-timeout", config)
                 .await,
             SessionHelloProbeDecision::BlockTimeout
         );
@@ -893,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn cache_failure_opens_or_blocks_according_to_strict_mode() {
         let service = SessionHelloProbeService::with_endpoint(
-            Arc::new(UnavailableProbeCache::new()),
+            Arc::new(FaultInjectingProbeCache::with_read_failure()),
             "http://127.0.0.1:9/api/hello".into(),
         );
         let account = test_account();
@@ -907,14 +1067,14 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-cache", config)
+                .ensure_ready(&account, "session-cache", "session-cache", config)
                 .await,
             SessionHelloProbeDecision::Proceed
         );
         config.strict = true;
         assert_eq!(
             service
-                .ensure_ready(&account, "session-cache", config)
+                .ensure_ready(&account, "session-cache", "session-cache", config)
                 .await,
             SessionHelloProbeDecision::BlockUnavailable
         );
@@ -976,13 +1136,21 @@ mod tests {
             let service = first_service.clone();
             let account = account.clone();
             let session = session.clone();
-            tokio::spawn(async move { service.ensure_ready(&account, &session, config).await })
+            tokio::spawn(async move {
+                service
+                    .ensure_ready(&account, &session, &session, config)
+                    .await
+            })
         };
         let second = {
             let service = second_service.clone();
             let account = account.clone();
             let session = session.clone();
-            tokio::spawn(async move { service.ensure_ready(&account, &session, config).await })
+            tokio::spawn(async move {
+                service
+                    .ensure_ready(&account, &session, &session, config)
+                    .await
+            })
         };
 
         assert_eq!(
@@ -997,16 +1165,16 @@ mod tests {
     }
 
     #[test]
-    fn state_key_changes_with_account_session_and_proxy_without_leaking_values() {
-        let first = probe_state_key(1, "secret-session", "http://proxy-a:8080");
-        let second_account = probe_state_key(2, "secret-session", "http://proxy-a:8080");
-        let second_session = probe_state_key(1, "other-session", "http://proxy-a:8080");
-        let second_proxy = probe_state_key(1, "secret-session", "http://proxy-b:8080");
+    fn state_key_changes_with_account_upstream_session_and_proxy_without_leaking_values() {
+        let first = probe_state_key(1, "secret-upstream", "http://proxy-a:8080");
+        let second_account = probe_state_key(2, "secret-upstream", "http://proxy-a:8080");
+        let second_session = probe_state_key(1, "other-upstream", "http://proxy-a:8080");
+        let second_proxy = probe_state_key(1, "secret-upstream", "http://proxy-b:8080");
 
         assert_ne!(first, second_account);
         assert_ne!(first, second_session);
         assert_ne!(first, second_proxy);
-        assert!(!first.contains("secret-session"));
+        assert!(!first.contains("secret-upstream"));
         assert!(!first.contains("proxy-a"));
     }
 

@@ -29,6 +29,31 @@ struct SessionHelloProbeEntry {
     expires_at: tokio::time::Instant,
 }
 
+const SESSION_HELLO_PROBE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+struct SessionHelloProbeEntries {
+    values: HashMap<String, SessionHelloProbeEntry>,
+    next_cleanup_at: tokio::time::Instant,
+}
+
+impl SessionHelloProbeEntries {
+    fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+            next_cleanup_at: tokio::time::Instant::now() + SESSION_HELLO_PROBE_CLEANUP_INTERVAL,
+        }
+    }
+
+    fn cleanup_expired_if_due(&mut self, now: tokio::time::Instant) {
+        if now < self.next_cleanup_at {
+            return;
+        }
+        // 新 session 持续涌入时不能只清理当前访问键；低频全量扫描兼顾内存上界和请求成本。
+        self.values.retain(|_, entry| now <= entry.expires_at);
+        self.next_cleanup_at = now + SESSION_HELLO_PROBE_CLEANUP_INTERVAL;
+    }
+}
+
 #[derive(Default)]
 struct UpstreamSessionPoolState {
     members: HashMap<String, i64>,
@@ -46,7 +71,7 @@ pub struct MemoryStore {
     locks: Mutex<HashMap<String, LockEntry>>,
     rpm: Mutex<HashMap<String, RpmEntry>>,
     upstream_session_pools: Mutex<HashMap<i64, UpstreamSessionPoolState>>,
-    session_hello_probes: Mutex<HashMap<String, SessionHelloProbeEntry>>,
+    session_hello_probes: Mutex<SessionHelloProbeEntries>,
 }
 
 impl MemoryStore {
@@ -57,7 +82,7 @@ impl MemoryStore {
             locks: Mutex::new(HashMap::new()),
             rpm: Mutex::new(HashMap::new()),
             upstream_session_pools: Mutex::new(HashMap::new()),
-            session_hello_probes: Mutex::new(HashMap::new()),
+            session_hello_probes: Mutex::new(SessionHelloProbeEntries::new()),
         }
     }
 }
@@ -355,11 +380,12 @@ impl CacheStore for MemoryStore {
     ) -> Result<Option<SessionHelloProbeState>, AppError> {
         let mut probes = self.session_hello_probes.lock().await;
         let now = tokio::time::Instant::now();
-        let Some(entry) = probes.get_mut(key) else {
+        probes.cleanup_expired_if_due(now);
+        let Some(entry) = probes.values.get_mut(key) else {
             return Ok(None);
         };
         if now > entry.expires_at {
-            probes.remove(key);
+            probes.values.remove(key);
             return Ok(None);
         }
         if entry.state == SessionHelloProbeState::Success {
@@ -374,11 +400,14 @@ impl CacheStore for MemoryStore {
         state: SessionHelloProbeState,
         ttl: Duration,
     ) -> Result<(), AppError> {
-        self.session_hello_probes.lock().await.insert(
+        let mut probes = self.session_hello_probes.lock().await;
+        let now = tokio::time::Instant::now();
+        probes.cleanup_expired_if_due(now);
+        probes.values.insert(
             key.to_string(),
             SessionHelloProbeEntry {
                 state,
-                expires_at: tokio::time::Instant::now() + ttl,
+                expires_at: now + ttl,
             },
         );
         Ok(())
@@ -469,6 +498,37 @@ mod tests {
                 .expect("再次读取失败状态"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn session_hello_probe_periodic_cleanup_removes_unvisited_expired_entries() {
+        let store = MemoryStore::new();
+        store
+            .set_session_hello_probe_state(
+                "expired-unvisited",
+                SessionHelloProbeState::Failure,
+                Duration::from_millis(1),
+            )
+            .await
+            .expect("写入待清理状态");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        {
+            let mut probes = store.session_hello_probes.lock().await;
+            probes.next_cleanup_at = tokio::time::Instant::now();
+        }
+
+        store
+            .set_session_hello_probe_state(
+                "fresh",
+                SessionHelloProbeState::Success,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("写入新状态并触发清理");
+
+        let probes = store.session_hello_probes.lock().await;
+        assert!(!probes.values.contains_key("expired-unvisited"));
+        assert!(probes.values.contains_key("fresh"));
     }
 
     #[tokio::test]
