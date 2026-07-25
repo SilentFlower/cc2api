@@ -366,7 +366,7 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 {
   "error": "messages[].role=system is not allowed for this model",
   "model": "claude-opus-4-7",
-  "allowed_system_role_models": ["claude-opus-4-8"]
+  "allowed_system_role_models": ["claude-opus-5", "claude-fable-5", "claude-opus-4-8"]
 }
 ```
 
@@ -627,11 +627,11 @@ Anthropic `thinking.signature`，也不会使用 Gemini `thoughtSignature` 的 d
 
 ### 系统角色模型白名单
 
-Claude Code 2.1.172 在 `claude-opus-4-8` 请求中可能把运行时提醒放入
+Claude Code 2.1.220 的 Opus 5 / Fable 5，以及旧版 `claude-opus-4-8` 请求，可能把运行时提醒放入
 `messages[].role=system`。网关通过全局 settings key
 `allow_system_role_models` 控制哪些模型允许透传这种格式：
 
-- 默认值：`claude-opus-4-8`
+- 默认值：`claude-opus-5,claude-fable-5,claude-opus-4-8`
 - 格式：逗号分隔的精确模型 ID 列表，例如 `claude-opus-4-8,claude-sonnet-4-6`
 - 空字符串：不允许任何模型透传 `messages[].role=system`
 - 未命中：本地返回 400，并在响应中返回 `allowed_system_role_models`

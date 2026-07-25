@@ -18,7 +18,7 @@ use crate::model::identity::{
 use crate::service::account::AccountService;
 use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
-    EVENT_LOGGING_V2_PATH, MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, TelemetryShape,
+    ClaudeCodeProfile, EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN, TelemetryShape,
     claude_code_user_agent, is_event_logging_path, normalize_version, profile_for_version,
 };
 use crate::store::account_store::AccountStore;
@@ -92,6 +92,8 @@ pub struct MessageTelemetryContext {
     pub request_key: String,
     /// 请求声明的模型名称。为空时事件构造会回退到默认 Claude Code 模型。
     pub model: String,
+    /// 当前账号版本画像声明的默认模型。
+    pub default_model: String,
     /// 请求级 session id，只来自 metadata 派生字段，不来自正文原文。
     pub session_id: Option<String>,
     /// 改写前 message 数量。
@@ -754,7 +756,7 @@ fn build_event_batch(
                 event,
                 run_profile,
                 &profile,
-                version_profile.telemetry.shape,
+                version_profile,
                 &env_obj,
                 &auth,
                 &process_b64,
@@ -1231,7 +1233,7 @@ fn build_event_json(
     event: &TelemetryEvent,
     run_profile: &RunProfile,
     profile: &crate::model::identity::DeviceProfile,
-    shape: TelemetryShape,
+    version_profile: &ClaudeCodeProfile,
     env_obj: &serde_json::Value,
     auth: &serde_json::Value,
     process_b64: &str,
@@ -1243,7 +1245,7 @@ fn build_event_json(
                 event,
                 run_profile,
                 profile,
-                shape,
+                version_profile,
                 env_obj,
                 auth,
                 process_b64,
@@ -1301,11 +1303,12 @@ fn base_internal_event_data(
     event: &TelemetryEvent,
     run_profile: &RunProfile,
     profile: &crate::model::identity::DeviceProfile,
-    shape: TelemetryShape,
+    version_profile: &ClaudeCodeProfile,
     env_obj: &serde_json::Value,
     auth: &serde_json::Value,
     process_b64: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
+    let shape = version_profile.telemetry.shape;
     let mut event_data = serde_json::Map::new();
     event_data.insert("event_id".into(), json!(uuid::Uuid::new_v4().to_string()));
     event_data.insert("event_name".into(), json!(event_name));
@@ -1330,10 +1333,7 @@ fn base_internal_event_data(
     event_data.insert("entrypoint".into(), json!("cli"));
     event_data.insert(
         "betas".into(),
-        json!(match shape {
-            TelemetryShape::ClaudeCode2173 => "",
-            TelemetryShape::ClaudeCode2185 => MESSAGE_BETA_TOKENS,
-        }),
+        json!(version_profile.telemetry.base_beta_tokens),
     );
     event_data.insert("agent_sdk_version".into(), json!(""));
     event_data.insert("swe_bench_run_id".into(), json!(""));
@@ -1407,7 +1407,11 @@ fn enqueue_events(queue: &mut VecDeque<TelemetryEvent>, events: Vec<TelemetryEve
 
 fn startup_events(account: &Account) -> VecDeque<TelemetryEvent> {
     let mut events = VecDeque::new();
-    let model = "claude-sonnet-4-20250514".to_string();
+    let profile = device_profile(account);
+    let model = profile_for_version(&profile.env.version)
+        .telemetry
+        .default_model
+        .to_string();
     let session_id = None;
     for name in [
         "tengu_started",
@@ -1453,7 +1457,7 @@ fn message_request_events(
     correlation: &MessageCorrelation,
 ) -> Vec<TelemetryEvent> {
     let mut events = Vec::new();
-    let model = normalized_model(&context.model);
+    let model = normalized_context_model(context);
     let session_id = context.session_id.clone();
 
     events.push(internal_event_with_fields(
@@ -1598,7 +1602,7 @@ fn message_result_events(
     correlation: &MessageCorrelation,
 ) -> Vec<TelemetryEvent> {
     let mut events = Vec::new();
-    let model = normalized_model(&context.model);
+    let model = normalized_context_model(context);
     let session_id = context.session_id.clone();
     let mut fields = success_fields(context, result, correlation);
     if let Some(ref error_kind) = result.error_kind {
@@ -1708,7 +1712,7 @@ fn query_fields(
     correlation: &MessageCorrelation,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut fields = serde_json::Map::new();
-    fields.insert("model".into(), json!(normalized_model(&context.model)));
+    fields.insert("model".into(), json!(normalized_context_model(context)));
     fields.insert(
         "messagesLength".into(),
         json!(context.post_normalized_message_count),
@@ -1736,7 +1740,7 @@ fn success_fields(
     correlation: &MessageCorrelation,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut fields = serde_json::Map::new();
-    fields.insert("model".into(), json!(normalized_model(&context.model)));
+    fields.insert("model".into(), json!(normalized_context_model(context)));
     fields.insert("betas".into(), json!(context.betas));
     fields.insert(
         "messageCount".into(),
@@ -1813,7 +1817,7 @@ fn success_fields(
     fields.insert("fastMode".into(), json!(false));
     fields.insert(
         "preNormalizedModel".into(),
-        json!(normalized_model(&context.model)),
+        json!(normalized_context_model(context)),
     );
     fields.insert(
         "cacheCreationInputTokens".into(),
@@ -1903,6 +1907,14 @@ fn normalized_model(model: &str) -> String {
     }
 }
 
+fn normalized_context_model(context: &MessageTelemetryContext) -> String {
+    if context.model.trim().is_empty() {
+        context.default_model.clone()
+    } else {
+        context.model.clone()
+    }
+}
+
 /// 构造 /api/eval/{clientKey} 请求体（GrowthBook remote eval）。
 fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_json::Value {
     let profile = device_profile(account);
@@ -1987,7 +1999,7 @@ mod tests {
         MessageCorrelation, MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage,
         TelemetryCorrelationStore, TelemetryEvent, build_event_batch, build_growthbook_eval,
         build_metrics, enqueue_events, internal_event, is_telemetry_path, message_request_events,
-        message_result_events, sanitize_telemetry_payload, telemetry_shape_summary,
+        message_result_events, sanitize_telemetry_payload, startup_events, telemetry_shape_summary,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -2081,6 +2093,7 @@ mod tests {
         MessageTelemetryContext {
             request_key: uuid::Uuid::new_v4().to_string(),
             model: "claude-sonnet-4-20250514".into(),
+            default_model: "claude-opus-5".into(),
             session_id: Some("session-1".into()),
             pre_normalized_message_count: 1,
             post_normalized_message_count: 2,
@@ -2282,10 +2295,18 @@ mod tests {
         assert_eq!(event["session_id"], "session-1");
         assert_eq!(event["auth"]["account_uuid"], "account-uuid");
         assert_eq!(event["auth"]["organization_uuid"], "org-uuid");
+        assert_eq!(
+            event["betas"],
+            profile_for_key("2.1.220")
+                .unwrap()
+                .telemetry
+                .base_beta_tokens
+        );
         assert!(
             event["betas"]
                 .as_str()
-                .is_some_and(|betas| !betas.is_empty())
+                .unwrap()
+                .contains("fallback-credit-2026-06-01")
         );
         assert_eq!(event["env"]["version"], DEFAULT_CLAUDE_CODE_VERSION);
         assert_eq!(
@@ -2313,6 +2334,30 @@ mod tests {
         let process: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert!(process["heapUsed"].as_i64().unwrap() <= process["heapTotal"].as_i64().unwrap());
         assert_eq!(process["constrainedMemory"], 0);
+    }
+
+    #[test]
+    fn startup_events_use_profile_default_model() {
+        let current = startup_events(&test_account());
+        assert!(current.iter().all(|event| event.model == "claude-opus-5"));
+
+        let rollback = startup_events(&test_account_with_profile("2.1.197"));
+        assert!(
+            rollback
+                .iter()
+                .all(|event| event.model == "claude-sonnet-4-20250514")
+        );
+    }
+
+    #[test]
+    fn message_events_fall_back_to_context_profile_model() {
+        let mut context = test_message_context();
+        context.model.clear();
+        context.default_model = "claude-opus-5".into();
+
+        let events = message_request_events(&context, &test_message_correlation());
+
+        assert!(events.iter().all(|event| event.model == "claude-opus-5"));
     }
 
     #[test]

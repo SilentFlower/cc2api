@@ -9,8 +9,16 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.185",
     "2.1.89-2.1.187",
     "2.1.89-2.1.195",
+    "2.1.89-2.1.197",
 ];
-const PREVIOUS_DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTINGS: &[&str] = &["2.1.187", "2.1.195"];
+const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
+    ("2.1.187", "2.1.89-2.1.187"),
+    ("2.1.195", "2.1.89-2.1.195"),
+    ("2.1.197", "2.1.89-2.1.197"),
+];
+const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
+const PREVIOUS_DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
+    "claude-fable-5,claude-opus-4-8,claude-opus-4-7";
 const MIGRATION_ALLOW_1M_MODELS_2_1_197_KEY: &str = "migration_allow_1m_models_2_1_197_done";
 const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
     "intercept_warmup_non_stream_aux_enabled",
@@ -191,7 +199,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         ("peak_prime_enabled", "true"),
         ("peak_prime_hours", "4,5,6"),
         ("peak_prime_model", "claude-haiku-4-5-20251001"),
-        // Claude Code Opus 4.8 会在 messages 中携带 role=system。
+        // Claude Code Opus 5、Fable 5 与 Opus 4.8 会在 messages 中携带 role=system。
         (
             "allow_system_role_models",
             crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
@@ -349,6 +357,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     upgrade_default_profile_setting(pool).await?;
     let claude_code_profile = selected_claude_code_profile(pool).await?;
     upgrade_default_settings(pool, claude_code_profile).await?;
+    upgrade_default_model_settings(pool).await?;
     upgrade_default_allow_1m_models(pool).await?;
     remove_obsolete_settings(pool).await?;
     upgrade_account_claude_code_profile(pool, driver, claude_code_profile).await?;
@@ -428,30 +437,51 @@ async fn upgrade_default_allow_1m_models(pool: &AnyPool) -> Result<(), sqlx::Err
 }
 
 async fn upgrade_default_profile_setting(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    for previous_profile in PREVIOUS_DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTINGS {
-        for previous_allowed in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
-            sqlx::query(
-                r#"
-                UPDATE settings
-                SET value=$1
-                WHERE key=$2
-                  AND value=$3
-                  AND EXISTS (
-                      SELECT 1
-                      FROM settings allowed_versions
-                      WHERE allowed_versions.key=$4
-                        AND allowed_versions.value=$5
-                  )
-                "#,
-            )
-            .bind(crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING)
-            .bind("claude_code_version_profile")
-            .bind(previous_profile)
-            .bind("allowed_claude_code_versions")
-            .bind(previous_allowed)
+    for (previous_profile, previous_allowed) in PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS {
+        sqlx::query(
+            r#"
+            UPDATE settings
+            SET value=$1
+            WHERE key=$2
+              AND value=$3
+              AND EXISTS (
+                  SELECT 1
+                  FROM settings allowed_versions
+                  WHERE allowed_versions.key=$4
+                    AND allowed_versions.value=$5
+              )
+            "#,
+        )
+        .bind(crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING)
+        .bind("claude_code_version_profile")
+        .bind(previous_profile)
+        .bind("allowed_claude_code_versions")
+        .bind(previous_allowed)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn upgrade_default_model_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    for (key, previous, current) in [
+        (
+            "allow_system_role_models",
+            PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+            crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+        ),
+        (
+            "intercept_assistant_prefill_models",
+            PREVIOUS_DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+            crate::store::settings_store::DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+        ),
+    ] {
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
+            .bind(current)
+            .bind(key)
+            .bind(previous)
             .execute(pool)
             .await?;
-        }
     }
     Ok(())
 }
@@ -700,15 +730,15 @@ mod tests {
     async fn migrate_upgrades_only_old_default_allowed_versions_setting() {
         let pool = make_sqlite_pool().await;
         migrate(&pool, "sqlite").await.expect("initial migrate");
-        for previous in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
+        for (previous_profile, previous_allowed) in PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS {
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
-                .bind("2.1.187")
+                .bind(previous_profile)
                 .bind("claude_code_version_profile")
                 .execute(&pool)
                 .await
                 .expect("set old profile default");
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
-                .bind(previous)
+                .bind(previous_allowed)
                 .bind("allowed_claude_code_versions")
                 .execute(&pool)
                 .await
@@ -752,6 +782,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrate_upgrades_only_exact_old_default_model_lists() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+
+        for (key, previous, expected) in [
+            (
+                "allow_system_role_models",
+                PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+                crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+            ),
+            (
+                "intercept_assistant_prefill_models",
+                PREVIOUS_DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+                crate::store::settings_store::DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
+            ),
+        ] {
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind(previous)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("set old default");
+            migrate(&pool, "sqlite").await.expect("upgrade old default");
+            let upgraded: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .expect("upgraded setting");
+            assert_eq!(upgraded, expected);
+
+            let custom = format!("{},custom-model", previous);
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind(&custom)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("set custom value");
+            migrate(&pool, "sqlite")
+                .await
+                .expect("preserve custom value");
+            let retained: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .expect("retained setting");
+            assert_eq!(retained, custom);
+        }
+    }
+
+    #[tokio::test]
     async fn migrate_preserves_explicit_old_claude_code_profile_with_custom_allowed_versions() {
         let pool = make_sqlite_pool().await;
         migrate(&pool, "sqlite").await.expect("initial migrate");
@@ -777,6 +857,7 @@ mod tests {
             ("2.1.185", "2.1.185", "2026-06-20T06:38:30Z"),
             ("2.1.187", "2.1.187", "2026-06-23T16:59:46Z"),
             ("2.1.195", "2.1.195", "2026-06-26T01:00:56Z"),
+            ("2.1.197", "2.1.197", "2026-06-29T19:08:42Z"),
         ] {
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
                 .bind(profile_key)

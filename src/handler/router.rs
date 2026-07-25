@@ -155,12 +155,38 @@ pub fn build_router(
         .merge(frontend_routes)
         .merge(asset_routes)
         .merge(admin_routes)
+        .route("/api/hello", get(hello_get).head(hello_head))
         .route("/v1/messages/count_tokens", post(gateway_count_tokens))
         .fallback(gateway_fallback)
         .with_state(state)
 }
 
 // --- Handlers ---
+
+const CLAUDE_CODE_HELLO_BODY: &[u8] = br#"{"message": "hello"}"#;
+
+/// 返回 Claude Code 连通性预检的 GET 响应。
+async fn hello_get() -> Response {
+    hello_response(true)
+}
+
+/// 返回 Claude Code 连通性预检的 HEAD 响应。
+async fn hello_head() -> Response {
+    hello_response(false)
+}
+
+fn hello_response(include_body: bool) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json; charset=utf-8")
+        .header("content-length", CLAUDE_CODE_HELLO_BODY.len().to_string())
+        .body(axum::body::Body::from(if include_body {
+            CLAUDE_CODE_HELLO_BODY
+        } else {
+            &[]
+        }))
+        .expect("固定 hello 响应必须可构造")
+}
 
 /// 网关透传 fallback：鉴权 + 代理上游
 async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Response {
@@ -1290,9 +1316,161 @@ async fn get_prime_logs(
 mod tests {
     use super::{
         ClaudeCodeContextSanitizerMode, MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS,
-        MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, normalize_oauth_credential_validity_seconds,
-        validate_model_id_list,
+        MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, build_router, hello_get, hello_head,
+        normalize_oauth_credential_validity_seconds, validate_model_id_list,
     };
+    use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
+    use crate::service::account::AccountService;
+    use crate::service::gateway::GatewayService;
+    use crate::service::oauth::TokenTester;
+    use crate::service::oauth_flow::OAuthFlowService;
+    use crate::service::rewriter::Rewriter;
+    use crate::service::telemetry::TelemetryService;
+    use crate::store::account_store::AccountStore;
+    use crate::store::memory::MemoryStore;
+    use crate::store::prime_log_store::PrimeLogStore;
+    use crate::store::settings_store::SettingsStore;
+    use crate::store::token_store::TokenStore;
+    use axum::Router;
+    use axum::body::{self, Body};
+    use axum::http::{Method, Request, StatusCode, header};
+    use sqlx::any::AnyPoolOptions;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    async fn test_router() -> Router {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("连接测试数据库");
+        crate::store::db::migrate(&pool, "sqlite")
+            .await
+            .expect("初始化测试数据库");
+        let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let settings_store = Arc::new(SettingsStore::new(pool.clone()));
+        let account_svc = Arc::new(AccountService::new(
+            account_store.clone(),
+            Arc::new(MemoryStore::new()),
+            settings_store.clone(),
+        ));
+        let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
+        let gateway_svc = Arc::new(GatewayService::new(
+            account_svc.clone(),
+            Arc::new(Rewriter::new()),
+            telemetry_svc.clone(),
+            settings_store.clone(),
+        ));
+        let cfg = Config {
+            server: ServerConfig {
+                port: 0,
+                host: "127.0.0.1".into(),
+                tls_cert: None,
+                tls_key: None,
+            },
+            database: DatabaseConfig {
+                driver: Some("sqlite".into()),
+                dsn: Some("sqlite::memory:".into()),
+                host: String::new(),
+                port: 0,
+                user: String::new(),
+                password: String::new(),
+                dbname: String::new(),
+            },
+            redis: None,
+            admin: AdminConfig {
+                password: "admin".into(),
+            },
+            log_level: "info".into(),
+            usage_poll_interval: Duration::from_secs(300),
+        };
+
+        build_router(
+            &cfg,
+            gateway_svc,
+            account_svc,
+            Arc::new(TokenTester::new()),
+            Arc::new(TokenStore::new(pool.clone(), "sqlite".into())),
+            settings_store,
+            Arc::new(PrimeLogStore::new(pool)),
+            Arc::new(OAuthFlowService::new()),
+            telemetry_svc,
+        )
+    }
+
+    #[tokio::test]
+    async fn hello_get_returns_capture_compatible_json() {
+        let response = hello_get().await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "20");
+        let body = body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"message": "hello"}"#);
+    }
+
+    #[tokio::test]
+    async fn hello_head_returns_length_without_body() {
+        let response = hello_head().await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "20");
+        let body = body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assembled_router_keeps_hello_public_and_fallback_authenticated() {
+        let app = test_router().await;
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let head_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fallback_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/not-registered")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(head_response.status(), StatusCode::OK);
+        assert_eq!(head_response.headers()[header::CONTENT_LENGTH], "20");
+        assert!(
+            body::to_bytes(head_response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fallback_response.status(), StatusCode::UNAUTHORIZED);
+    }
 
     #[test]
     fn model_id_list_allows_empty_and_valid_ids() {

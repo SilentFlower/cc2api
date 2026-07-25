@@ -3,26 +3,30 @@ use serde_json::Value;
 use crate::error::AppError;
 
 /// 默认 Claude Code 版本画像 key。
-pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.197";
+pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.220";
 /// Claude Code 默认兼容版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_197.identity.version;
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_220.identity.version;
 /// Claude Code 默认基础版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_197.identity.version_base;
+pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_220.identity.version_base;
 /// 当前默认 Claude Code 抓包对应的构建时间。
-pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_197.identity.build_time;
+pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_220.identity.build_time;
 /// 默认画像对应的 Claude Code / Claude CLI 允许版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str =
-    PROFILE_2_1_197.access_policy.allowed_claude_code_versions;
+    PROFILE_2_1_220.access_policy.allowed_claude_code_versions;
 /// 当前默认 Claude Code 使用的 Stainless SDK 版本。
 pub const STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
 /// 当前默认 Claude Code 抓包中的 Node runtime 版本。
 pub const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
 /// 旧版回滚画像使用的 Node runtime 版本。
 const STAINLESS_RUNTIME_VERSION_2_1_187: &str = "v24.3.0";
-/// Claude Code 2.1.195 抓包中的通用 message beta token 集合。
+/// Claude Code 2.1.197 抓包中的通用 message beta token 集合。
 ///
 /// `context-1m-2025-08-07` 仍由账号白名单单独控制,不能放进必需集合。
-pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+const MESSAGE_BETA_TOKENS_2_1_197: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.220 抓包中的通用 message beta token 集合。
+///
+/// `fallback-credit-2026-06-01` 位于 effort 与 extended-cache-ttl 之间。
+pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code 2.1.195 Haiku 非流式标题/探测请求使用的窄 beta token 集合。
 pub const HAIKU_PROBE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 /// Claude Code 2.1.195 Haiku 流式标题请求使用的窄 beta token 集合。
@@ -88,6 +92,16 @@ pub struct RequestProfile {
     pub oauth_beta_token: &'static str,
     pub code_triggers_beta_token: &'static str,
     pub mcp_servers_beta_token: &'static str,
+    pub fable_fallback_model: &'static str,
+    pub opus_default_max_tokens_model: &'static str,
+    pub message_body_order: MessageBodyOrderProfile,
+}
+
+/// `/v1/messages` 顶层字段顺序画像。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageBodyOrderProfile {
+    Legacy,
+    ClaudeCode21220,
 }
 
 /// billing header 和 CCH 子画像。
@@ -114,6 +128,8 @@ pub enum CchProfile {
 pub struct TelemetryProfile {
     pub shape: TelemetryShape,
     pub growthbook_user_agent: &'static str,
+    pub default_model: &'static str,
+    pub base_beta_tokens: &'static str,
 }
 
 /// 自动 telemetry payload 结构版本。
@@ -140,7 +156,52 @@ impl TelemetryShape {
 pub struct EndpointProfile {
     pub event_logging_path: &'static str,
     pub event_logging_legacy_path: &'static str,
+    pub bootstrap_cedar_basin: Option<&'static str>,
+    pub bootstrap_fable_cwk_cfg_key: Option<&'static str>,
+    pub bootstrap_opus_cwk_cfg_key: Option<&'static str>,
 }
+
+const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
+    key: "2.1.220",
+    identity: IdentityProfile {
+        version: "2.1.220",
+        version_base: "2.1.220",
+        build_time: "2026-07-24T22:17:45Z",
+        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
+    },
+    access_policy: AccessPolicyProfile {
+        allowed_claude_code_versions: "2.1.89-2.1.220",
+    },
+    request: RequestProfile {
+        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
+        count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
+        oauth_beta_token: OAUTH_BETA_TOKEN,
+        code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
+        mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        fable_fallback_model: "claude-opus-5",
+        opus_default_max_tokens_model: "claude-opus-5",
+        message_body_order: MessageBodyOrderProfile::ClaudeCode21220,
+    },
+    billing: BillingProfile {
+        cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
+        cch_profile: CchProfile::ClaudeCode2172Plus,
+    },
+    telemetry: TelemetryProfile {
+        shape: TelemetryShape::ClaudeCode2185,
+        growthbook_user_agent: "Bun/1.4.0",
+        default_model: "claude-opus-5",
+        base_beta_tokens: MESSAGE_BETA_TOKENS,
+    },
+    endpoints: EndpointProfile {
+        event_logging_path: EVENT_LOGGING_V2_PATH,
+        event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: Some("2026-08-31"),
+        bootstrap_fable_cwk_cfg_key: Some("marigold"),
+        bootstrap_opus_cwk_cfg_key: Some("belladonna"),
+    },
+};
 
 const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.185",
@@ -155,12 +216,15 @@ const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
         allowed_claude_code_versions: "2.1.89-2.1.185",
     },
     request: RequestProfile {
-        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
         fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
         count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
         oauth_beta_token: OAUTH_BETA_TOKEN,
         code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
         mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        fable_fallback_model: "claude-opus-4-8",
+        opus_default_max_tokens_model: "claude-opus-4-8",
+        message_body_order: MessageBodyOrderProfile::Legacy,
     },
     billing: BillingProfile {
         cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
@@ -169,10 +233,15 @@ const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
     telemetry: TelemetryProfile {
         shape: TelemetryShape::ClaudeCode2185,
         growthbook_user_agent: "Bun/1.4.0",
+        default_model: "claude-sonnet-4-20250514",
+        base_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
     },
     endpoints: EndpointProfile {
         event_logging_path: EVENT_LOGGING_V2_PATH,
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: None,
+        bootstrap_fable_cwk_cfg_key: Some("marigold"),
+        bootstrap_opus_cwk_cfg_key: None,
     },
 };
 
@@ -189,12 +258,15 @@ const PROFILE_2_1_195: ClaudeCodeProfile = ClaudeCodeProfile {
         allowed_claude_code_versions: "2.1.89-2.1.195",
     },
     request: RequestProfile {
-        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
         fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
         count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
         oauth_beta_token: OAUTH_BETA_TOKEN,
         code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
         mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        fable_fallback_model: "claude-opus-4-8",
+        opus_default_max_tokens_model: "claude-opus-4-8",
+        message_body_order: MessageBodyOrderProfile::Legacy,
     },
     billing: BillingProfile {
         cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
@@ -203,10 +275,15 @@ const PROFILE_2_1_195: ClaudeCodeProfile = ClaudeCodeProfile {
     telemetry: TelemetryProfile {
         shape: TelemetryShape::ClaudeCode2185,
         growthbook_user_agent: "Bun/1.4.0",
+        default_model: "claude-sonnet-4-20250514",
+        base_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
     },
     endpoints: EndpointProfile {
         event_logging_path: EVENT_LOGGING_V2_PATH,
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: None,
+        bootstrap_fable_cwk_cfg_key: Some("marigold"),
+        bootstrap_opus_cwk_cfg_key: None,
     },
 };
 
@@ -223,12 +300,15 @@ const PROFILE_2_1_187: ClaudeCodeProfile = ClaudeCodeProfile {
         allowed_claude_code_versions: "2.1.89-2.1.187",
     },
     request: RequestProfile {
-        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
         fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
         count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
         oauth_beta_token: OAUTH_BETA_TOKEN,
         code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
         mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        fable_fallback_model: "claude-opus-4-8",
+        opus_default_max_tokens_model: "claude-opus-4-8",
+        message_body_order: MessageBodyOrderProfile::Legacy,
     },
     billing: BillingProfile {
         cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
@@ -237,10 +317,15 @@ const PROFILE_2_1_187: ClaudeCodeProfile = ClaudeCodeProfile {
     telemetry: TelemetryProfile {
         shape: TelemetryShape::ClaudeCode2185,
         growthbook_user_agent: "Bun/1.4.0",
+        default_model: "claude-sonnet-4-20250514",
+        base_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
     },
     endpoints: EndpointProfile {
         event_logging_path: EVENT_LOGGING_V2_PATH,
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: None,
+        bootstrap_fable_cwk_cfg_key: Some("marigold"),
+        bootstrap_opus_cwk_cfg_key: None,
     },
 };
 
@@ -257,12 +342,15 @@ const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
         allowed_claude_code_versions: "2.1.89-2.1.173",
     },
     request: RequestProfile {
-        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
         fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
         count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
         oauth_beta_token: OAUTH_BETA_TOKEN,
         code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
         mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        fable_fallback_model: "claude-opus-4-8",
+        opus_default_max_tokens_model: "claude-opus-4-8",
+        message_body_order: MessageBodyOrderProfile::Legacy,
     },
     billing: BillingProfile {
         cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
@@ -271,10 +359,15 @@ const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
     telemetry: TelemetryProfile {
         shape: TelemetryShape::ClaudeCode2173,
         growthbook_user_agent: "Bun/1.3.14",
+        default_model: "claude-sonnet-4-20250514",
+        base_beta_tokens: "",
     },
     endpoints: EndpointProfile {
         event_logging_path: EVENT_LOGGING_V2_PATH,
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: None,
+        bootstrap_fable_cwk_cfg_key: Some("marigold"),
+        bootstrap_opus_cwk_cfg_key: None,
     },
 };
 
@@ -291,12 +384,15 @@ const PROFILE_2_1_197: ClaudeCodeProfile = ClaudeCodeProfile {
         allowed_claude_code_versions: "2.1.89-2.1.197",
     },
     request: RequestProfile {
-        message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
         fable_message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
         count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
         oauth_beta_token: OAUTH_BETA_TOKEN,
         code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
         mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        fable_fallback_model: "claude-opus-4-8",
+        opus_default_max_tokens_model: "claude-opus-4-8",
+        message_body_order: MessageBodyOrderProfile::Legacy,
     },
     billing: BillingProfile {
         cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
@@ -305,14 +401,20 @@ const PROFILE_2_1_197: ClaudeCodeProfile = ClaudeCodeProfile {
     telemetry: TelemetryProfile {
         shape: TelemetryShape::ClaudeCode2185,
         growthbook_user_agent: "Bun/1.4.0",
+        default_model: "claude-sonnet-4-20250514",
+        base_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
     },
     endpoints: EndpointProfile {
         event_logging_path: EVENT_LOGGING_V2_PATH,
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: None,
+        bootstrap_fable_cwk_cfg_key: Some("marigold"),
+        bootstrap_opus_cwk_cfg_key: None,
     },
 };
 
-static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 5] = [
+static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 6] = [
+    &PROFILE_2_1_220,
     &PROFILE_2_1_197,
     &PROFILE_2_1_195,
     &PROFILE_2_1_187,
@@ -324,7 +426,7 @@ static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 5] = [
 ///
 /// @return 默认版本画像。
 pub fn default_profile() -> &'static ClaudeCodeProfile {
-    &PROFILE_2_1_197
+    &PROFILE_2_1_220
 }
 
 /// 返回所有内置 Claude Code 版本画像。
@@ -468,7 +570,10 @@ mod tests {
             assert!(!profile.request.fable_message_beta_tokens.is_empty());
             assert!(!profile.request.count_tokens_beta_tokens.is_empty());
             assert!(!profile.request.oauth_beta_token.is_empty());
+            assert!(!profile.request.fable_fallback_model.is_empty());
+            assert!(!profile.request.opus_default_max_tokens_model.is_empty());
             assert!(!profile.telemetry.growthbook_user_agent.is_empty());
+            assert!(!profile.telemetry.default_model.is_empty());
             assert!(!profile.endpoints.event_logging_path.is_empty());
         }
     }
@@ -488,17 +593,27 @@ mod tests {
 
     #[test]
     fn profile_declares_known_telemetry_differences() {
-        let current = profile_for_key("2.1.197").unwrap();
+        let current = profile_for_key("2.1.220").unwrap();
         assert_eq!(current.telemetry.shape, TelemetryShape::ClaudeCode2185);
         assert_eq!(current.telemetry.growthbook_user_agent, "Bun/1.4.0");
         assert_eq!(
             current.access_policy.allowed_claude_code_versions,
-            "2.1.89-2.1.197"
+            "2.1.89-2.1.220"
         );
         assert_eq!(
             current.identity.stainless_runtime_version,
             STAINLESS_RUNTIME_VERSION
         );
+        assert_eq!(current.request.fable_fallback_model, "claude-opus-5");
+        assert_eq!(current.telemetry.default_model, "claude-opus-5");
+
+        let rollback = profile_for_key("2.1.197").unwrap();
+        assert_eq!(
+            rollback.request.message_beta_tokens,
+            MESSAGE_BETA_TOKENS_2_1_197
+        );
+        assert_eq!(rollback.request.fable_fallback_model, "claude-opus-4-8");
+        assert_eq!(rollback.telemetry.default_model, "claude-sonnet-4-20250514");
 
         let latest_rollback = profile_for_key("2.1.195").unwrap();
         assert_eq!(

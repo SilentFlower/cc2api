@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
+use crate::model::identity::device_profile;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, access_policy_error_response,
@@ -37,7 +38,8 @@ use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
 };
 use crate::service::version_profile::{
-    COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, is_event_logging_path,
+    COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile, is_event_logging_path,
+    profile_for_version,
 };
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
@@ -1603,6 +1605,10 @@ impl GatewayService {
                     client_type,
                     attempt,
                     final_beta_header(&rewritten_headers),
+                    profile_for_version(&device_profile(&account).env.version)
+                        .telemetry
+                        .default_model
+                        .to_string(),
                 ))
             } else {
                 None
@@ -2252,6 +2258,7 @@ impl GatewayService {
                     body_bytes,
                     query,
                     &config,
+                    profile_for_version(&device_profile(account).env.version),
                 );
             }
         }
@@ -3001,6 +3008,7 @@ fn rewrite_bootstrap_response(
     body_bytes: Bytes,
     query: &str,
     config: &BootstrapProfileConfig,
+    version_profile: &ClaudeCodeProfile,
 ) -> Result<Response, AppError> {
     let codings = response_content_codings(headers);
     let decoded = decode_response_body_with_codings(&body_bytes, &codings);
@@ -3015,7 +3023,7 @@ fn rewrite_bootstrap_response(
         );
         return rebuild_upstream_response(status_code, headers, body_bytes);
     };
-    if !patch_bootstrap_json(&mut value, query, config) {
+    if !patch_bootstrap_json(&mut value, query, config, version_profile) {
         info!(
             "[bootstrap] rewrite_skipped | reason=unchanged mode={} model={} entrypoint={} status={} encoding={} raw_bytes={} decoded_bytes={}",
             config.mode.as_str(),
@@ -3147,15 +3155,16 @@ fn patch_bootstrap_json(
     value: &mut serde_json::Value,
     query: &str,
     config: &BootstrapProfileConfig,
+    version_profile: &ClaudeCodeProfile,
 ) -> bool {
     match config.mode {
         BootstrapModelOptionsMode::Passthrough => false,
         BootstrapModelOptionsMode::Configured => {
-            inject_bootstrap_fable_profile(value, query, config);
+            inject_bootstrap_fable_profile(value, query, config, version_profile);
             true
         }
         BootstrapModelOptionsMode::HideFable => {
-            hide_bootstrap_fable_profile(value);
+            hide_bootstrap_fable_profile(value, version_profile);
             true
         }
     }
@@ -3165,6 +3174,7 @@ fn inject_bootstrap_fable_profile(
     value: &mut serde_json::Value,
     query: &str,
     config: &BootstrapProfileConfig,
+    version_profile: &ClaudeCodeProfile,
 ) {
     let Some(obj) = value.as_object_mut() else {
         return;
@@ -3176,6 +3186,9 @@ fn inject_bootstrap_fable_profile(
         *client_data = serde_json::json!({});
     }
     if let Some(client_data_obj) = client_data.as_object_mut() {
+        if let Some(cedar_basin) = version_profile.endpoints.bootstrap_cedar_basin {
+            client_data_obj.insert("cedar_basin".into(), serde_json::json!(cedar_basin));
+        }
         let cedar_lagoon = client_data_obj
             .entry("cedar_lagoon")
             .or_insert_with(|| serde_json::json!({}));
@@ -3192,11 +3205,20 @@ fn inject_bootstrap_fable_profile(
         serde_json::Value::Array(config.additional_model_options.clone()),
     );
     if query_model_is_fable(query) {
-        obj.insert("cwk_cfg_key".into(), serde_json::json!("marigold"));
+        if let Some(key) = version_profile.endpoints.bootstrap_fable_cwk_cfg_key {
+            obj.insert("cwk_cfg_key".into(), serde_json::json!(key));
+        }
+    } else if query_model_is_opus_5(query) {
+        if let Some(key) = version_profile.endpoints.bootstrap_opus_cwk_cfg_key {
+            obj.insert("cwk_cfg_key".into(), serde_json::json!(key));
+        }
     }
 }
 
-fn hide_bootstrap_fable_profile(value: &mut serde_json::Value) {
+fn hide_bootstrap_fable_profile(
+    value: &mut serde_json::Value,
+    version_profile: &ClaudeCodeProfile,
+) {
     let Some(obj) = value.as_object_mut() else {
         return;
     };
@@ -3229,8 +3251,10 @@ fn hide_bootstrap_fable_profile(value: &mut serde_json::Value) {
                 .unwrap_or(false)
         });
     }
-    if obj.get("cwk_cfg_key").and_then(|value| value.as_str()) == Some("marigold") {
-        obj.insert("cwk_cfg_key".into(), serde_json::Value::Null);
+    if let Some(fable_key) = version_profile.endpoints.bootstrap_fable_cwk_cfg_key {
+        if obj.get("cwk_cfg_key").and_then(|value| value.as_str()) == Some(fable_key) {
+            obj.insert("cwk_cfg_key".into(), serde_json::Value::Null);
+        }
     }
 }
 
@@ -3238,6 +3262,14 @@ fn query_model_is_fable(query: &str) -> bool {
     query.split('&').any(|part| {
         part.strip_prefix("model=")
             .map(|model| model.starts_with("claude-fable-5"))
+            .unwrap_or(false)
+    })
+}
+
+fn query_model_is_opus_5(query: &str) -> bool {
+    query.split('&').any(|part| {
+        part.strip_prefix("model=")
+            .map(|model| model.starts_with("claude-opus-5"))
             .unwrap_or(false)
     })
 }
@@ -4768,6 +4800,7 @@ fn build_message_telemetry_context(
     client_type: ClientType,
     attempt: usize,
     betas: String,
+    default_model: String,
 ) -> MessageTelemetryContext {
     MessageTelemetryContext {
         request_key: uuid::Uuid::new_v4().to_string(),
@@ -4776,6 +4809,7 @@ fn build_message_telemetry_context(
             .and_then(|m| m.as_str())
             .unwrap_or_default()
             .to_string(),
+        default_model,
         session_id: extract_message_session_id(rewritten_body)
             .or_else(|| crate::service::rewriter::extract_session_id_from_body(rewritten_body)),
         pre_normalized_message_count: count_messages(original_body),
@@ -6016,6 +6050,7 @@ mod tests {
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_VERSION, STAINLESS_PACKAGE_VERSION, claude_code_user_agent,
+        profile_for_key,
     };
     use crate::store::account_store::AccountStore;
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
@@ -7665,6 +7700,7 @@ mod tests {
             &mut body,
             "entrypoint=cli&model=claude-fable-5",
             &bootstrap_config(BootstrapModelOptionsMode::Passthrough),
+            profile_for_key("2.1.220").unwrap(),
         );
 
         assert!(!changed);
@@ -7681,11 +7717,13 @@ mod tests {
             &mut body,
             "entrypoint=cli&model=claude-fable-5",
             &bootstrap_config(BootstrapModelOptionsMode::Configured),
+            profile_for_key("2.1.220").unwrap(),
         );
 
         assert!(changed);
         assert_eq!(body["client_data"]["cedar_lagoon"]["claude-fable"], true);
         assert_eq!(body["client_data"]["cedar_lagoon"]["claude-mythos"], true);
+        assert_eq!(body["client_data"]["cedar_basin"], "2026-08-31");
         assert_eq!(
             body["additional_model_options"][0]["model"],
             "claude-fable-5[1m]"
@@ -7696,16 +7734,18 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_patch_configured_does_not_force_marigold_for_opus() {
+    fn bootstrap_patch_configured_uses_belladonna_for_opus_5() {
         let mut body = bootstrap_body();
 
         patch_bootstrap_json(
             &mut body,
-            "entrypoint=cli&model=claude-opus-4-8",
+            "entrypoint=cli&model=claude-opus-5",
             &bootstrap_config(BootstrapModelOptionsMode::Configured),
+            profile_for_key("2.1.220").unwrap(),
         );
 
-        assert!(body["cwk_cfg_key"].is_null());
+        assert_eq!(body["cwk_cfg_key"], "belladonna");
+        assert_eq!(body["client_data"]["cedar_basin"], "2026-08-31");
         assert_eq!(body["client_data"]["cedar_lagoon"]["claude-fable"], true);
     }
 
@@ -7724,6 +7764,7 @@ mod tests {
             &mut body,
             "entrypoint=cli&model=claude-fable-5",
             &bootstrap_config(BootstrapModelOptionsMode::HideFable),
+            profile_for_key("2.1.220").unwrap(),
         );
 
         assert!(changed);
@@ -7734,6 +7775,24 @@ mod tests {
             json!([{"model": "claude-opus-4-8", "name": "Opus"}])
         );
         assert!(body["cwk_cfg_key"].is_null());
+    }
+
+    #[test]
+    fn bootstrap_patch_hide_fable_preserves_opus_belladonna() {
+        let mut body = json!({
+            "client_data": {"cedar_lagoon": {"claude-fable": true}},
+            "additional_model_options": [{"model": "claude-fable-5[1m]", "name": "Fable"}],
+            "cwk_cfg_key": "belladonna"
+        });
+
+        patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-opus-5",
+            &bootstrap_config(BootstrapModelOptionsMode::HideFable),
+            profile_for_key("2.1.220").unwrap(),
+        );
+
+        assert_eq!(body["cwk_cfg_key"], "belladonna");
     }
 
     #[tokio::test]
@@ -7753,6 +7812,7 @@ mod tests {
             bytes::Bytes::from(compressed),
             "entrypoint=cli&model=claude-fable-5",
             &bootstrap_config(BootstrapModelOptionsMode::Configured),
+            profile_for_key("2.1.220").unwrap(),
         )
         .expect("rewrite");
         assert_eq!(response.status(), StatusCode::OK);
@@ -8841,6 +8901,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
             ClientType::ClaudeCode,
             1,
             "claude-code-20250219".into(),
+            "claude-opus-5".into(),
         );
 
         assert_eq!(context.model, "claude-sonnet-4-20250514");
@@ -8906,6 +8967,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
             ClientType::ClaudeCode,
             0,
             String::new(),
+            "claude-opus-5".into(),
         );
 
         assert_eq!(
@@ -8963,6 +9025,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
             ClientType::API,
             0,
             String::new(),
+            "claude-opus-5".into(),
         );
 
         assert_eq!(context.session_id, None);

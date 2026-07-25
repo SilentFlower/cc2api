@@ -1,8 +1,8 @@
 use crate::error::AppError;
 use crate::model::account::CanonicalEnvData;
 use crate::service::version_profile::{
-    MESSAGE_BETA_TOKENS, OAUTH_BETA_TOKEN, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
-    claude_cli_user_agent, claude_code_user_agent, normalize_version,
+    OAUTH_BETA_TOKEN, claude_cli_user_agent, claude_code_user_agent, normalize_version,
+    profile_for_version,
 };
 use crate::tlsfp::get_request_client;
 use chrono::{DateTime, Utc};
@@ -39,6 +39,9 @@ struct OAuthRefreshResponse {
 pub struct TokenTester;
 
 impl TokenTester {
+    /// 创建 Setup Token 验证器。
+    ///
+    /// @return 返回无状态的 TokenTester 实例。
     pub fn new() -> Self {
         Self
     }
@@ -50,44 +53,11 @@ impl TokenTester {
         proxy_url: &str,
         canonical_env: &Value,
     ) -> Result<(), AppError> {
-        let env: CanonicalEnvData =
-            serde_json::from_value(canonical_env.clone()).unwrap_or_default();
-        let version = normalize_version(&env.version);
-        let stainless_os = match env.platform.as_str() {
-            "darwin" => "Mac OS X",
-            "win32" => "Windows",
-            _ => "Linux",
-        };
-
-        let body = serde_json::json!({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-
         let client = get_request_client(proxy_url);
+        let request = build_test_token_request(&client, token, canonical_env)?;
 
         let resp = client
-            .post("https://api.anthropic.com/v1/messages?beta=true")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", MESSAGE_BETA_TOKENS)
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("User-Agent", claude_cli_user_agent(version))
-            .header("x-app", "cli")
-            .header("accept-encoding", "gzip, deflate, br, zstd")
-            .header("X-Stainless-Lang", "js")
-            .header("X-Stainless-Package-Version", STAINLESS_PACKAGE_VERSION)
-            .header("X-Stainless-OS", stainless_os)
-            .header("X-Stainless-Arch", &env.arch)
-            .header("X-Stainless-Runtime", "node")
-            .header("X-Stainless-Runtime-Version", STAINLESS_RUNTIME_VERSION)
-            .header("X-Stainless-Retry-Count", "0")
-            .header("X-Stainless-Timeout", "600")
-            .json(&body)
-            .send()
+            .execute(request)
             .await
             .map_err(|e| AppError::Internal(format!("request failed: {:?}", e)))?;
 
@@ -101,6 +71,58 @@ impl TokenTester {
         }
         Ok(())
     }
+}
+
+fn build_test_token_request(
+    client: &reqwest::Client,
+    token: &str,
+    canonical_env: &Value,
+) -> Result<reqwest::Request, AppError> {
+    let env: CanonicalEnvData = serde_json::from_value(canonical_env.clone()).unwrap_or_default();
+    let version = normalize_version(&env.version);
+    let version_profile = profile_for_version(version);
+    let stainless_os = match env.platform.as_str() {
+        "darwin" => "Mac OS X",
+        "win32" => "Windows",
+        _ => "Linux",
+    };
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    client
+        .post("https://api.anthropic.com/v1/messages?beta=true")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header(
+            "anthropic-beta",
+            version_profile.request.message_beta_tokens,
+        )
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("User-Agent", claude_cli_user_agent(version))
+        .header("x-app", "cli")
+        .header("accept-encoding", "gzip, deflate, br, zstd")
+        .header("X-Stainless-Lang", "js")
+        .header(
+            "X-Stainless-Package-Version",
+            version_profile.identity.stainless_package_version,
+        )
+        .header("X-Stainless-OS", stainless_os)
+        .header("X-Stainless-Arch", &env.arch)
+        .header("X-Stainless-Runtime", "node")
+        .header(
+            "X-Stainless-Runtime-Version",
+            version_profile.identity.stainless_runtime_version,
+        )
+        .header("X-Stainless-Retry-Count", "0")
+        .header("X-Stainless-Timeout", "600")
+        .json(&body)
+        .build()
+        .map_err(|e| AppError::Internal(format!("request build failed: {:?}", e)))
 }
 
 /// 使用 refresh token 刷新 OAuth access token。
@@ -264,6 +286,73 @@ fn scoped_weekly_usage_window(usage: &Value, model_name: &str) -> Option<Value> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn request_header<'a>(request: &'a reqwest::Request, name: &str) -> &'a str {
+        request
+            .headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("缺少请求头: {}", name))
+            .to_str()
+            .expect("请求头必须是有效字符串")
+    }
+
+    fn test_canonical_env(version: &str) -> Value {
+        json!({
+            "platform": "linux",
+            "platform_raw": "linux",
+            "arch": "x64",
+            "node_version": "v26.3.0",
+            "terminal": "",
+            "package_managers": "",
+            "runtimes": "node",
+            "version": version,
+            "version_base": version,
+            "build_time": "",
+            "deployment_environment": "local",
+            "vcs": "git"
+        })
+    }
+
+    #[test]
+    fn token_test_request_uses_selected_version_profile_headers() {
+        let client = get_request_client("");
+        let current =
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.220"))
+                .expect("构造当前画像请求");
+        let rollback =
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.197"))
+                .expect("构造回滚画像请求");
+
+        assert_eq!(
+            request_header(&current, "user-agent"),
+            "claude-cli/2.1.220 (external, cli)"
+        );
+        assert_eq!(
+            request_header(&current, "x-stainless-package-version"),
+            "0.94.0"
+        );
+        assert_eq!(
+            request_header(&current, "x-stainless-runtime-version"),
+            "v26.3.0"
+        );
+        assert!(request_header(&current, "anthropic-beta").contains("fallback-credit-2026-06-01"));
+
+        assert_eq!(
+            request_header(&rollback, "user-agent"),
+            "claude-cli/2.1.197 (external, cli)"
+        );
+        assert_eq!(
+            request_header(&rollback, "x-stainless-package-version"),
+            "0.94.0"
+        );
+        assert_eq!(
+            request_header(&rollback, "x-stainless-runtime-version"),
+            "v26.3.0"
+        );
+        assert!(
+            !request_header(&rollback, "anthropic-beta").contains("fallback-credit-2026-06-01")
+        );
+    }
 
     #[test]
     fn normalize_usage_response_adds_fable_from_scoped_limit() {

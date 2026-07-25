@@ -32,11 +32,11 @@ const primeHours = ref('4,5,6');
 const primeModel = ref('claude-haiku-4-5-20251001');
 
 /** 允许 messages[].role=system 的模型列表 */
-const allowSystemRoleModels = ref('claude-opus-4-8');
+const allowSystemRoleModels = ref('claude-opus-5,claude-fable-5,claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const claudeCodeVersionProfile = ref('2.1.197');
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.197');
+const claudeCodeVersionProfile = ref('2.1.220');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.220');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
@@ -63,7 +63,7 @@ const rewriteDisabledThinkingModels = ref('claude-fable-5');
 
 /** assistant prefill 本地拦截配置 */
 const interceptAssistantPrefillEnabled = ref(false);
-const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-4-8,claude-opus-4-7');
+const interceptAssistantPrefillModels = ref('claude-fable-5,claude-opus-5,claude-opus-4-8,claude-opus-4-7');
 
 /** 429 请求观测日志配置 */
 const log429RequestEnabled = ref(false);
@@ -109,6 +109,15 @@ interface ClaudeCodeVersionProfileOption {
 
 /** Claude Code 版本画像选项 */
 const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
+  {
+    key: '2.1.220',
+    version: '2.1.220',
+    version_base: '2.1.220',
+    build_time: '2026-07-24T22:17:45Z',
+    allowed_claude_code_versions: '2.1.89-2.1.220',
+    growthbook_user_agent: 'Bun/1.4.0',
+    telemetry_shape: 'claude_code_2_1_185',
+  },
   {
     key: '2.1.197',
     version: '2.1.197',
@@ -355,10 +364,10 @@ async function loadSettings() {
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
-    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-4-8';
+    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5,claude-fable-5,claude-opus-4-8';
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
-    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.197';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.197';
+    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.220';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.220';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     const contextSanitizerMode = data.claude_code_context_sanitizer_mode ?? 'report_only';
@@ -381,7 +390,7 @@ async function loadSettings() {
     rewriteDisabledThinkingEnabled.value = (data.rewrite_disabled_thinking_enabled ?? 'false') === 'true';
     rewriteDisabledThinkingModels.value = data.rewrite_disabled_thinking_models ?? 'claude-fable-5';
     interceptAssistantPrefillEnabled.value = (data.intercept_assistant_prefill_enabled ?? 'false') === 'true';
-    interceptAssistantPrefillModels.value = data.intercept_assistant_prefill_models ?? 'claude-fable-5,claude-opus-4-8,claude-opus-4-7';
+    interceptAssistantPrefillModels.value = data.intercept_assistant_prefill_models ?? 'claude-fable-5,claude-opus-5,claude-opus-4-8,claude-opus-4-7';
     log429RequestEnabled.value = (data.log_429_request_enabled ?? 'false') === 'true';
     logNonStreamRequestEnabled.value = (data.log_non_stream_request_enabled ?? 'false') === 'true';
     nonStreamProbeCacheEnabled.value = (data.non_stream_probe_cache_enabled ?? 'false') === 'true';
@@ -786,7 +795,7 @@ onMounted(async () => {
             <Label class="text-[#5c5647] text-sm">拦截模型 (逗号分隔)</Label>
             <Input
               v-model="interceptAssistantPrefillModels"
-              placeholder="claude-fable-5,claude-opus-4-8,claude-opus-4-7"
+              placeholder="claude-fable-5,claude-opus-5,claude-opus-4-8,claude-opus-4-7"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
               :class="isValidInterceptAssistantPrefillModels ? '' : 'border-red-400'"
             />
@@ -943,7 +952,7 @@ onMounted(async () => {
           <Label class="text-[#5c5647] text-sm">允许模型 (逗号分隔)</Label>
           <Input
             v-model="allowSystemRoleModels"
-            placeholder="claude-opus-4-8"
+            placeholder="claude-opus-5,claude-fable-5,claude-opus-4-8"
             class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
             :class="isValidSystemRoleModels ? '' : 'border-red-400'"
           />
@@ -951,9 +960,9 @@ onMounted(async () => {
             <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
             <button
               type="button"
-              @click="allowSystemRoleModels = 'claude-opus-4-8'"
+              @click="allowSystemRoleModels = 'claude-opus-5,claude-fable-5,claude-opus-4-8'"
               class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-            >Opus 4.8</button>
+            >2.1.220 默认</button>
             <button
               type="button"
               @click="allowSystemRoleModels = ''"
@@ -1329,7 +1338,7 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.197"
+              placeholder="2.1.89-2.1.220"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm bg-[#f9f6f1]"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
               readonly
