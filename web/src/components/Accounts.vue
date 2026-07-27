@@ -92,6 +92,7 @@ const form = ref({
   auto_telemetry: false,
   auto_poll_usage: false,
   allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
+  allow_fast_mode: false,
   upstream_session_pool_enabled: false,
   upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
   upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -176,6 +177,7 @@ function openCreate() {
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
+    allow_fast_mode: false,
     upstream_session_pool_enabled: false,
     upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -209,6 +211,7 @@ function openEdit(a: Account) {
     auto_telemetry: a.auto_telemetry ?? false,
     auto_poll_usage: a.auto_poll_usage ?? false,
     allow_1m_models: a.allow_1m_models ?? DEFAULT_ALLOW_1M_MODELS,
+    allow_fast_mode: a.allow_fast_mode ?? false,
     upstream_session_pool_enabled: a.upstream_session_pool_enabled ?? false,
     upstream_session_pool_size: a.upstream_session_pool_size ?? DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     upstream_session_ttl_minutes: a.upstream_session_ttl_minutes ?? DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -260,6 +263,7 @@ async function save() {
       updates.auto_telemetry = form.value.auto_telemetry;
       updates.auto_poll_usage = form.value.auto_poll_usage;
       updates.allow_1m_models = form.value.allow_1m_models;
+      updates.allow_fast_mode = form.value.allow_fast_mode;
       updates.upstream_session_pool_enabled = form.value.upstream_session_pool_enabled;
       updates.upstream_session_pool_size = form.value.upstream_session_pool_size;
       updates.upstream_session_ttl_minutes = form.value.upstream_session_ttl_minutes;
@@ -290,6 +294,7 @@ async function save() {
         auto_telemetry: form.value.auto_telemetry,
         auto_poll_usage: form.value.auto_poll_usage,
         allow_1m_models: form.value.allow_1m_models,
+        allow_fast_mode: form.value.allow_fast_mode,
         upstream_session_pool_enabled: form.value.upstream_session_pool_enabled,
         upstream_session_pool_size: form.value.upstream_session_pool_size,
         upstream_session_ttl_minutes: form.value.upstream_session_ttl_minutes,
@@ -734,6 +739,7 @@ function applyOAuthResult() {
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
+    allow_fast_mode: false,
     upstream_session_pool_enabled: false,
     upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -1369,6 +1375,32 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后后台定时拉取该账号的用量数据</p>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">允许客户端 Fast Mode</Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="form.allow_fast_mode = false"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="!form.allow_fast_mode
+                  ? 'bg-[#f9f6f1] border-[#8c8475] text-[#5c5647]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#8c8475]/40'"
+              >
+                禁止
+              </button>
+              <button
+                type="button"
+                @click="form.allow_fast_mode = true"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.allow_fast_mode
+                  ? 'bg-amber-50 border-amber-400 text-amber-600'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+              >
+                允许透传
+              </button>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">默认禁止。允许后仅透传客户端携带的 fast-mode-2026-02-01，可能增加计费和限流风险。</p>
           </div>
           <div class="space-y-3 rounded-lg border border-[#e8e2d9] bg-[#f9f6f1] p-3">
             <div class="space-y-2">

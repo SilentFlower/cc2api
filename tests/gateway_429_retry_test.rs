@@ -63,6 +63,7 @@ async fn create_test_account(svc: &AccountService, email: &str, priority: i32) -
         auto_telemetry: false,
         auto_poll_usage: false,
         allow_1m_models: "opus".into(),
+        allow_fast_mode: false,
         upstream_session_pool_enabled: false,
         upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
         upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,

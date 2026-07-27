@@ -100,6 +100,7 @@ pub struct UpstreamSessionRewrite {
 const API_MAX_TOKENS_LIMIT: u64 = 64000;
 const API_DEFAULT_MAX_TOKENS: u64 = 32000;
 const CONTEXT_1M_BETA_TOKEN: &str = "context-1m-2025-08-07";
+const FAST_MODE_BETA_TOKEN: &str = "fast-mode-2026-02-01";
 const FABLE_MODEL_ID: &str = "claude-fable-5";
 const MESSAGE_BODY_ORDER_OPUS_MAIN: &[&str] = &[
     "model",
@@ -165,6 +166,29 @@ pub(crate) fn matches_1m_whitelist(model_id: &str, allow_1m_models: &str) -> boo
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .any(|pat| m.contains(pat.to_lowercase().as_str()))
+}
+
+/// 根据账号能力过滤客户端传入的受控 beta token。
+///
+/// # 参数
+///
+/// - `beta`: 客户端或已改写请求中的 `anthropic-beta` 值。
+/// - `account`: 决定 1M 与 Fast Mode 是否允许透传的账号。
+/// - `model_id`: 用于匹配账号 1M 模型白名单的最终模型 ID。
+///
+/// # 返回
+///
+/// 过滤后的 beta 值；未被过滤的 token 保持原始相对顺序。
+pub(crate) fn filter_account_beta_tokens(beta: &str, account: &Account, model_id: &str) -> String {
+    let mut filtered = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
+        beta.to_string()
+    } else {
+        strip_beta_token(beta, CONTEXT_1M_BETA_TOKEN)
+    };
+    if !account.allow_fast_mode {
+        filtered = strip_beta_token(&filtered, FAST_MODE_BETA_TOKEN);
+    }
+    filtered
 }
 
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
@@ -1149,16 +1173,10 @@ impl Rewriter {
                     .or_insert_with(|| "true".into());
             }
 
-            // 合并客户端 beta 与必需 beta；对于不在账号 1M 白名单内的模型，
-            // 强制剥掉 context-1m-2025-08-07（即便客户端传了）。
-            // 对应 sub2api BetaPolicy(action=filter, model_whitelist=..., fallback=filter)：
-            // 默认精确放行 Opus 与 Sonnet 5，避免宽泛 "sonnet" 误放行 Sonnet 4.6。
+            // 先按账号能力过滤客户端 beta，再与必需画像合并。Fast Mode 默认禁止，
+            // 只有管理员显式放行后才允许透传；1M 继续沿用现有模型白名单。
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
-            let filtered_existing = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
-                existing_beta
-            } else {
-                strip_beta_token(&existing_beta, CONTEXT_1M_BETA_TOKEN)
-            };
+            let filtered_existing = filter_account_beta_tokens(&existing_beta, account, model_id);
             if requires_anthropic_beta(path) {
                 let required_beta =
                     beta_header_for_path(&version_profile.request, path, model_id, body_map);
@@ -5431,6 +5449,7 @@ mod tests {
     use std::collections::HashMap;
 
     const CTX_1M: &str = "context-1m-2025-08-07";
+    const FAST_MODE: &str = "fast-mode-2026-02-01";
 
     fn test_account() -> Account {
         let env = CanonicalEnvData {
@@ -5493,6 +5512,7 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            allow_fast_mode: false,
             upstream_session_pool_enabled: false,
             upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
             upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -8826,6 +8846,76 @@ mod tests {
             beta,
             "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
         );
+    }
+
+    #[test]
+    fn fast_mode_beta_is_filtered_by_default_without_reordering_other_client_tokens() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert(
+            "anthropic-beta".to_string(),
+            format!("client-before,{FAST_MODE},{CTX_1M},client-after"),
+        );
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-sonnet-5",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert!(!beta.split(',').any(|token| token == FAST_MODE));
+        assert!(beta.split(',').any(|token| token == CTX_1M));
+        assert!(beta.find("client-before").unwrap() < beta.find("client-after").unwrap());
+    }
+
+    #[test]
+    fn fast_mode_beta_is_preserved_when_account_allows_it() {
+        let mut account = test_account();
+        account.allow_fast_mode = true;
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), FAST_MODE.to_string());
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-4-8",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(
+            beta.split(',').filter(|token| *token == FAST_MODE).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fast_mode_filter_uses_exact_beta_token_matching() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let partial_token = format!("{FAST_MODE}-extra");
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), partial_token.clone());
+
+        let headers = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-4-8",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert!(beta.split(',').any(|token| token == partial_token));
     }
 
     #[test]

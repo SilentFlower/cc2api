@@ -351,6 +351,7 @@ struct CreateAccountRequest {
     auto_telemetry: Option<bool>,
     auto_poll_usage: Option<bool>,
     allow_1m_models: Option<String>,
+    allow_fast_mode: Option<bool>,
     upstream_session_pool_enabled: Option<bool>,
     upstream_session_pool_size: Option<i32>,
     upstream_session_ttl_minutes: Option<i32>,
@@ -431,6 +432,7 @@ async fn create_account(
         allow_1m_models: req
             .allow_1m_models
             .unwrap_or_else(|| DEFAULT_ALLOW_1M_MODELS.to_string()),
+        allow_fast_mode: req.allow_fast_mode.unwrap_or(false),
         upstream_session_pool_enabled: req.upstream_session_pool_enabled.unwrap_or(false),
         upstream_session_pool_size: req
             .upstream_session_pool_size
@@ -566,6 +568,9 @@ async fn update_account(
     }
     if let Some(allow_1m_models) = updates.get("allow_1m_models").and_then(|v| v.as_str()) {
         existing.allow_1m_models = allow_1m_models.to_string();
+    }
+    if let Some(allow_fast_mode) = updates.get("allow_fast_mode").and_then(|v| v.as_bool()) {
+        existing.allow_fast_mode = allow_fast_mode;
     }
     if let Some(enabled) = updates
         .get("upstream_session_pool_enabled")

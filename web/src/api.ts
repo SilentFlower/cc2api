@@ -58,6 +58,7 @@ export interface Account {
   auto_telemetry: boolean
   auto_poll_usage: boolean
   allow_1m_models: string
+  allow_fast_mode: boolean
   upstream_session_pool_enabled: boolean
   upstream_session_pool_size: number
   upstream_session_ttl_minutes: number

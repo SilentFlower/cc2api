@@ -840,6 +840,7 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            allow_fast_mode: false,
             upstream_session_pool_enabled: false,
             upstream_session_pool_size: crate::model::account::DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
             upstream_session_ttl_minutes:

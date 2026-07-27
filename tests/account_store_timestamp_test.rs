@@ -52,6 +52,7 @@ fn new_account(email: &str) -> Account {
         auto_telemetry: false,
         auto_poll_usage: false,
         allow_1m_models: "opus".into(),
+        allow_fast_mode: false,
         upstream_session_pool_enabled: false,
         upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
         upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -115,6 +116,21 @@ async fn test_account_upstream_session_pool_fields_round_trip() {
     assert!(!updated.upstream_session_pool_enabled);
     assert_eq!(updated.upstream_session_pool_size, 0);
     assert_eq!(updated.upstream_session_refresh_policy, "mapped_request");
+}
+
+#[tokio::test]
+async fn test_account_fast_mode_defaults_to_disabled_and_round_trips() {
+    let store = setup().await;
+    let mut a = new_account("fast-mode@example.com");
+    store.create(&mut a).await.expect("create failed");
+
+    let mut fetched = store.get_by_id(a.id).await.expect("get_by_id failed");
+    assert!(!fetched.allow_fast_mode);
+
+    fetched.allow_fast_mode = true;
+    store.update(&fetched).await.expect("update failed");
+    let updated = store.get_by_id(a.id).await.expect("get updated failed");
+    assert!(updated.allow_fast_mode);
 }
 
 // ─── UPDATE: oauth_expires_at and oauth_refreshed_at ───

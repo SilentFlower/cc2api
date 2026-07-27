@@ -129,6 +129,7 @@ impl AccountStore {
             allow_1m_models: row
                 .try_get::<String, _>("allow_1m_models")
                 .unwrap_or_else(|_| DEFAULT_ALLOW_1M_MODELS.into()),
+            allow_fast_mode: row.try_get::<i32, _>("allow_fast_mode").unwrap_or(0) != 0,
             upstream_session_pool_enabled: row
                 .try_get::<i32, _>("upstream_session_pool_enabled")
                 .unwrap_or(0)
@@ -173,6 +174,7 @@ impl AccountStore {
 
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let auto_poll_usage_int: i32 = if a.auto_poll_usage { 1 } else { 0 };
+        let allow_fast_mode_int: i32 = if a.allow_fast_mode { 1 } else { 0 };
         let upstream_session_pool_enabled_int: i32 = if a.upstream_session_pool_enabled {
             1
         } else {
@@ -184,9 +186,9 @@ impl AccountStore {
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models,
-                upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
+                allow_fast_mode, upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
                 upstream_session_refresh_policy)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
             RETURNING id, created_at, updated_at"#,
             self.ts(9),
             self.ts(10),
@@ -218,6 +220,7 @@ impl AccountStore {
             .bind(auto_telemetry_int)
             .bind(auto_poll_usage_int)
             .bind(&a.allow_1m_models)
+            .bind(allow_fast_mode_int)
             .bind(upstream_session_pool_enabled_int)
             .bind(a.upstream_session_pool_size)
             .bind(a.upstream_session_ttl_minutes)
@@ -236,6 +239,7 @@ impl AccountStore {
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let auto_poll_usage_int: i32 = if a.auto_poll_usage { 1 } else { 0 };
+        let allow_fast_mode_int: i32 = if a.allow_fast_mode { 1 } else { 0 };
         let upstream_session_pool_enabled_int: i32 = if a.upstream_session_pool_enabled {
             1
         } else {
@@ -247,9 +251,10 @@ impl AccountStore {
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid=$13, organization_uuid=$14, subscription_type=$15,
                 concurrency=$16, priority=$17, rpm_limit=$18, auto_telemetry=$19, auto_poll_usage=$20,
-                allow_1m_models=$21, upstream_session_pool_enabled=$22, upstream_session_pool_size=$23,
-                upstream_session_ttl_minutes=$24, upstream_session_refresh_policy=$25, updated_at={}
-            WHERE id=$26"#,
+                allow_1m_models=$21, allow_fast_mode=$22, upstream_session_pool_enabled=$23,
+                upstream_session_pool_size=$24, upstream_session_ttl_minutes=$25,
+                upstream_session_refresh_policy=$26, updated_at={}
+            WHERE id=$27"#,
             self.ts(8),
             self.ts(9),
             self.now_expr()
@@ -276,6 +281,7 @@ impl AccountStore {
             .bind(auto_telemetry_int)
             .bind(auto_poll_usage_int)
             .bind(&a.allow_1m_models)
+            .bind(allow_fast_mode_int)
             .bind(upstream_session_pool_enabled_int)
             .bind(a.upstream_session_pool_size)
             .bind(a.upstream_session_ttl_minutes)
@@ -575,7 +581,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rpm_limit, rate_limited_at, rate_limit_reset_at,
-    disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models,
+    disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models, allow_fast_mode,
     upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
     upstream_session_refresh_policy, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;

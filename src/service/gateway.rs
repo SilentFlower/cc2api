@@ -31,8 +31,8 @@ use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
     StatefulCacheUsage, UpstreamSessionRewrite, collect_telemetry_session_ids, detect_client_type,
-    matches_1m_whitelist, merge_anthropic_beta, order_context_1m_after_oauth,
-    ordered_anthropic_headers, strip_beta_token, strip_empty_text_blocks,
+    filter_account_beta_tokens, merge_anthropic_beta, order_context_1m_after_oauth,
+    ordered_anthropic_headers, strip_empty_text_blocks,
 };
 use crate::service::session_hello_probe::{
     SessionHelloProbeConfig, SessionHelloProbeDecision, SessionHelloProbeService,
@@ -2664,11 +2664,7 @@ fn apply_count_tokens_beta_header(
     } else {
         incoming_beta
     };
-    let filtered_beta = if matches_1m_whitelist(model_id, &account.allow_1m_models) {
-        base_beta.to_string()
-    } else {
-        strip_beta_token(base_beta, "context-1m-2025-08-07")
-    };
+    let filtered_beta = filter_account_beta_tokens(base_beta, account, model_id);
     let beta = order_context_1m_after_oauth(merge_anthropic_beta(
         COUNT_TOKENS_BETA_TOKENS,
         &filtered_beta,
@@ -6330,6 +6326,7 @@ mod tests {
             auto_telemetry: false,
             auto_poll_usage: false,
             allow_1m_models: DEFAULT_ALLOW_1M_MODELS.into(),
+            allow_fast_mode: false,
             upstream_session_pool_enabled: false,
             upstream_session_pool_size: DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
             upstream_session_ttl_minutes: DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
@@ -7861,6 +7858,42 @@ mod tests {
 
         let beta = headers.get("anthropic-beta").expect("beta header");
         assert!(!beta.contains("context-1m-2025-08-07"));
+        assert!(beta.contains("token-counting-2024-11-01"));
+    }
+
+    #[test]
+    fn count_tokens_beta_filters_fast_mode_by_default() {
+        let account = test_account();
+        let mut headers = HashMap::new();
+        let mut original = HashMap::new();
+        original.insert(
+            "anthropic-beta".into(),
+            "oauth-2025-04-20,fast-mode-2026-02-01,client-beta".into(),
+        );
+
+        super::apply_count_tokens_beta_header(&mut headers, &original, &account, "claude-opus-4-8");
+
+        let beta = headers.get("anthropic-beta").expect("beta header");
+        assert!(!beta.contains("fast-mode-2026-02-01"));
+        assert!(beta.contains("client-beta"));
+        assert!(beta.contains("token-counting-2024-11-01"));
+    }
+
+    #[test]
+    fn count_tokens_beta_preserves_fast_mode_when_account_allows_it() {
+        let mut account = test_account();
+        account.allow_fast_mode = true;
+        let mut headers = HashMap::new();
+        let mut original = HashMap::new();
+        original.insert(
+            "anthropic-beta".into(),
+            "oauth-2025-04-20,fast-mode-2026-02-01".into(),
+        );
+
+        super::apply_count_tokens_beta_header(&mut headers, &original, &account, "claude-opus-4-8");
+
+        let beta = headers.get("anthropic-beta").expect("beta header");
+        assert!(beta.contains("fast-mode-2026-02-01"));
         assert!(beta.contains("token-counting-2024-11-01"));
     }
 

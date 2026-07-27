@@ -205,6 +205,9 @@ pub struct Account {
     /// 不使用宽泛 `"sonnet"`，避免误放行 Sonnet 4.6。
     #[serde(default = "default_allow_1m_models")]
     pub allow_1m_models: String,
+    /// 是否允许透传客户端显式携带的 `fast-mode-2026-02-01` beta；默认禁止。
+    #[serde(default)]
+    pub allow_fast_mode: bool,
     /// 是否启用账号级上游 session 池；默认关闭，保持旧协议行为。
     #[serde(default)]
     pub upstream_session_pool_enabled: bool,
