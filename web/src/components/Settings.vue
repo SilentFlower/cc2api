@@ -25,6 +25,7 @@ const w7d = ref('0.5');
 const w5h = ref('0.3');
 const wconc = ref('0.2');
 const fableStickyQuotaFallbackEnabled = ref(true);
+const fableWeeklyUsageLimitPercent = ref('50');
 
 /** 峰值预热表单 */
 const primeEnabled = ref(true);
@@ -186,6 +187,14 @@ function isValidWeight(v: string): boolean {
 /** 所有权重是否合法 */
 const allValid = computed(() => {
   return isValidWeight(w7d.value) && isValidWeight(w5h.value) && isValidWeight(wconc.value);
+});
+
+/** Fable 周用量百分比上限是否合法 */
+const isValidFableWeeklyUsageLimitPercent = computed(() => {
+  const raw = fableWeeklyUsageLimitPercent.value.trim();
+  if (!/^\d+$/.test(raw)) return false;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 1 && value <= 100;
 });
 
 /** 总和是否为 1.0 */
@@ -392,6 +401,7 @@ async function loadSettings() {
     w5h.value = data.score_weight_5h ?? '0.3';
     wconc.value = data.score_weight_concurrency ?? '0.2';
     fableStickyQuotaFallbackEnabled.value = (data.fable_sticky_quota_fallback_enabled ?? 'true') === 'true';
+    fableWeeklyUsageLimitPercent.value = data.fable_weekly_usage_limit_percent ?? '50';
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
@@ -466,6 +476,10 @@ async function saveSettings() {
     toast('权重必须为非负数');
     return;
   }
+  if (!isValidFableWeeklyUsageLimitPercent.value) {
+    toast('Fable 周用量上限必须是 1 到 100 之间的整数');
+    return;
+  }
   if (!isValidHours.value) {
     toast('预热小时必须是逗号分隔的 0-23 整数');
     return;
@@ -533,6 +547,7 @@ async function saveSettings() {
       score_weight_5h: String(w5h.value),
       score_weight_concurrency: String(wconc.value),
       fable_sticky_quota_fallback_enabled: fableStickyQuotaFallbackEnabled.value ? 'true' : 'false',
+      fable_weekly_usage_limit_percent: fableWeeklyUsageLimitPercent.value.trim(),
       peak_prime_enabled: primeEnabled.value ? 'true' : 'false',
       peak_prime_hours: primeHours.value.trim(),
       peak_prime_model: primeModel.value.trim(),
@@ -668,21 +683,38 @@ onMounted(async () => {
           </p>
         </div>
 
-        <div class="border-t border-[#eee7dc] pt-4 space-y-2">
+        <div class="border-t border-[#eee7dc] pt-4 space-y-3">
           <div>
             <h4 class="text-sm font-semibold text-[#29261e]">Fable 配额切换</h4>
             <p class="text-xs text-[#8c8475] mt-1">
-              Fable 周用量明确耗尽时，允许打破粘性会话并切换到其他可用账号；RPM 饱和仍保持粘性等待。
+              达到最近观测的 Fable 周用量上限后，停止向该账号分配新的 Fable 请求并尝试切换账号；单次请求可能轻微越线。
             </p>
           </div>
-          <label class="inline-flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
-            <input
-              v-model="fableStickyQuotaFallbackEnabled"
-              type="checkbox"
-              class="accent-[#c4704f] w-4 h-4"
-            />
-            <span class="text-sm text-[#29261e]">{{ fableStickyQuotaFallbackEnabled ? '已启用' : '保持粘性' }}</span>
-          </label>
+          <div class="grid grid-cols-1 md:grid-cols-[auto_180px] gap-3 items-end">
+            <label class="inline-flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="fableStickyQuotaFallbackEnabled"
+                type="checkbox"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">{{ fableStickyQuotaFallbackEnabled ? '已启用' : '保持粘性' }}</span>
+            </label>
+            <div class="space-y-1.5">
+              <Label class="text-[#5c5647] text-sm">周用量上限 (%)</Label>
+              <Input
+                v-model="fableWeeklyUsageLimitPercent"
+                type="number"
+                min="1"
+                max="100"
+                step="1"
+                :disabled="!fableStickyQuotaFallbackEnabled"
+                class="border-[#e8e2d9] focus:ring-[#c4704f] text-center"
+              />
+            </div>
+          </div>
+          <p v-if="!fableStickyQuotaFallbackEnabled" class="text-[11px] text-[#b5b0a6]">
+            当前关闭限制；重新启用后继续使用已保存的百分比。
+          </p>
         </div>
       </div>
     </Card>

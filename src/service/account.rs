@@ -44,8 +44,6 @@ pub const HAIKU_REQUEST_SLOT_UNITS: u32 = 1;
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
 /// rollover 后仍处于该高位的成功样本视为上一周期残留值。
 const USAGE_ROLLOVER_STALE_THRESHOLD: f64 = USAGE_HIT_THRESHOLD;
-/// Fable 模型级周配额只有明确达到 100% 才视为耗尽。
-const FABLE_QUOTA_EXHAUSTED_THRESHOLD: f64 = 100.0;
 /// 撞墙之外的纯速率限制请求级等待时间。瞬时 429 很快即过，只让当前请求等一小段时间再重试，
 /// 不写入账号级冷却,避免把仍可服务其他请求的账号从调度池里摘掉。
 const PURE_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -116,8 +114,10 @@ pub struct SelectedAccount {
 /// 账号选择和 429 分类需要的请求模型上下文。
 #[derive(Debug, Clone)]
 pub struct AccountSelectionContext {
-    /// 是否启用 Fable 周配额耗尽后的 sticky fallback 策略。
+    /// 是否启用 Fable 周用量达到上限后的 sticky fallback 策略。
     pub fable_quota_fallback_enabled: bool,
+    /// Fable 周用量百分比上限,范围为 1 到 100。
+    pub fable_weekly_usage_limit_percent: u32,
     /// 当前请求体里的模型 ID；非 `/v1/messages` 或未解析到模型时为空。
     pub request_model: Option<String>,
 }
@@ -129,6 +129,7 @@ impl AccountSelectionContext {
     pub fn disabled() -> Self {
         Self {
             fable_quota_fallback_enabled: false,
+            fable_weekly_usage_limit_percent: 100,
             request_model: None,
         }
     }
@@ -966,6 +967,7 @@ impl AccountService {
     ) -> Result<SelectedAccount, AppError> {
         let mut runtime_exclude_ids = exclude_ids.to_vec();
         let fable_quota_fallback_active = context.is_fable_quota_fallback_active();
+        let fable_weekly_usage_limit_percent = context.fable_weekly_usage_limit_percent;
         let mut skipped_sticky_for_fable_quota = false;
 
         // 检查粘性会话
@@ -980,9 +982,12 @@ impl AccountService {
                             && id_allowed
                         {
                             if fable_quota_fallback_active
-                                && account_fable_quota_exhausted(&account)
+                                && account_fable_weekly_usage_limit_reached(
+                                    &account,
+                                    fable_weekly_usage_limit_percent,
+                                )
                             {
-                                // Fable 模型级周配额耗尽只影响本轮选号；没有替代账号时保留旧 sticky。
+                                // Fable 周用量达到控制线只影响本轮选号；没有替代账号时保留旧 sticky。
                                 if !runtime_exclude_ids.contains(&account_id) {
                                     runtime_exclude_ids.push(account_id);
                                 }
@@ -1036,15 +1041,21 @@ impl AccountService {
         if fable_quota_fallback_active {
             let fable_available: Vec<Account> = candidates
                 .iter()
-                .filter(|account| !account_fable_quota_exhausted(account))
+                .filter(|account| {
+                    !account_fable_weekly_usage_limit_reached(
+                        account,
+                        fable_weekly_usage_limit_percent,
+                    )
+                })
                 .cloned()
                 .collect();
             if !fable_available.is_empty() {
                 candidates = fable_available;
             } else if !candidates.is_empty() || skipped_sticky_for_fable_quota {
-                return Err(AppError::TooManyRequests(
-                    "所有可用账号的 Fable 周用量均已耗尽".into(),
-                ));
+                return Err(AppError::TooManyRequests(format!(
+                    "所有可用账号的 Fable 周用量均已达到 {}% 上限",
+                    fable_weekly_usage_limit_percent
+                )));
             }
         }
 
@@ -1056,9 +1067,10 @@ impl AccountService {
 
         if candidates.is_empty() {
             if skipped_sticky_for_fable_quota {
-                return Err(AppError::TooManyRequests(
-                    "Fable 周用量已耗尽,暂无可切换账号".into(),
-                ));
+                return Err(AppError::TooManyRequests(format!(
+                    "Fable 周用量已达到 {}% 上限,暂无可切换账号",
+                    fable_weekly_usage_limit_percent
+                )));
             }
             return Err(AppError::ServiceUnavailable("no available accounts".into()));
         }
@@ -1790,8 +1802,18 @@ impl AccountService {
         if context.is_fable_quota_fallback_active() && account.auth_type == AccountAuthType::Oauth {
             let fable_reset_at = usage
                 .as_ref()
-                .and_then(fable_quota_reset_at)
-                .or_else(|| fable_quota_reset_at(&account.usage_data));
+                .and_then(|usage| {
+                    fable_weekly_usage_limit_reset_at(
+                        usage,
+                        context.fable_weekly_usage_limit_percent,
+                    )
+                })
+                .or_else(|| {
+                    fable_weekly_usage_limit_reset_at(
+                        &account.usage_data,
+                        context.fable_weekly_usage_limit_percent,
+                    )
+                });
             return RateLimitWindowDecision::RetryOtherAccount("Fable 模型级 429", fable_reset_at);
         }
 
@@ -2154,17 +2176,24 @@ fn is_fable_quota_model_id(model: &str) -> bool {
     model == "claude-fable-5" || model.starts_with("claude-fable-5[")
 }
 
-/// 判断账号缓存中的 Fable 周配额是否明确耗尽。
+/// 判断账号缓存中的 Fable 周用量是否达到配置上限。
 ///
 /// @param account 待判断的账号。
-/// @return `seven_day_fable.utilization >= 100` 且 `resets_at` 在未来时返回 `true`。
-pub(crate) fn account_fable_quota_exhausted(account: &Account) -> bool {
+/// @param limit_percent 全局 Fable 周用量百分比上限。
+/// @return OAuth 账号用量达到上限且 `resets_at` 在未来时返回 `true`。
+pub(crate) fn account_fable_weekly_usage_limit_reached(
+    account: &Account,
+    limit_percent: u32,
+) -> bool {
     account.auth_type == AccountAuthType::Oauth
-        && fable_quota_reset_at(&account.usage_data).is_some()
+        && fable_weekly_usage_limit_reset_at(&account.usage_data, limit_percent).is_some()
 }
 
-fn fable_quota_reset_at(usage: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
-    check_usage_window(usage, "seven_day_fable", FABLE_QUOTA_EXHAUSTED_THRESHOLD)
+fn fable_weekly_usage_limit_reset_at(
+    usage: &serde_json::Value,
+    limit_percent: u32,
+) -> Option<chrono::DateTime<Utc>> {
+    check_usage_window(usage, "seven_day_fable", f64::from(limit_percent))
 }
 
 fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
@@ -2935,6 +2964,29 @@ mod tests {
         assert_eq!(result.timestamp(), expected.timestamp());
     }
 
+    #[test]
+    fn fable_weekly_usage_limit_uses_configured_threshold() {
+        let future = rfc3339_at(ChronoDuration::days(3));
+        let account = test_account_with_usage(json!({
+            "seven_day_fable": make_window(json!(49), &future),
+        }));
+
+        assert!(!account_fable_weekly_usage_limit_reached(&account, 50));
+        assert!(account_fable_weekly_usage_limit_reached(&account, 49));
+        assert!(!account_fable_weekly_usage_limit_reached(&account, 100));
+    }
+
+    #[test]
+    fn setup_token_never_reaches_fable_weekly_usage_limit() {
+        let future = rfc3339_at(ChronoDuration::days(3));
+        let mut account = test_account_with_usage(json!({
+            "seven_day_fable": make_window(json!(100), &future),
+        }));
+        account.auth_type = AccountAuthType::SetupToken;
+
+        assert!(!account_fable_weekly_usage_limit_reached(&account, 50));
+    }
+
     // ---- classify_rate_limit ----
 
     #[test]
@@ -3179,10 +3231,11 @@ mod tests {
     #[test]
     fn fable_429_with_cached_fable_quota_hit_retries_other_account_before_credit_passthrough() {
         let account = test_account_with_usage(json!({
-            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+            "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
             fable_quota_fallback_enabled: true,
+            fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
         };
 
@@ -3201,10 +3254,11 @@ mod tests {
     #[test]
     fn fable_429_without_cached_quota_hit_still_retries_other_account() {
         let account = test_account_with_usage(json!({
-            "seven_day_fable": make_window(json!(99), &rfc3339_at(ChronoDuration::days(3))),
+            "seven_day_fable": make_window(json!(49), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
             fable_quota_fallback_enabled: true,
+            fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5[1m]".into()),
         };
 
@@ -3223,10 +3277,11 @@ mod tests {
     #[test]
     fn fable_429_with_retry_after_stays_model_scoped() {
         let account = test_account_with_usage(json!({
-            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+            "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
             fable_quota_fallback_enabled: true,
+            fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
         };
 
@@ -3246,10 +3301,11 @@ mod tests {
     fn fable_429_keeps_common_usage_quarantine_when_common_window_hit() {
         let account = test_account_with_usage(json!({
             "seven_day": make_window(json!(100), &rfc3339_at(ChronoDuration::days(5))),
-            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+            "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
             fable_quota_fallback_enabled: true,
+            fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
         };
 
@@ -3268,11 +3324,12 @@ mod tests {
     #[test]
     fn setup_token_fable_429_keeps_legacy_credit_passthrough() {
         let mut account = test_account_with_usage(json!({
-            "seven_day_fable": make_window(json!(100), &rfc3339_at(ChronoDuration::days(3))),
+            "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         account.auth_type = AccountAuthType::SetupToken;
         let context = AccountSelectionContext {
             fable_quota_fallback_enabled: true,
+            fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
         };
 

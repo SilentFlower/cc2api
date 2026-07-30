@@ -49,8 +49,8 @@ use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
     DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
-    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -406,6 +406,7 @@ pub struct GatewayService {
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
     message_body_order_fingerprint_enabled: RwLock<bool>,
     fable_sticky_quota_fallback_enabled: RwLock<bool>,
+    fable_weekly_usage_limit_percent: RwLock<u32>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
@@ -460,6 +461,9 @@ impl GatewayService {
             ),
             fable_sticky_quota_fallback_enabled: RwLock::new(
                 default_fable_sticky_quota_fallback_enabled(),
+            ),
+            fable_weekly_usage_limit_percent: RwLock::new(
+                default_fable_weekly_usage_limit_percent(),
             ),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
             disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
@@ -713,6 +717,24 @@ impl GatewayService {
             )
             .await?;
         *self.fable_sticky_quota_fallback_enabled.write().await = parse_setting_flag(&raw);
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Fable 周用量百分比上限。
+    ///
+    /// 非法存量值回退到默认值,避免旧数据库脏配置让 `/v1/messages` 热路径失败。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
+    pub async fn reload_fable_weekly_usage_limit_percent(&self) -> Result<(), AppError> {
+        let raw = self
+            .settings_store
+            .get_value(
+                "fable_weekly_usage_limit_percent",
+                DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT,
+            )
+            .await?;
+        *self.fable_weekly_usage_limit_percent.write().await =
+            parse_fable_weekly_usage_limit_percent(&raw);
         Ok(())
     }
 
@@ -1024,6 +1046,14 @@ impl GatewayService {
     #[cfg(test)]
     pub(crate) async fn session_hello_probe_config_for_test(&self) -> SessionHelloProbeConfig {
         *self.session_hello_probe_config.read().await
+    }
+
+    /// 返回测试使用的 Fable 周用量百分比上限。
+    ///
+    /// @return 当前热加载的百分比上限。
+    #[cfg(test)]
+    pub(crate) async fn fable_weekly_usage_limit_percent_for_test(&self) -> u32 {
+        *self.fable_weekly_usage_limit_percent.read().await
     }
 
     /// 从全局设置刷新客户端访问策略。
@@ -1445,8 +1475,10 @@ impl GatewayService {
             .map(str::to_string);
         let fable_quota_fallback_enabled =
             path == "/v1/messages" && *self.fable_sticky_quota_fallback_enabled.read().await;
+        let fable_weekly_usage_limit_percent = *self.fable_weekly_usage_limit_percent.read().await;
         let account_selection_context = AccountSelectionContext {
             fable_quota_fallback_enabled,
+            fable_weekly_usage_limit_percent,
             request_model,
         };
 
@@ -4796,6 +4828,22 @@ fn default_fable_sticky_quota_fallback_enabled() -> bool {
     parse_setting_flag(DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED)
 }
 
+/// 解析 Fable 周用量百分比上限,非法值回退默认配置。
+fn parse_fable_weekly_usage_limit_percent(raw: &str) -> u32 {
+    raw.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or_else(default_fable_weekly_usage_limit_percent)
+}
+
+/// 构造 Fable 周用量百分比上限初始值。
+fn default_fable_weekly_usage_limit_percent() -> u32 {
+    DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT
+        .parse::<u32>()
+        .expect("默认 Fable 周用量百分比上限必须是整数")
+}
+
 /// 构造预热请求拦截配置初始值(reload 之前的兜底,与设置默认值保持一致)。
 fn default_warmup_intercept_config() -> WarmupInterceptConfig {
     WarmupInterceptConfig {
@@ -6151,8 +6199,9 @@ mod tests {
         buffered_error_body_for_downstream, buffered_response_body_for_downstream,
         build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
         cached_non_stream_probe_response, classify_non_stream_probe_text,
-        detect_auto_mode_classifier_request, detect_non_stream_probe_type, detect_warmup_intercept,
-        extract_message_session_id, extract_passive_usage, extract_rejected_passive_usage_windows,
+        default_fable_weekly_usage_limit_percent, detect_auto_mode_classifier_request,
+        detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
+        extract_passive_usage, extract_rejected_passive_usage_windows,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
         is_signature_related_error_body, is_signature_related_error_response_body,
@@ -6405,6 +6454,42 @@ mod tests {
         assert_eq!(config.timeout, std::time::Duration::from_secs(7));
         assert_eq!(config.success_ttl, std::time::Duration::from_secs(7200));
         assert_eq!(config.failure_cooldown, std::time::Duration::from_secs(600));
+    }
+
+    #[tokio::test]
+    async fn fable_weekly_usage_limit_setting_reloads_and_rejects_dirty_stored_value() {
+        let service = test_gateway_service().await;
+        let mut settings = std::collections::HashMap::from([(
+            "fable_weekly_usage_limit_percent".into(),
+            "75".into(),
+        )]);
+        service
+            .settings_store
+            .upsert_many(&settings)
+            .await
+            .expect("写入 Fable 周用量上限");
+
+        service
+            .reload_fable_weekly_usage_limit_percent()
+            .await
+            .expect("热加载 Fable 周用量上限");
+        assert_eq!(*service.fable_weekly_usage_limit_percent.read().await, 75);
+
+        settings.insert("fable_weekly_usage_limit_percent".into(), "invalid".into());
+        service
+            .settings_store
+            .upsert_many(&settings)
+            .await
+            .expect("写入非法 Fable 周用量上限");
+        service
+            .reload_fable_weekly_usage_limit_percent()
+            .await
+            .expect("非法存量值应回退默认配置");
+
+        assert_eq!(
+            *service.fable_weekly_usage_limit_percent.read().await,
+            default_fable_weekly_usage_limit_percent()
+        );
     }
 
     #[tokio::test]

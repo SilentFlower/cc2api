@@ -262,6 +262,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "fable_sticky_quota_fallback_enabled",
             crate::store::settings_store::DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
         ),
+        // Fable 周用量达到全局控制线后停止继续分配新请求,默认保留一半额度。
+        (
+            "fable_weekly_usage_limit_percent",
+            crate::store::settings_store::DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT,
+        ),
         // 代理 reqwest Client 连接池默认开启,可通过设置页关闭用于排查连接复用问题。
         (
             "proxy_client_pool_enabled",
@@ -1118,6 +1123,23 @@ mod tests {
         assert_eq!(
             enabled,
             crate::store::settings_store::DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_fable_weekly_usage_limit_percent_default() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let percent: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("fable_weekly_usage_limit_percent")
+            .fetch_one(&pool)
+            .await
+            .expect("fable weekly usage limit percent setting");
+
+        assert_eq!(
+            percent,
+            crate::store::settings_store::DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT
         );
     }
 

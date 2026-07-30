@@ -103,8 +103,17 @@ async fn wait_for_stable_rpm_window() {
 }
 
 fn fable_selection_context(enabled: bool, model: &str) -> AccountSelectionContext {
+    fable_selection_context_with_limit(enabled, model, 50)
+}
+
+fn fable_selection_context_with_limit(
+    enabled: bool,
+    model: &str,
+    limit_percent: u32,
+) -> AccountSelectionContext {
     AccountSelectionContext {
         fable_quota_fallback_enabled: enabled,
+        fable_weekly_usage_limit_percent: limit_percent,
         request_model: Some(model.into()),
     }
 }
@@ -383,7 +392,7 @@ async fn test_non_sticky_selection_skips_rpm_saturated_account() {
 }
 
 #[tokio::test]
-async fn test_fable_sticky_exhausted_selects_alternative_account() {
+async fn test_fable_sticky_at_limit_selects_alternative_account() {
     let (_store, svc) = setup().await;
     let mut a1 = create_test_account(&svc, "fable-sticky-full@example.com").await;
     let mut a2 = create_test_account(&svc, "fable-sticky-free@example.com").await;
@@ -395,7 +404,7 @@ async fn test_fable_sticky_exhausted_selects_alternative_account() {
     mark_oauth_account(&svc, &mut a2).await;
     svc.update_passive_usage(
         a1.id,
-        fable_usage_window(100, Duration::days(3)),
+        fable_usage_window(50, Duration::days(3)),
         UsageObservationKind::Allowed,
     )
     .await
@@ -434,6 +443,45 @@ async fn test_fable_sticky_exhausted_selects_alternative_account() {
         .unwrap();
     assert_eq!(rebound.account.id, a2.id);
     assert!(rebound.sticky);
+}
+
+#[tokio::test]
+async fn test_fable_sticky_below_limit_keeps_original_account() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-sticky-below@example.com").await;
+    let mut a2 = create_test_account(&svc, "fable-sticky-spare@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(49, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
+
+    let session_hash = "fable-sticky-below-limit-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
+    assert!(!selected.should_bind_session);
 }
 
 #[tokio::test]
@@ -602,7 +650,7 @@ async fn test_non_sticky_fable_selection_filters_exhausted_accounts() {
     mark_oauth_account(&svc, &mut a2).await;
     svc.update_passive_usage(
         a1.id,
-        fable_usage_window(100, Duration::days(3)),
+        fable_usage_window(50, Duration::days(3)),
         UsageObservationKind::Allowed,
     )
     .await
@@ -620,6 +668,76 @@ async fn test_non_sticky_fable_selection_filters_exhausted_accounts() {
     assert_eq!(selected.account.id, a2.id);
     assert!(!selected.sticky);
     assert!(!selected.should_bind_session);
+}
+
+#[tokio::test]
+async fn test_non_sticky_fable_selection_returns_429_when_all_accounts_reach_limit() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-all-limit-a@example.com").await;
+    let mut a2 = create_test_account(&svc, "fable-all-limit-b@example.com").await;
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    for account in [&a1, &a2] {
+        svc.update_passive_usage(
+            account.id,
+            fable_usage_window(50, Duration::days(3)),
+            UsageObservationKind::Allowed,
+        )
+        .await
+        .unwrap();
+    }
+
+    let result = svc
+        .select_account_with_selection_context(
+            "",
+            &[],
+            &[],
+            &fable_selection_context(true, "claude-fable-5"),
+        )
+        .await;
+
+    match result.unwrap_err() {
+        AppError::TooManyRequests(message) => assert!(message.contains("50%")),
+        error => panic!("expected TooManyRequests, got: {:?}", error),
+    }
+}
+
+#[tokio::test]
+async fn test_fable_limit_100_preserves_previous_exhaustion_boundary() {
+    let (_store, svc) = setup().await;
+    let mut a1 = create_test_account(&svc, "fable-limit-100@example.com").await;
+    let mut a2 = create_test_account(&svc, "fable-limit-100-spare@example.com").await;
+    a1.priority = 10;
+    a2.priority = 20;
+    svc.update_account(&a1).await.unwrap();
+    svc.update_account(&a2).await.unwrap();
+    mark_oauth_account(&svc, &mut a1).await;
+    mark_oauth_account(&svc, &mut a2).await;
+    svc.update_passive_usage(
+        a1.id,
+        fable_usage_window(99, Duration::days(3)),
+        UsageObservationKind::Allowed,
+    )
+    .await
+    .unwrap();
+
+    let session_hash = "fable-limit-100-session";
+    svc.bind_selected_session(session_hash, a1.id)
+        .await
+        .unwrap();
+
+    let selected = svc
+        .select_account_with_selection_context(
+            session_hash,
+            &[],
+            &[],
+            &fable_selection_context_with_limit(true, "claude-fable-5", 100),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(selected.account.id, a1.id);
+    assert!(selected.sticky);
 }
 
 #[tokio::test]

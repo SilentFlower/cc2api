@@ -141,6 +141,10 @@ async fn main() {
         .await
         .expect("load fable sticky quota fallback setting failed");
     gateway_svc
+        .reload_fable_weekly_usage_limit_percent()
+        .await
+        .expect("load fable weekly usage limit percent setting failed");
+    gateway_svc
         .reload_warmup_intercept_config()
         .await
         .expect("load warmup intercept config failed");

@@ -41,8 +41,8 @@ use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
     DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
-    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
-    DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
+    DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
+    DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
@@ -933,6 +933,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("fable_sticky_quota_fallback_enabled".into())
         .or_insert_with(|| DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED.to_string());
     settings
+        .entry("fable_weekly_usage_limit_percent".into())
+        .or_insert_with(|| DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT.to_string());
+    settings
         .entry("proxy_client_pool_enabled".into())
         .or_insert_with(|| DEFAULT_PROXY_CLIENT_POOL_ENABLED.to_string());
     settings
@@ -1136,6 +1139,9 @@ async fn update_settings(
             ));
         }
     }
+    if let Some(val) = body.get("fable_weekly_usage_limit_percent") {
+        validate_usize_range("fable_weekly_usage_limit_percent", val, 1, 100)?;
+    }
     for key in &[
         "intercept_warmup_title_enabled",
         "intercept_warmup_suggestion_enabled",
@@ -1244,6 +1250,12 @@ async fn update_settings(
         state
             .gateway_svc
             .reload_fable_sticky_quota_fallback_enabled()
+            .await?;
+    }
+    if body.contains_key("fable_weekly_usage_limit_percent") {
+        state
+            .gateway_svc
+            .reload_fable_weekly_usage_limit_percent()
             .await?;
     }
     if body.contains_key("claude_code_context_sanitizer_mode") {
@@ -1549,6 +1561,84 @@ mod tests {
         assert_eq!(value["session_hello_probe_timeout_secs"], "5");
         assert_eq!(value["session_hello_probe_success_ttl_secs"], "3600");
         assert_eq!(value["session_hello_probe_failure_cooldown_secs"], "300");
+    }
+
+    #[tokio::test]
+    async fn settings_return_fable_weekly_usage_limit_default() {
+        let response = test_router()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["fable_weekly_usage_limit_percent"], "50");
+    }
+
+    #[tokio::test]
+    async fn settings_reject_invalid_fable_weekly_usage_limits() {
+        for value in ["0", "101", "50.5", "invalid"] {
+            let response = test_router()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "fable_weekly_usage_limit_percent": value
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "value={value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_update_hot_reloads_fable_weekly_usage_limit() {
+        let (app, gateway_svc) = test_router_with_gateway().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "fable_weekly_usage_limit_percent": "75"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gateway_svc
+                .fable_weekly_usage_limit_percent_for_test()
+                .await,
+            75
+        );
     }
 
     #[tokio::test]
