@@ -105,6 +105,17 @@ const logsLoading = ref(false);
 const saving = ref(false);
 const loaded = ref(false);
 
+/** 将 number input 或历史响应带来的非字符串值统一成表单字符串。 */
+function formString(value: unknown): string {
+  if (value == null) return '';
+  return typeof value === 'string' ? value : String(value);
+}
+
+/** 读取表单字符串并去掉首尾空白，避免对 number 直接调用 trim。 */
+function trimFormString(value: unknown): string {
+  return formString(value).trim();
+}
+
 interface ClaudeCodeVersionProfileOption {
   key: string;
   version: string;
@@ -175,12 +186,12 @@ const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
 
 /** 权重总和 */
 const totalWeight = computed(() => {
-  return parseFloat(w7d.value || '0') + parseFloat(w5h.value || '0') + parseFloat(wconc.value || '0');
+  return parseFloat(formString(w7d.value) || '0') + parseFloat(formString(w5h.value) || '0') + parseFloat(formString(wconc.value) || '0');
 });
 
 /** 单个权重是否合法（非负有限数） */
-function isValidWeight(v: string): boolean {
-  const n = parseFloat(v);
+function isValidWeight(v: unknown): boolean {
+  const n = parseFloat(formString(v));
   return !isNaN(n) && isFinite(n) && n >= 0;
 }
 
@@ -191,7 +202,7 @@ const allValid = computed(() => {
 
 /** Fable 周用量百分比上限是否合法 */
 const isValidFableWeeklyUsageLimitPercent = computed(() => {
-  const raw = fableWeeklyUsageLimitPercent.value.trim();
+  const raw = trimFormString(fableWeeklyUsageLimitPercent.value);
   if (!/^\d+$/.test(raw)) return false;
   const value = Number(raw);
   return Number.isSafeInteger(value) && value >= 1 && value <= 100;
@@ -254,7 +265,7 @@ function formatTelemetryShape(shape: string): string {
 
 /** 预热小时输入是否合法(逗号分隔的 0-23,允许空) */
 const isValidHours = computed(() => {
-  const raw = primeHours.value.trim();
+  const raw = trimFormString(primeHours.value);
   if (!raw) return true;
   return raw.split(',').every((s) => {
     const t = s.trim();
@@ -265,11 +276,11 @@ const isValidHours = computed(() => {
 });
 
 /** 预热模型不能为空 */
-const isValidModel = computed(() => primeModel.value.trim().length > 0);
+const isValidModel = computed(() => trimFormString(primeModel.value).length > 0);
 
 /** 系统角色模型列表是否合法 */
 const isValidSystemRoleModels = computed(() => {
-  const raw = allowSystemRoleModels.value.trim();
+  const raw = trimFormString(allowSystemRoleModels.value);
   if (!raw) return true;
   return raw.split(',').every((s) => {
     const model = s.trim();
@@ -300,7 +311,7 @@ const isValidBlockedClaudeCodeVersions = computed(() => isValidClaudeCodeVersion
 
 /** UA pattern 列表是否合法 */
 const isValidAllowedUserAgents = computed(() => {
-  const raw = allowedUserAgents.value.trim();
+  const raw = trimFormString(allowedUserAgents.value);
   if (!raw) return true;
   return raw.split(/[,\n\r]+/).every((s) => {
     const pattern = s.trim();
@@ -310,7 +321,7 @@ const isValidAllowedUserAgents = computed(() => {
 
 /** thinking.type=disabled 改写模型列表是否合法 */
 const isValidRewriteDisabledThinkingModels = computed(() => {
-  const raw = rewriteDisabledThinkingModels.value.trim();
+  const raw = trimFormString(rewriteDisabledThinkingModels.value);
   if (!raw) return true;
   return raw.split(',').every((s) => {
     const model = s.trim();
@@ -320,7 +331,7 @@ const isValidRewriteDisabledThinkingModels = computed(() => {
 
 /** assistant prefill 拦截模型列表是否合法 */
 const isValidInterceptAssistantPrefillModels = computed(() => {
-  const raw = interceptAssistantPrefillModels.value.trim();
+  const raw = trimFormString(interceptAssistantPrefillModels.value);
   if (!raw) return true;
   return raw.split(',').every((s) => {
     const model = s.trim();
@@ -330,7 +341,7 @@ const isValidInterceptAssistantPrefillModels = computed(() => {
 
 /** 429 请求体日志字符上限是否合法 */
 const isValidLog429RequestBodyLimit = computed(() => {
-  const raw = log429RequestBodyLimit.value.trim();
+  const raw = trimFormString(log429RequestBodyLimit.value);
   if (!/^\d+$/.test(raw)) return false;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 0 && n <= 1048576;
@@ -338,7 +349,7 @@ const isValidLog429RequestBodyLimit = computed(() => {
 
 /** 流式 keep-alive 间隔是否合法 */
 const isValidStreamKeepaliveIntervalSecs = computed(() => {
-  const raw = streamKeepaliveIntervalSecs.value.trim();
+  const raw = trimFormString(streamKeepaliveIntervalSecs.value);
   if (!/^\d+$/.test(raw)) return false;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 5 && n <= 240;
@@ -346,7 +357,7 @@ const isValidStreamKeepaliveIntervalSecs = computed(() => {
 
 /** 上游流静默超时是否合法 */
 const isValidStreamUpstreamIdleTimeoutSecs = computed(() => {
-  const raw = streamUpstreamIdleTimeoutSecs.value.trim();
+  const raw = trimFormString(streamUpstreamIdleTimeoutSecs.value);
   if (!/^\d+$/.test(raw)) return false;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 30 && n <= 1800;
@@ -354,7 +365,7 @@ const isValidStreamUpstreamIdleTimeoutSecs = computed(() => {
 
 /** Session Hello 探测超时是否合法 */
 const isValidSessionHelloProbeTimeoutSecs = computed(() => {
-  const raw = sessionHelloProbeTimeoutSecs.value.trim();
+  const raw = trimFormString(sessionHelloProbeTimeoutSecs.value);
   if (!/^\d+$/.test(raw)) return false;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 1 && n <= 30;
@@ -362,7 +373,7 @@ const isValidSessionHelloProbeTimeoutSecs = computed(() => {
 
 /** Session Hello 成功状态 TTL 是否合法 */
 const isValidSessionHelloProbeSuccessTtlSecs = computed(() => {
-  const raw = sessionHelloProbeSuccessTtlSecs.value.trim();
+  const raw = trimFormString(sessionHelloProbeSuccessTtlSecs.value);
   if (!/^\d+$/.test(raw)) return false;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 60 && n <= 86400;
@@ -370,7 +381,7 @@ const isValidSessionHelloProbeSuccessTtlSecs = computed(() => {
 
 /** Session Hello 失败冷却是否设置在支持范围内 */
 const isValidSessionHelloProbeFailureCooldownSecs = computed(() => {
-  const raw = sessionHelloProbeFailureCooldownSecs.value.trim();
+  const raw = trimFormString(sessionHelloProbeFailureCooldownSecs.value);
   if (!/^\d+$/.test(raw)) return false;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 10 && n <= 3600;
@@ -378,7 +389,7 @@ const isValidSessionHelloProbeFailureCooldownSecs = computed(() => {
 
 /** bootstrap 模型选项 JSON 是否合法 */
 const isValidBootstrapAdditionalModelOptions = computed(() => {
-  const raw = bootstrapAdditionalModelOptions.value.trim();
+  const raw = trimFormString(bootstrapAdditionalModelOptions.value);
   if (!raw) return true;
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -547,15 +558,15 @@ async function saveSettings() {
       score_weight_5h: String(w5h.value),
       score_weight_concurrency: String(wconc.value),
       fable_sticky_quota_fallback_enabled: fableStickyQuotaFallbackEnabled.value ? 'true' : 'false',
-      fable_weekly_usage_limit_percent: fableWeeklyUsageLimitPercent.value.trim(),
+      fable_weekly_usage_limit_percent: trimFormString(fableWeeklyUsageLimitPercent.value),
       peak_prime_enabled: primeEnabled.value ? 'true' : 'false',
-      peak_prime_hours: primeHours.value.trim(),
-      peak_prime_model: primeModel.value.trim(),
-      allow_system_role_models: allowSystemRoleModels.value.trim(),
+      peak_prime_hours: trimFormString(primeHours.value),
+      peak_prime_model: trimFormString(primeModel.value),
+      allow_system_role_models: trimFormString(allowSystemRoleModels.value),
       claude_code_version_profile: claudeCodeVersionProfile.value,
-      allowed_claude_code_versions: allowedClaudeCodeVersions.value.trim(),
-      blocked_claude_code_versions: blockedClaudeCodeVersions.value.trim(),
-      allowed_user_agents: allowedUserAgents.value.trim(),
+      allowed_claude_code_versions: trimFormString(allowedClaudeCodeVersions.value),
+      blocked_claude_code_versions: trimFormString(blockedClaudeCodeVersions.value),
+      allowed_user_agents: trimFormString(allowedUserAgents.value),
       claude_code_context_sanitizer_mode: claudeCodeContextSanitizerMode.value,
       passthrough_shell: passthroughShell.value ? 'true' : 'false',
       passthrough_os_version: passthroughOsVersion.value ? 'true' : 'false',
@@ -566,22 +577,22 @@ async function saveSettings() {
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
       session_hello_probe_enabled: sessionHelloProbeEnabled.value ? 'true' : 'false',
       session_hello_probe_strict: sessionHelloProbeStrict.value ? 'true' : 'false',
-      session_hello_probe_timeout_secs: sessionHelloProbeTimeoutSecs.value.trim(),
-      session_hello_probe_success_ttl_secs: sessionHelloProbeSuccessTtlSecs.value.trim(),
-      session_hello_probe_failure_cooldown_secs: sessionHelloProbeFailureCooldownSecs.value.trim(),
+      session_hello_probe_timeout_secs: trimFormString(sessionHelloProbeTimeoutSecs.value),
+      session_hello_probe_success_ttl_secs: trimFormString(sessionHelloProbeSuccessTtlSecs.value),
+      session_hello_probe_failure_cooldown_secs: trimFormString(sessionHelloProbeFailureCooldownSecs.value),
       rewrite_disabled_thinking_enabled: rewriteDisabledThinkingEnabled.value ? 'true' : 'false',
-      rewrite_disabled_thinking_models: rewriteDisabledThinkingModels.value.trim(),
+      rewrite_disabled_thinking_models: trimFormString(rewriteDisabledThinkingModels.value),
       intercept_assistant_prefill_enabled: interceptAssistantPrefillEnabled.value ? 'true' : 'false',
-      intercept_assistant_prefill_models: interceptAssistantPrefillModels.value.trim(),
+      intercept_assistant_prefill_models: trimFormString(interceptAssistantPrefillModels.value),
       log_429_request_enabled: log429RequestEnabled.value ? 'true' : 'false',
       log_non_stream_request_enabled: logNonStreamRequestEnabled.value ? 'true' : 'false',
       non_stream_probe_cache_enabled: nonStreamProbeCacheEnabled.value ? 'true' : 'false',
-      log_429_request_body_limit: log429RequestBodyLimit.value.trim(),
+      log_429_request_body_limit: trimFormString(log429RequestBodyLimit.value),
       stream_keepalive_enabled: streamKeepaliveEnabled.value ? 'true' : 'false',
-      stream_keepalive_interval_secs: streamKeepaliveIntervalSecs.value.trim(),
-      stream_upstream_idle_timeout_secs: streamUpstreamIdleTimeoutSecs.value.trim(),
+      stream_keepalive_interval_secs: trimFormString(streamKeepaliveIntervalSecs.value),
+      stream_upstream_idle_timeout_secs: trimFormString(streamUpstreamIdleTimeoutSecs.value),
       bootstrap_model_options_mode: bootstrapModelOptionsMode.value,
-      bootstrap_additional_model_options: bootstrapAdditionalModelOptions.value.trim(),
+      bootstrap_additional_model_options: trimFormString(bootstrapAdditionalModelOptions.value),
       intercept_warmup_title_enabled: interceptWarmupTitleEnabled.value ? 'true' : 'false',
       intercept_warmup_suggestion_enabled: interceptWarmupSuggestionEnabled.value ? 'true' : 'false',
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',

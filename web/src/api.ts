@@ -178,6 +178,23 @@ export interface PrimeLogEntry {
 
 export type SettingsMap = Record<string, string>
 
+type RawSettingsMap = Record<string, unknown>
+
+/** 将历史或代理返回的非字符串 settings 值规整为前端表单契约使用的字符串。 */
+function normalizeSettingsMap(data: RawSettingsMap): SettingsMap {
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => {
+      if (typeof value === 'string') return [key, value]
+      if (value == null) return [key, '']
+      if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+        return [key, String(value)]
+      }
+      const encoded = JSON.stringify(value)
+      return [key, encoded ?? String(value)]
+    }),
+  )
+}
+
 export const api = {
   listAccounts: (page = 1, pageSize = 12) =>
     request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
@@ -203,7 +220,7 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
 
   // 设置
-  getSettings: () => request<SettingsMap>('GET', '/admin/settings'),
+  getSettings: () => request<RawSettingsMap>('GET', '/admin/settings').then(normalizeSettingsMap),
   updateSettings: (data: SettingsMap) => request<{ ok: boolean }>('PUT', '/admin/settings', data),
 
   // 峰值预热日志
