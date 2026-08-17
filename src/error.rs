@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tracing::error;
 
+/// 应用统一错误类型及其 HTTP 响应映射。
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("not found")]
@@ -17,6 +18,9 @@ pub enum AppError {
     BadGateway(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// 账号凭据已永久失效，需要停用账号并由管理员重新授权。
+    #[error("permanent credential failure: {0}")]
+    PermanentCredential(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -39,6 +43,7 @@ impl IntoResponse for AppError {
             AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, ""),
             AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, ""),
             AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, ""),
+            AppError::PermanentCredential(_) => (StatusCode::SERVICE_UNAVAILABLE, ""),
             AppError::Internal(detail) => {
                 error!("internal error: {}", detail);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")

@@ -11,6 +11,8 @@ use serde_json::{Map, Value, json};
 
 pub(crate) const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const OAUTH_ERROR_BODY_LIMIT: usize = 4 * 1024;
+const OAUTH_ERROR_CODE_LIMIT: usize = 64;
 const OAUTH_SCOPES: &[&str] = &[
     "user:profile",
     "user:inference",
@@ -33,6 +35,57 @@ struct OAuthRefreshResponse {
     refresh_token: String,
     #[serde(default)]
     expires_in: i64,
+}
+
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    #[serde(default)]
+    error: String,
+}
+
+async fn read_oauth_error_body(mut response: reqwest::Response) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < OAUTH_ERROR_BODY_LIMIT {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = OAUTH_ERROR_BODY_LIMIT - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    body
+}
+
+fn parse_oauth_error_code(body: &[u8]) -> Option<String> {
+    let code = serde_json::from_slice::<OAuthErrorResponse>(body)
+        .ok()?
+        .error;
+    let code = code.trim();
+    if code.is_empty()
+        || code.len() > OAUTH_ERROR_CODE_LIMIT
+        || !code
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return None;
+    }
+    Some(code.to_string())
+}
+
+fn classify_oauth_refresh_error(status: reqwest::StatusCode, body: &[u8]) -> AppError {
+    let error_code = parse_oauth_error_code(body);
+    let summary = match error_code.as_deref() {
+        Some(code) => format!("OAuth refresh rejected: status {} error={}", status, code),
+        None => format!("OAuth refresh rejected: status {}", status),
+    };
+    let permanent_invalid_grant = status.is_client_error()
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && error_code.as_deref() == Some("invalid_grant");
+    if permanent_invalid_grant {
+        AppError::PermanentCredential(summary)
+    } else {
+        AppError::Internal(summary)
+    }
 }
 
 /// 通过轻量级 API 调用验证 Setup Token。
@@ -162,11 +215,8 @@ pub(crate) async fn refresh_oauth_token_at(
 
     if resp.status() != 200 {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "oauth refresh failed: status {} {}",
-            status, text
-        )));
+        let body = read_oauth_error_body(resp).await;
+        return Err(classify_oauth_refresh_error(status, &body));
     }
 
     let data: OAuthRefreshResponse = resp
@@ -352,6 +402,52 @@ mod tests {
         assert!(
             !request_header(&rollback, "anthropic-beta").contains("fallback-credit-2026-06-01")
         );
+    }
+
+    #[test]
+    fn invalid_grant_is_classified_as_permanent_without_description() {
+        let error = classify_oauth_refresh_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"error":"invalid_grant","error_description":"fixture secret detail"}"#,
+        );
+
+        assert!(matches!(&error, AppError::PermanentCredential(_)));
+        let message = error.to_string();
+        assert!(message.contains("status 400"));
+        assert!(message.contains("invalid_grant"));
+        assert!(!message.contains("fixture secret detail"));
+    }
+
+    #[test]
+    fn unclassified_oauth_error_remains_transient_and_sanitized() {
+        let error = classify_oauth_refresh_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":"temporarily_unavailable","error_description":"fixture response body"}"#,
+        );
+
+        assert!(matches!(&error, AppError::Internal(_)));
+        let message = error.to_string();
+        assert!(message.contains("status 429"));
+        assert!(message.contains("temporarily_unavailable"));
+        assert!(!message.contains("fixture response body"));
+    }
+
+    #[test]
+    fn transient_http_statuses_override_invalid_grant_code() {
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let error = classify_oauth_refresh_error(
+                status,
+                br#"{"error":"invalid_grant","error_description":"fixture transient detail"}"#,
+            );
+
+            assert!(matches!(&error, AppError::Internal(_)));
+            let message = error.to_string();
+            assert!(message.contains("invalid_grant"));
+            assert!(!message.contains("fixture transient detail"));
+        }
     }
 
     #[test]

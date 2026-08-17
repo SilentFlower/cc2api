@@ -1341,6 +1341,16 @@ impl GatewayService {
 
             let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
                 Ok(token) => token,
+                Err(AppError::PermanentCredential(reason)) => {
+                    self.disable_account_after_permanent_credential_failure(
+                        &account,
+                        &reason,
+                        "count_tokens",
+                    )
+                    .await?;
+                    exclude_ids.push(account.id);
+                    continue;
+                }
                 Err(e) => {
                     warn!(
                         "count_tokens upstream token resolve failed: account={} error={}",
@@ -1487,6 +1497,7 @@ impl GatewayService {
         let mut backoff_retry_ids: Vec<i64> = Vec::new();
         let mut last_resp: Option<Response> = None;
         let mut auth_failure_excluded = false;
+        let mut permanent_credential_excluded = false;
 
         loop {
             let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
@@ -1509,6 +1520,13 @@ impl GatewayService {
                         selected.account.name
                     );
                     selected
+                }
+                Err(_) if permanent_credential_excluded => {
+                    return Ok(anthropic_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "Service temporarily unavailable",
+                    ));
                 }
                 Err(_) if last_resp.is_some() => {
                     // 无可用账号但有上一次的 429 响应，返回给客户端
@@ -1786,6 +1804,16 @@ impl GatewayService {
             let upstream_token = if requires_upstream_authorization(&path) {
                 match self.account_svc.resolve_upstream_token(account.id).await {
                     Ok(t) => Some(t),
+                    Err(AppError::PermanentCredential(reason)) => {
+                        self.disable_account_after_permanent_credential_failure(
+                            &account, &reason, "gateway",
+                        )
+                        .await?;
+                        permanent_credential_excluded = true;
+                        exclude_ids.push(account.id);
+                        drop(slot_guard);
+                        continue;
+                    }
                     Err(e) => {
                         // SlotReleaseGuard drop 会自动释放槽位
                         return Err(e);
@@ -2595,6 +2623,21 @@ impl GatewayService {
             .disable_for_auth_failure(account.id, "401 OAuth 刷新后仍认证失败")
             .await
     }
+
+    async fn disable_account_after_permanent_credential_failure(
+        &self,
+        account: &Account,
+        reason: &str,
+        request_kind: &str,
+    ) -> Result<(), AppError> {
+        warn!(
+            "account {} has permanent credential failure before {} forwarding: {}",
+            account.id, request_kind, reason
+        );
+        self.account_svc
+            .disable_for_auth_failure(account.id, reason)
+            .await
+    }
 }
 
 fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
@@ -2755,6 +2798,11 @@ fn count_tokens_app_error_response(err: AppError) -> Response {
             "Upstream request failed",
         ),
         AppError::ServiceUnavailable(_) => anthropic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "Service temporarily unavailable",
+        ),
+        AppError::PermanentCredential(_) => anthropic_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             "Service temporarily unavailable",
@@ -6705,6 +6753,7 @@ mod tests {
     struct AuthMockState {
         authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
         refresh_calls: Arc<AtomicUsize>,
+        refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
         hello_calls: Arc<AtomicUsize>,
         hello_status: Arc<AtomicU16>,
     }
@@ -6856,6 +6905,17 @@ mod tests {
             )
                 .into_response();
         }
+        if authorization == "Bearer setup-rate-limited" {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "3600")],
+                Json(json!({
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": "fixture rate limited"}
+                })),
+            )
+                .into_response();
+        }
 
         (
             StatusCode::OK,
@@ -6871,13 +6931,59 @@ mod tests {
             .into_response()
     }
 
-    async fn mock_oauth_refresh(State(state): State<AuthMockState>) -> Json<serde_json::Value> {
+    async fn mock_oauth_refresh(
+        State(state): State<AuthMockState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
         state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        let refresh_token = body
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        state
+            .refresh_tokens
+            .lock()
+            .await
+            .push(refresh_token.clone());
+
+        if refresh_token.starts_with("refresh-invalid") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_grant",
+                    "error_description": "fixture refresh token expired"
+                })),
+            )
+                .into_response();
+        }
+        if refresh_token == "refresh-rate-limited" {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "fixture endpoint overload"
+                })),
+            )
+                .into_response();
+        }
+        if refresh_token == "refresh-server-error" {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "fixture endpoint unavailable"
+                })),
+            )
+                .into_response();
+        }
+
         Json(json!({
             "access_token": "access-refreshed",
             "refresh_token": "refresh-refreshed",
             "expires_in": 3600
         }))
+        .into_response()
     }
 
     async fn mock_hello_response(State(state): State<AuthMockState>) -> StatusCode {
@@ -6930,6 +7036,16 @@ mod tests {
         upstream_base: String,
         oauth_token_url: String,
     ) -> GatewayService {
+        test_gateway_service_with_cache_store_and_urls(cache, upstream_base, oauth_token_url)
+            .await
+            .0
+    }
+
+    async fn test_gateway_service_with_cache_store_and_urls(
+        cache: Arc<dyn CacheStore>,
+        upstream_base: String,
+        oauth_token_url: String,
+    ) -> (GatewayService, Arc<AccountStore>) {
         sqlx::any::install_default_drivers();
         let tmp =
             std::env::temp_dir().join(format!("ccgw_gateway_unit_{}.db", rand::random::<u64>()));
@@ -6946,7 +7062,10 @@ mod tests {
             settings_store.clone(),
             oauth_token_url,
         ));
-        let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
+        let telemetry_svc = Arc::new(TelemetryService::new(
+            account_store.clone(),
+            account_svc.clone(),
+        ));
         let mut service = GatewayService::new(
             account_svc,
             Arc::new(crate::service::rewriter::Rewriter::new()),
@@ -6955,7 +7074,7 @@ mod tests {
             cache,
         );
         service.upstream_base = upstream_base;
-        service
+        (service, account_store)
     }
 
     async fn create_gateway_account(
@@ -6997,12 +7116,32 @@ mod tests {
         email: &str,
         access_token: &str,
     ) -> Account {
+        create_oauth_gateway_account_with_credentials(
+            service,
+            email,
+            access_token,
+            "refresh-old",
+            Utc::now() + chrono::Duration::hours(1),
+            50,
+        )
+        .await
+    }
+
+    async fn create_oauth_gateway_account_with_credentials(
+        service: &GatewayService,
+        email: &str,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: chrono::DateTime<Utc>,
+        priority: i32,
+    ) -> Account {
         let mut account = create_gateway_account(service, email, 1, 0).await;
         account.auth_type = AccountAuthType::Oauth;
         account.setup_token.clear();
         account.access_token = access_token.into();
-        account.refresh_token = "refresh-old".into();
-        account.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        account.refresh_token = refresh_token.into();
+        account.expires_at = Some(expires_at);
+        account.priority = priority;
         service.account_svc.update_account(&account).await.unwrap();
         account
     }
@@ -7117,6 +7256,481 @@ mod tests {
         let stored = service.account_svc.get_account(account.id).await.unwrap();
         assert_eq!(stored.status, AccountStatus::Active);
         assert_eq!(stored.access_token, "access-refreshed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_invalid_grant_disables_and_switches_gateway_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let rejected = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-invalid@example.com",
+            "fixture-access-invalid",
+            "refresh-invalid",
+            Utc::now() + chrono::Duration::minutes(1),
+            10,
+        )
+        .await;
+        service
+            .account_svc
+            .set_rate_limit(rejected.id, Utc::now() - chrono::Duration::minutes(1))
+            .await
+            .unwrap();
+        let accepted =
+            create_setup_gateway_account(&service, "oauth-fallback@example.com", "setup-good", 20)
+                .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.refresh_tokens.lock().await.as_slice(),
+            ["refresh-invalid"]
+        );
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-good"]
+        );
+        let rejected = service.account_svc.get_account(rejected.id).await.unwrap();
+        assert_eq!(rejected.status, AccountStatus::Disabled);
+        assert_eq!(rejected.auth_error, rejected.disable_reason);
+        assert!(rejected.auth_error.contains("invalid_grant"));
+        assert!(
+            !rejected
+                .auth_error
+                .contains("fixture refresh token expired")
+        );
+        assert!(rejected.rate_limited_at.is_none());
+        assert!(rejected.rate_limit_reset_at.is_none());
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(accepted.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Active
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_refresh_token_disables_and_switches_gateway_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let (service, account_store) = test_gateway_service_with_cache_store_and_urls(
+            Arc::new(MemoryStore::new()),
+            base_url,
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        let rejected = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-missing-refresh@example.com",
+            "fixture-access-still-valid",
+            "fixture-refresh-initial",
+            Utc::now() + chrono::Duration::hours(1),
+            10,
+        )
+        .await;
+        account_store
+            .update_oauth_tokens(
+                rejected.id,
+                "fixture-access-still-valid",
+                "",
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        create_setup_gateway_account(
+            &service,
+            "oauth-missing-refresh-fallback@example.com",
+            "setup-good",
+            20,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-good"]
+        );
+        let rejected = service.account_svc.get_account(rejected.id).await.unwrap();
+        assert_eq!(rejected.status, AccountStatus::Disabled);
+        assert!(rejected.auth_error.contains("missing refresh token"));
+        assert_eq!(rejected.auth_error, rejected.disable_reason);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_invalid_grant_sticky_session_switches_gateway_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let cache = Arc::new(MemoryStore::new());
+        let service = test_gateway_service_with_cache_and_urls(
+            cache.clone(),
+            base_url.clone(),
+            format!("{}/oauth/token", base_url),
+        )
+        .await;
+        let rejected = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-sticky-invalid@example.com",
+            "fixture-access-sticky-invalid",
+            "refresh-invalid-sticky",
+            Utc::now() + chrono::Duration::minutes(1),
+            50,
+        )
+        .await;
+        create_setup_gateway_account(
+            &service,
+            "oauth-sticky-fallback@example.com",
+            "setup-good",
+            10,
+        )
+        .await;
+        let session_id = "123e4567-e89b-12d3-a456-426614174701";
+        cache
+            .set_session_account_id(session_id, rejected.id, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let response = service
+            .handle_request(claude_code_messages_request(session_id), None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-good"]
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(rejected.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_invalid_grant_disables_and_switches_count_tokens_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let rejected = create_oauth_gateway_account_with_credentials(
+            &service,
+            "count-oauth-invalid@example.com",
+            "fixture-count-access-invalid",
+            "refresh-invalid-count",
+            Utc::now() + chrono::Duration::minutes(1),
+            10,
+        )
+        .await;
+        create_setup_gateway_account(
+            &service,
+            "count-oauth-fallback@example.com",
+            "setup-good",
+            20,
+        )
+        .await;
+
+        let response = service
+            .handle_count_tokens_request(count_tokens_request(), None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response_body).unwrap()["input_tokens"],
+            42
+        );
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-good"]
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(rejected.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn all_oauth_invalid_grant_accounts_return_generic_service_unavailable() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let first = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-invalid-first@example.com",
+            "fixture-access-invalid-first",
+            "refresh-invalid-first",
+            Utc::now() + chrono::Duration::minutes(1),
+            10,
+        )
+        .await;
+        let second = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-invalid-second@example.com",
+            "fixture-access-invalid-second",
+            "refresh-invalid-second",
+            Utc::now() + chrono::Duration::minutes(1),
+            20,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_json = serde_json::from_slice::<serde_json::Value>(&response_body).unwrap();
+        assert_eq!(response_json["error"]["type"], "api_error");
+        assert_eq!(
+            response_json["error"]["message"],
+            "Service temporarily unavailable"
+        );
+        let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(!response_text.contains("invalid_grant"));
+        assert!(!response_text.contains("fixture-access"));
+        assert!(!response_text.contains("refresh-invalid"));
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.refresh_tokens.lock().await.as_slice(),
+            ["refresh-invalid-first", "refresh-invalid-second"]
+        );
+        assert!(state.authorization_headers.lock().await.is_empty());
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(first.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(second.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_then_invalid_grant_returns_generic_service_unavailable() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let rate_limited = create_setup_gateway_account(
+            &service,
+            "oauth-rate-limited-first@example.com",
+            "setup-rate-limited",
+            10,
+        )
+        .await;
+        let rejected = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-invalid-after-rate-limit@example.com",
+            "fixture-access-invalid-after-rate-limit",
+            "refresh-invalid-after-rate-limit",
+            Utc::now() + chrono::Duration::minutes(1),
+            20,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_json = serde_json::from_slice::<serde_json::Value>(&response_body).unwrap();
+        assert_eq!(response_json["error"]["type"], "api_error");
+        assert_eq!(
+            response_json["error"]["message"],
+            "Service temporarily unavailable"
+        );
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-rate-limited"]
+        );
+        let rate_limited = service
+            .account_svc
+            .get_account(rate_limited.id)
+            .await
+            .unwrap();
+        assert_eq!(rate_limited.status, AccountStatus::Active);
+        assert!(rate_limited.rate_limit_reset_at.is_some());
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(rejected.id)
+                .await
+                .unwrap()
+                .status,
+            AccountStatus::Disabled
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transient_oauth_refresh_error_uses_valid_access_token_without_switching() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let retained = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-transient@example.com",
+            "fixture-access-transient",
+            "refresh-rate-limited",
+            Utc::now() + chrono::Duration::minutes(1),
+            10,
+        )
+        .await;
+        create_setup_gateway_account(
+            &service,
+            "oauth-transient-backup@example.com",
+            "setup-good",
+            20,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer fixture-access-transient"]
+        );
+        let retained = service.account_svc.get_account(retained.id).await.unwrap();
+        assert_eq!(retained.status, AccountStatus::Active);
+        assert!(retained.auth_error.contains("status 429"));
+        assert!(!retained.auth_error.contains("fixture endpoint overload"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_server_error_uses_valid_access_token_without_disabling() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let retained = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-server-error@example.com",
+            "fixture-access-server-error",
+            "refresh-server-error",
+            Utc::now() + chrono::Duration::minutes(1),
+            10,
+        )
+        .await;
+        create_setup_gateway_account(
+            &service,
+            "oauth-server-error-backup@example.com",
+            "setup-good",
+            20,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer fixture-access-server-error"]
+        );
+        let retained = service.account_svc.get_account(retained.id).await.unwrap();
+        assert_eq!(retained.status, AccountStatus::Active);
+        assert!(retained.auth_error.contains("status 503"));
+        assert!(!retained.auth_error.contains("fixture endpoint unavailable"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_network_error_does_not_disable_or_switch_account() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+        let service = test_gateway_service_with_urls(
+            base_url,
+            format!("http://{}/oauth/token", unavailable_address),
+        )
+        .await;
+        let retained = create_oauth_gateway_account_with_credentials(
+            &service,
+            "oauth-network-error@example.com",
+            "fixture-access-expired",
+            "fixture-refresh-network-error",
+            Utc::now() - chrono::Duration::minutes(1),
+            10,
+        )
+        .await;
+        create_setup_gateway_account(
+            &service,
+            "oauth-network-error-backup@example.com",
+            "setup-good",
+            20,
+        )
+        .await;
+
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+        assert!(state.authorization_headers.lock().await.is_empty());
+        let retained = service.account_svc.get_account(retained.id).await.unwrap();
+        assert_eq!(retained.status, AccountStatus::Active);
+        assert!(retained.auth_error.contains("oauth refresh request failed"));
         server.abort();
     }
 

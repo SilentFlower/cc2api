@@ -27,6 +27,7 @@ use crate::store::cache::{
 
 const STICKY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
+const OAUTH_MISSING_REFRESH_TOKEN_REASON: &str = "OAuth refresh unavailable: missing refresh token";
 const OAUTH_LOCK_TTL: Duration = Duration::from_secs(30);
 const OAUTH_WAIT_RETRY: Duration = Duration::from_millis(500);
 const OAUTH_WAIT_ATTEMPTS: usize = 20;
@@ -575,7 +576,12 @@ fn build_oauth_credential_snapshot(
     let expires_at = account
         .expires_at
         .ok_or_else(|| AppError::ServiceUnavailable("OAuth expires_at 为空".into()))?;
-    if account.access_token.is_empty() || account.refresh_token.is_empty() {
+    if account.refresh_token.is_empty() {
+        return Err(AppError::PermanentCredential(
+            OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
+        ));
+    }
+    if account.access_token.is_empty() {
         return Err(AppError::ServiceUnavailable("OAuth 凭据不完整".into()));
     }
     if !account.has_valid_oauth_access_token(min_validity_seconds) {
@@ -1507,6 +1513,15 @@ impl AccountService {
     ) -> Result<OAuthCredentialSnapshot, AppError> {
         let account = self.store.get_by_id(id).await?;
         validate_managed_oauth_account(&account)?;
+        if account.refresh_token.is_empty() {
+            let _ = self
+                .store
+                .update_auth_error(id, OAUTH_MISSING_REFRESH_TOKEN_REASON)
+                .await;
+            return Err(AppError::PermanentCredential(
+                OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
+            ));
+        }
         if policy.force_refresh
             || !account.has_valid_oauth_access_token(policy.min_validity_seconds)
         {
@@ -1523,19 +1538,19 @@ impl AccountService {
         account: &Account,
         policy: OAuthResolvePolicy,
     ) -> Result<Account, AppError> {
+        if account.refresh_token.is_empty() {
+            let _ = self
+                .store
+                .update_auth_error(account.id, OAUTH_MISSING_REFRESH_TOKEN_REASON)
+                .await;
+            return Err(AppError::PermanentCredential(
+                OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
+            ));
+        }
         if !policy.force_refresh
             && account.has_valid_oauth_access_token(policy.min_validity_seconds)
         {
             return Ok(account.clone());
-        }
-        if account.refresh_token.is_empty() {
-            let _ = self
-                .store
-                .update_auth_error(account.id, "missing refresh token")
-                .await;
-            return Err(AppError::ServiceUnavailable(
-                "oauth refresh token is empty".into(),
-            ));
         }
 
         let lock_key = format!("oauth:refresh:account:{}", account.id);
@@ -1576,15 +1591,18 @@ impl AccountService {
     ) -> Result<Account, AppError> {
         let latest = self.store.get_by_id(id).await?;
         validate_managed_oauth_account(&latest)?;
+        if latest.refresh_token.is_empty() {
+            let _ = self
+                .store
+                .update_auth_error(id, OAUTH_MISSING_REFRESH_TOKEN_REASON)
+                .await;
+            return Err(AppError::PermanentCredential(
+                OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
+            ));
+        }
         if !policy.force_refresh && latest.has_valid_oauth_access_token(policy.min_validity_seconds)
         {
             return Ok(latest);
-        }
-        if latest.refresh_token.is_empty() {
-            let _ = self.store.update_auth_error(id, "缺少 refresh token").await;
-            return Err(AppError::ServiceUnavailable(
-                "OAuth refresh token 为空".into(),
-            ));
         }
 
         let fallback_access_token = latest.access_token.clone();
@@ -1614,6 +1632,10 @@ impl AccountService {
             Err(err) => {
                 let msg = err.to_string();
                 let _ = self.store.update_auth_error(id, &msg).await;
+                // 永久凭据错误说明 RT 已无法继续使用，即使旧 AT 尚未过期也不能伪装刷新成功。
+                if matches!(&err, AppError::PermanentCredential(_)) {
+                    return Err(err);
+                }
                 if policy.allow_still_valid_fallback
                     && fallback_is_still_valid
                     && !fallback_access_token.is_empty()
@@ -3447,6 +3469,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn valid_access_token_does_not_hide_missing_refresh_token() {
+        let (store, svc) = setup_account_service().await;
+        let mut account = new_account_request("missing-refresh-fast-path@example.com");
+        account.access_token = "fixture-access-still-valid".into();
+        account.refresh_token = "fixture-refresh-initial".into();
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        svc.create_account(&mut account).await.unwrap();
+        store
+            .update_oauth_tokens(
+                account.id,
+                "fixture-access-still-valid",
+                "",
+                Utc::now() + ChronoDuration::hours(1),
+            )
+            .await
+            .unwrap();
+
+        let upstream_error = svc.resolve_upstream_token(account.id).await.unwrap_err();
+        assert!(matches!(&upstream_error, AppError::PermanentCredential(_)));
+        let snapshot_error = svc
+            .resolve_oauth_credentials(account.id, 600, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(&snapshot_error, AppError::PermanentCredential(_)));
+
+        let stored = svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Active);
+        assert_eq!(stored.auth_error, OAUTH_MISSING_REFRESH_TOKEN_REASON);
+    }
+
+    #[tokio::test]
     async fn unauthorized_recovery_does_not_fallback_without_refresh_token() {
         let (store, svc) = setup_account_service().await;
         let mut account = new_account_request("unauthorized-no-refresh@example.com");
@@ -3469,6 +3522,7 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert!(matches!(&error, AppError::PermanentCredential(_)));
         assert!(error.to_string().contains("refresh token"));
         let stored = svc.get_account(account.id).await.unwrap();
         assert_eq!(stored.access_token, "access-still-locally-valid");
