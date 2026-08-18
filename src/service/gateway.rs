@@ -269,6 +269,12 @@ impl AutoModeClassifierMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoModeClassifierProtocol {
+    Block,
+    Severity,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct BootstrapProfileConfig {
     mode: BootstrapModelOptionsMode,
@@ -4132,17 +4138,34 @@ fn auto_mode_classifier_common_matches(
         return false;
     }
 
+    auto_mode_classifier_protocol(body).is_some()
+}
+
+fn auto_mode_classifier_protocol(body: &serde_json::Value) -> Option<AutoModeClassifierProtocol> {
     let mut has_transcript_open = false;
     let mut has_transcript_close = false;
     let mut has_block_yes = false;
     let mut has_block_no = false;
+    let mut has_severity_open = false;
+    let mut has_severity_close = false;
     for text in request_text_items(body) {
         has_transcript_open |= text.contains("<transcript>");
         has_transcript_close |= text.contains("</transcript>");
         has_block_yes |= text.contains("<block>yes</block>");
         has_block_no |= text.contains("<block>no</block>");
+        has_severity_open |= text.contains("<severity>");
+        has_severity_close |= text.contains("</severity>");
     }
-    has_transcript_open && has_transcript_close && has_block_yes && has_block_no
+    if !has_transcript_open || !has_transcript_close {
+        return None;
+    }
+    if has_severity_open && has_severity_close {
+        return Some(AutoModeClassifierProtocol::Severity);
+    }
+    if has_block_yes && has_block_no {
+        return Some(AutoModeClassifierProtocol::Block);
+    }
+    None
 }
 
 fn messages_end_with_user(body: &serde_json::Value) -> bool {
@@ -4394,17 +4417,27 @@ fn auto_mode_classifier_response(
     mode: AutoModeClassifierMode,
     request_body: &serde_json::Value,
 ) -> Result<Response, AppError> {
+    let protocol =
+        auto_mode_classifier_protocol(request_body).unwrap_or(AutoModeClassifierProtocol::Block);
     match mode {
         AutoModeClassifierMode::Passthrough => auto_mode_classifier_error_response(request_body),
         AutoModeClassifierMode::MockAllow => mock_auto_mode_classifier_json_response(
             intercept_type,
             request_body,
-            "<block>no</block>",
+            match protocol {
+                AutoModeClassifierProtocol::Block => "<block>no</block>",
+                AutoModeClassifierProtocol::Severity => "<severity>0</severity>",
+            },
         ),
         AutoModeClassifierMode::MockBlock => mock_auto_mode_classifier_json_response(
             intercept_type,
             request_body,
-            "<block>yes</block><reason>blocked by local policy</reason>",
+            match protocol {
+                AutoModeClassifierProtocol::Block => {
+                    "<block>yes</block><reason>blocked by local policy</reason>"
+                }
+                AutoModeClassifierProtocol::Severity => "<severity>100</severity>",
+            },
         ),
         AutoModeClassifierMode::Error => auto_mode_classifier_error_response(request_body),
     }
@@ -6340,6 +6373,28 @@ mod tests {
             "system": [{
                 "type": "text",
                 "text": "## Output Format\nIf the action should be blocked:\n<block>yes</block><reason>one short sentence</reason>\nIf the action should be allowed:\n<block>no</block>"
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<transcript>\n"},
+                    {"type": "text", "text": "tool transcript"},
+                    {"type": "text", "text": "</transcript>\n"},
+                    {"type": "text", "text": suffix}
+                ]
+            }]
+        })
+    }
+
+    fn severity_classifier_body(max_tokens: u64, suffix: &str) -> serde_json::Value {
+        json!({
+            "model": "claude-sonnet-5",
+            "stream": false,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "system": [{
+                "type": "text",
+                "text": "Output <severity>N</severity> where N is an integer 0-100 and 50 is exactly the allow/block boundary."
             }],
             "messages": [{
                 "role": "user",
@@ -9657,6 +9712,19 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_classifier_detects_severity_stage1() {
+        let body = severity_classifier_body(
+            64,
+            "\nRespond with <severity>N</severity> ONLY. Grade HARM ONLY.",
+        );
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            Some(WarmupInterceptType::AutoModeClassifierStage1)
+        );
+    }
+
+    #[test]
     fn auto_mode_classifier_ignores_stage1_above_padding_range() {
         let body = classifier_body(2305, "\nUpdated classifier instruction.");
 
@@ -9692,6 +9760,19 @@ mod tests {
     #[test]
     fn auto_mode_classifier_detects_stage2_even_with_stop_sequence() {
         let body = classifier_body_with_stop_sequence(4096, "\nUpdated classifier instruction.");
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            Some(WarmupInterceptType::AutoModeClassifierStage2)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_detects_severity_stage2() {
+        let body = severity_classifier_body(
+            8192,
+            "\nUse <thinking> first, then respond with <severity>N</severity>.",
+        );
 
         assert_eq!(
             detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
@@ -9740,6 +9821,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_mode_classifier_mock_allow_returns_parseable_severity() {
+        let request = severity_classifier_body(
+            64,
+            "\nRespond with <severity>N</severity> ONLY. Grade HARM ONLY.",
+        );
+        let response = auto_mode_classifier_response(
+            WarmupInterceptType::AutoModeClassifierStage1,
+            AutoModeClassifierMode::MockAllow,
+            &request,
+        )
+        .expect("mock response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+
+        assert_eq!(body_json["content"][0]["text"], "<severity>0</severity>");
+        assert_eq!(body_json["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(body_json["usage"]["cache_read_input_tokens"], 0);
+    }
+
+    #[tokio::test]
     async fn auto_mode_classifier_mock_block_returns_parseable_block_reason() {
         let request = classifier_body(
             4096,
@@ -9763,6 +9868,28 @@ mod tests {
             body_json["content"][0]["text"],
             "<block>yes</block><reason>blocked by local policy</reason>"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_classifier_mock_block_returns_parseable_severity() {
+        let request = severity_classifier_body(
+            8192,
+            "\nUse <thinking> first, then respond with <severity>N</severity>.",
+        );
+        let response = auto_mode_classifier_response(
+            WarmupInterceptType::AutoModeClassifierStage2,
+            AutoModeClassifierMode::MockBlock,
+            &request,
+        )
+        .expect("mock response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+
+        assert_eq!(body_json["content"][0]["text"], "<severity>100</severity>");
     }
 
     #[tokio::test]
