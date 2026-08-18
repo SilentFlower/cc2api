@@ -4148,24 +4148,59 @@ fn auto_mode_classifier_protocol(body: &serde_json::Value) -> Option<AutoModeCla
     let mut has_block_no = false;
     let mut has_severity_open = false;
     let mut has_severity_close = false;
-    for text in request_text_items(body) {
-        has_transcript_open |= text.contains("<transcript>");
-        has_transcript_close |= text.contains("</transcript>");
+    let mut observe_protocol_markers = |text: &str| {
         has_block_yes |= text.contains("<block>yes</block>");
         has_block_no |= text.contains("<block>no</block>");
         has_severity_open |= text.contains("<severity>");
         has_severity_close |= text.contains("</severity>");
+    };
+
+    for text in system_text_items(body) {
+        observe_protocol_markers(text);
     }
-    if !has_transcript_open || !has_transcript_close {
+
+    let last_message_content = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("content"));
+    let mut inside_transcript = false;
+    for text in content_text_items(last_message_content) {
+        let mut remaining = text;
+        loop {
+            if inside_transcript {
+                let Some(close_index) = remaining.find("</transcript>") else {
+                    break;
+                };
+                has_transcript_close = true;
+                inside_transcript = false;
+                remaining = &remaining[close_index + "</transcript>".len()..];
+                continue;
+            }
+
+            let Some(open_index) = remaining.find("<transcript>") else {
+                observe_protocol_markers(remaining);
+                break;
+            };
+            // 被审计 transcript 属于不可信输入，里面的 XML 示例不能决定本地 mock 协议。
+            observe_protocol_markers(&remaining[..open_index]);
+            has_transcript_open = true;
+            inside_transcript = true;
+            remaining = &remaining[open_index + "<transcript>".len()..];
+        }
+    }
+    if !has_transcript_open || !has_transcript_close || inside_transcript {
         return None;
     }
-    if has_severity_open && has_severity_close {
-        return Some(AutoModeClassifierProtocol::Severity);
+
+    match (
+        has_block_yes && has_block_no,
+        has_severity_open && has_severity_close,
+    ) {
+        (true, false) => Some(AutoModeClassifierProtocol::Block),
+        (false, true) => Some(AutoModeClassifierProtocol::Severity),
+        _ => None,
     }
-    if has_block_yes && has_block_no {
-        return Some(AutoModeClassifierProtocol::Block);
-    }
-    None
 }
 
 fn messages_end_with_user(body: &serde_json::Value) -> bool {
@@ -6270,13 +6305,14 @@ impl Drop for SlotGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistantPrefillInterceptConfig, AutoModeClassifierMode, BootstrapModelOptionsMode,
-        BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse, GatewayAdmissionError,
-        GatewayService, NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
-        RateLimitRequestLogConfig, STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES,
-        SignatureRetryStage, StreamStabilityConfig, UPSTREAM_BASE, WarmupInterceptConfig,
-        WarmupInterceptType, align_mapped_upstream_session_header,
-        assistant_prefill_intercept_body, auto_mode_classifier_response,
+        AssistantPrefillInterceptConfig, AutoModeClassifierMode, AutoModeClassifierProtocol,
+        BootstrapModelOptionsMode, BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse,
+        GatewayAdmissionError, GatewayService, NON_STREAM_PROBE_CACHE_TTL,
+        NonStreamProbeCacheLookup, NonStreamProbeType, RateLimitRequestLogConfig,
+        STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES, SignatureRetryStage,
+        StreamStabilityConfig, UPSTREAM_BASE, WarmupInterceptConfig, WarmupInterceptType,
+        align_mapped_upstream_session_header, assistant_prefill_intercept_body,
+        auto_mode_classifier_protocol, auto_mode_classifier_response,
         buffered_error_body_for_downstream, buffered_response_body_for_downstream,
         build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
         cached_non_stream_probe_response, classify_non_stream_probe_text,
@@ -9725,6 +9761,30 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_classifier_detects_protocol_from_post_transcript_instruction() {
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "stream": false,
+            "max_tokens": 64,
+            "system": "Review the following transcript.",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<transcript>"},
+                    {"type": "text", "text": "tool transcript"},
+                    {"type": "text", "text": "</transcript>"},
+                    {"type": "text", "text": "Respond with <severity>N</severity> ONLY."}
+                ]
+            }]
+        });
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            Some(WarmupInterceptType::AutoModeClassifierStage1)
+        );
+    }
+
+    #[test]
     fn auto_mode_classifier_ignores_stage1_above_padding_range() {
         let body = classifier_body(2305, "\nUpdated classifier instruction.");
 
@@ -9777,6 +9837,67 @@ mod tests {
         assert_eq!(
             detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
             Some(WarmupInterceptType::AutoModeClassifierStage2)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_uses_block_protocol_when_transcript_mentions_severity() {
+        let mut body = classifier_body(64, "\nUpdated classifier instruction.");
+        body["messages"][0]["content"][1]["text"] = json!("讨论新版响应 <severity>0</severity>");
+
+        assert_eq!(
+            auto_mode_classifier_protocol(&body),
+            Some(AutoModeClassifierProtocol::Block)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_uses_severity_protocol_when_transcript_mentions_block() {
+        let mut body = severity_classifier_body(
+            64,
+            "\nRespond with <severity>N</severity> ONLY. Grade HARM ONLY.",
+        );
+        body["messages"][0]["content"][1]["text"] =
+            json!("旧版格式包含 <block>yes</block> 和 <block>no</block>");
+
+        assert_eq!(
+            auto_mode_classifier_protocol(&body),
+            Some(AutoModeClassifierProtocol::Severity)
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_ignores_protocol_markers_only_inside_transcript() {
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "stream": false,
+            "max_tokens": 64,
+            "system": "Review the following text.",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "<transcript>示例响应 <severity>0</severity></transcript>"
+                }]
+            }]
+        });
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_mode_classifier_ignores_conflicting_trusted_protocol_markers() {
+        let mut body = classifier_body(64, "\nRespond with <severity>N</severity> ONLY.");
+        body["system"][0]["text"] = json!(
+            "Return <block>yes</block> or <block>no</block>, then output <severity>N</severity>."
+        );
+
+        assert_eq!(
+            detect_auto_mode_classifier_request("/v1/messages", &body, ClientType::ClaudeCode),
+            None
         );
     }
 
