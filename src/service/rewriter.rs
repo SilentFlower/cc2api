@@ -13,10 +13,10 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    HAIKU_PROBE_BETA_TOKENS, HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
-    MCP_PROTOCOL_VERSION, MessageBodyOrderProfile, OAUTH_BETA_TOKEN, RequestProfile,
-    TelemetryShape, claude_cli_user_agent, claude_code_user_agent, is_event_logging_path,
-    normalize_version, profile_for_version,
+    CchProfile, FableFallbackProfile, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
+    MessageBodyOrderProfile, OAUTH_BETA_TOKEN, RequestProfile, TelemetryShape,
+    claude_cli_user_agent, claude_code_user_agent, exact_profile_for_version,
+    is_event_logging_path, normalize_version, profile_for_version,
 };
 use crate::store::cache::UpstreamSessionPoolResolve;
 
@@ -101,7 +101,6 @@ const API_MAX_TOKENS_LIMIT: u64 = 64000;
 const API_DEFAULT_MAX_TOKENS: u64 = 32000;
 const CONTEXT_1M_BETA_TOKEN: &str = "context-1m-2025-08-07";
 const FAST_MODE_BETA_TOKEN: &str = "fast-mode-2026-02-01";
-const FABLE_MODEL_ID: &str = "claude-fable-5";
 const MESSAGE_BODY_ORDER_OPUS_MAIN: &[&str] = &[
     "model",
     "messages",
@@ -242,11 +241,11 @@ pub(crate) fn order_context_1m_after_oauth(beta: String) -> String {
 
 /// 根据模型返回正确的 anthropic-beta 值。
 fn beta_header_for_model(request_profile: &RequestProfile, model_id: &str) -> String {
-    if is_fable_model(model_id) {
-        request_profile.fable_message_beta_tokens.to_string()
-    } else {
-        request_profile.message_beta_tokens.to_string()
-    }
+    request_profile
+        .fable_model(model_id)
+        .map(|profile| profile.message_beta_tokens)
+        .unwrap_or(request_profile.message_beta_tokens)
+        .to_string()
 }
 
 /// 根据 endpoint 返回当前 Claude Code 画像的必需 beta token。
@@ -270,37 +269,60 @@ fn beta_header_for_path(
         request_profile.code_triggers_beta_token.to_string()
     } else if path.starts_with("/v1/mcp_servers") {
         request_profile.mcp_servers_beta_token.to_string()
-    } else if path.starts_with("/v1/messages") && is_haiku_probe_or_title_request(model_id, body) {
-        if is_streaming_messages_body(body) {
-            HAIKU_STREAMING_TITLE_BETA_TOKENS.to_string()
-        } else {
-            HAIKU_PROBE_BETA_TOKENS.to_string()
+    } else if path.starts_with("/v1/messages") {
+        match haiku_request_kind(model_id, body) {
+            Some(HaikuRequestKind::Probe) => request_profile.haiku_probe_beta_tokens.to_string(),
+            Some(HaikuRequestKind::Title) => request_profile
+                .haiku_streaming_title_beta_tokens
+                .to_string(),
+            Some(HaikuRequestKind::NonStreamAux) => {
+                request_profile.haiku_non_stream_aux_beta_tokens.to_string()
+            }
+            Some(HaikuRequestKind::Main) if body.get("diagnostics").is_none() => request_profile
+                .haiku_main_no_diagnostics_beta_tokens
+                .to_string(),
+            Some(HaikuRequestKind::Main) => request_profile.haiku_main_beta_tokens.to_string(),
+            None => beta_header_for_model(request_profile, model_id),
         }
     } else {
         beta_header_for_model(request_profile, model_id)
     }
 }
 
-fn is_fable_model(model_id: &str) -> bool {
-    // 2.1.173 抓包显示 Fable `[1m]` 不会改变主请求画像，不能用后缀裁剪推断 beta。
-    model_id == FABLE_MODEL_ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaikuRequestKind {
+    Probe,
+    Title,
+    Main,
+    NonStreamAux,
 }
 
-fn is_haiku_probe_or_title_request(model_id: &str, body: &serde_json::Value) -> bool {
+fn haiku_request_kind(model_id: &str, body: &serde_json::Value) -> Option<HaikuRequestKind> {
     if !model_id.to_ascii_lowercase().contains("haiku") {
-        return false;
+        return None;
     }
-    let tools_empty = body
-        .get("tools")
-        .and_then(|tools| tools.as_array())
-        .map(|tools| tools.is_empty())
-        .unwrap_or(true);
     let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    tools_empty && (max_tokens == 1 || (max_tokens == 32000 && has_title_prompt_marker(body)))
+    if tools_are_empty(body) && max_tokens == 1 && !is_streaming_messages_body(body) {
+        return Some(HaikuRequestKind::Probe);
+    }
+    if tools_are_empty(body)
+        && max_tokens == 32_000
+        && (is_structured_haiku_title_request(body) || has_title_prompt_marker(body))
+    {
+        return Some(HaikuRequestKind::Title);
+    }
+    if tools_are_empty(body) && max_tokens == 1_024 && !is_streaming_messages_body(body) {
+        return Some(HaikuRequestKind::NonStreamAux);
+    }
+    Some(HaikuRequestKind::Main)
 }
 
 fn requires_exact_beta_profile(path: &str, model_id: &str, body: &serde_json::Value) -> bool {
-    path.starts_with("/v1/messages") && is_haiku_probe_or_title_request(model_id, body)
+    path.starts_with("/v1/messages")
+        && matches!(
+            haiku_request_kind(model_id, body),
+            Some(HaikuRequestKind::Probe | HaikuRequestKind::Title)
+        )
 }
 
 fn is_streaming_messages_body(body: &serde_json::Value) -> bool {
@@ -315,6 +337,58 @@ fn has_title_prompt_marker(body: &serde_json::Value) -> bool {
             || text.contains("Please write a 5-10 word title for the following conversation:")
             || text.contains("extract a 2-3 word title")
     })
+}
+
+/// 判断请求是否为 Claude Code 2.1.257 的结构化 Haiku 标题请求。
+///
+/// @param body `/v1/messages` JSON 请求体。
+/// @return 同时命中 Haiku、流式、空 tools、disabled thinking 和 title schema 时返回 true。
+pub(crate) fn is_structured_haiku_title_request(body: &serde_json::Value) -> bool {
+    let is_haiku = body
+        .get("model")
+        .and_then(|model| model.as_str())
+        .map(|model| model.to_ascii_lowercase().contains("haiku"))
+        .unwrap_or(false);
+    let thinking_disabled = body
+        .pointer("/thinking/type")
+        .and_then(|value| value.as_str())
+        == Some("disabled");
+    is_haiku
+        && is_streaming_messages_body(body)
+        && tools_are_empty(body)
+        && body.get("max_tokens").and_then(|value| value.as_u64()) == Some(32_000)
+        && thinking_disabled
+        && body
+            .pointer("/output_config/format")
+            .map(schema_requires_only_title)
+            .unwrap_or(false)
+}
+
+fn tools_are_empty(body: &serde_json::Value) -> bool {
+    body.get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| tools.is_empty())
+        .unwrap_or(true)
+}
+
+fn schema_requires_only_title(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let required_title = map
+                .get("required")
+                .and_then(|required| required.as_array())
+                .map(|required| required.len() == 1 && required[0].as_str() == Some("title"))
+                .unwrap_or(false);
+            let declares_title = map
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .map(|properties| properties.contains_key("title"))
+                .unwrap_or(false);
+            (required_title && declares_title) || map.values().any(schema_requires_only_title)
+        }
+        serde_json::Value::Array(items) => items.iter().any(schema_requires_only_title),
+        _ => false,
+    }
 }
 
 fn text_values(value: &serde_json::Value) -> Vec<&str> {
@@ -1390,10 +1464,7 @@ impl Rewriter {
             rewrite_disabled_thinking_to_adaptive(&mut parsed, disabled_thinking_rewrite);
             // 真实 Claude Code 客户端已经带原始 wire 顺序；这里只对 API mimicry 生成的 body 套画像顺序。
             if message_body_order_fingerprint_enabled && client_type == ClientType::API {
-                order_message_body_top_level_fields(
-                    &mut parsed,
-                    version_profile.request.message_body_order,
-                );
+                order_message_body_top_level_fields(&mut parsed, &version_profile.request);
             }
         } else if is_event_logging_path(path) {
             self.rewrite_event_batch(
@@ -1494,6 +1565,7 @@ impl Rewriter {
 
             normalize_api_max_tokens(body, request_profile);
             ensure_fable_fallbacks(body, request_profile);
+            ensure_fable_thinking(body, request_profile);
 
             // 注入 Claude Code-like system 画像，并把原始 system 迁移到 messages。
             self.rewrite_api_system_prompt(body, &profile.env.version);
@@ -1901,16 +1973,29 @@ fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
 }
 
 fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
-    if !matches!(
-        normalize_version(version),
-        "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195" | "2.1.197" | "2.1.220"
-    ) {
-        return body.to_vec();
-    }
-
+    let profile = match normalize_version(version) {
+        "2.1.172" => CchProfile::ClaudeCode2172DropFallbacks,
+        normalized => match exact_profile_for_version(normalized) {
+            Some(profile) => profile.billing.cch_profile,
+            None => return body.to_vec(),
+        },
+    };
     let mut normalized = replace_top_level_string_value(body, "model", b"\"\"");
     normalized = remove_top_level_field(&normalized, "max_tokens");
-    remove_top_level_field(&normalized, "fallbacks")
+    match profile {
+        CchProfile::ClaudeCode2172DropFallbacks => remove_top_level_field(&normalized, "fallbacks"),
+        CchProfile::ClaudeCode21257ModelAware
+            if top_level_string_field(body, "model").as_deref() == Some("claude-fable-5-1") =>
+        {
+            normalized
+        }
+        CchProfile::ClaudeCode21257ModelAware => remove_top_level_field(&normalized, "fallbacks"),
+    }
+}
+
+fn top_level_string_field(body: &[u8], field: &str) -> Option<String> {
+    let range = find_top_level_field_value_range(body, field)?;
+    serde_json::from_slice(&body[range]).ok()
 }
 
 fn find_cch_value(body: &[u8]) -> Option<usize> {
@@ -1952,7 +2037,7 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
         "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195"
-        | "2.1.197" | "2.1.220" => CCH_ATTESTATION_SEED_2156,
+        | "2.1.197" | "2.1.220" | "2.1.257" => CCH_ATTESTATION_SEED_2156,
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -4929,8 +5014,10 @@ fn api_default_max_tokens(body: &serde_json::Value, request_profile: &RequestPro
         .unwrap_or_default()
         .to_lowercase();
 
-    if model == request_profile.opus_default_max_tokens_model || is_fable_model(&model) {
+    if model == request_profile.opus_default_max_tokens_model {
         API_MAX_TOKENS_LIMIT
+    } else if let Some(fable) = request_profile.fable_model(&model) {
+        fable.default_max_tokens
     } else {
         API_DEFAULT_MAX_TOKENS
     }
@@ -4942,14 +5029,42 @@ fn ensure_fable_fallbacks(body: &mut serde_json::Value, request_profile: &Reques
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or_default();
-    if !is_fable_model(model) {
+    let Some(fable) = request_profile.fable_model(model) else {
         return;
-    }
+    };
     let Some(obj) = body.as_object_mut() else {
         return;
     };
     obj.entry("fallbacks")
-        .or_insert_with(|| serde_json::json!([{ "model": request_profile.fable_fallback_model }]));
+        .or_insert_with(|| match fable.fallback {
+            FableFallbackProfile::Model(model) => serde_json::json!([{ "model": model }]),
+            FableFallbackProfile::Default => serde_json::Value::String("default".into()),
+        });
+}
+
+/// 为 Fable 5.1 API mimicry 补齐抓包确认的 thinking display 字段。
+fn ensure_fable_thinking(body: &mut serde_json::Value, request_profile: &RequestProfile) {
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    let Some(display) = request_profile
+        .fable_model(model)
+        .and_then(|fable| fable.thinking_display)
+    else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let thinking = obj
+        .entry("thinking")
+        .or_insert_with(|| serde_json::json!({ "type": "adaptive" }));
+    if let Some(thinking) = thinking.as_object_mut() {
+        thinking
+            .entry("display")
+            .or_insert_with(|| serde_json::Value::String(display.to_string()));
+    }
 }
 
 /// 移除消息和 system 中的空文本内容块。
@@ -5368,12 +5483,12 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 /// 按 2.1.195 抓包画像重排 API mimicry 生成的 `/v1/messages` 顶层字段,未知字段追加并保留原相对顺序。
 fn order_message_body_top_level_fields(
     body: &mut serde_json::Value,
-    body_order_profile: MessageBodyOrderProfile,
+    request_profile: &RequestProfile,
 ) {
     let Some(map) = body.as_object_mut() else {
         return;
     };
-    let profile_order = message_body_order_profile(map, body_order_profile);
+    let profile_order = message_body_order_profile(map, request_profile);
     let mut original = std::mem::take(map);
     let mut ordered = serde_json::Map::new();
     for key in profile_order {
@@ -5389,14 +5504,16 @@ fn order_message_body_top_level_fields(
 
 fn message_body_order_profile(
     map: &serde_json::Map<String, serde_json::Value>,
-    body_order_profile: MessageBodyOrderProfile,
+    request_profile: &RequestProfile,
 ) -> &'static [&'static str] {
     let model = map
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if body_order_profile == MessageBodyOrderProfile::ClaudeCode21220 && is_fable_model(&model) {
+    if request_profile.message_body_order == MessageBodyOrderProfile::ClaudeCode21220
+        && request_profile.fable_model(&model).is_some()
+    {
         return MESSAGE_BODY_ORDER_FABLE_2_1_220;
     }
     if model.contains("haiku")
@@ -5436,7 +5553,9 @@ mod tests {
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_FALLBACK_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_5_1_MESSAGE_BETA_TOKENS,
+        FABLE_FALLBACK_BETA_TOKENS, FABLE_MESSAGE_BETA_TOKENS, HAIKU_MAIN_BETA_TOKENS_2_1_257,
+        HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_257, HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
         HAIKU_PROBE_BETA_TOKENS, HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
         MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION,
         STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json, claude_cli_user_agent,
@@ -8513,6 +8632,48 @@ mod tests {
     }
 
     #[test]
+    fn api_messages_fable_5_1_uses_default_fallback_and_display_updates() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-fable-5-1",
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(64000));
+        assert_eq!(parsed["fallbacks"], json!("default"));
+        assert_eq!(parsed["thinking"]["type"], json!("adaptive"));
+        assert_eq!(parsed["thinking"]["display"], json!("updates"));
+    }
+
+    #[test]
+    fn api_messages_21220_does_not_apply_unverified_fable_5_1_profile() {
+        let account = test_account_with_profile("2.1.220");
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-fable-5-1",
+            "messages": []
+        });
+
+        let out = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed["max_tokens"], json!(32000));
+        assert!(parsed.get("fallbacks").is_none());
+        assert!(parsed.get("thinking").is_none());
+    }
+
+    #[test]
     fn api_messages_rollback_profile_keeps_opus48_limits_and_fable_fallback() {
         let account = test_account_with_profile("2.1.197");
         let rewriter = Rewriter::new();
@@ -9005,6 +9166,57 @@ mod tests {
     }
 
     #[test]
+    fn fable_5_1_headers_use_21257_profile_without_context_1m() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-fable-5-1",
+            &json!({}),
+        );
+        let beta = headers.get("anthropic-beta").unwrap();
+
+        assert_eq!(beta, FABLE_5_1_MESSAGE_BETA_TOKENS);
+        assert!(!beta.contains("redact-thinking-2026-02-12"));
+        assert!(beta.contains("server-side-fallback-2026-07-01"));
+        assert!(beta.contains("thinking-display-updates-2026-08-18"));
+        assert!(!beta.contains(CTX_1M));
+    }
+
+    #[test]
+    fn fable_5_1_explicit_context_1m_obeys_account_allowlist() {
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert("anthropic-beta".to_string(), CTX_1M.to_string());
+
+        let filtered = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &test_account(),
+            ClientType::ClaudeCode,
+            "claude-fable-5-1",
+            &json!({}),
+        );
+        assert!(!filtered.get("anthropic-beta").unwrap().contains(CTX_1M));
+
+        let mut allowed_account = test_account();
+        allowed_account.allow_1m_models = "fable".into();
+        let allowed = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &allowed_account,
+            ClientType::ClaudeCode,
+            "claude-fable-5-1",
+            &json!({}),
+        );
+        assert!(allowed.get("anthropic-beta").unwrap().contains(CTX_1M));
+    }
+
+    #[test]
     fn haiku_non_stream_probe_uses_capture_narrow_beta() {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -9068,7 +9280,7 @@ mod tests {
     }
 
     #[test]
-    fn haiku_normal_request_keeps_full_message_beta() {
+    fn haiku_structured_title_uses_schema_without_prompt_marker() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -9076,6 +9288,47 @@ mod tests {
             "stream": true,
             "max_tokens": 32000,
             "tools": [],
+            "thinking": {"type": "disabled"},
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "messages": [{"role": "user", "content": "new title wording"}]
+        });
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+
+        assert!(super::is_structured_haiku_title_request(&body));
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            HAIKU_STREAMING_TITLE_BETA_TOKENS
+        );
+    }
+
+    #[test]
+    fn haiku_main_request_uses_21257_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "stream": true,
+            "max_tokens": 32000,
+            "tools": [{"name": "Read"}],
+            "diagnostics": {"previous_message_id": "msg_previous"},
             "messages": [{"role": "user", "content": "请分析这个项目"}]
         });
 
@@ -9088,7 +9341,72 @@ mod tests {
             &body,
         );
 
-        assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            HAIKU_MAIN_BETA_TOKENS_2_1_257
+        );
+    }
+
+    #[test]
+    fn haiku_main_without_diagnostics_omits_claude_code_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "stream": true,
+            "max_tokens": 32000,
+            "tools": [{"name": "Read"}],
+            "messages": [{"role": "user", "content": "请分析这个项目"}]
+        });
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_257
+        );
+        assert!(
+            !headers
+                .get("anthropic-beta")
+                .unwrap()
+                .contains("claude-code-20250219")
+        );
+    }
+
+    #[test]
+    fn haiku_non_stream_aux_uses_21257_narrow_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "stream": false,
+            "max_tokens": 1024,
+            "tools": [],
+            "thinking": {"type": "disabled"},
+            "system": [{"type": "text", "text": "auxiliary request"}],
+            "messages": [{"role": "user", "content": "auxiliary input"}]
+        });
+
+        let headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257
+        );
     }
 
     #[test]
@@ -10008,7 +10326,7 @@ mod tests {
             "",
             &body,
         );
-        assert_eq!(eval_headers.get("User-Agent").unwrap(), "Bun/1.4.0");
+        assert_eq!(eval_headers.get("User-Agent").unwrap(), "Bun/1.4.1");
 
         let trigger_headers = rewriter.rewrite_headers(
             &empty,
@@ -10568,6 +10886,10 @@ mod tests {
             compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.220"),
             "1bd"
         );
+        assert_eq!(
+            compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.257"),
+            "29f"
+        );
     }
 
     #[test]
@@ -10604,6 +10926,7 @@ mod tests {
         assert_eq!(cch_attestation_seed("2.1.195"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.197"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.220"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.257"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
@@ -10661,6 +10984,31 @@ mod tests {
         assert!(normalized.contains(r#""fallbacks":{"model":"keep-nested"}"#));
         assert!(normalized.contains(r#""max_tokens":{"type":"integer"}"#));
         assert!(normalized.contains("nested model and fallbacks stay"));
+    }
+
+    #[test]
+    fn cch_21257_fable_5_1_keeps_top_level_default_fallback() {
+        let body = br#"{"model":"claude-fable-5-1","max_tokens":64000,"fallbacks":"default","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.257.e73; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"fable continuation"}]}]}"#;
+
+        let normalized = cch_attestation_input(body, "2.1.257");
+
+        assert_eq!(
+            normalized,
+            br#"{"model":"","fallbacks":"default","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.257.e73; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"fable continuation"}]}]}"#
+        );
+        let output = String::from_utf8(compute_cch_attestation(body.to_vec(), "2.1.257"))
+            .expect("cch output");
+        assert!(!output.contains("cch=00000"));
+    }
+
+    #[test]
+    fn cch_21257_non_fable_5_1_still_removes_top_level_fallbacks() {
+        let body = br#"{"model":"claude-opus-5","max_tokens":64000,"fallbacks":"default","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.257.e73; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+        let normalized = String::from_utf8(cch_attestation_input(body, "2.1.257")).unwrap();
+
+        assert!(normalized.contains(r#""model":"""#));
+        assert!(!normalized.contains("max_tokens"));
+        assert!(!normalized.contains("fallbacks"));
     }
 
     #[test]

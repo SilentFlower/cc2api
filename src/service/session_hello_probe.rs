@@ -9,10 +9,11 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::Account;
+use crate::model::identity::device_profile;
+use crate::service::version_profile::profile_for_version;
 use crate::store::cache::{CacheStore, SessionHelloProbeState};
 
 const DEFAULT_HELLO_ENDPOINT: &str = "https://api.anthropic.com/api/hello";
-const HELLO_USER_AGENT: &str = "Bun/1.4.0";
 const HELLO_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 const FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LOCK_SAFETY_MARGIN: Duration = Duration::from_secs(2);
@@ -297,9 +298,10 @@ impl SessionHelloProbeService {
                 (SessionHelloProbeState::Failure, None)
             } else {
                 let client = crate::tlsfp::get_request_client(&account.proxy_url);
+                let user_agent = hello_user_agent_for_account(account);
                 let request = client
                     .head(&self.endpoint)
-                    .header(USER_AGENT, HELLO_USER_AGENT)
+                    .header(USER_AGENT, user_agent)
                     .header(ACCEPT, "*/*")
                     .header(ACCEPT_ENCODING, HELLO_ACCEPT_ENCODING)
                     .header(CONNECTION, "keep-alive");
@@ -365,6 +367,13 @@ impl SessionHelloProbeService {
     pub(crate) fn set_endpoint_for_test(&mut self, endpoint: String) {
         self.endpoint = endpoint;
     }
+}
+
+fn hello_user_agent_for_account(account: &Account) -> &'static str {
+    let profile = device_profile(account);
+    profile_for_version(&profile.env.version)
+        .telemetry
+        .growthbook_user_agent
 }
 
 fn parse_bool(key: &str, raw: &str) -> Result<bool, AppError> {
@@ -451,7 +460,7 @@ mod tests {
 
     use super::*;
     use crate::model::account::{
-        AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
+        AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData, DEFAULT_ALLOW_1M_MODELS,
         DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
@@ -661,6 +670,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hello_user_agent_follows_selected_account_profile() {
+        let current = test_account();
+        assert_eq!(hello_user_agent_for_account(&current), "Bun/1.4.1");
+
+        let mut rollback = test_account();
+        let profile = crate::service::version_profile::profile_for_key("2.1.220").unwrap();
+        rollback.canonical_env = serde_json::to_value(CanonicalEnvData {
+            version: profile.identity.version.into(),
+            version_base: profile.identity.version_base.into(),
+            build_time: profile.identity.build_time.into(),
+            node_version: profile.identity.stainless_runtime_version.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::service::version_profile::apply_identity_to_env_json(
+            &mut rollback.canonical_env,
+            &profile.identity,
+        );
+        assert_eq!(hello_user_agent_for_account(&rollback), "Bun/1.4.0");
+    }
+
     #[tokio::test]
     async fn first_request_sends_exact_anonymous_head_and_second_hits_cache() {
         async fn capture_headers(
@@ -710,7 +741,10 @@ mod tests {
         );
 
         let headers = receiver.recv().await.expect("收到探测请求");
-        assert_eq!(headers.get(USER_AGENT).unwrap(), HELLO_USER_AGENT);
+        assert_eq!(
+            headers.get(USER_AGENT).unwrap(),
+            hello_user_agent_for_account(&account)
+        );
         assert_eq!(headers.get(ACCEPT).unwrap(), "*/*");
         assert_eq!(headers.get(ACCEPT_ENCODING).unwrap(), HELLO_ACCEPT_ENCODING);
         assert_eq!(headers.get(CONNECTION).unwrap(), "keep-alive");

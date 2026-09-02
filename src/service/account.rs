@@ -2195,7 +2195,10 @@ fn check_usage_window(
 
 fn is_fable_quota_model_id(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model == "claude-fable-5" || model.starts_with("claude-fable-5[")
+    model == "claude-fable-5"
+        || model.starts_with("claude-fable-5[")
+        || model == "claude-fable-5-1"
+        || model.starts_with("claude-fable-5-1[")
 }
 
 /// 判断账号缓存中的 Fable 周用量是否达到配置上限。
@@ -2999,6 +3002,25 @@ mod tests {
     }
 
     #[test]
+    fn fable_quota_model_ids_include_5_and_5_1_only() {
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+        ] {
+            assert!(is_fable_quota_model_id(model), "{model}");
+        }
+        for model in [
+            "claude-fable-5-2",
+            "claude-fable-51",
+            "claude-fable-5-1-preview",
+        ] {
+            assert!(!is_fable_quota_model_id(model), "{model}");
+        }
+    }
+
+    #[test]
     fn setup_token_never_reaches_fable_weekly_usage_limit() {
         let future = rfc3339_at(ChronoDuration::days(3));
         let mut account = test_account_with_usage(json!({
@@ -3258,7 +3280,7 @@ mod tests {
         let context = AccountSelectionContext {
             fable_quota_fallback_enabled: true,
             fable_weekly_usage_limit_percent: 50,
-            request_model: Some("claude-fable-5".into()),
+            request_model: Some("claude-fable-5-1".into()),
         };
 
         match AccountService::determine_rate_limit_window(

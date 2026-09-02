@@ -10,16 +10,21 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.187",
     "2.1.89-2.1.195",
     "2.1.89-2.1.197",
+    "2.1.89-2.1.220",
 ];
 const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
     ("2.1.187", "2.1.89-2.1.187"),
     ("2.1.195", "2.1.89-2.1.195"),
     ("2.1.197", "2.1.89-2.1.197"),
+    ("2.1.220", "2.1.89-2.1.220"),
 ];
 const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
+const PREVIOUS_DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
 const PREVIOUS_DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
     "claude-fable-5,claude-opus-4-8,claude-opus-4-7";
 const MIGRATION_ALLOW_1M_MODELS_2_1_197_KEY: &str = "migration_allow_1m_models_2_1_197_done";
+const MIGRATION_ALLOW_SYSTEM_ROLE_FABLE_5_1_KEY: &str =
+    "migration_allow_system_role_fable_5_1_done";
 const OBSOLETE_SETTINGS_KEYS: &[&str] = &[
     "intercept_warmup_non_stream_aux_enabled",
     "intercept_warmup_non_stream_aux_mode",
@@ -388,6 +393,8 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     let claude_code_profile = selected_claude_code_profile(pool).await?;
     upgrade_default_settings(pool, claude_code_profile).await?;
     upgrade_default_model_settings(pool).await?;
+    upgrade_system_role_models_for_fable_5_1(pool).await?;
+    upgrade_default_bootstrap_model_options(pool).await?;
     upgrade_default_allow_1m_models(pool).await?;
     remove_obsolete_settings(pool).await?;
     upgrade_account_claude_code_profile(pool, driver, claude_code_profile).await?;
@@ -513,6 +520,65 @@ async fn upgrade_default_model_settings(pool: &AnyPool) -> Result<(), sqlx::Erro
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+async fn upgrade_system_role_models_for_fable_5_1(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let already_done: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind(MIGRATION_ALLOW_SYSTEM_ROLE_FABLE_5_1_KEY)
+            .fetch_optional(pool)
+            .await?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+
+    let configured: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+        .bind("allow_system_role_models")
+        .fetch_optional(pool)
+        .await?;
+    if let Some(configured) = configured.filter(|value| !value.trim().is_empty()) {
+        let mut models = Vec::new();
+        for model in configured
+            .split(',')
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            if !models.iter().any(|existing| existing == model) {
+                models.push(model.to_string());
+            }
+        }
+        if !models.iter().any(|model| model == "claude-fable-5-1") {
+            models.push("claude-fable-5-1".into());
+        }
+        let upgraded = models.join(",");
+        if upgraded != configured {
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+                .bind(upgraded)
+                .bind("allow_system_role_models")
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(MIGRATION_ALLOW_SYSTEM_ROLE_FABLE_5_1_KEY)
+    .bind("true")
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn upgrade_default_bootstrap_model_options(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
+        .bind(crate::store::settings_store::DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS)
+        .bind("bootstrap_additional_model_options")
+        .bind(PREVIOUS_DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -864,6 +930,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrate_appends_fable_5_1_and_preserves_unrelated_model_settings() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        sqlx::query("DELETE FROM settings WHERE key=$1")
+            .bind(MIGRATION_ALLOW_SYSTEM_ROLE_FABLE_5_1_KEY)
+            .execute(&pool)
+            .await
+            .expect("reset migration marker");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("claude-opus-5,claude-fable-5,claude-opus-4-8,claude-sonnet-5")
+            .bind("allow_system_role_models")
+            .execute(&pool)
+            .await
+            .expect("set online system role models");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("claude-fable-5,custom-prefill")
+            .bind("intercept_assistant_prefill_models")
+            .execute(&pool)
+            .await
+            .expect("set custom prefill models");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("claude-fable-5")
+            .bind("rewrite_disabled_thinking_models")
+            .execute(&pool)
+            .await
+            .expect("set disabled thinking models");
+
+        migrate(&pool, "sqlite").await.expect("upgrade fable 5.1");
+
+        let system_role_models: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind("allow_system_role_models")
+                .fetch_one(&pool)
+                .await
+                .expect("system role models");
+        assert_eq!(
+            system_role_models,
+            "claude-opus-5,claude-fable-5,claude-opus-4-8,claude-sonnet-5,claude-fable-5-1"
+        );
+        let prefill_models: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_assistant_prefill_models")
+            .fetch_one(&pool)
+            .await
+            .expect("prefill models");
+        assert_eq!(prefill_models, "claude-fable-5,custom-prefill");
+        let disabled_thinking_models: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind("rewrite_disabled_thinking_models")
+                .fetch_one(&pool)
+                .await
+                .expect("disabled thinking models");
+        assert_eq!(disabled_thinking_models, "claude-fable-5");
+    }
+
+    #[tokio::test]
+    async fn migrate_upgrades_only_old_default_bootstrap_model_option() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("initial migrate");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind(PREVIOUS_DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS)
+            .bind("bootstrap_additional_model_options")
+            .execute(&pool)
+            .await
+            .expect("set previous bootstrap default");
+
+        migrate(&pool, "sqlite")
+            .await
+            .expect("upgrade bootstrap default");
+        let upgraded: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("bootstrap_additional_model_options")
+            .fetch_one(&pool)
+            .await
+            .expect("upgraded bootstrap option");
+        assert_eq!(
+            upgraded,
+            crate::store::settings_store::DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS
+        );
+
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind(r#"[{"model":"custom-fable"}]"#)
+            .bind("bootstrap_additional_model_options")
+            .execute(&pool)
+            .await
+            .expect("set custom bootstrap option");
+        migrate(&pool, "sqlite")
+            .await
+            .expect("preserve custom bootstrap");
+        let custom: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("bootstrap_additional_model_options")
+            .fetch_one(&pool)
+            .await
+            .expect("custom bootstrap option");
+        assert_eq!(custom, r#"[{"model":"custom-fable"}]"#);
+    }
+
+    #[tokio::test]
     async fn migrate_preserves_explicit_old_claude_code_profile_with_custom_allowed_versions() {
         let pool = make_sqlite_pool().await;
         migrate(&pool, "sqlite").await.expect("initial migrate");
@@ -890,6 +1052,7 @@ mod tests {
             ("2.1.187", "2.1.187", "2026-06-23T16:59:46Z"),
             ("2.1.195", "2.1.195", "2026-06-26T01:00:56Z"),
             ("2.1.197", "2.1.197", "2026-06-29T19:08:42Z"),
+            ("2.1.220", "2.1.220", "2026-07-24T22:17:45Z"),
         ] {
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
                 .bind(profile_key)

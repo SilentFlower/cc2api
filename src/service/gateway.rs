@@ -31,8 +31,8 @@ use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
     StatefulCacheUsage, UpstreamSessionRewrite, collect_telemetry_session_ids, detect_client_type,
-    filter_account_beta_tokens, merge_anthropic_beta, order_context_1m_after_oauth,
-    ordered_anthropic_headers, strip_empty_text_blocks,
+    filter_account_beta_tokens, is_structured_haiku_title_request, merge_anthropic_beta,
+    order_context_1m_after_oauth, ordered_anthropic_headers, strip_empty_text_blocks,
 };
 use crate::service::session_hello_probe::{
     SessionHelloProbeConfig, SessionHelloProbeDecision, SessionHelloProbeService,
@@ -2503,8 +2503,13 @@ impl GatewayService {
         }
 
         let stream_config = *self.stream_stability_config.read().await;
-        let body_stream =
-            stable_upstream_stream(resp.bytes_stream(), account.name.clone(), stream_config);
+        let upstream_request_id = extract_upstream_request_id(resp.headers());
+        let body_stream = stable_upstream_stream(
+            resp.bytes_stream(),
+            account.id.to_string(),
+            upstream_request_id,
+            stream_config,
+        );
         let body = Body::from_stream(body_stream);
 
         response_builder
@@ -3594,7 +3599,8 @@ fn safe_header_log_value(name: &str, value: &str) -> String {
 #[derive(Debug)]
 struct StreamForwardState<S> {
     upstream: S,
-    account_name: String,
+    account_id: String,
+    upstream_request_id: Option<String>,
     config: StreamStabilityConfig,
     stream_start: std::time::Instant,
     last_chunk_at: Option<std::time::Instant>,
@@ -3607,7 +3613,8 @@ struct StreamForwardState<S> {
 
 fn stable_upstream_stream<S, E>(
     upstream: S,
-    account_name: String,
+    account_id: String,
+    upstream_request_id: Option<String>,
     config: StreamStabilityConfig,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>>
 where
@@ -3617,7 +3624,8 @@ where
     futures_util::stream::unfold(
         StreamForwardState {
             upstream,
-            account_name,
+            account_id,
+            upstream_request_id,
             config,
             stream_start: std::time::Instant::now(),
             last_chunk_at: None,
@@ -3637,21 +3645,8 @@ where
                 let last_upstream_chunk = state.last_chunk_at.unwrap_or(state.stream_start);
                 let idle_elapsed = now.duration_since(last_upstream_chunk);
                 if idle_elapsed >= state.config.upstream_idle_timeout {
-                    warn!(
-                        "上游流 idle {}s 超时 (account: {}, 已收 {} chunks, 最大间隔 {}ms)",
-                        state.config.upstream_idle_timeout.as_secs(),
-                        state.account_name,
-                        state.chunk_count,
-                        state.max_gap_ms
-                    );
                     state.done = true;
-                    return Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "upstream stream idle timeout",
-                        )),
-                        state,
-                    ));
+                    return Some((Err(upstream_stream_timeout_error(&state)), state));
                 }
 
                 let last_keepalive = state.last_keepalive_at.unwrap_or(last_upstream_chunk);
@@ -3660,7 +3655,7 @@ where
                     state.last_keepalive_at = Some(now);
                     info!(
                         "stream_keepalive_injected account={} after_idle={}s chunks={} max_gap_ms={}",
-                        state.account_name,
+                        state.account_id,
                         state.config.keepalive_interval.as_secs(),
                         state.chunk_count,
                         state.max_gap_ms
@@ -3688,8 +3683,12 @@ where
                 }
                 Ok(Some(Err(e))) => {
                     warn!(
-                        "上游流错误 (account: {}, 已收 {} chunks, 最大间隔 {}ms): {}",
-                        state.account_name, state.chunk_count, state.max_gap_ms, e
+                        "upstream_stream_error account={} upstream_request_id={} chunks={} max_gap_ms={} error={}",
+                        state.account_id,
+                        state.upstream_request_id.as_deref().unwrap_or("unknown"),
+                        state.chunk_count,
+                        state.max_gap_ms,
+                        e
                     );
                     state.done = true;
                     Some((Err(std::io::Error::other(e)), state))
@@ -3700,27 +3699,14 @@ where
                     let last_upstream_chunk = state.last_chunk_at.unwrap_or(state.stream_start);
                     if now.duration_since(last_upstream_chunk) >= state.config.upstream_idle_timeout
                     {
-                        warn!(
-                            "上游流 idle {}s 超时 (account: {}, 已收 {} chunks, 最大间隔 {}ms)",
-                            state.config.upstream_idle_timeout.as_secs(),
-                            state.account_name,
-                            state.chunk_count,
-                            state.max_gap_ms
-                        );
                         state.done = true;
-                        return Some((
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "upstream stream idle timeout",
-                            )),
-                            state,
-                        ));
+                        return Some((Err(upstream_stream_timeout_error(&state)), state));
                     }
 
                     state.last_keepalive_at = Some(now);
                     info!(
                         "stream_keepalive_injected account={} after_idle={}s chunks={} max_gap_ms={}",
-                        state.account_name,
+                        state.account_id,
                         state.config.keepalive_interval.as_secs(),
                         state.chunk_count,
                         state.max_gap_ms
@@ -3728,25 +3714,52 @@ where
                     Some((Ok(Bytes::from_static(STREAM_KEEPALIVE_BYTES)), state))
                 }
                 Err(_elapsed) => {
-                    warn!(
-                        "上游流 idle {}s 超时 (account: {}, 已收 {} chunks, 最大间隔 {}ms)",
-                        state.config.upstream_idle_timeout.as_secs(),
-                        state.account_name,
-                        state.chunk_count,
-                        state.max_gap_ms
-                    );
                     state.done = true;
-                    Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "upstream stream idle timeout",
-                        )),
-                        state,
-                    ))
+                    Some((Err(upstream_stream_timeout_error(&state)), state))
                 }
             }
         },
     )
+}
+
+fn upstream_stream_timeout_error<S>(state: &StreamForwardState<S>) -> std::io::Error {
+    let now = std::time::Instant::now();
+    let wait_started_at = state.last_chunk_at.unwrap_or(state.stream_start);
+    let wait_ms = now.duration_since(wait_started_at).as_millis();
+    let request_id = state.upstream_request_id.as_deref().unwrap_or("unknown");
+    if state.chunk_count == 0 {
+        warn!(
+            "upstream_first_byte_timeout account={} upstream_request_id={} wait_ms={} chunk_count=0 max_gap_ms={}",
+            state.account_id, request_id, wait_ms, state.max_gap_ms
+        );
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream first byte timeout")
+    } else {
+        warn!(
+            "upstream_stream_idle_timeout account={} upstream_request_id={} wait_ms={} chunk_count={} max_gap_ms={}",
+            state.account_id, request_id, wait_ms, state.chunk_count, state.max_gap_ms
+        );
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream stream idle timeout")
+    }
+}
+
+fn extract_upstream_request_id(headers: &HeaderMap) -> Option<String> {
+    ["request-id", "x-request-id"]
+        .into_iter()
+        .find_map(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.len() <= 128
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+            {
+                value.to_string()
+            } else {
+                format!("sha256:{}", short_hash_for_log(value.as_bytes()))
+            }
+        })
 }
 
 fn record_upstream_stream_chunk<S>(state: &mut StreamForwardState<S>, bytes_len: usize) {
@@ -3763,7 +3776,7 @@ fn record_upstream_stream_chunk<S>(state: &mut StreamForwardState<S>, bytes_len:
             info!(
                 "[chunk-gap] {}ms (account: {}, #{} chunk, {} bytes, 已过 {}ms)",
                 gap_ms,
-                state.account_name,
+                state.account_id,
                 state.chunk_count,
                 bytes_len,
                 now.duration_since(state.stream_start).as_millis()
@@ -4299,11 +4312,12 @@ fn is_suggestion_mode_request(body: &serde_json::Value) -> bool {
 }
 
 fn is_json_title_request(body: &serde_json::Value) -> bool {
-    system_text_items(body).any(|text| {
-        text.contains(
-            "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session",
-        )
-    })
+    is_structured_haiku_title_request(body)
+        || system_text_items(body).any(|text| {
+            text.contains(
+                "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session",
+            )
+        })
 }
 
 fn is_text_title_or_warmup_request(body: &serde_json::Value) -> bool {
@@ -6318,7 +6332,7 @@ mod tests {
         cached_non_stream_probe_response, classify_non_stream_probe_text,
         default_fable_weekly_usage_limit_percent, detect_auto_mode_classifier_request,
         detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
-        extract_passive_usage, extract_rejected_passive_usage_windows,
+        extract_passive_usage, extract_rejected_passive_usage_windows, extract_upstream_request_id,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
         is_signature_related_error_body, is_signature_related_error_response_body,
@@ -6358,7 +6372,9 @@ mod tests {
         UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
     };
     use crate::store::memory::MemoryStore;
-    use crate::store::settings_store::SettingsStore;
+    use crate::store::settings_store::{
+        DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, SettingsStore,
+    };
     use axum::body::{self, Body};
     use axum::extract::{Request, State};
     use axum::http::{
@@ -9290,6 +9306,33 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_patch_21257_uses_fable_5_1_sorrel_and_new_cedar_basin() {
+        let mut body = bootstrap_body();
+        let config = BootstrapProfileConfig {
+            mode: BootstrapModelOptionsMode::Configured,
+            additional_model_options: parse_bootstrap_additional_model_options(
+                DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
+            )
+            .expect("2.1.257 bootstrap options"),
+        };
+
+        let changed = patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-fable-5-1",
+            &config,
+            profile_for_key("2.1.257").unwrap(),
+        );
+
+        assert!(changed);
+        assert_eq!(body["client_data"]["cedar_basin"], "2027-08-31");
+        assert_eq!(
+            body["additional_model_options"][0]["model"],
+            "claude-fable-5-1[1m]"
+        );
+        assert_eq!(body["cwk_cfg_key"], "sorrel");
+    }
+
+    #[test]
     fn bootstrap_patch_configured_uses_belladonna_for_opus_5() {
         let mut body = bootstrap_body();
 
@@ -9600,6 +9643,7 @@ mod tests {
         let mut stream = Box::pin(stable_upstream_stream(
             ReceiverStream::new(rx),
             "测试账号".into(),
+            Some("req_first_byte".into()),
             StreamStabilityConfig {
                 keepalive_enabled: true,
                 keepalive_interval: Duration::from_millis(10),
@@ -9610,6 +9654,13 @@ mod tests {
         let next = tokio::time::timeout(Duration::from_millis(30), stream.next()).await;
 
         assert!(next.is_err());
+        let timeout = stream
+            .next()
+            .await
+            .expect("first byte timeout item")
+            .expect_err("first byte timeout");
+        assert_eq!(timeout.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(timeout.to_string(), "upstream first byte timeout");
     }
 
     #[tokio::test]
@@ -9621,6 +9672,7 @@ mod tests {
         let mut stream = Box::pin(stable_upstream_stream(
             ReceiverStream::new(rx),
             "测试账号".into(),
+            Some("req_keepalive".into()),
             StreamStabilityConfig {
                 keepalive_enabled: true,
                 keepalive_interval: Duration::from_millis(10),
@@ -9652,6 +9704,7 @@ mod tests {
         let mut stream = Box::pin(stable_upstream_stream(
             ReceiverStream::new(rx),
             "测试账号".into(),
+            Some("req_idle".into()),
             StreamStabilityConfig {
                 keepalive_enabled: true,
                 keepalive_interval: Duration::from_millis(10),
@@ -9685,6 +9738,7 @@ mod tests {
         assert_eq!(keepalive, Bytes::from_static(STREAM_KEEPALIVE_BYTES));
         assert!(keepalive_count >= 1);
         assert_eq!(idle_result.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(idle_result.to_string(), "upstream stream idle timeout");
     }
 
     #[tokio::test]
@@ -9696,6 +9750,7 @@ mod tests {
         let mut stream = Box::pin(stable_upstream_stream(
             ReceiverStream::new(rx),
             "测试账号".into(),
+            Some("req_disabled".into()),
             StreamStabilityConfig {
                 keepalive_enabled: false,
                 keepalive_interval: Duration::from_millis(10),
@@ -9715,6 +9770,22 @@ mod tests {
             idle_result.expect_err("idle timeout").kind(),
             std::io::ErrorKind::TimedOut
         );
+    }
+
+    #[test]
+    fn upstream_request_id_prefers_request_id_and_hashes_unsafe_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req_fallback".parse().unwrap());
+        headers.insert("request-id", "req_primary".parse().unwrap());
+        assert_eq!(
+            extract_upstream_request_id(&headers).as_deref(),
+            Some("req_primary")
+        );
+
+        headers.insert("request-id", "unsafe/request/id".parse().unwrap());
+        let sanitized = extract_upstream_request_id(&headers).expect("sanitized request id");
+        assert!(sanitized.starts_with("sha256:"));
+        assert!(!sanitized.contains("unsafe/request/id"));
     }
 
     #[test]
@@ -10100,6 +10171,39 @@ mod tests {
                 }
             },
             "messages": [{"role": "user", "content": [{"type": "text", "text": "<session>实现 MVP</session>"}]}]
+        });
+
+        assert_eq!(
+            detect_test_warmup_intercept(
+                &body,
+                ClientType::ClaudeCode,
+                all_warmup_intercepts_enabled()
+            ),
+            Some(WarmupInterceptType::JsonTitle)
+        );
+    }
+
+    #[test]
+    fn warmup_intercept_detects_structured_title_without_prompt_marker() {
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 32000,
+            "stream": true,
+            "tools": [],
+            "thinking": {"type": "disabled"},
+            "system": "new title instruction wording",
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "messages": [{"role": "user", "content": "session summary"}]
         });
 
         assert_eq!(
@@ -10785,6 +10889,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
         assert!(is_system_role_model_allowed("claude-opus-4-8", &allowed));
         assert!(!is_system_role_model_allowed("opus", &allowed));
         assert!(!is_system_role_model_allowed("claude-opus-4-7", &allowed));
+        let defaults = parse_system_role_model_list(DEFAULT_ALLOW_SYSTEM_ROLE_MODELS);
+        assert!(is_system_role_model_allowed("claude-fable-5-1", &defaults));
     }
 
     #[test]

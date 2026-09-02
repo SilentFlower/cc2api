@@ -10,7 +10,8 @@ use crate::service::access_policy::{
 use crate::service::version_profile::{ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_VERSION_PROFILE};
 
 /// 允许 `messages[].role=system` 的默认模型列表。
-pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-5,claude-fable-5,claude-opus-4-8";
+pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str =
+    "claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8";
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
 /// 默认禁止的 Claude Code / Claude CLI 版本范围。
@@ -77,7 +78,7 @@ pub const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS: &str = "120";
 /// bootstrap 模型选项默认透传上游响应,避免未配置时改变上游能力列表。
 pub const DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE: &str = "passthrough";
 /// bootstrap 自定义模型选项默认保留当前抓包中出现的 Fable 入口。
-pub const DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
+pub const DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5-1[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
 /// 有效上游 Session 首次 Hello 代理探测默认关闭，保持升级前转发行为。
 pub const DEFAULT_SESSION_HELLO_PROBE_ENABLED: &str = "false";
 /// 有效上游 Session 首次 Hello 代理探测严格模式默认关闭，失败时继续业务请求。

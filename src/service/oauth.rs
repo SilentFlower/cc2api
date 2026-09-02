@@ -153,7 +153,7 @@ fn build_test_token_request(
         .header("anthropic-version", "2023-06-01")
         .header(
             "anthropic-beta",
-            version_profile.request.message_beta_tokens,
+            version_profile.request.haiku_probe_beta_tokens,
         )
         .header("anthropic-dangerous-direct-browser-access", "true")
         .header("User-Agent", claude_cli_user_agent(version))
@@ -367,25 +367,48 @@ mod tests {
     fn token_test_request_uses_selected_version_profile_headers() {
         let client = get_request_client("");
         let current =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.220"))
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.257"))
                 .expect("构造当前画像请求");
+        let previous =
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.220"))
+                .expect("构造上一画像请求");
         let rollback =
             build_test_token_request(&client, "test-token", &test_canonical_env("2.1.197"))
                 .expect("构造回滚画像请求");
 
         assert_eq!(
             request_header(&current, "user-agent"),
-            "claude-cli/2.1.220 (external, cli)"
+            "claude-cli/2.1.257 (external, cli)"
         );
         assert_eq!(
             request_header(&current, "x-stainless-package-version"),
-            "0.94.0"
+            "0.112.1"
         );
         assert_eq!(
             request_header(&current, "x-stainless-runtime-version"),
             "v26.3.0"
         );
-        assert!(request_header(&current, "anthropic-beta").contains("fallback-credit-2026-06-01"));
+        assert_eq!(
+            request_header(&current, "anthropic-beta"),
+            crate::service::version_profile::HAIKU_PROBE_BETA_TOKENS
+        );
+
+        assert_eq!(
+            request_header(&previous, "user-agent"),
+            "claude-cli/2.1.220 (external, cli)"
+        );
+        assert_eq!(
+            request_header(&previous, "x-stainless-package-version"),
+            "0.94.0"
+        );
+        assert_eq!(
+            request_header(&previous, "x-stainless-runtime-version"),
+            "v26.3.0"
+        );
+        assert_eq!(
+            request_header(&previous, "anthropic-beta"),
+            crate::service::version_profile::HAIKU_PROBE_BETA_TOKENS
+        );
 
         assert_eq!(
             request_header(&rollback, "user-agent"),
@@ -399,8 +422,9 @@ mod tests {
             request_header(&rollback, "x-stainless-runtime-version"),
             "v26.3.0"
         );
-        assert!(
-            !request_header(&rollback, "anthropic-beta").contains("fallback-credit-2026-06-01")
+        assert_eq!(
+            request_header(&rollback, "anthropic-beta"),
+            crate::service::version_profile::HAIKU_PROBE_BETA_TOKENS
         );
     }
 

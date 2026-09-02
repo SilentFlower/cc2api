@@ -33,11 +33,11 @@ const primeHours = ref('4,5,6');
 const primeModel = ref('claude-haiku-4-5-20251001');
 
 /** 允许 messages[].role=system 的模型列表 */
-const allowSystemRoleModels = ref('claude-opus-5,claude-fable-5,claude-opus-4-8');
+const allowSystemRoleModels = ref('claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const claudeCodeVersionProfile = ref('2.1.220');
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.220');
+const claudeCodeVersionProfile = ref('2.1.257');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.257');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
@@ -77,7 +77,7 @@ const streamUpstreamIdleTimeoutSecs = ref('120');
 
 /** Claude Code bootstrap 模型选项配置 */
 const bootstrapModelOptionsMode = ref<'passthrough' | 'configured' | 'hide_fable'>('passthrough');
-const bootstrapAdditionalModelOptions = ref('[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]');
+const bootstrapAdditionalModelOptions = ref('[{"model":"claude-fable-5-1[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]');
 
 type AutoModeClassifierMode = 'passthrough' | 'mock_allow' | 'mock_block' | 'error';
 
@@ -128,6 +128,15 @@ interface ClaudeCodeVersionProfileOption {
 
 /** Claude Code 版本画像选项 */
 const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
+  {
+    key: '2.1.257',
+    version: '2.1.257',
+    version_base: '2.1.257',
+    build_time: '2026-09-01T05:28:54Z',
+    allowed_claude_code_versions: '2.1.89-2.1.257',
+    growthbook_user_agent: 'Bun/1.4.1',
+    telemetry_shape: 'claude_code_2_1_185',
+  },
   {
     key: '2.1.220',
     version: '2.1.220',
@@ -416,10 +425,10 @@ async function loadSettings() {
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
-    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5,claude-fable-5,claude-opus-4-8';
+    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8';
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
-    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.220';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.220';
+    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.257';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.257';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     const contextSanitizerMode = data.claude_code_context_sanitizer_mode ?? 'report_only';
@@ -457,7 +466,7 @@ async function loadSettings() {
     streamUpstreamIdleTimeoutSecs.value = data.stream_upstream_idle_timeout_secs ?? '120';
     const bootstrapMode = data.bootstrap_model_options_mode ?? 'passthrough';
     bootstrapModelOptionsMode.value = bootstrapMode === 'configured' || bootstrapMode === 'hide_fable' ? bootstrapMode : 'passthrough';
-    bootstrapAdditionalModelOptions.value = data.bootstrap_additional_model_options ?? '[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]';
+    bootstrapAdditionalModelOptions.value = data.bootstrap_additional_model_options ?? '[{"model":"claude-fable-5-1[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]';
     interceptWarmupTitleEnabled.value = (data.intercept_warmup_title_enabled ?? 'false') === 'true';
     interceptWarmupSuggestionEnabled.value = (data.intercept_warmup_suggestion_enabled ?? 'false') === 'true';
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
@@ -1131,7 +1140,7 @@ onMounted(async () => {
           <Label class="text-[#5c5647] text-sm">允许模型 (逗号分隔)</Label>
           <Input
             v-model="allowSystemRoleModels"
-            placeholder="claude-opus-5,claude-fable-5,claude-opus-4-8"
+            placeholder="claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8"
             class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
             :class="isValidSystemRoleModels ? '' : 'border-red-400'"
           />
@@ -1139,9 +1148,9 @@ onMounted(async () => {
             <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
             <button
               type="button"
-              @click="allowSystemRoleModels = 'claude-opus-5,claude-fable-5,claude-opus-4-8'"
+              @click="allowSystemRoleModels = 'claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8'"
               class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-            >2.1.220 默认</button>
+            >2.1.257 默认</button>
             <button
               type="button"
               @click="allowSystemRoleModels = ''"
@@ -1410,7 +1419,7 @@ onMounted(async () => {
           <Textarea
             v-model="bootstrapAdditionalModelOptions"
             rows="5"
-            placeholder='[{"model":"claude-fable-5[1m]","name":"Fable"}]'
+            placeholder='[{"model":"claude-fable-5-1[1m]","name":"Fable"}]'
             class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-xs"
             :class="isValidBootstrapAdditionalModelOptions ? '' : 'border-red-400'"
           />
@@ -1517,7 +1526,7 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.220"
+              placeholder="2.1.89-2.1.257"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm bg-[#f9f6f1]"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
               readonly

@@ -366,7 +366,7 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 {
   "error": "messages[].role=system is not allowed for this model",
   "model": "claude-opus-4-7",
-  "allowed_system_role_models": ["claude-opus-5", "claude-fable-5", "claude-opus-4-8"]
+  "allowed_system_role_models": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-4-8"]
 }
 ```
 
@@ -518,7 +518,7 @@ cc-bridge/
 
 网关通过全局 settings 控制客户端入口访问，校验发生在账号选择和上游请求之前：
 
-- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.187`
+- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.257`
 - `blocked_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认空；命中后优先拒绝
 - `allowed_user_agents`：只作用于非 Claude Code / CLI UA，默认允许 `AI-Hub-Monitor*` 和 `python-httpx*`
 - 版本规则支持精确版本、通配和闭区间，例如 `2.1.187`、`2.1.*`、`2.1.89-2.1.187`
@@ -590,10 +590,10 @@ cc-bridge/
 
 ### 请求头改写
 
-- 默认 Claude Code 指纹为 `2.1.185`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移会把已有账号的这三个版本字段升级到当前默认值
-- `/v1/messages` 使用 `claude-cli/<version> (external, cli)`、`X-Stainless-Package-Version=0.94.0`、`X-Stainless-Runtime-Version=v24.3.0`
+- 默认 Claude Code 指纹为 `2.1.257`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移会把仍使用历史默认组合的账号升级到当前画像
+- `/v1/messages` 使用所选画像的 `claude-cli/<version> (external, cli)`、Stainless package 和 Node runtime；2.1.257 为 `0.112.1` / `v26.3.0`
 - `/api/event_logging/v2/batch` 使用 `claude-code/<version>`、`anthropic-beta=oauth-2025-04-20`、`x-service-name=claude-code`
-- `/api/eval/*` 使用抓包中的 `Bun/1.4.0` UA
+- `/api/eval/*` 使用所选画像的 Bun UA；2.1.257 为 `Bun/1.4.1`
 - `/v1/code/triggers` / `/v1/mcp_servers` 使用各自 endpoint beta token
 - 注入/合并 `anthropic-beta`、固定必要 `anthropic-version`
 - 强制使用账号真实 `Authorization`
@@ -627,11 +627,11 @@ Anthropic `thinking.signature`，也不会使用 Gemini `thoughtSignature` 的 d
 
 ### 系统角色模型白名单
 
-Claude Code 2.1.220 的 Opus 5 / Fable 5，以及旧版 `claude-opus-4-8` 请求，可能把运行时提醒放入
+Claude Code 2.1.257 的 Opus 5 / Fable 5 / Fable 5.1，以及旧版 `claude-opus-4-8` 请求，可能把运行时提醒放入
 `messages[].role=system`。网关通过全局 settings key
 `allow_system_role_models` 控制哪些模型允许透传这种格式：
 
-- 默认值：`claude-opus-5,claude-fable-5,claude-opus-4-8`
+- 默认值：`claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8`
 - 格式：逗号分隔的精确模型 ID 列表，例如 `claude-opus-4-8,claude-sonnet-4-6`
 - 空字符串：不允许任何模型透传 `messages[].role=system`
 - 未命中：本地返回 400，并在响应中返回 `allowed_system_role_models`
