@@ -52,12 +52,12 @@ use crate::store::settings_store::{
     DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
-    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
-    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
-    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PASSTHROUGH_OS_VERSION,
-    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
+    DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
+    DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
     DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
@@ -144,6 +144,18 @@ fn session_hello_probe_block_response(decision: SessionHelloProbeDecision) -> Op
     }
 }
 
+fn upstream_request_client(account: &Account) -> Result<reqwest::Client, AppError> {
+    crate::tlsfp::get_request_client(&account.proxy_url).map_err(|_| {
+        // 代理 URL 可能含凭据，失败日志只记录是否配置代理，不输出原值或底层错误文本。
+        warn!(
+            "upstream request client unavailable: account={} proxy_configured={}",
+            account.id,
+            !account.proxy_url.trim().is_empty()
+        );
+        AppError::BadGateway("upstream request client unavailable".into())
+    })
+}
+
 #[derive(Clone, Copy)]
 struct RateLimitResponseDecision {
     delay: std::time::Duration,
@@ -180,6 +192,18 @@ struct RateLimitRequestLogConfig {
     enabled: bool,
     non_stream_enabled: bool,
     body_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestCapturePolicy {
+    Configured,
+    SummaryOnly,
+}
+
+impl RequestCapturePolicy {
+    fn allows_full_capture(self) -> bool {
+        matches!(self, Self::Configured)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +259,37 @@ pub enum AutoModeClassifierMode {
     MockAllow,
     MockBlock,
     Error,
+}
+
+/// Claude Code 后台状态分类请求的处理模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliBgStatusClassifierMode {
+    Passthrough,
+    Mock,
+}
+
+impl CliBgStatusClassifierMode {
+    /// 从 settings 字符串解析后台状态分类请求处理模式。
+    ///
+    /// @param raw settings 中保存的原始字符串。
+    /// @return 解析成功返回模式,非法值返回业务错误。
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "passthrough" => Ok(Self::Passthrough),
+            "mock" => Ok(Self::Mock),
+            other => Err(AppError::BadRequest(format!(
+                "'intercept_cli_bg_status_classifier_mode' 不支持的值: {}",
+                other
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::Mock => "mock",
+        }
+    }
 }
 
 impl AutoModeClassifierMode {
@@ -414,6 +469,7 @@ pub struct GatewayService {
     fable_sticky_quota_fallback_enabled: RwLock<bool>,
     fable_weekly_usage_limit_percent: RwLock<u32>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
+    cli_bg_status_classifier_mode: RwLock<CliBgStatusClassifierMode>,
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
     rate_limit_request_log_config: RwLock<RateLimitRequestLogConfig>,
@@ -472,6 +528,7 @@ impl GatewayService {
                 default_fable_weekly_usage_limit_percent(),
             ),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
+            cli_bg_status_classifier_mode: RwLock::new(default_cli_bg_status_classifier_mode()),
             disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
             assistant_prefill_intercept_config: RwLock::new(
                 default_assistant_prefill_intercept_config(),
@@ -799,6 +856,23 @@ impl GatewayService {
         Ok(())
     }
 
+    /// 从全局设置刷新 Claude Code 后台状态分类请求处理模式。
+    ///
+    /// 配置缓存在内存中,命中请求时不查询数据库。
+    ///
+    /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析模式失败时返回业务错误。
+    pub async fn reload_cli_bg_status_classifier_mode(&self) -> Result<(), AppError> {
+        let raw = self
+            .settings_store
+            .get_value(
+                "intercept_cli_bg_status_classifier_mode",
+                DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
+            )
+            .await?;
+        *self.cli_bg_status_classifier_mode.write().await = CliBgStatusClassifierMode::parse(&raw)?;
+        Ok(())
+    }
+
     /// 从全局设置刷新 `thinking.type=disabled` 兼容改写配置。
     ///
     /// 配置缓存到内存,并在 body 序列化和 CCH attestation 之前参与改写。
@@ -1060,6 +1134,14 @@ impl GatewayService {
     #[cfg(test)]
     pub(crate) async fn fable_weekly_usage_limit_percent_for_test(&self) -> u32 {
         *self.fable_weekly_usage_limit_percent.read().await
+    }
+
+    /// 返回测试使用的后台状态分类请求处理模式。
+    ///
+    /// @return 当前热加载模式。
+    #[cfg(test)]
+    pub(crate) async fn cli_bg_status_classifier_mode_for_test(&self) -> CliBgStatusClassifierMode {
+        *self.cli_bg_status_classifier_mode.read().await
     }
 
     /// 从全局设置刷新客户端访问策略。
@@ -1460,6 +1542,24 @@ impl GatewayService {
         // 检测客户端类型
         let client_type = detect_client_type(&ua, &path, &body_map);
 
+        let cli_bg_status_classifier_mode =
+            if is_cli_bg_status_classifier_request(&path, &headers, &body_map, client_type) {
+                Some(*self.cli_bg_status_classifier_mode.read().await)
+            } else {
+                None
+            };
+        if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Mock) {
+            log_cli_bg_status_classifier_hit(
+                CliBgStatusClassifierMode::Mock,
+                None,
+                &headers,
+                &body_map,
+                body_bytes.len(),
+                0,
+            );
+            return Ok(mock_cli_bg_status_classifier_response(&body_map)?);
+        }
+
         if path.starts_with("/v1/messages") {
             let assistant_prefill_config = self.assistant_prefill_intercept_config.read().await;
             if should_intercept_assistant_prefill(&body_map, &assistant_prefill_config) {
@@ -1725,6 +1825,23 @@ impl GatewayService {
                     return Ok(response);
                 }
             }
+            if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
+                log_cli_bg_status_classifier_hit(
+                    CliBgStatusClassifierMode::Passthrough,
+                    Some(&account),
+                    &headers,
+                    &body_map,
+                    body_bytes.len(),
+                    attempt,
+                );
+            }
+            // cli-bg 正文包含用户最近请求和 Agent 尾部，命中后只允许脱敏摘要日志。
+            let request_capture_policy =
+                if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
+                    RequestCapturePolicy::SummaryOnly
+                } else {
+                    RequestCapturePolicy::Configured
+                };
 
             // 改写请求体
             let t_rewrite = std::time::Instant::now();
@@ -1741,19 +1858,30 @@ impl GatewayService {
             let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
             let context_sanitizer_config = *self.context_sanitizer_config.read().await;
             let (rewritten_body, stateful_cache_completion) =
-                self.rewriter.rewrite_body_with_stateful_completion(
-                    &body_bytes,
-                    &path,
-                    &account,
-                    client_type,
-                    env_pt,
-                    cache_ttl,
-                    message_cache,
-                    message_body_order_fingerprint_enabled,
-                    &disabled_thinking,
-                    &upstream_session_rewrite,
-                    context_sanitizer_config,
-                );
+                if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
+                    (
+                        self.rewriter.rewrite_claude_code_identity_only(
+                            &body_bytes,
+                            &account,
+                            &upstream_session_rewrite,
+                        ),
+                        None,
+                    )
+                } else {
+                    self.rewriter.rewrite_body_with_stateful_completion(
+                        &body_bytes,
+                        &path,
+                        &account,
+                        client_type,
+                        env_pt,
+                        cache_ttl,
+                        message_cache,
+                        message_body_order_fingerprint_enabled,
+                        &disabled_thinking,
+                        &upstream_session_rewrite,
+                        context_sanitizer_config,
+                    )
+                };
             debug!(
                 "request body summary AFTER rewrite: {}",
                 safe_body_summary(&rewritten_body)
@@ -1841,7 +1969,9 @@ impl GatewayService {
                 && !is_streaming_messages_request(&rewritten_body_map)
             {
                 let request_log_config = *self.rate_limit_request_log_config.read().await;
-                if request_log_config.non_stream_enabled {
+                if request_log_config.non_stream_enabled
+                    && request_capture_policy.allows_full_capture()
+                {
                     warn!(
                         "non_stream_request_capture {}",
                         format_request_capture(
@@ -1855,15 +1985,19 @@ impl GatewayService {
                 }
             }
 
-            let non_stream_probe_cache_lookup = self
-                .non_stream_probe_cache_lookup(
-                    &path,
-                    client_type,
-                    &rewritten_body_map,
-                    &final_headers,
-                    &final_body,
-                )
-                .await?;
+            let non_stream_probe_cache_lookup =
+                if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
+                    None
+                } else {
+                    self.non_stream_probe_cache_lookup(
+                        &path,
+                        client_type,
+                        &rewritten_body_map,
+                        &final_headers,
+                        &final_body,
+                    )
+                    .await?
+                };
             if let Some(lookup) = &non_stream_probe_cache_lookup {
                 if let Some(resp) = self
                     .try_non_stream_probe_cache_hit(lookup, &account)
@@ -1912,6 +2046,7 @@ impl GatewayService {
                     &final_body,
                     &account,
                     &account_selection_context,
+                    request_capture_policy,
                 )
                 .await
             {
@@ -1960,6 +2095,7 @@ impl GatewayService {
                                 &final_body,
                                 &account,
                                 &account_selection_context,
+                                request_capture_policy,
                             )
                             .await?;
                         if resp.status() == StatusCode::UNAUTHORIZED {
@@ -1989,6 +2125,7 @@ impl GatewayService {
                     &account,
                     client_type,
                     &account_selection_context,
+                    request_capture_policy,
                     resp,
                 )
                 .await?;
@@ -2121,6 +2258,7 @@ impl GatewayService {
     /// @param account 当前已选账号，重试必须复用该账号。
     /// @param client_type 原始客户端类型，用于判断 API mimicry 生成的 CCH 是否需要刷新。
     /// @param account_selection_context 当前请求模型与 Fable 配额 fallback 开关上下文。
+    /// @param request_capture_policy 当前请求是否允许写入全文请求/响应捕获日志。
     /// @param resp 首次上游响应。
     /// @return 返回最终响应和最后执行的 signature retry 阶段。
     async fn maybe_retry_signature_error(
@@ -2133,6 +2271,7 @@ impl GatewayService {
         account: &Account,
         client_type: ClientType,
         account_selection_context: &AccountSelectionContext,
+        request_capture_policy: RequestCapturePolicy,
         resp: Response,
     ) -> Result<(Response, Option<SignatureRetryStage>), AppError> {
         if path != "/v1/messages" || resp.status() != StatusCode::BAD_REQUEST {
@@ -2177,6 +2316,7 @@ impl GatewayService {
                     &retry_body,
                     account,
                     account_selection_context,
+                    request_capture_policy,
                 )
                 .await
             {
@@ -2225,12 +2365,13 @@ impl GatewayService {
         body: &[u8],
         account: &Account,
         account_selection_context: &AccountSelectionContext,
+        request_capture_policy: RequestCapturePolicy,
     ) -> Result<Response, AppError> {
         let target_url = upstream_url_with_base(&self.upstream_base, path, query);
 
         debug!("upstream URL: {}", target_url);
 
-        let client = crate::tlsfp::get_request_client(&account.proxy_url);
+        let client = upstream_request_client(account)?;
 
         let mut req_builder = match method {
             "GET" => client.get(&target_url),
@@ -2298,7 +2439,7 @@ impl GatewayService {
             }
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let request_log_config = *self.rate_limit_request_log_config.read().await;
-            if request_log_config.enabled {
+            if request_log_config.enabled && request_capture_policy.allows_full_capture() {
                 warn!(
                     "429_request_capture {}",
                     format_request_capture(path, account, headers, body, request_log_config)
@@ -2401,7 +2542,8 @@ impl GatewayService {
                 &serde_json::from_slice::<serde_json::Value>(body)
                     .unwrap_or_else(|_| serde_json::json!({})),
             )
-            && request_log_config.non_stream_enabled;
+            && request_log_config.non_stream_enabled
+            && request_capture_policy.allows_full_capture();
 
         if status_code >= 400 {
             let response_headers = resp.headers().clone();
@@ -2526,7 +2668,7 @@ impl GatewayService {
         let target_url = count_tokens_upstream_url_with_base(&self.upstream_base);
         debug!("count_tokens upstream URL: {}", target_url);
 
-        let client = crate::tlsfp::get_request_client(&account.proxy_url);
+        let client = upstream_request_client(account)?;
         let mut req_builder = client.post(&target_url);
         for (k, v) in ordered_anthropic_headers(COUNT_TOKENS_PATH, headers) {
             debug!(
@@ -4106,6 +4248,369 @@ fn non_stream_probe_cache_hit_log_payload(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliBgAgentState {
+    Working,
+    Blocked,
+    Done,
+    Failed,
+}
+
+impl CliBgAgentState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Working => "Agent 仍在继续执行任务",
+            Self::Blocked => "Agent 正在等待用户处理阻塞条件",
+            Self::Done => "Agent 已完成当前任务",
+            Self::Failed => "Agent 已停止且任务未完成",
+        }
+    }
+}
+
+fn is_cli_bg_status_classifier_request(
+    path: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+    client_type: ClientType,
+) -> bool {
+    if path != "/v1/messages"
+        || client_type != ClientType::ClaudeCode
+        || request_header_value(headers, "x-app") != Some("cli-bg")
+        || body.get("model").and_then(|model| model.as_str()) != Some("claude-fable-5-1")
+        || body.get("stream").and_then(|stream| stream.as_bool()) != Some(false)
+        || body.get("max_tokens").and_then(|tokens| tokens.as_u64()) != Some(3072)
+    {
+        return false;
+    }
+
+    let Some(system_text) = cli_bg_status_classifier_system_text(body) else {
+        return false;
+    };
+    if !system_text.contains("A user kicked off a Claude Code agent")
+        || !system_text.contains("THE FOUR STATES")
+        || !system_text.contains("respond with ONLY this JSON")
+        || !["\"working\"", "\"blocked\"", "\"done\"", "\"failed\""]
+            .iter()
+            .all(|marker| system_text.contains(marker))
+        || ![
+            "\"state\"",
+            "\"detail\"",
+            "\"tempo\"",
+            "\"needs\"",
+            "\"output\"",
+        ]
+        .iter()
+        .all(|marker| system_text.contains(marker))
+    {
+        return false;
+    }
+
+    cli_bg_status_classifier_user_text(body)
+        .map(|text| {
+            text.starts_with("Current state:")
+                && text.contains("Tool calls so far:")
+                && text.contains("User's most recent ask:")
+                && text.contains("Assistant message tail")
+        })
+        .unwrap_or(false)
+}
+
+fn request_header_value<'a>(
+    headers: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn cli_bg_status_classifier_system_text(body: &serde_json::Value) -> Option<&str> {
+    let blocks = body.get("system")?.as_array()?;
+    if blocks.len() != 1 {
+        return None;
+    }
+    let block = blocks[0].as_object()?;
+    if block.get("type").and_then(|value| value.as_str()) != Some("text")
+        || block
+            .get("cache_control")
+            .and_then(|value| value.as_object())
+            .and_then(|cache| cache.get("type"))
+            .and_then(|value| value.as_str())
+            != Some("ephemeral")
+    {
+        return None;
+    }
+    block.get("text").and_then(|value| value.as_str())
+}
+
+fn cli_bg_status_classifier_user_text(body: &serde_json::Value) -> Option<&str> {
+    let messages = body.get("messages")?.as_array()?;
+    if messages.len() != 1 {
+        return None;
+    }
+    let message = messages[0].as_object()?;
+    if message.get("role").and_then(|value| value.as_str()) != Some("user") {
+        return None;
+    }
+    strict_single_text_content(message.get("content")?)
+}
+
+fn strict_single_text_content(content: &serde_json::Value) -> Option<&str> {
+    match content {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Array(items) if items.len() == 1 => strict_text_block(items.first()?),
+        serde_json::Value::Object(_) => strict_text_block(content),
+        _ => None,
+    }
+}
+
+fn strict_text_block(block: &serde_json::Value) -> Option<&str> {
+    let block = block.as_object()?;
+    if block.get("type").and_then(|value| value.as_str()) != Some("text") {
+        return None;
+    }
+    block.get("text").and_then(|value| value.as_str())
+}
+
+fn log_cli_bg_status_classifier_hit(
+    mode: CliBgStatusClassifierMode,
+    account: Option<&Account>,
+    headers: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+    body_bytes: usize,
+    attempt: usize,
+) {
+    let text_bytes = system_text_items(body)
+        .chain(message_text_items(body))
+        .map(str::len)
+        .sum::<usize>();
+    let message_count = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    let retry_count = request_header_value(headers, "x-stainless-retry-count").unwrap_or("-");
+    let summary = serde_json::json!({
+        "mode": mode.as_str(),
+        "model": body.get("model").and_then(|model| model.as_str()).unwrap_or_default(),
+        "stream": false,
+        "max_tokens": body.get("max_tokens").and_then(|tokens| tokens.as_u64()),
+        "body_bytes": body_bytes,
+        "text_bytes": text_bytes,
+        "message_count": message_count,
+        "retry_count": retry_count,
+        "attempt": attempt,
+        "body_hash": stable_body_hash_for_log(body),
+        "shape_bypass": mode == CliBgStatusClassifierMode::Passthrough,
+        "proxy_configured": account
+            .map(|selected| !selected.proxy_url.trim().is_empty())
+            .unwrap_or(false),
+    });
+    info!(
+        "cli_bg_status_classifier_hit {}",
+        serde_json::to_string(&summary).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+fn classify_cli_bg_status(body: &serde_json::Value) -> CliBgAgentState {
+    let Some(user_text) = cli_bg_status_classifier_user_text(body) else {
+        return CliBgAgentState::Working;
+    };
+    let tail = user_text
+        .find("Assistant message tail")
+        .map(|index| &user_text[index + "Assistant message tail".len()..])
+        .unwrap_or_default();
+    let tail_lower = tail.to_ascii_lowercase();
+
+    if cli_bg_tail_has_api_auth_or_infra_error(&tail_lower) {
+        return CliBgAgentState::Blocked;
+    }
+    // Agent 明确承诺自动复查时，即使同时出现等待用户的措辞，也仍由 Agent 持有下一步。
+    if cli_bg_tail_is_working(&tail_lower, tail) {
+        return CliBgAgentState::Working;
+    }
+    if cli_bg_tail_has_user_gate(&tail_lower, tail) {
+        return CliBgAgentState::Blocked;
+    }
+    if cli_bg_tail_is_failed(&tail_lower, tail) {
+        return CliBgAgentState::Failed;
+    }
+    if cli_bg_tail_is_done(&tail_lower, tail) {
+        return CliBgAgentState::Done;
+    }
+
+    cli_bg_current_state(user_text).unwrap_or(CliBgAgentState::Working)
+}
+
+fn cli_bg_tail_has_api_auth_or_infra_error(tail_lower: &str) -> bool {
+    [
+        "api error:",
+        "no response from api",
+        "401 invalid api key",
+        "invalid api key",
+        "please run /login",
+        "rate limited",
+        "overloaded",
+        "credit balance too low",
+        "usage limit reached",
+        "oauth token expired",
+        "oauth token revoked",
+        "vault credential missing",
+        "mcp authentication failed",
+        "mcp unauthorized",
+        "gh auth login",
+        "gcloud auth login",
+        "aws sso login",
+        "bad credentials",
+        "token expired",
+    ]
+    .iter()
+    .any(|marker| tail_lower.contains(marker))
+}
+
+fn cli_bg_tail_has_user_gate(tail_lower: &str, tail: &str) -> bool {
+    [
+        "blocked:",
+        "i'm blocked:",
+        "awaiting your `go`",
+        "reply `go`",
+        "can't proceed",
+        "cannot proceed",
+        "want me to fix",
+        "want me to apply",
+        "want me to add it to this pr",
+        "which approach do you want",
+        "let me know which env",
+        "let me know which environment",
+        "which env to use",
+        "which environment to use",
+    ]
+    .iter()
+    .any(|marker| tail_lower.contains(marker))
+        || tail.contains("等待用户")
+        || tail.contains("需要用户")
+        || tail.contains("请提供")
+}
+
+fn cli_bg_tail_is_failed(tail_lower: &str, tail: &str) -> bool {
+    tail_lower.contains("giving up")
+        || tail_lower.contains("not actionable")
+        || tail.contains("放弃")
+        || tail.contains("任务不可执行")
+}
+
+fn cli_bg_tail_is_working(tail_lower: &str, tail: &str) -> bool {
+    [
+        "now let me",
+        "next i'll",
+        "still running",
+        "i'll report",
+        "next check",
+        "checking back",
+        "waiting for ci",
+        "waiting on ci",
+        "shepherding ci",
+        "build in progress",
+        "in progress",
+    ]
+    .iter()
+    .any(|marker| tail_lower.contains(marker))
+        || tail.contains("正在执行")
+        || tail.contains("还在运行")
+        || tail.contains("还在跑")
+        || tail.contains("继续检查")
+}
+
+fn cli_bg_tail_is_done(tail_lower: &str, tail: &str) -> bool {
+    [
+        "no response requested",
+        "no action needed",
+        "nothing needed from you",
+        "\nresult:",
+        "tests pass",
+        "completed",
+        "if you want, i can also",
+        "let me know if you also want",
+        "want me to also",
+        "say the word and i'll",
+        "auto-merge armed",
+        "awaiting stamp",
+    ]
+    .iter()
+    .any(|marker| tail_lower.contains(marker))
+        || tail_lower.trim_start().starts_with("result:")
+        || tail.contains("已完成")
+        || tail.contains("测试通过")
+}
+
+fn cli_bg_current_state(user_text: &str) -> Option<CliBgAgentState> {
+    let state = user_text
+        .strip_prefix("Current state:")?
+        .trim_start()
+        .split(|character: char| character.is_whitespace() || character == '(')
+        .next()?
+        .to_ascii_lowercase();
+    match state.as_str() {
+        "working" => Some(CliBgAgentState::Working),
+        "blocked" => Some(CliBgAgentState::Blocked),
+        "done" => Some(CliBgAgentState::Done),
+        "failed" => Some(CliBgAgentState::Failed),
+        _ => None,
+    }
+}
+
+fn cli_bg_working_tempo(body: &serde_json::Value) -> &'static str {
+    let tail = cli_bg_status_classifier_user_text(body)
+        .and_then(|text| {
+            text.find("Assistant message tail")
+                .map(|index| &text[index..])
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if tail.contains("waiting") || tail.contains("next check") || tail.contains("still running") {
+        "idle"
+    } else {
+        "active"
+    }
+}
+
+fn cli_bg_status_json(body: &serde_json::Value) -> serde_json::Value {
+    let state = classify_cli_bg_status(body);
+    let tempo = match state {
+        CliBgAgentState::Working => cli_bg_working_tempo(body),
+        CliBgAgentState::Blocked => "blocked",
+        CliBgAgentState::Done | CliBgAgentState::Failed => "idle",
+    };
+    let mut status = serde_json::json!({
+        "state": state.as_str(),
+        "detail": state.detail(),
+        "tempo": tempo,
+        "output": {},
+    });
+    if state == CliBgAgentState::Blocked {
+        status.as_object_mut().expect("状态对象").insert(
+            "needs".into(),
+            serde_json::Value::String("请返回 Claude Code 会话处理阻塞条件".into()),
+        );
+    } else if matches!(state, CliBgAgentState::Done | CliBgAgentState::Failed) {
+        status.as_object_mut().expect("状态对象").insert(
+            "output".into(),
+            serde_json::json!({"result": state.detail()}),
+        );
+    }
+    status
+}
+
 fn is_auto_mode_classifier_stage1_request(
     path: &str,
     body: &serde_json::Value,
@@ -4528,13 +5033,40 @@ fn mock_auto_mode_classifier_json_response(
     mock_text_message_response(intercept_type, request_body, text)
 }
 
+fn mock_cli_bg_status_classifier_response(
+    request_body: &serde_json::Value,
+) -> Result<Response, AppError> {
+    let text = serde_json::to_string(&cli_bg_status_json(request_body))
+        .map_err(|error| AppError::Internal(format!("serialize cli-bg status: {}", error)))?;
+    build_mock_text_message_response(
+        "msg_mock_cli_bg_status_classifier",
+        "end_turn",
+        request_body,
+        &text,
+    )
+}
+
 fn mock_text_message_response(
     intercept_type: WarmupInterceptType,
     request_body: &serde_json::Value,
     text: &str,
 ) -> Result<Response, AppError> {
+    build_mock_text_message_response(
+        intercept_type.message_id(),
+        intercept_type.stop_reason(),
+        request_body,
+        text,
+    )
+}
+
+fn build_mock_text_message_response(
+    message_id: &str,
+    stop_reason: &str,
+    request_body: &serde_json::Value,
+    text: &str,
+) -> Result<Response, AppError> {
     let body = serde_json::json!({
-        "id": intercept_type.message_id(),
+        "id": message_id,
         "type": "message",
         "role": "assistant",
         "model": request_body.get("model").and_then(|model| model.as_str()).unwrap_or("claude-mock"),
@@ -4542,7 +5074,7 @@ fn mock_text_message_response(
             "type": "text",
             "text": text,
         }],
-        "stop_reason": intercept_type.stop_reason(),
+        "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
         "usage": {
             "input_tokens": 0,
@@ -4552,12 +5084,12 @@ fn mock_text_message_response(
         }
     });
     let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| AppError::Internal(format!("serialize warmup mock response: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("serialize mock response: {}", e)))?;
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(Body::from(body_bytes))
-        .map_err(|e| AppError::Internal(format!("build warmup mock response: {}", e)))
+        .map_err(|e| AppError::Internal(format!("build mock response: {}", e)))
 }
 
 fn mock_warmup_intercept_stream_response(
@@ -4989,6 +5521,12 @@ fn default_warmup_intercept_config() -> WarmupInterceptConfig {
         )
         .expect("默认 Auto Mode classifier Stage 2 模式必须合法"),
     }
+}
+
+/// 构造后台状态分类请求处理模式初始值。
+fn default_cli_bg_status_classifier_mode() -> CliBgStatusClassifierMode {
+    CliBgStatusClassifierMode::parse(DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE)
+        .expect("默认后台状态分类请求处理模式必须合法")
 }
 
 /// 构造 `thinking.type=disabled` 兼容改写的内存初始值。
@@ -6321,30 +6859,32 @@ mod tests {
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, AutoModeClassifierProtocol,
         BootstrapModelOptionsMode, BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse,
-        GatewayAdmissionError, GatewayService, NON_STREAM_PROBE_CACHE_TTL,
-        NonStreamProbeCacheLookup, NonStreamProbeType, RateLimitRequestLogConfig,
-        STATEFUL_USAGE_BUFFER_LIMIT, STREAM_KEEPALIVE_BYTES, SignatureRetryStage,
-        StreamStabilityConfig, UPSTREAM_BASE, WarmupInterceptConfig, WarmupInterceptType,
-        align_mapped_upstream_session_header, assistant_prefill_intercept_body,
-        auto_mode_classifier_protocol, auto_mode_classifier_response,
-        buffered_error_body_for_downstream, buffered_response_body_for_downstream,
-        build_message_telemetry_context, build_warmup_intercept_sse, cached_non_stream_probe_body,
-        cached_non_stream_probe_response, classify_non_stream_probe_text,
+        CliBgAgentState, CliBgStatusClassifierMode, GatewayAdmissionError, GatewayService,
+        NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
+        RateLimitRequestLogConfig, RequestCapturePolicy, STATEFUL_USAGE_BUFFER_LIMIT,
+        STREAM_KEEPALIVE_BYTES, SignatureRetryStage, StreamStabilityConfig, UPSTREAM_BASE,
+        WarmupInterceptConfig, WarmupInterceptType, align_mapped_upstream_session_header,
+        assistant_prefill_intercept_body, auto_mode_classifier_protocol,
+        auto_mode_classifier_response, buffered_error_body_for_downstream,
+        buffered_response_body_for_downstream, build_message_telemetry_context,
+        build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
+        classify_cli_bg_status, classify_non_stream_probe_text, cli_bg_status_json,
         default_fable_weekly_usage_limit_percent, detect_auto_mode_classifier_request,
         detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
         extract_passive_usage, extract_rejected_passive_usage_windows, extract_upstream_request_id,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
-        is_signature_related_error_body, is_signature_related_error_response_body,
-        is_system_role_model_allowed, mock_warmup_intercept_json_response,
-        non_stream_probe_cache_create_log_payload, non_stream_probe_cache_hit_log_payload,
-        non_stream_probe_cache_key, parse_bootstrap_additional_model_options,
-        parse_rate_limit_request_body_limit, parse_system_role_model_list, patch_bootstrap_json,
-        redact_request_headers, redact_sensitive_text, redacted_request_body_for_log,
-        request_slot_units, rewrite_bootstrap_response, safe_body_summary,
-        safe_non_stream_probe_response_headers, sanitize_count_tokens_body,
-        session_hello_probe_block_response, session_hello_probe_session_id,
-        should_intercept_assistant_prefill, signature_retry_body_for_stage, stable_upstream_stream,
+        is_cli_bg_status_classifier_request, is_signature_related_error_body,
+        is_signature_related_error_response_body, is_system_role_model_allowed,
+        mock_warmup_intercept_json_response, non_stream_probe_cache_create_log_payload,
+        non_stream_probe_cache_hit_log_payload, non_stream_probe_cache_key,
+        parse_bootstrap_additional_model_options, parse_rate_limit_request_body_limit,
+        parse_system_role_model_list, patch_bootstrap_json, redact_request_headers,
+        redact_sensitive_text, redacted_request_body_for_log, request_slot_units,
+        rewrite_bootstrap_response, safe_body_summary, safe_non_stream_probe_response_headers,
+        sanitize_count_tokens_body, session_hello_probe_block_response,
+        session_hello_probe_session_id, should_intercept_assistant_prefill,
+        signature_retry_body_for_stage, stable_upstream_stream,
         strip_signature_sensitive_blocks_from_messages_request,
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
@@ -6414,6 +6954,62 @@ mod tests {
         config: WarmupInterceptConfig,
     ) -> Option<WarmupInterceptType> {
         detect_warmup_intercept(body, client_type, config)
+    }
+
+    fn cli_bg_status_classifier_body(state: &str, tail: &str) -> serde_json::Value {
+        let user_id = json!({
+            "device_id": "123e4567-e89b-12d3-a456-426614174001",
+            "account_uuid": "123e4567-e89b-12d3-a456-426614174002",
+            "session_id": "123e4567-e89b-12d3-a456-426614174003"
+        })
+        .to_string();
+        json!({
+            "model": "claude-fable-5-1",
+            "stream": false,
+            "max_tokens": 3072,
+            "system": [{
+                "type": "text",
+                "cache_control": {"type": "ephemeral"},
+                "text": concat!(
+                    "A user kicked off a Claude Code agent. THE FOUR STATES are ",
+                    "\"working\", \"blocked\", \"done\", and \"failed\". ",
+                    "respond with ONLY this JSON using \"state\", \"detail\", ",
+                    "\"tempo\", \"needs\", and \"output\"."
+                )
+            }],
+            "messages": [{
+                "role": "user",
+                "content": format!(
+                    "Current state: {}\nTool calls so far: Bash×1\nUser's most recent ask: test\n\nAssistant message tail: {}",
+                    state, tail
+                )
+            }],
+            "metadata": {"user_id": user_id},
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "fallbacks": "default"
+        })
+    }
+
+    fn cli_bg_status_classifier_headers() -> HashMap<String, String> {
+        HashMap::from([
+            ("user-agent".into(), "claude-code/2.1.257".into()),
+            ("x-app".into(), "cli-bg".into()),
+            ("x-stainless-retry-count".into(), "0".into()),
+        ])
+    }
+
+    fn cli_bg_status_classifier_request(state: &str, tail: &str) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("user-agent", "claude-code/2.1.257")
+            .header("x-app", "cli-bg")
+            .header("x-stainless-retry-count", "0")
+            .body(Body::from(
+                serde_json::to_vec(&cli_bg_status_classifier_body(state, tail)).unwrap(),
+            ))
+            .unwrap()
     }
 
     fn classifier_body(max_tokens: u64, suffix: &str) -> serde_json::Value {
@@ -6859,6 +7455,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct AuthMockState {
         authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
+        x_app_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
+        request_bodies: Arc<tokio::sync::Mutex<Vec<Bytes>>>,
         refresh_calls: Arc<AtomicUsize>,
         refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
         hello_calls: Arc<AtomicUsize>,
@@ -6990,6 +7588,7 @@ mod tests {
     async fn mock_upstream_response(
         State(state): State<AuthMockState>,
         headers: HeaderMap,
+        body: Bytes,
     ) -> Response {
         let authorization = headers
             .get("authorization")
@@ -7001,6 +7600,14 @@ mod tests {
             .lock()
             .await
             .push(authorization.clone());
+        state.x_app_headers.lock().await.push(
+            headers
+                .get("x-app")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        state.request_bodies.lock().await.push(body);
 
         if matches!(
             authorization.as_str(),
@@ -7114,6 +7721,24 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve mock upstream");
+        });
+        (format!("http://{}", address), state, server)
+    }
+
+    async fn spawn_http_proxy_mock_server() -> (String, AuthMockState, tokio::task::JoinHandle<()>)
+    {
+        let state = AuthMockState::default();
+        let app = Router::new()
+            .fallback(mock_upstream_response)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock proxy server");
+        let address = listener.local_addr().expect("mock proxy server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock HTTP proxy");
         });
         (format!("http://{}", address), state, server)
     }
@@ -9786,6 +10411,355 @@ mod tests {
         let sanitized = extract_upstream_request_id(&headers).expect("sanitized request id");
         assert!(sanitized.starts_with("sha256:"));
         assert!(!sanitized.contains("unsafe/request/id"));
+    }
+
+    #[test]
+    fn cli_bg_status_classifier_mode_accepts_only_supported_values() {
+        assert_eq!(
+            CliBgStatusClassifierMode::parse("passthrough").unwrap(),
+            CliBgStatusClassifierMode::Passthrough
+        );
+        assert_eq!(
+            CliBgStatusClassifierMode::parse("mock").unwrap(),
+            CliBgStatusClassifierMode::Mock
+        );
+        assert!(CliBgStatusClassifierMode::parse("error").is_err());
+    }
+
+    #[test]
+    fn cli_bg_status_classifier_detector_matches_only_strong_shape() {
+        let headers = cli_bg_status_classifier_headers();
+        let body = cli_bg_status_classifier_body("working (for 21m)", "文档组还在跑");
+
+        assert!(is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &body,
+            ClientType::ClaudeCode
+        ));
+
+        let mut wrong_headers = headers.clone();
+        wrong_headers.insert("x-app".into(), "cli".into());
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &wrong_headers,
+            &body,
+            ClientType::ClaudeCode
+        ));
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages/count_tokens",
+            &headers,
+            &body,
+            ClientType::ClaudeCode
+        ));
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &body,
+            ClientType::API
+        ));
+
+        for model in ["claude-fable-5", "claude-fable-5-1[1m]"] {
+            let mut changed = body.clone();
+            changed["model"] = json!(model);
+            assert!(!is_cli_bg_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &changed,
+                ClientType::ClaudeCode
+            ));
+        }
+
+        let mut streaming = body.clone();
+        streaming["stream"] = json!(true);
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &streaming,
+            ClientType::ClaudeCode
+        ));
+
+        let mut wrong_tokens = body.clone();
+        wrong_tokens["max_tokens"] = json!(3073);
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &wrong_tokens,
+            ClientType::ClaudeCode
+        ));
+
+        let mut missing_system_marker = body.clone();
+        missing_system_marker["system"][0]["text"] = json!("generic classifier prompt");
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &missing_system_marker,
+            ClientType::ClaudeCode
+        ));
+
+        let mut missing_user_marker = body.clone();
+        missing_user_marker["messages"][0]["content"] = json!("Current state: working");
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &missing_user_marker,
+            ClientType::ClaudeCode
+        ));
+
+        let mut multiple_system_blocks = body.clone();
+        multiple_system_blocks["system"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "text", "text": "extra"}));
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &multiple_system_blocks,
+            ClientType::ClaudeCode
+        ));
+
+        let mut multiple_messages = body.clone();
+        multiple_messages["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": "copied prompt"}));
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &multiple_messages,
+            ClientType::ClaudeCode
+        ));
+
+        let mut multiple_user_blocks = body.clone();
+        multiple_user_blocks["messages"][0]["content"] = json!([
+            {"type": "text", "text": body["messages"][0]["content"]},
+            {"type": "text", "text": "copied transcript"}
+        ]);
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &multiple_user_blocks,
+            ClientType::ClaudeCode
+        ));
+
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &classifier_body(256, "<block> immediately"),
+            ClientType::ClaudeCode
+        ));
+    }
+
+    #[test]
+    fn cli_bg_status_classifier_uses_explicit_markers_then_current_state() {
+        let cases = [
+            (
+                cli_bg_status_classifier_body("working", "API Error: No response from API"),
+                CliBgAgentState::Blocked,
+            ),
+            (
+                cli_bg_status_classifier_body("done", "Next check in 5 min"),
+                CliBgAgentState::Working,
+            ),
+            (
+                cli_bg_status_classifier_body("working", "Fixed it; tests pass."),
+                CliBgAgentState::Done,
+            ),
+            (
+                cli_bg_status_classifier_body("working", "Giving up. The task is not actionable."),
+                CliBgAgentState::Failed,
+            ),
+            (
+                cli_bg_status_classifier_body("blocked", "没有额外标记"),
+                CliBgAgentState::Blocked,
+            ),
+            (
+                cli_bg_status_classifier_body("blocked", "Awaiting your `go`. Next check in 20m."),
+                CliBgAgentState::Working,
+            ),
+            (
+                cli_bg_status_classifier_body(
+                    "working",
+                    "I found the bug. Want me to fix it or just report?",
+                ),
+                CliBgAgentState::Blocked,
+            ),
+            (
+                cli_bg_status_classifier_body(
+                    "working",
+                    "Tests written but I haven't run them. Let me know which env to use.",
+                ),
+                CliBgAgentState::Blocked,
+            ),
+            (
+                cli_bg_status_classifier_body(
+                    "working",
+                    "Fixed the regex; tests pass. If you want, I can also clean up the helper.",
+                ),
+                CliBgAgentState::Done,
+            ),
+            (
+                cli_bg_status_classifier_body(
+                    "working",
+                    "Not applied - say the word and I'll update both widgets.",
+                ),
+                CliBgAgentState::Done,
+            ),
+            (
+                cli_bg_status_classifier_body(
+                    "working",
+                    "Auto-merge armed on PR #4821. Posted to #stamps. Awaiting stamp.",
+                ),
+                CliBgAgentState::Done,
+            ),
+        ];
+
+        for (body, expected) in cases {
+            assert_eq!(classify_cli_bg_status(&body), expected);
+        }
+    }
+
+    #[test]
+    fn cli_bg_summary_only_policy_disables_full_capture() {
+        assert!(RequestCapturePolicy::Configured.allows_full_capture());
+        assert!(!RequestCapturePolicy::SummaryOnly.allows_full_capture());
+    }
+
+    #[test]
+    fn cli_bg_status_classifier_mock_schema_matches_state_contract() {
+        let cases = [
+            (
+                cli_bg_status_classifier_body("working", "Now let me check the logs."),
+                "working",
+                false,
+                false,
+            ),
+            (
+                cli_bg_status_classifier_body("working", "API Error: 401 Invalid API key"),
+                "blocked",
+                true,
+                false,
+            ),
+            (
+                cli_bg_status_classifier_body("working", "Fixed it; tests pass."),
+                "done",
+                false,
+                true,
+            ),
+            (
+                cli_bg_status_classifier_body("working", "Giving up. Not actionable."),
+                "failed",
+                false,
+                true,
+            ),
+        ];
+
+        for (body, expected_state, has_needs, has_result) in cases {
+            let status = cli_bg_status_json(&body);
+            assert_eq!(status["state"], expected_state);
+            assert_eq!(status.get("needs").is_some(), has_needs);
+            assert_eq!(status["output"].get("result").is_some(), has_result);
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_bg_status_classifier_mock_returns_parseable_message_without_account() {
+        let service = test_gateway_service().await;
+        *service.cli_bg_status_classifier_mode.write().await = CliBgStatusClassifierMode::Mock;
+
+        let response = service
+            .handle_request(
+                cli_bg_status_classifier_request("working", "API Error: No response from API"),
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(envelope["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["id"], "msg_mock_cli_bg_status_classifier");
+        assert_eq!(envelope["model"], "claude-fable-5-1");
+        assert_eq!(status["state"], "blocked");
+        assert_eq!(status["tempo"], "blocked");
+        assert!(status.get("needs").is_some());
+        assert!(status["output"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cli_bg_status_classifier_passthrough_uses_account_proxy() {
+        let (proxy_url, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            "http://upstream.invalid".into(),
+            "http://oauth.invalid/token".into(),
+        )
+        .await;
+        let mut account = create_gateway_account(&service, "cli-bg@example.com", 1, 0).await;
+        account.proxy_url = proxy_url;
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("保存测试账号代理");
+
+        let response = service
+            .handle_request(
+                cli_bg_status_classifier_request("working", "继续检查剩余文件"),
+                None,
+            )
+            .await;
+        let status = response.status();
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.authorization_headers.lock().await.len(), 1);
+        assert_eq!(state.x_app_headers.lock().await.as_slice(), ["cli-bg"]);
+        let captured_body = state.request_bodies.lock().await[0].clone();
+        let captured: serde_json::Value = serde_json::from_slice(&captured_body).unwrap();
+        assert_eq!(
+            captured["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(captured["system"][0]["cache_control"].get("ttl").is_none());
+        assert!(captured["messages"][0].get("cache_control").is_none());
+        assert_eq!(
+            captured["thinking"],
+            json!({"type": "adaptive", "display": "updates"})
+        );
+        assert_eq!(captured["fallbacks"], "default");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_bg_status_classifier_invalid_proxy_fails_closed() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(base_url.clone(), format!("{}/oauth/token", base_url))
+                .await;
+        let mut account =
+            create_gateway_account(&service, "cli-bg-bad-proxy@example.com", 1, 0).await;
+        account.proxy_url = "://invalid-proxy".into();
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("保存非法测试代理");
+
+        let response = service
+            .handle_request(
+                cli_bg_status_classifier_request("working", "继续检查剩余文件"),
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(state.request_bodies.lock().await.is_empty());
+        server.abort();
     }
 
     #[test]

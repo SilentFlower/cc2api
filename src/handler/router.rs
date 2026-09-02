@@ -26,7 +26,7 @@ use crate::service::access_policy::{
 };
 use crate::service::account::AccountService;
 use crate::service::gateway::{
-    AutoModeClassifierMode, BootstrapModelOptionsMode, GatewayService,
+    AutoModeClassifierMode, BootstrapModelOptionsMode, CliBgStatusClassifierMode, GatewayService,
     parse_bootstrap_additional_model_options,
 };
 use crate::service::oauth::TokenTester;
@@ -44,17 +44,17 @@ use crate::store::settings_store::{
     DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
-    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
-    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
-    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
-    DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
-    DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
-    DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
-    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
-    SettingsStore,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
+    DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
+    DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
+    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, DEFAULT_SESSION_HELLO_PROBE_ENABLED,
+    DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS, DEFAULT_SESSION_HELLO_PROBE_STRICT,
+    DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS, DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
+    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -954,6 +954,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("intercept_auto_mode_classifier_stage2_mode".into())
         .or_insert_with(|| DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE.to_string());
     settings
+        .entry("intercept_cli_bg_status_classifier_mode".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE.to_string());
+    settings
         .entry("rewrite_disabled_thinking_enabled".into())
         .or_insert_with(|| DEFAULT_REWRITE_DISABLED_THINKING_ENABLED.to_string());
     settings
@@ -1196,6 +1199,9 @@ async fn update_settings(
     if let Some(val) = body.get("intercept_auto_mode_classifier_stage2_mode") {
         AutoModeClassifierMode::parse(val)?;
     }
+    if let Some(val) = body.get("intercept_cli_bg_status_classifier_mode") {
+        CliBgStatusClassifierMode::parse(val)?;
+    }
     if let Some(val) = body.get("bootstrap_model_options_mode") {
         BootstrapModelOptionsMode::parse(val)?;
     }
@@ -1268,6 +1274,12 @@ async fn update_settings(
         || body.contains_key("intercept_auto_mode_classifier_stage2_mode")
     {
         state.gateway_svc.reload_warmup_intercept_config().await?;
+    }
+    if body.contains_key("intercept_cli_bg_status_classifier_mode") {
+        state
+            .gateway_svc
+            .reload_cli_bg_status_classifier_mode()
+            .await?;
     }
     if body.contains_key("rewrite_disabled_thinking_enabled")
         || body.contains_key("rewrite_disabled_thinking_models")
@@ -1372,9 +1384,9 @@ async fn get_prime_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeCodeContextSanitizerMode, MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS,
-        MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, build_router, hello_get, hello_head,
-        normalize_oauth_credential_validity_seconds, validate_model_id_list,
+        ClaudeCodeContextSanitizerMode, CliBgStatusClassifierMode,
+        MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS, MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, build_router,
+        hello_get, hello_head, normalize_oauth_credential_validity_seconds, validate_model_id_list,
     };
     use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
     use crate::service::account::AccountService;
@@ -1584,6 +1596,85 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["fable_weekly_usage_limit_percent"], "50");
+    }
+
+    #[tokio::test]
+    async fn settings_return_cli_bg_status_classifier_default() {
+        let response = test_router()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["intercept_cli_bg_status_classifier_mode"],
+            "passthrough"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_reject_invalid_cli_bg_status_classifier_mode() {
+        for value in ["", "error", "mock_allow"] {
+            let response = test_router()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "intercept_cli_bg_status_classifier_mode": value
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "value={value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_update_hot_reloads_cli_bg_status_classifier_mode() {
+        let (app, gateway_svc) = test_router_with_gateway().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "intercept_cli_bg_status_classifier_mode": "mock"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gateway_svc.cli_bg_status_classifier_mode_for_test().await,
+            CliBgStatusClassifierMode::Mock
+        );
     }
 
     #[tokio::test]

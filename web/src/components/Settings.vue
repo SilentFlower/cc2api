@@ -80,6 +80,7 @@ const bootstrapModelOptionsMode = ref<'passthrough' | 'configured' | 'hide_fable
 const bootstrapAdditionalModelOptions = ref('[{"model":"claude-fable-5-1[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]');
 
 type AutoModeClassifierMode = 'passthrough' | 'mock_allow' | 'mock_block' | 'error';
+type CliBgStatusClassifierMode = 'passthrough' | 'mock';
 
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
@@ -97,6 +98,7 @@ const interceptWarmupSuggestionEnabled = ref(false);
 const interceptWarmupHaikuProbeEnabled = ref(false);
 const interceptAutoModeClassifierStage1Mode = ref<AutoModeClassifierMode>('passthrough');
 const interceptAutoModeClassifierStage2Mode = ref<AutoModeClassifierMode>('passthrough');
+const interceptCliBgStatusClassifierMode = ref<CliBgStatusClassifierMode>('passthrough');
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -472,6 +474,7 @@ async function loadSettings() {
     interceptWarmupHaikuProbeEnabled.value = (data.intercept_warmup_haiku_probe_enabled ?? 'false') === 'true';
     interceptAutoModeClassifierStage1Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage1_mode);
     interceptAutoModeClassifierStage2Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage2_mode);
+    interceptCliBgStatusClassifierMode.value = data.intercept_cli_bg_status_classifier_mode === 'mock' ? 'mock' : 'passthrough';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -607,6 +610,7 @@ async function saveSettings() {
       intercept_warmup_haiku_probe_enabled: interceptWarmupHaikuProbeEnabled.value ? 'true' : 'false',
       intercept_auto_mode_classifier_stage1_mode: interceptAutoModeClassifierStage1Mode.value,
       intercept_auto_mode_classifier_stage2_mode: interceptAutoModeClassifierStage2Mode.value,
+      intercept_cli_bg_status_classifier_mode: interceptCliBgStatusClassifierMode.value,
     });
     await loadSettings();
     toast('保存成功');
@@ -869,6 +873,35 @@ onMounted(async () => {
               </select>
               <p class="text-[11px] text-[#b5b0a6]">匹配 4096-8192 token 与 Stage 2 suffix，不处理 64000 fallback。</p>
             </div>
+          </div>
+        </div>
+
+        <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">Claude Code 后台状态分类</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              仅处理 Fable 5.1 的 cli-bg 状态请求。放行保留账号代理链路并绕过正文指纹改写；模拟在本地返回状态 JSON。
+            </p>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptCliBgStatusClassifierMode"
+                type="radio"
+                value="passthrough"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">放行上游</span>
+            </label>
+            <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+              <input
+                v-model="interceptCliBgStatusClassifierMode"
+                type="radio"
+                value="mock"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">本地模拟</span>
+            </label>
           </div>
         </div>
       </div>

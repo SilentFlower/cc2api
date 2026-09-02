@@ -298,6 +298,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "intercept_auto_mode_classifier_stage2_mode",
             crate::store::settings_store::DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
         ),
+        (
+            "intercept_cli_bg_status_classifier_mode",
+            crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
+        ),
         // thinking.type=disabled 兼容改写默认关闭,管理员确认模型后再开启。
         (
             "rewrite_disabled_thinking_enabled",
@@ -1270,6 +1274,37 @@ mod tests {
             enabled,
             crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED
         );
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_cli_bg_status_classifier_default_without_overwriting_custom_value() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let mode: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_cli_bg_status_classifier_mode")
+            .fetch_one(&pool)
+            .await
+            .expect("cli-bg status classifier setting");
+        assert_eq!(
+            mode,
+            crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE
+        );
+
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("mock")
+            .bind("intercept_cli_bg_status_classifier_mode")
+            .execute(&pool)
+            .await
+            .expect("update cli-bg status classifier setting");
+        migrate(&pool, "sqlite").await.expect("second migrate");
+
+        let retained: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_cli_bg_status_classifier_mode")
+            .fetch_one(&pool)
+            .await
+            .expect("retained cli-bg status classifier setting");
+        assert_eq!(retained, "mock");
     }
 
     #[tokio::test]

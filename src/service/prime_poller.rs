@@ -631,7 +631,8 @@ impl PrimePollerService {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> Result<reqwest::Response, String> {
-        let client = crate::tlsfp::get_request_client(&account.proxy_url);
+        let client = crate::tlsfp::get_request_client(&account.proxy_url)
+            .map_err(|_| "request client unavailable".to_string())?;
         let mut req = client.post(&self.upstream_url).body(body.to_vec());
         for (k, v) in ordered_anthropic_headers("/v1/messages", headers) {
             req = req.header(k, v);

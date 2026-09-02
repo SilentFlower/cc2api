@@ -21,6 +21,11 @@ const OAUTH_SCOPES: &[&str] = &[
     "user:file_upload",
 ];
 
+fn oauth_request_client(proxy_url: &str) -> Result<reqwest::Client, AppError> {
+    get_request_client(proxy_url)
+        .map_err(|_| AppError::Internal("OAuth request client unavailable".into()))
+}
+
 #[derive(Debug, Clone)]
 pub struct RefreshedOAuthTokens {
     pub access_token: String,
@@ -106,7 +111,7 @@ impl TokenTester {
         proxy_url: &str,
         canonical_env: &Value,
     ) -> Result<(), AppError> {
-        let client = get_request_client(proxy_url);
+        let client = oauth_request_client(proxy_url)?;
         let request = build_test_token_request(&client, token, canonical_env)?;
 
         let resp = client
@@ -197,7 +202,7 @@ pub(crate) async fn refresh_oauth_token_at(
     proxy_url: &str,
     token_url: &str,
 ) -> Result<RefreshedOAuthTokens, AppError> {
-    let client = get_request_client(proxy_url);
+    let client = oauth_request_client(proxy_url)?;
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -244,7 +249,7 @@ pub(crate) async fn refresh_oauth_token_at(
 
 /// 从 Anthropic OAuth API 获取账号用量数据。
 pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError> {
-    let client = get_request_client(proxy_url);
+    let client = oauth_request_client(proxy_url)?;
 
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -365,7 +370,7 @@ mod tests {
 
     #[test]
     fn token_test_request_uses_selected_version_profile_headers() {
-        let client = get_request_client("");
+        let client = get_request_client("").expect("构造无代理请求客户端");
         let current =
             build_test_token_request(&client, "test-token", &test_canonical_env("2.1.257"))
                 .expect("构造当前画像请求");

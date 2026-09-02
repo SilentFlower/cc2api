@@ -474,7 +474,18 @@ async fn telemetry_loop(
     account_id: i64,
     proxy_url: String,
 ) {
-    let client = crate::tlsfp::get_request_client(&proxy_url);
+    let client = match crate::tlsfp::get_request_client(&proxy_url) {
+        Ok(client) => client,
+        Err(_) => {
+            warn!(
+                "telemetry: request client unavailable for account {} proxy_configured={}",
+                account_id,
+                !proxy_url.trim().is_empty()
+            );
+            sessions.lock().await.remove(&account_id);
+            return;
+        }
+    };
 
     loop {
         tokio::time::sleep(TICK_INTERVAL).await;

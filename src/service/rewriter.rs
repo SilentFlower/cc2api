@@ -1361,6 +1361,43 @@ impl Rewriter {
         )
     }
 
+    /// 仅改写 Claude Code 请求中的账号身份与上游 session 映射。
+    ///
+    /// 该入口用于必须保持原始正文形状的辅助请求，不执行 system、cache_control、
+    /// thinking、字段顺序或 CCH 等通用改写。正文不是 JSON 或身份无需变化时原样返回。
+    ///
+    /// @param body 原始下游请求体。
+    /// @param account 当前选中的代理账号。
+    /// @param upstream_session_rewrite 上游 session 改写上下文。
+    /// @return 只应用身份映射后的请求体字节。
+    pub fn rewrite_claude_code_identity_only(
+        &self,
+        body: &[u8],
+        account: &Account,
+        upstream_session_rewrite: &UpstreamSessionRewrite,
+    ) -> Vec<u8> {
+        if body.is_empty() {
+            return body.to_vec();
+        }
+
+        let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => return body.to_vec(),
+        };
+        let original = parsed.clone();
+        let profile = device_profile(account);
+        self.rewrite_metadata_user_id(
+            &mut parsed,
+            &profile,
+            upstream_session_rewrite.message.as_ref(),
+        );
+        if parsed == original {
+            return body.to_vec();
+        }
+
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
+    }
+
     /// 提交已经被上游成功消费完成的 stateful 缓存状态。
     ///
     /// @param completion `rewrite_body_with_stateful_completion` 返回的延迟提交句柄。
@@ -5551,6 +5588,7 @@ mod tests {
         DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
+    use crate::model::identity::device_profile;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_5_1_MESSAGE_BETA_TOKENS,
@@ -5951,6 +5989,83 @@ mod tests {
             },
             "messages": messages
         })
+    }
+
+    #[test]
+    fn cli_bg_identity_only_rewrite_preserves_request_shape() {
+        let account = test_account();
+        let profile = device_profile(&account);
+        let rewriter = Rewriter::new();
+        let original = json!({
+            "model": "claude-fable-5-1",
+            "stream": false,
+            "max_tokens": 3072,
+            "fallbacks": "default",
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "system": [{
+                "type": "text",
+                "text": "synthetic classifier system",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "Current state: working"}]
+            }],
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "123e4567-e89b-12d3-a456-426614174001",
+                    "account_uuid": "123e4567-e89b-12d3-a456-426614174002",
+                    "session_id": "123e4567-e89b-12d3-a456-426614174003"
+                }).to_string()
+            }
+        });
+        let rewrite = upstream_session_rewrite(
+            "123e4567-e89b-12d3-a456-426614174003",
+            "123e4567-e89b-12d3-a456-426614174004",
+        );
+
+        let output = rewriter.rewrite_claude_code_identity_only(
+            &serde_json::to_vec(&original).unwrap(),
+            &account,
+            &rewrite,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let metadata_user_id: serde_json::Value = serde_json::from_str(
+            parsed["metadata"]["user_id"]
+                .as_str()
+                .expect("metadata.user_id"),
+        )
+        .unwrap();
+
+        assert_eq!(parsed["system"], original["system"]);
+        assert_eq!(parsed["messages"], original["messages"]);
+        assert_eq!(parsed["thinking"], original["thinking"]);
+        assert_eq!(parsed["fallbacks"], original["fallbacks"]);
+        assert_eq!(parsed["max_tokens"], original["max_tokens"]);
+        assert_eq!(parsed["system"][0]["cache_control"].get("ttl"), None);
+        assert!(
+            parsed["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(metadata_user_id["device_id"], profile.device_id);
+        assert_eq!(metadata_user_id["account_uuid"], profile.account_uuid);
+        assert_eq!(
+            metadata_user_id["session_id"],
+            "123e4567-e89b-12d3-a456-426614174004"
+        );
+    }
+
+    #[test]
+    fn cli_bg_identity_only_rewrite_fails_open_for_non_json_body() {
+        let body = b"not-json";
+        let output = Rewriter::new().rewrite_claude_code_identity_only(
+            body,
+            &test_account(),
+            &UpstreamSessionRewrite::default(),
+        );
+
+        assert_eq!(output, body);
     }
 
     #[test]

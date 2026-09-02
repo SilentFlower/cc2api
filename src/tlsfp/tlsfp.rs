@@ -358,8 +358,8 @@ pub fn request_client_pool_enabled() -> bool {
 /// - `proxy_url`: 代理地址。空字符串表示直连，非空时沿用 reqwest 支持的 HTTP/SOCKS 代理格式。
 ///
 /// # 返回
-/// 返回可直接发起请求的 `reqwest::Client` clone。
-pub fn get_request_client(proxy_url: &str) -> reqwest::Client {
+/// 成功时返回可直接发起请求的 `reqwest::Client` clone；代理配置或客户端构建失败时返回错误。
+pub fn get_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::Error> {
     if !request_client_pool_enabled() {
         return make_request_client(proxy_url);
     }
@@ -370,19 +370,19 @@ pub fn get_request_client(proxy_url: &str) -> reqwest::Client {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(client) = cache.get(&cache_key) {
-            return client.clone();
+            return Ok(client.clone());
         }
     }
 
-    let client = make_request_client(proxy_url);
+    let client = make_request_client(proxy_url)?;
     let mut cache = REQUEST_CLIENT_CACHE
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = cache.get(&cache_key) {
-        return existing.clone();
+        return Ok(existing.clone());
     }
     cache.insert(cache_key, client.clone());
-    client
+    Ok(client)
 }
 
 /// 创建带 TLS 指纹伪装的 reqwest 客户端。
@@ -393,8 +393,8 @@ pub fn get_request_client(proxy_url: &str) -> reqwest::Client {
 /// - `proxy_url`: 代理地址。空字符串表示直连，非空时沿用 reqwest 支持的 HTTP/SOCKS 代理格式。
 ///
 /// # 返回
-/// 返回新建的 `reqwest::Client`。
-pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
+/// 成功时返回新建的 `reqwest::Client`；代理配置或客户端构建失败时返回错误。
+pub fn make_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::Error> {
     let tls_config = build_tls_config();
 
     // 不设整体 timeout，也不用 read_timeout（reqwest 0.12.4 不支持该 API）：
@@ -410,12 +410,11 @@ pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
         .no_proxy();
 
     if !proxy_url.is_empty() {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
-            builder = builder.proxy(proxy);
-        }
+        // 非空代理必须成功解析并真正挂到客户端上，不能因配置错误退回直连。
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
     }
 
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder.build()
 }
 
 #[cfg(test)]
@@ -463,10 +462,10 @@ mod tests {
 
         let proxy_url = "socks5h://127.0.0.1:65530";
 
-        let _first = get_request_client(proxy_url);
+        let _first = get_request_client(proxy_url).unwrap();
         assert_eq!(request_client_cache_len_for_test(), 1);
 
-        let _second = get_request_client(proxy_url);
+        let _second = get_request_client(proxy_url).unwrap();
         assert_eq!(request_client_cache_len_for_test(), 1);
     }
 
@@ -475,8 +474,8 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let _state_guard = RequestClientPoolStateGuard::new();
 
-        let _first = get_request_client("socks5h://127.0.0.1:65530");
-        let _second = get_request_client("socks5h://127.0.0.1:65531");
+        let _first = get_request_client("socks5h://127.0.0.1:65530").unwrap();
+        let _second = get_request_client("socks5h://127.0.0.1:65531").unwrap();
 
         assert_eq!(request_client_cache_len_for_test(), 2);
     }
@@ -491,10 +490,19 @@ mod tests {
 
         let proxy_url = "socks5h://127.0.0.1:65530";
 
-        let _first = get_request_client(proxy_url);
+        let _first = get_request_client(proxy_url).unwrap();
         assert_eq!(request_client_cache_len_for_test(), 0);
 
-        let _second = get_request_client(proxy_url);
+        let _second = get_request_client(proxy_url).unwrap();
+        assert_eq!(request_client_cache_len_for_test(), 0);
+    }
+
+    #[test]
+    fn invalid_proxy_is_rejected_without_caching_direct_client() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _state_guard = RequestClientPoolStateGuard::new();
+
+        assert!(get_request_client("://invalid-proxy").is_err());
         assert_eq!(request_client_cache_len_for_test(), 0);
     }
 }

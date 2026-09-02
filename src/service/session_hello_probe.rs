@@ -293,11 +293,9 @@ impl SessionHelloProbeService {
         config: SessionHelloProbeConfig,
     ) -> SessionHelloProbeDecision {
         let started_at = Instant::now();
-        let (state, http_status) =
-            if !account.proxy_url.is_empty() && reqwest::Proxy::all(&account.proxy_url).is_err() {
-                (SessionHelloProbeState::Failure, None)
-            } else {
-                let client = crate::tlsfp::get_request_client(&account.proxy_url);
+        let (state, http_status) = match crate::tlsfp::get_request_client(&account.proxy_url) {
+            Err(_) => (SessionHelloProbeState::Failure, None),
+            Ok(client) => {
                 let user_agent = hello_user_agent_for_account(account);
                 let request = client
                     .head(&self.endpoint)
@@ -317,7 +315,8 @@ impl SessionHelloProbeService {
                         Some(response.status().as_u16()),
                     ),
                 }
-            };
+            }
+        };
 
         let ttl = if state == SessionHelloProbeState::Success {
             config.success_ttl

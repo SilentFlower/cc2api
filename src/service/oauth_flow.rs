@@ -294,7 +294,8 @@ impl OAuthFlowService {
         debug!("exchanging code for session {}", session_id);
 
         // 发送 token exchange 请求
-        let client = crate::tlsfp::get_request_client(&session.proxy_url);
+        let client = crate::tlsfp::get_request_client(&session.proxy_url)
+            .map_err(|_| AppError::Internal("token exchange request client unavailable".into()))?;
         let resp = client
             .post(TOKEN_URL)
             .header("Content-Type", "application/json")
