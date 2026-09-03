@@ -149,9 +149,9 @@ async fn main() {
         .await
         .expect("load warmup intercept config failed");
     gateway_svc
-        .reload_cli_bg_status_classifier_mode()
+        .reload_cli_bg_status_classifier_config()
         .await
-        .expect("load cli-bg status classifier mode failed");
+        .expect("load cli-bg status classifier config failed");
     gateway_svc
         .reload_disabled_thinking_rewrite()
         .await

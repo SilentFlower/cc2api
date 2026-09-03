@@ -31,7 +31,8 @@ use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
     StatefulCacheUsage, UpstreamSessionRewrite, collect_telemetry_session_ids, detect_client_type,
-    filter_account_beta_tokens, is_structured_haiku_title_request, merge_anthropic_beta,
+    filter_account_beta_tokens, is_claude_code_billing_system_block,
+    is_claude_code_identity_system_block, is_structured_haiku_title_request, merge_anthropic_beta,
     order_context_1m_after_oauth, ordered_anthropic_headers, strip_empty_text_blocks,
 };
 use crate::service::session_hello_probe::{
@@ -52,6 +53,7 @@ use crate::store::settings_store::{
     DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
     DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
     DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
@@ -292,6 +294,12 @@ impl CliBgStatusClassifierMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliBgStatusClassifierConfig {
+    mode: CliBgStatusClassifierMode,
+    identity_injection_enabled: bool,
+}
+
 impl AutoModeClassifierMode {
     /// 从 settings 字符串解析 Auto Mode classifier 处理模式。
     ///
@@ -469,7 +477,7 @@ pub struct GatewayService {
     fable_sticky_quota_fallback_enabled: RwLock<bool>,
     fable_weekly_usage_limit_percent: RwLock<u32>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
-    cli_bg_status_classifier_mode: RwLock<CliBgStatusClassifierMode>,
+    cli_bg_status_classifier_config: RwLock<CliBgStatusClassifierConfig>,
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
     rate_limit_request_log_config: RwLock<RateLimitRequestLogConfig>,
@@ -528,7 +536,7 @@ impl GatewayService {
                 default_fable_weekly_usage_limit_percent(),
             ),
             warmup_intercept_config: RwLock::new(default_warmup_intercept_config()),
-            cli_bg_status_classifier_mode: RwLock::new(default_cli_bg_status_classifier_mode()),
+            cli_bg_status_classifier_config: RwLock::new(default_cli_bg_status_classifier_config()),
             disabled_thinking_rewrite: RwLock::new(default_disabled_thinking_rewrite()),
             assistant_prefill_intercept_config: RwLock::new(
                 default_assistant_prefill_intercept_config(),
@@ -856,20 +864,30 @@ impl GatewayService {
         Ok(())
     }
 
-    /// 从全局设置刷新 Claude Code 后台状态分类请求处理模式。
+    /// 从全局设置刷新 Claude Code 后台状态分类请求处理配置。
     ///
-    /// 配置缓存在内存中,命中请求时不查询数据库。
+    /// 处理模式与身份注入开关以同一快照写入内存,命中请求时不查询数据库。
     ///
     /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析模式失败时返回业务错误。
-    pub async fn reload_cli_bg_status_classifier_mode(&self) -> Result<(), AppError> {
-        let raw = self
+    pub async fn reload_cli_bg_status_classifier_config(&self) -> Result<(), AppError> {
+        let mode = self
             .settings_store
             .get_value(
                 "intercept_cli_bg_status_classifier_mode",
                 DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
             )
             .await?;
-        *self.cli_bg_status_classifier_mode.write().await = CliBgStatusClassifierMode::parse(&raw)?;
+        let identity_injection_enabled = self
+            .settings_store
+            .get_value(
+                "intercept_cli_bg_status_classifier_identity_injection_enabled",
+                DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
+            )
+            .await?;
+        *self.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::parse(&mode)?,
+            identity_injection_enabled: parse_setting_flag(&identity_injection_enabled),
+        };
         Ok(())
     }
 
@@ -1141,7 +1159,20 @@ impl GatewayService {
     /// @return 当前热加载模式。
     #[cfg(test)]
     pub(crate) async fn cli_bg_status_classifier_mode_for_test(&self) -> CliBgStatusClassifierMode {
-        *self.cli_bg_status_classifier_mode.read().await
+        self.cli_bg_status_classifier_config.read().await.mode
+    }
+
+    /// 返回测试使用的后台状态分类身份注入开关。
+    ///
+    /// @return 当前热加载开关值。
+    #[cfg(test)]
+    pub(crate) async fn cli_bg_status_classifier_identity_injection_enabled_for_test(
+        &self,
+    ) -> bool {
+        self.cli_bg_status_classifier_config
+            .read()
+            .await
+            .identity_injection_enabled
     }
 
     /// 从全局设置刷新客户端访问策略。
@@ -1542,12 +1573,28 @@ impl GatewayService {
         // 检测客户端类型
         let client_type = detect_client_type(&ua, &path, &body_map);
 
+        let is_narrow_cli_bg_status_classifier =
+            is_cli_bg_status_classifier_request(&path, &headers, &body_map, client_type);
+        let generic_cli_status_classifier =
+            detect_claude_code_status_classifier_request(&path, &headers, &body_map, client_type);
+        let is_cli_status_classifier =
+            is_narrow_cli_bg_status_classifier || generic_cli_status_classifier.is_some();
+        let cli_bg_status_classifier_config = if is_cli_status_classifier {
+            *self.cli_bg_status_classifier_config.read().await
+        } else {
+            default_cli_bg_status_classifier_config()
+        };
         let cli_bg_status_classifier_mode =
-            if is_cli_bg_status_classifier_request(&path, &headers, &body_map, client_type) {
-                Some(*self.cli_bg_status_classifier_mode.read().await)
-            } else {
-                None
-            };
+            is_narrow_cli_bg_status_classifier.then_some(cli_bg_status_classifier_config.mode);
+        let complete_cli_status_classifier_attribution = matches!(
+            generic_cli_status_classifier,
+            Some(matched)
+                if cli_bg_status_classifier_config.mode == CliBgStatusClassifierMode::Passthrough
+                    && cli_bg_status_classifier_config.identity_injection_enabled
+                    && !matched.is_haiku
+        );
+        let cli_status_classifier_summary_only = complete_cli_status_classifier_attribution
+            || cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough);
         if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Mock) {
             log_cli_bg_status_classifier_hit(
                 CliBgStatusClassifierMode::Mock,
@@ -1556,6 +1603,8 @@ impl GatewayService {
                 &body_map,
                 body_bytes.len(),
                 0,
+                generic_cli_status_classifier,
+                false,
             );
             return Ok(mock_cli_bg_status_classifier_response(&body_map)?);
         }
@@ -1825,7 +1874,7 @@ impl GatewayService {
                     return Ok(response);
                 }
             }
-            if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
+            if cli_status_classifier_summary_only {
                 log_cli_bg_status_classifier_hit(
                     CliBgStatusClassifierMode::Passthrough,
                     Some(&account),
@@ -1833,15 +1882,16 @@ impl GatewayService {
                     &body_map,
                     body_bytes.len(),
                     attempt,
+                    generic_cli_status_classifier,
+                    complete_cli_status_classifier_attribution,
                 );
             }
-            // cli-bg 正文包含用户最近请求和 Agent 尾部，命中后只允许脱敏摘要日志。
-            let request_capture_policy =
-                if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
-                    RequestCapturePolicy::SummaryOnly
-                } else {
-                    RequestCapturePolicy::Configured
-                };
+            // 状态分类正文包含用户最近请求和 Agent 尾部，命中后只允许脱敏摘要日志。
+            let request_capture_policy = if cli_status_classifier_summary_only {
+                RequestCapturePolicy::SummaryOnly
+            } else {
+                RequestCapturePolicy::Configured
+            };
 
             // 改写请求体
             let t_rewrite = std::time::Instant::now();
@@ -1858,7 +1908,19 @@ impl GatewayService {
             let disabled_thinking = self.disabled_thinking_rewrite.read().await.clone();
             let context_sanitizer_config = *self.context_sanitizer_config.read().await;
             let (rewritten_body, stateful_cache_completion) =
-                if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
+                if complete_cli_status_classifier_attribution {
+                    (
+                        self.rewriter
+                            .rewrite_claude_code_status_classifier_attribution(
+                                &body_bytes,
+                                &account,
+                                &upstream_session_rewrite,
+                            ),
+                        None,
+                    )
+                } else if cli_bg_status_classifier_mode
+                    == Some(CliBgStatusClassifierMode::Passthrough)
+                {
                     (
                         self.rewriter.rewrite_claude_code_identity_only(
                             &body_bytes,
@@ -1985,19 +2047,18 @@ impl GatewayService {
                 }
             }
 
-            let non_stream_probe_cache_lookup =
-                if cli_bg_status_classifier_mode == Some(CliBgStatusClassifierMode::Passthrough) {
-                    None
-                } else {
-                    self.non_stream_probe_cache_lookup(
-                        &path,
-                        client_type,
-                        &rewritten_body_map,
-                        &final_headers,
-                        &final_body,
-                    )
-                    .await?
-                };
+            let non_stream_probe_cache_lookup = if cli_status_classifier_summary_only {
+                None
+            } else {
+                self.non_stream_probe_cache_lookup(
+                    &path,
+                    client_type,
+                    &rewritten_body_map,
+                    &final_headers,
+                    &final_body,
+                )
+                .await?
+            };
             if let Some(lookup) = &non_stream_probe_cache_lookup {
                 if let Some(resp) = self
                     .try_non_stream_probe_cache_hit(lookup, &account)
@@ -4295,13 +4356,110 @@ fn is_cli_bg_status_classifier_request(
     let Some(system_text) = cli_bg_status_classifier_system_text(body) else {
         return false;
     };
-    if !system_text.contains("A user kicked off a Claude Code agent")
-        || !system_text.contains("THE FOUR STATES")
-        || !system_text.contains("respond with ONLY this JSON")
-        || !["\"working\"", "\"blocked\"", "\"done\"", "\"failed\""]
+    if !is_cli_bg_status_classifier_system_prompt(system_text) {
+        return false;
+    }
+
+    cli_bg_status_classifier_user_text(body)
+        .map(is_cli_bg_status_classifier_user_prompt)
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliStatusClassifierMatch {
+    is_haiku: bool,
+    has_billing: bool,
+    has_cch: bool,
+    has_identity: bool,
+}
+
+fn detect_claude_code_status_classifier_request(
+    path: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+    client_type: ClientType,
+) -> Option<CliStatusClassifierMatch> {
+    if path != "/v1/messages" || client_type != ClientType::ClaudeCode {
+        return None;
+    }
+    if !matches!(
+        request_header_value(headers, "x-app"),
+        Some("cli" | "cli-bg")
+    ) {
+        return None;
+    }
+    match body.get("stream") {
+        None | Some(serde_json::Value::Bool(false)) => {}
+        _ => return None,
+    }
+    let model = body.get("model").and_then(|value| value.as_str())?;
+    if model.trim().is_empty() {
+        return None;
+    }
+
+    let system_blocks = body.get("system")?.as_array()?;
+    let mut classifier_count = 0usize;
+    let mut has_billing = false;
+    let mut has_cch = false;
+    let mut has_identity = false;
+    for block in system_blocks {
+        if is_claude_code_billing_system_block(block) {
+            if has_billing {
+                return None;
+            }
+            has_billing = true;
+            has_cch = block
+                .get("text")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| text.contains(" cch="));
+            continue;
+        }
+        if is_claude_code_identity_system_block(block) {
+            if has_identity {
+                return None;
+            }
+            has_identity = true;
+            continue;
+        }
+        let text = strict_text_block(block)?;
+        let ephemeral = block
+            .get("cache_control")
+            .and_then(|value| value.as_object())
+            .and_then(|cache| cache.get("type"))
+            .and_then(|value| value.as_str())
+            == Some("ephemeral");
+        if !ephemeral || !is_cli_bg_status_classifier_system_prompt(text) {
+            return None;
+        }
+        classifier_count += 1;
+        if classifier_count > 1 {
+            return None;
+        }
+    }
+    if classifier_count != 1 {
+        return None;
+    }
+    let user_text = cli_bg_status_classifier_user_text(body)?;
+    if !is_cli_bg_status_classifier_user_prompt(user_text) {
+        return None;
+    }
+
+    Some(CliStatusClassifierMatch {
+        is_haiku: is_haiku_model_id(model),
+        has_billing,
+        has_cch,
+        has_identity,
+    })
+}
+
+fn is_cli_bg_status_classifier_system_prompt(text: &str) -> bool {
+    text.contains("A user kicked off a Claude Code agent")
+        && text.contains("THE FOUR STATES")
+        && text.contains("respond with ONLY this JSON")
+        && ["\"working\"", "\"blocked\"", "\"done\"", "\"failed\""]
             .iter()
-            .all(|marker| system_text.contains(marker))
-        || ![
+            .all(|marker| text.contains(marker))
+        && [
             "\"state\"",
             "\"detail\"",
             "\"tempo\"",
@@ -4309,19 +4467,14 @@ fn is_cli_bg_status_classifier_request(
             "\"output\"",
         ]
         .iter()
-        .all(|marker| system_text.contains(marker))
-    {
-        return false;
-    }
+        .all(|marker| text.contains(marker))
+}
 
-    cli_bg_status_classifier_user_text(body)
-        .map(|text| {
-            text.starts_with("Current state:")
-                && text.contains("Tool calls so far:")
-                && text.contains("User's most recent ask:")
-                && text.contains("Assistant message tail")
-        })
-        .unwrap_or(false)
+fn is_cli_bg_status_classifier_user_prompt(text: &str) -> bool {
+    text.starts_with("Current state:")
+        && text.contains("Tool calls so far:")
+        && text.contains("User's most recent ask:")
+        && text.contains("Assistant message tail")
 }
 
 fn request_header_value<'a>(
@@ -4389,6 +4542,8 @@ fn log_cli_bg_status_classifier_hit(
     body: &serde_json::Value,
     body_bytes: usize,
     attempt: usize,
+    generic_match: Option<CliStatusClassifierMatch>,
+    attribution_completed: bool,
 ) {
     let text_bytes = system_text_items(body)
         .chain(message_text_items(body))
@@ -4412,6 +4567,12 @@ fn log_cli_bg_status_classifier_hit(
         "attempt": attempt,
         "body_hash": stable_body_hash_for_log(body),
         "shape_bypass": mode == CliBgStatusClassifierMode::Passthrough,
+        "generic_match": generic_match.is_some(),
+        "is_haiku": generic_match.map(|matched| matched.is_haiku),
+        "has_billing": generic_match.map(|matched| matched.has_billing),
+        "has_cch": generic_match.map(|matched| matched.has_cch),
+        "has_identity": generic_match.map(|matched| matched.has_identity),
+        "attribution_completed": attribution_completed,
         "proxy_configured": account
             .map(|selected| !selected.proxy_url.trim().is_empty())
             .unwrap_or(false),
@@ -5523,10 +5684,15 @@ fn default_warmup_intercept_config() -> WarmupInterceptConfig {
     }
 }
 
-/// 构造后台状态分类请求处理模式初始值。
-fn default_cli_bg_status_classifier_mode() -> CliBgStatusClassifierMode {
-    CliBgStatusClassifierMode::parse(DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE)
-        .expect("默认后台状态分类请求处理模式必须合法")
+/// 构造后台状态分类请求处理配置初始值。
+fn default_cli_bg_status_classifier_config() -> CliBgStatusClassifierConfig {
+    CliBgStatusClassifierConfig {
+        mode: CliBgStatusClassifierMode::parse(DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE)
+            .expect("默认后台状态分类请求处理模式必须合法"),
+        identity_injection_enabled: parse_setting_flag(
+            DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
+        ),
+    }
 }
 
 /// 构造 `thinking.type=disabled` 兼容改写的内存初始值。
@@ -6859,7 +7025,8 @@ mod tests {
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, AutoModeClassifierProtocol,
         BootstrapModelOptionsMode, BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse,
-        CliBgAgentState, CliBgStatusClassifierMode, GatewayAdmissionError, GatewayService,
+        CliBgAgentState, CliBgStatusClassifierConfig, CliBgStatusClassifierMode,
+        CliStatusClassifierMatch, GatewayAdmissionError, GatewayService,
         NON_STREAM_PROBE_CACHE_TTL, NonStreamProbeCacheLookup, NonStreamProbeType,
         RateLimitRequestLogConfig, RequestCapturePolicy, STATEFUL_USAGE_BUFFER_LIMIT,
         STREAM_KEEPALIVE_BYTES, SignatureRetryStage, StreamStabilityConfig, UPSTREAM_BASE,
@@ -6870,8 +7037,9 @@ mod tests {
         build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
         classify_cli_bg_status, classify_non_stream_probe_text, cli_bg_status_json,
         default_fable_weekly_usage_limit_percent, detect_auto_mode_classifier_request,
-        detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
-        extract_passive_usage, extract_rejected_passive_usage_windows, extract_upstream_request_id,
+        detect_claude_code_status_classifier_request, detect_non_stream_probe_type,
+        detect_warmup_intercept, extract_message_session_id, extract_passive_usage,
+        extract_rejected_passive_usage_windows, extract_upstream_request_id,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
         is_cli_bg_status_classifier_request, is_signature_related_error_body,
@@ -6898,7 +7066,9 @@ mod tests {
     use crate::service::account::{
         AccountService, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
     };
-    use crate::service::rewriter::{ClientType, StatefulCacheUsage, UpstreamSessionRewrite};
+    use crate::service::rewriter::{
+        CLAUDE_CODE_SYSTEM_PROMPT, ClientType, StatefulCacheUsage, UpstreamSessionRewrite,
+    };
     use crate::service::session_hello_probe::{SessionHelloProbeConfig, SessionHelloProbeDecision};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
@@ -6998,18 +7168,20 @@ mod tests {
         ])
     }
 
-    fn cli_bg_status_classifier_request(state: &str, tail: &str) -> Request {
+    fn cli_status_classifier_request(body: serde_json::Value, x_app: &str) -> Request {
         Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header("content-type", "application/json")
             .header("user-agent", "claude-code/2.1.257")
-            .header("x-app", "cli-bg")
+            .header("x-app", x_app)
             .header("x-stainless-retry-count", "0")
-            .body(Body::from(
-                serde_json::to_vec(&cli_bg_status_classifier_body(state, tail)).unwrap(),
-            ))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    fn cli_bg_status_classifier_request(state: &str, tail: &str) -> Request {
+        cli_status_classifier_request(cli_bg_status_classifier_body(state, tail), "cli-bg")
     }
 
     fn classifier_body(max_tokens: u64, suffix: &str) -> serde_json::Value {
@@ -10551,6 +10723,162 @@ mod tests {
     }
 
     #[test]
+    fn generic_status_classifier_detector_matches_supported_wire_shapes() {
+        let headers = cli_bg_status_classifier_headers();
+        for model in ["claude-fable-5-1", "claude-opus-5", "claude-sonnet-4-6"] {
+            let mut body = cli_bg_status_classifier_body("working", "继续检查剩余文件");
+            body["model"] = json!(model);
+            assert_eq!(
+                detect_claude_code_status_classifier_request(
+                    "/v1/messages",
+                    &headers,
+                    &body,
+                    ClientType::ClaudeCode,
+                ),
+                Some(CliStatusClassifierMatch {
+                    is_haiku: false,
+                    has_billing: false,
+                    has_cch: false,
+                    has_identity: false,
+                }),
+                "model={model}"
+            );
+        }
+
+        let mut haiku_headers = headers.clone();
+        haiku_headers.insert("x-app".into(), "cli".into());
+        let mut haiku = cli_bg_status_classifier_body("working", "继续检查剩余文件");
+        haiku["model"] = json!("claude-haiku-4-5-20251001");
+        haiku["max_tokens"] = json!(1024);
+        haiku.as_object_mut().unwrap().remove("stream");
+        haiku["system"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.257.abc; cc_entrypoint=cli; cch=12345;"
+            }),
+        );
+        assert_eq!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &haiku_headers,
+                &haiku,
+                ClientType::ClaudeCode,
+            ),
+            Some(CliStatusClassifierMatch {
+                is_haiku: true,
+                has_billing: true,
+                has_cch: true,
+                has_identity: false,
+            })
+        );
+
+        haiku["system"].as_array_mut().unwrap().insert(
+            1,
+            json!({
+                "type": "text",
+                "text": CLAUDE_CODE_SYSTEM_PROMPT
+            }),
+        );
+        assert_eq!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &haiku_headers,
+                &haiku,
+                ClientType::ClaudeCode,
+            )
+            .map(|matched| matched.has_identity),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn generic_status_classifier_detector_rejects_ambiguous_shapes() {
+        let headers = cli_bg_status_classifier_headers();
+        let body = cli_bg_status_classifier_body("working", "继续检查剩余文件");
+
+        let mut streaming = body.clone();
+        streaming["stream"] = json!(true);
+        assert!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &streaming,
+                ClientType::ClaudeCode,
+            )
+            .is_none()
+        );
+
+        let mut unknown_system = body.clone();
+        unknown_system["system"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "text", "text": "ordinary system prompt"}));
+        assert!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &unknown_system,
+                ClientType::ClaudeCode,
+            )
+            .is_none()
+        );
+
+        let billing = json!({
+            "type": "text",
+            "text": "x-anthropic-billing-header: cc_version=2.1.257.abc; cc_entrypoint=cli; cch=12345;"
+        });
+        let mut duplicate_billing = body.clone();
+        duplicate_billing["system"]
+            .as_array_mut()
+            .unwrap()
+            .splice(0..0, [billing.clone(), billing]);
+        assert!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &duplicate_billing,
+                ClientType::ClaudeCode,
+            )
+            .is_none()
+        );
+
+        let mut multiple_user_blocks = body.clone();
+        multiple_user_blocks["messages"][0]["content"] = json!([
+            {"type": "text", "text": body["messages"][0]["content"]},
+            {"type": "text", "text": "copied transcript"}
+        ]);
+        assert!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &multiple_user_blocks,
+                ClientType::ClaudeCode,
+            )
+            .is_none()
+        );
+
+        assert!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages/count_tokens",
+                &headers,
+                &body,
+                ClientType::ClaudeCode,
+            )
+            .is_none()
+        );
+        assert!(
+            detect_claude_code_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &body,
+                ClientType::API,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn cli_bg_status_classifier_uses_explicit_markers_then_current_state() {
         let cases = [
             (
@@ -10665,7 +10993,10 @@ mod tests {
     #[tokio::test]
     async fn cli_bg_status_classifier_mock_returns_parseable_message_without_account() {
         let service = test_gateway_service().await;
-        *service.cli_bg_status_classifier_mode.write().await = CliBgStatusClassifierMode::Mock;
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Mock,
+            identity_injection_enabled: true,
+        };
 
         let response = service
             .handle_request(
@@ -10721,6 +11052,7 @@ mod tests {
         assert_eq!(state.x_app_headers.lock().await.as_slice(), ["cli-bg"]);
         let captured_body = state.request_bodies.lock().await[0].clone();
         let captured: serde_json::Value = serde_json::from_slice(&captured_body).unwrap();
+        assert_eq!(captured["system"].as_array().unwrap().len(), 1);
         assert_eq!(
             captured["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
@@ -10732,6 +11064,230 @@ mod tests {
             json!({"type": "adaptive", "display": "updates"})
         );
         assert_eq!(captured["fallbacks"], "default");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_bg_status_classifier_passthrough_keeps_session_hello_probe() {
+        let (base_url, state, server) = spawn_auth_mock_server().await;
+        state
+            .hello_status
+            .store(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Ordering::SeqCst);
+        let mut service = test_gateway_service_with_urls(
+            base_url.clone(),
+            crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{}/api/hello", base_url));
+        *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+            enabled: true,
+            strict: true,
+            timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        };
+        create_setup_gateway_account(&service, "cli-bg-hello@example.com", "setup-good", 10).await;
+
+        let response = service
+            .handle_request(
+                cli_bg_status_classifier_request("working", "继续检查剩余文件"),
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 1);
+        assert!(state.authorization_headers.lock().await.is_empty());
+        assert!(state.request_bodies.lock().await.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_bg_status_classifier_injection_uses_account_proxy_and_completes_prefix() {
+        let (proxy_url, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            "http://upstream.invalid".into(),
+            "http://oauth.invalid/token".into(),
+        )
+        .await;
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Passthrough,
+            identity_injection_enabled: true,
+        };
+        let mut account = create_gateway_account(&service, "cli-bg-prefix@example.com", 1, 0).await;
+        account.proxy_url = proxy_url;
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("保存测试账号代理");
+
+        let response = service
+            .handle_request(
+                cli_bg_status_classifier_request("working", "继续检查剩余文件"),
+                None,
+            )
+            .await;
+        let status = response.status();
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.authorization_headers.lock().await.len(), 1);
+        assert_eq!(state.x_app_headers.lock().await.as_slice(), ["cli-bg"]);
+        let captured_body = state.request_bodies.lock().await[0].clone();
+        let captured: serde_json::Value = serde_json::from_slice(&captured_body).unwrap();
+        let system = captured["system"].as_array().unwrap();
+        assert_eq!(system.len(), 3);
+        let billing = system[0]["text"].as_str().unwrap();
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.257."));
+        assert!(billing.contains("; cc_entrypoint=cli; cch="));
+        assert!(!billing.contains("cch=00000"));
+        assert!(system[0].get("cache_control").is_none());
+        assert_eq!(system[1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert!(system[1].get("cache_control").is_none());
+        assert_eq!(system[2]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            captured["thinking"],
+            json!({"type": "adaptive", "display": "updates"})
+        );
+        assert_eq!(captured["fallbacks"], "default");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_status_classifier_injection_does_not_change_haiku_proxy_body() {
+        let (proxy_url, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            "http://upstream.invalid".into(),
+            "http://oauth.invalid/token".into(),
+        )
+        .await;
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Passthrough,
+            identity_injection_enabled: false,
+        };
+        let mut account = create_gateway_account(&service, "cli-bg-haiku@example.com", 1, 0).await;
+        account.proxy_url = proxy_url;
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("保存测试账号代理");
+        let mut request_body = cli_bg_status_classifier_body("working", "继续检查剩余文件");
+        request_body["model"] = json!("claude-haiku-4-5-20251001");
+        request_body["max_tokens"] = json!(1024);
+        request_body.as_object_mut().unwrap().remove("stream");
+        request_body["system"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.257.abc; cc_entrypoint=cli; cch=12345;"
+            }),
+        );
+
+        let baseline_response = service
+            .handle_request(
+                cli_status_classifier_request(request_body.clone(), "cli"),
+                None,
+            )
+            .await;
+        let baseline_status = baseline_response.status();
+        let _ = body::to_bytes(baseline_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let baseline_body = state.request_bodies.lock().await[0].clone();
+
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Passthrough,
+            identity_injection_enabled: true,
+        };
+        let enabled_response = service
+            .handle_request(cli_status_classifier_request(request_body, "cli"), None)
+            .await;
+        let enabled_status = enabled_response.status();
+        let _ = body::to_bytes(enabled_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let enabled_body = state.request_bodies.lock().await[1].clone();
+
+        assert_eq!(baseline_status, StatusCode::OK);
+        assert_eq!(enabled_status, StatusCode::OK);
+        assert_eq!(state.x_app_headers.lock().await.as_slice(), ["cli", "cli"]);
+        assert_eq!(enabled_body, baseline_body);
+        let captured: serde_json::Value = serde_json::from_slice(&enabled_body).unwrap();
+        let system = captured["system"].as_array().unwrap();
+        assert_eq!(
+            system
+                .iter()
+                .filter(|block| block["text"] == CLAUDE_CODE_SYSTEM_PROMPT)
+                .count(),
+            0
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_status_classifier_injection_does_not_duplicate_existing_identity_through_proxy() {
+        let (proxy_url, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(
+            "http://upstream.invalid".into(),
+            "http://oauth.invalid/token".into(),
+        )
+        .await;
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Passthrough,
+            identity_injection_enabled: true,
+        };
+        let mut account =
+            create_gateway_account(&service, "cli-bg-existing-identity@example.com", 1, 0).await;
+        account.proxy_url = proxy_url;
+        service
+            .account_svc
+            .update_account(&account)
+            .await
+            .expect("保存测试账号代理");
+        let mut request_body = cli_bg_status_classifier_body("working", "继续检查剩余文件");
+        request_body["model"] = json!("claude-opus-5");
+        request_body["system"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "type": "text",
+                "text": CLAUDE_CODE_SYSTEM_PROMPT
+            }),
+        );
+
+        let response = service
+            .handle_request(cli_status_classifier_request(request_body, "cli-bg"), None)
+            .await;
+        let status = response.status();
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let captured: serde_json::Value =
+            serde_json::from_slice(&state.request_bodies.lock().await[0]).unwrap();
+        let system = captured["system"].as_array().unwrap();
+        assert_eq!(system.len(), 3);
+        assert!(
+            system[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("x-anthropic-billing-header:")
+        );
+        assert_eq!(system[1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(
+            system
+                .iter()
+                .filter(|block| block["text"] == CLAUDE_CODE_SYSTEM_PROMPT)
+                .count(),
+            1
+        );
+        assert_eq!(system[2]["cache_control"], json!({"type": "ephemeral"}));
         server.abort();
     }
 

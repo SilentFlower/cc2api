@@ -302,6 +302,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "intercept_cli_bg_status_classifier_mode",
             crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
         ),
+        (
+            "intercept_cli_bg_status_classifier_identity_injection_enabled",
+            crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
+        ),
         // thinking.type=disabled 兼容改写默认关闭,管理员确认模型后再开启。
         (
             "rewrite_disabled_thinking_enabled",
@@ -1305,6 +1309,37 @@ mod tests {
             .await
             .expect("retained cli-bg status classifier setting");
         assert_eq!(retained, "mock");
+    }
+
+    #[tokio::test]
+    async fn migrate_inserts_cli_bg_identity_injection_default_without_overwriting_custom_value() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.expect("migrate");
+
+        let enabled: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_cli_bg_status_classifier_identity_injection_enabled")
+            .fetch_one(&pool)
+            .await
+            .expect("cli-bg identity injection setting");
+        assert_eq!(
+            enabled,
+            crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED
+        );
+
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("true")
+            .bind("intercept_cli_bg_status_classifier_identity_injection_enabled")
+            .execute(&pool)
+            .await
+            .expect("update cli-bg identity injection setting");
+        migrate(&pool, "sqlite").await.expect("second migrate");
+
+        let retained: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_cli_bg_status_classifier_identity_injection_enabled")
+            .fetch_one(&pool)
+            .await
+            .expect("retained cli-bg identity injection setting");
+        assert_eq!(retained, "true");
     }
 
     #[tokio::test]

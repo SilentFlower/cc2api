@@ -672,6 +672,13 @@ CCH attestation 重新计算之前完成。
 
 `billing_mode=rewrite` 会按版本改写 `cc_version` / `cch`。Claude Code `2.1.185` 的 `cc_version` 后缀公式沿用 JS 字符串索引语义；`cch` 使用序列化后的 body（其中 `cch=00000` 保持占位）计算 `xxhash64` 低 20 bits。`2.1.156` / `2.1.169` 使用完整最终 body 与 seed `0x4D659218E32A3268`；`2.1.172` / `2.1.173` / `2.1.185` 继续使用同 seed，但计算前会把顶层 `model` 值替换为 `""`，并排除顶层 `max_tokens` / `fallbacks` 字段。旧版本继续使用旧 seed `0x6E52736AC806831E`。
 
+### Claude Code 后台状态分类
+
+- `intercept_cli_bg_status_classifier_mode=passthrough|mock` 控制已确认的 Fable 5.1 `cli-bg` 事故画像是继续真实转发，还是在账号选择前返回本地状态 JSON；默认 `passthrough`。
+- `intercept_cli_bg_status_classifier_identity_injection_enabled=true|false` 是独立开关，默认 `false`，只在 `passthrough` 下作用于强特征命中的非 Haiku 状态分类请求。
+- 开启身份注入后，缺少 billing 的请求会按所选账号 Claude Code 版本画像生成 billing 与 CCH，缺少 identity 时补入官方身份块；最终 system 顺序为 billing、identity、classifier。
+- Haiku 请求、普通 `/v1/messages`、未知 system 结构和本地 mock 不进入该补齐分支。命中请求仍使用账号 OAuth、代理/TLS、RPM、并发与上游重试链路，并只记录脱敏摘要。
+
 ### TLS 指纹
 
 所有上游请求通过 `craftls` 发出，模拟 Node.js TLS 指纹。每账号可配代理（HTTP / SOCKS5）。

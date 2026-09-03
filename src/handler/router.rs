@@ -44,6 +44,7 @@ use crate::store::settings_store::{
     DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
     DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
     DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
     DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
@@ -957,6 +958,11 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("intercept_cli_bg_status_classifier_mode".into())
         .or_insert_with(|| DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE.to_string());
     settings
+        .entry("intercept_cli_bg_status_classifier_identity_injection_enabled".into())
+        .or_insert_with(|| {
+            DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED.to_string()
+        });
+    settings
         .entry("rewrite_disabled_thinking_enabled".into())
         .or_insert_with(|| DEFAULT_REWRITE_DISABLED_THINKING_ENABLED.to_string());
     settings
@@ -1159,6 +1165,7 @@ async fn update_settings(
         "fable_sticky_quota_fallback_enabled",
         "session_hello_probe_enabled",
         "session_hello_probe_strict",
+        "intercept_cli_bg_status_classifier_identity_injection_enabled",
     ] {
         if let Some(val) = body.get(*key) {
             if val != "true" && val != "false" {
@@ -1275,10 +1282,12 @@ async fn update_settings(
     {
         state.gateway_svc.reload_warmup_intercept_config().await?;
     }
-    if body.contains_key("intercept_cli_bg_status_classifier_mode") {
+    if body.contains_key("intercept_cli_bg_status_classifier_mode")
+        || body.contains_key("intercept_cli_bg_status_classifier_identity_injection_enabled")
+    {
         state
             .gateway_svc
-            .reload_cli_bg_status_classifier_mode()
+            .reload_cli_bg_status_classifier_config()
             .await?;
     }
     if body.contains_key("rewrite_disabled_thinking_enabled")
@@ -1622,6 +1631,10 @@ mod tests {
             value["intercept_cli_bg_status_classifier_mode"],
             "passthrough"
         );
+        assert_eq!(
+            value["intercept_cli_bg_status_classifier_identity_injection_enabled"],
+            "false"
+        );
     }
 
     #[tokio::test]
@@ -1650,6 +1663,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_reject_invalid_cli_bg_status_classifier_identity_injection_flag() {
+        for value in ["", "1", "yes"] {
+            let response = test_router()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "intercept_cli_bg_status_classifier_identity_injection_enabled": value
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "value={value}");
+        }
+    }
+
+    #[tokio::test]
     async fn settings_update_hot_reloads_cli_bg_status_classifier_mode() {
         let (app, gateway_svc) = test_router_with_gateway().await;
         let response = app
@@ -1661,7 +1699,8 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "intercept_cli_bg_status_classifier_mode": "mock"
+                            "intercept_cli_bg_status_classifier_mode": "mock",
+                            "intercept_cli_bg_status_classifier_identity_injection_enabled": "true"
                         })
                         .to_string(),
                     ))
@@ -1674,6 +1713,11 @@ mod tests {
         assert_eq!(
             gateway_svc.cli_bg_status_classifier_mode_for_test().await,
             CliBgStatusClassifierMode::Mock
+        );
+        assert!(
+            gateway_svc
+                .cli_bg_status_classifier_identity_injection_enabled_for_test()
+                .await
         );
     }
 

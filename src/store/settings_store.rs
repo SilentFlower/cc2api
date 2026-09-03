@@ -54,6 +54,8 @@ pub const DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE: &str = "passthroug
 pub const DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE: &str = "passthrough";
 /// Claude Code 后台状态分类请求默认真实转发,仅绕过会改变正文指纹的通用改写。
 pub const DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE: &str = "passthrough";
+/// Claude Code 后台状态分类请求默认不补齐 billing/CCH 与身份块。
+pub const DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED: &str = "false";
 /// `thinking.type=disabled` 自动改写默认关闭,避免升级后改变请求体语义。
 pub const DEFAULT_REWRITE_DISABLED_THINKING_ENABLED: &str = "false";
 /// 默认只匹配线上已确认报错的 Fable 5,避免影响 Opus 4.8 / 4.7 的正常请求。

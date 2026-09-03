@@ -1398,6 +1398,105 @@ impl Rewriter {
         serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
     }
 
+    /// 补齐 Claude Code 状态分类请求的 billing/CCH 与官方身份块。
+    ///
+    /// 该入口只处理已经被 Gateway 强特征识别的 classifier 请求。除账号身份、上游
+    /// session、billing、identity 和 CCH 外，不执行普通 system、cache_control、
+    /// thinking、字段顺序或 expansion 改写；结构不符合预期时失败开放并返回原正文。
+    ///
+    /// @param body 原始下游请求体。
+    /// @param account 当前选中的代理账号。
+    /// @param upstream_session_rewrite 上游 session 改写上下文。
+    /// @return 补齐归因前缀并刷新 CCH 后的请求体字节。
+    pub fn rewrite_claude_code_status_classifier_attribution(
+        &self,
+        body: &[u8],
+        account: &Account,
+        upstream_session_rewrite: &UpstreamSessionRewrite,
+    ) -> Vec<u8> {
+        if body.is_empty() {
+            return body.to_vec();
+        }
+
+        let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => return body.to_vec(),
+        };
+        let Some(system_blocks) = parsed.get("system").and_then(|system| system.as_array()) else {
+            return body.to_vec();
+        };
+
+        let mut billing_block = None;
+        let mut identity_block = None;
+        let mut classifier_block = None;
+        let mut existing_billing_has_cch = false;
+        for block in system_blocks {
+            if is_claude_code_billing_system_block(block) {
+                if billing_block.replace(block.clone()).is_some() {
+                    return body.to_vec();
+                }
+                existing_billing_has_cch = block
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .is_some_and(|text| CCH_VALUE_REGEX.is_match(text));
+                continue;
+            }
+            if is_claude_code_identity_system_block(block) {
+                if identity_block.replace(block.clone()).is_some() {
+                    return body.to_vec();
+                }
+                continue;
+            }
+            let is_ephemeral_classifier = block.get("type").and_then(|value| value.as_str())
+                == Some("text")
+                && block
+                    .get("cache_control")
+                    .and_then(|value| value.as_object())
+                    .and_then(|cache| cache.get("type"))
+                    .and_then(|value| value.as_str())
+                    == Some("ephemeral");
+            if !is_ephemeral_classifier || classifier_block.replace(block.clone()).is_some() {
+                return body.to_vec();
+            }
+        }
+        let Some(classifier_block) = classifier_block else {
+            return body.to_vec();
+        };
+
+        let profile = device_profile(account);
+        let version = normalize_version(&profile.env.version);
+        self.rewrite_metadata_user_id(
+            &mut parsed,
+            &profile,
+            upstream_session_rewrite.message.as_ref(),
+        );
+
+        let had_billing = billing_block.is_some();
+        let billing_block = billing_block
+            .unwrap_or_else(|| build_claude_code_billing_system_block(&parsed, version));
+        let identity_block = identity_block.unwrap_or_else(build_claude_code_identity_system_block);
+        if let Some(object) = parsed.as_object_mut() {
+            object.insert(
+                "system".into(),
+                serde_json::Value::Array(vec![billing_block, identity_block, classifier_block]),
+            );
+        } else {
+            return body.to_vec();
+        }
+
+        let output = match serde_json::to_vec(&parsed) {
+            Ok(output) => output,
+            Err(_) => return body.to_vec(),
+        };
+        if !had_billing {
+            compute_cch_attestation(output, version)
+        } else if existing_billing_has_cch {
+            refresh_cch_attestation(output, version)
+        } else {
+            output
+        }
+    }
+
     /// 提交已经被上游成功消费完成的 stateful 缓存状态。
     ///
     /// @param completion `rewrite_body_with_stateful_completion` 返回的延迟提交句柄。
@@ -1706,18 +1805,8 @@ impl Rewriter {
     fn rewrite_api_system_prompt(&self, body: &mut serde_json::Value, version: &str) {
         let original_system_text = extract_api_original_system_text(body);
         let version = normalize_version(version);
-        let first_msg = extract_first_user_message(body);
-        let cc_suffix = compute_cc_version_suffix(&first_msg, version);
-        let billing_block = serde_json::json!({
-            "type": "text",
-            "text": format!(
-                "x-anthropic-billing-header: cc_version={version}.{cc_suffix}; cc_entrypoint=cli; cch=00000;"
-            )
-        });
-        let banner_block = serde_json::json!({
-            "type": "text",
-            "text": CLAUDE_CODE_SYSTEM_PROMPT
-        });
+        let billing_block = build_claude_code_billing_system_block(body, version);
+        let banner_block = build_claude_code_identity_system_block();
         let expansion_block = serde_json::json!({
             "type": "text",
             "text": CLAUDE_CODE_SYSTEM_PROMPT_EXPANSION,
@@ -1958,6 +2047,12 @@ static BILLING_REGEX: Lazy<Regex> =
 static BILLING_VERSION_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3}").unwrap());
 static CCH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
+static CLAUDE_CODE_BILLING_BLOCK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^x-anthropic-billing-header: cc_version=[\d.]+\.[a-f0-9]{3}; cc_entrypoint=cli;(?: cch=[a-f0-9]{5};)?$",
+    )
+    .unwrap()
+});
 static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
@@ -2068,6 +2163,27 @@ fn compute_cc_version_suffix(first_user_message_text: &str, version: &str) -> St
 
 fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
     format!("{:04x}", u16::from_be_bytes(bytes))[..3].to_string()
+}
+
+fn build_claude_code_billing_system_block(
+    body: &serde_json::Value,
+    version: &str,
+) -> serde_json::Value {
+    let first_message = extract_first_user_message(body);
+    let cc_suffix = compute_cc_version_suffix(&first_message, version);
+    serde_json::json!({
+        "type": "text",
+        "text": format!(
+            "x-anthropic-billing-header: cc_version={version}.{cc_suffix}; cc_entrypoint=cli; cch=00000;"
+        )
+    })
+}
+
+fn build_claude_code_identity_system_block() -> serde_json::Value {
+    serde_json::json!({
+        "type": "text",
+        "text": CLAUDE_CODE_SYSTEM_PROMPT
+    })
 }
 
 /// 返回指定 Claude Code 版本使用的 CCH attestation seed。
@@ -5445,7 +5561,39 @@ fn is_uuid_like(value: &str) -> bool {
     true
 }
 
-const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+/// Claude Code 官方 system 身份块文本。
+pub(crate) const CLAUDE_CODE_SYSTEM_PROMPT: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// 判断 system block 是否为精确 Claude Code billing attribution block。
+///
+/// @param block 待检查的 system block。
+/// @return 仅包含标准 `type/text` 字段且 billing 文本合法时返回 `true`。
+pub(crate) fn is_claude_code_billing_system_block(block: &serde_json::Value) -> bool {
+    let Some(object) = block.as_object() else {
+        return false;
+    };
+    object.len() == 2
+        && object.get("type").and_then(|value| value.as_str()) == Some("text")
+        && object
+            .get("text")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| CLAUDE_CODE_BILLING_BLOCK_REGEX.is_match(text))
+}
+
+/// 判断 system block 是否为精确 Claude Code 官方身份块。
+///
+/// @param block 待检查的 system block。
+/// @return 仅包含标准 `type/text` 字段且文本精确匹配时返回 `true`。
+pub(crate) fn is_claude_code_identity_system_block(block: &serde_json::Value) -> bool {
+    let Some(object) = block.as_object() else {
+        return false;
+    };
+    object.len() == 2
+        && object.get("type").and_then(|value| value.as_str()) == Some("text")
+        && object.get("text").and_then(|value| value.as_str()) == Some(CLAUDE_CODE_SYSTEM_PROMPT)
+}
+
 const CLAUDE_CODE_SYSTEM_PROMPT_EXPANSION: &str = r#"You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
 
 IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
@@ -5576,11 +5724,12 @@ fn message_body_order_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClaudeCodeContextSanitizerMode,
-        ClientType, DisabledThinkingRewrite, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
-        UpstreamSessionRewrite, cch_attestation_input, cch_attestation_seed,
-        compute_cc_version_suffix, compute_cch_attestation, extract_first_user_message,
-        matches_1m_whitelist, ordered_anthropic_headers, strip_beta_token,
+        CLAUDE_CODE_SYSTEM_PROMPT, CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig,
+        ClaudeCodeContextSanitizerMode, ClientType, DisabledThinkingRewrite, EnvPassthrough,
+        MessageCacheControlRewrite, Rewriter, UpstreamSessionRewrite, cch_attestation_input,
+        cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
+        extract_first_user_message, matches_1m_whitelist, ordered_anthropic_headers,
+        strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -6066,6 +6215,172 @@ mod tests {
         );
 
         assert_eq!(output, body);
+    }
+
+    #[test]
+    fn cli_bg_attribution_rewrite_adds_billing_identity_and_valid_cch() {
+        let account = test_account();
+        let profile = device_profile(&account);
+        let original = json!({
+            "model": "claude-fable-5-1",
+            "stream": false,
+            "max_tokens": 3072,
+            "fallbacks": "default",
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "system": [{
+                "type": "text",
+                "text": "synthetic classifier system",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": "Current state: working\nTool calls so far: Bash×1\nUser's most recent ask: test\nAssistant message tail: checking"
+            }],
+            "metadata": {
+                "user_id": json!({
+                    "device_id": "123e4567-e89b-12d3-a456-426614174001",
+                    "account_uuid": "123e4567-e89b-12d3-a456-426614174002",
+                    "session_id": "123e4567-e89b-12d3-a456-426614174003"
+                }).to_string()
+            }
+        });
+        let rewrite = upstream_session_rewrite(
+            "123e4567-e89b-12d3-a456-426614174003",
+            "123e4567-e89b-12d3-a456-426614174004",
+        );
+
+        let output = Rewriter::new().rewrite_claude_code_status_classifier_attribution(
+            &serde_json::to_vec(&original).unwrap(),
+            &account,
+            &rewrite,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let system = parsed["system"].as_array().unwrap();
+        let billing = system[0]["text"].as_str().unwrap();
+        let metadata_user_id: serde_json::Value =
+            serde_json::from_str(parsed["metadata"]["user_id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(system.len(), 3);
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.257."));
+        assert!(billing.contains("; cc_entrypoint=cli; cch="));
+        assert!(!billing.contains("cch=00000"));
+        assert_eq!(system[1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(system[2], original["system"][0]);
+        assert_eq!(parsed["messages"], original["messages"]);
+        assert_eq!(parsed["thinking"], original["thinking"]);
+        assert_eq!(parsed["fallbacks"], original["fallbacks"]);
+        assert_eq!(metadata_user_id["device_id"], profile.device_id);
+        assert_eq!(metadata_user_id["account_uuid"], profile.account_uuid);
+        assert_eq!(
+            metadata_user_id["session_id"],
+            "123e4567-e89b-12d3-a456-426614174004"
+        );
+
+        let mut placeholder = output.clone();
+        let cch_pos = placeholder
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        assert_eq!(
+            output,
+            compute_cch_attestation(placeholder, DEFAULT_CLAUDE_CODE_VERSION)
+        );
+    }
+
+    #[test]
+    fn cli_bg_attribution_rewrite_refreshes_existing_cch_and_is_idempotent() {
+        let account = test_account();
+        let body = json!({
+            "model": "claude-fable-5-1",
+            "stream": false,
+            "max_tokens": 3072,
+            "fallbacks": "default",
+            "system": [
+                {
+                    "type": "text",
+                    "cache_control": {"type": "ephemeral"},
+                    "text": "synthetic classifier system"
+                },
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.257.abc; cc_entrypoint=cli; cch=12345;"
+                },
+                {"type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT}
+            ],
+            "messages": [{"role": "user", "content": "classifier input"}]
+        });
+        let rewriter = Rewriter::new();
+
+        let first = rewriter.rewrite_claude_code_status_classifier_attribution(
+            &serde_json::to_vec(&body).unwrap(),
+            &account,
+            &UpstreamSessionRewrite::default(),
+        );
+        let second = rewriter.rewrite_claude_code_status_classifier_attribution(
+            &first,
+            &account,
+            &UpstreamSessionRewrite::default(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&first).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(parsed["system"].as_array().unwrap().len(), 3);
+        assert!(
+            parsed["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cc_entrypoint=cli; cch=")
+        );
+        assert!(!String::from_utf8_lossy(&first).contains("cch=12345"));
+        assert_eq!(parsed["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(parsed["system"][2]["text"], "synthetic classifier system");
+
+        let mut placeholder = first.clone();
+        let cch_pos = placeholder
+            .windows(super::CCH_PLACEHOLDER.len())
+            .position(|window| window.starts_with(b"cch="))
+            .expect("cch value position");
+        placeholder[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
+        assert_eq!(
+            first,
+            compute_cch_attestation(placeholder, DEFAULT_CLAUDE_CODE_VERSION)
+        );
+    }
+
+    #[test]
+    fn cli_bg_attribution_rewrite_keeps_existing_billing_without_cch() {
+        let body = json!({
+            "model": "claude-opus-5",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.257.abc; cc_entrypoint=cli;"
+                },
+                {
+                    "type": "text",
+                    "cache_control": {"type": "ephemeral"},
+                    "text": "synthetic classifier system"
+                }
+            ],
+            "messages": [{"role": "user", "content": "classifier input"}]
+        });
+
+        let output = Rewriter::new().rewrite_claude_code_status_classifier_attribution(
+            &serde_json::to_vec(&body).unwrap(),
+            &test_account(),
+            &UpstreamSessionRewrite::default(),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let billing = parsed["system"][0]["text"].as_str().unwrap();
+
+        assert_eq!(
+            billing,
+            "x-anthropic-billing-header: cc_version=2.1.257.abc; cc_entrypoint=cli;"
+        );
+        assert!(!billing.contains("cch="));
+        assert_eq!(parsed["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(parsed["system"][2]["text"], "synthetic classifier system");
     }
 
     #[test]

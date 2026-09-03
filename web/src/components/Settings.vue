@@ -99,6 +99,7 @@ const interceptWarmupHaikuProbeEnabled = ref(false);
 const interceptAutoModeClassifierStage1Mode = ref<AutoModeClassifierMode>('passthrough');
 const interceptAutoModeClassifierStage2Mode = ref<AutoModeClassifierMode>('passthrough');
 const interceptCliBgStatusClassifierMode = ref<CliBgStatusClassifierMode>('passthrough');
+const interceptCliBgStatusClassifierIdentityInjectionEnabled = ref(false);
 
 /** 预热历史记录 */
 const primeLogs = ref<PrimeLogEntry[]>([]);
@@ -475,6 +476,8 @@ async function loadSettings() {
     interceptAutoModeClassifierStage1Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage1_mode);
     interceptAutoModeClassifierStage2Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage2_mode);
     interceptCliBgStatusClassifierMode.value = data.intercept_cli_bg_status_classifier_mode === 'mock' ? 'mock' : 'passthrough';
+    interceptCliBgStatusClassifierIdentityInjectionEnabled.value =
+      (data.intercept_cli_bg_status_classifier_identity_injection_enabled ?? 'false') === 'true';
     loaded.value = true;
   } catch (e) {
     toast((e as Error).message || '加载设置失败');
@@ -611,6 +614,8 @@ async function saveSettings() {
       intercept_auto_mode_classifier_stage1_mode: interceptAutoModeClassifierStage1Mode.value,
       intercept_auto_mode_classifier_stage2_mode: interceptAutoModeClassifierStage2Mode.value,
       intercept_cli_bg_status_classifier_mode: interceptCliBgStatusClassifierMode.value,
+      intercept_cli_bg_status_classifier_identity_injection_enabled:
+        interceptCliBgStatusClassifierIdentityInjectionEnabled.value ? 'true' : 'false',
     });
     await loadSettings();
     toast('保存成功');
@@ -902,6 +907,28 @@ onMounted(async () => {
               />
               <span class="text-sm text-[#29261e]">本地模拟</span>
             </label>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-sm">Claude Code 身份块</Label>
+            <label
+              class="flex items-center gap-2 min-h-9 px-3 py-2 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] select-none"
+              :class="interceptCliBgStatusClassifierMode === 'mock' ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'"
+            >
+              <input
+                v-model="interceptCliBgStatusClassifierIdentityInjectionEnabled"
+                type="checkbox"
+                :disabled="interceptCliBgStatusClassifierMode === 'mock'"
+                class="accent-[#c4704f] w-4 h-4"
+              />
+              <span class="text-sm text-[#29261e]">
+                {{ interceptCliBgStatusClassifierIdentityInjectionEnabled ? '缺失时注入身份块' : '保持原始身份块' }}
+              </span>
+            </label>
+            <p class="text-[11px] text-[#b5b0a6]">
+              {{ interceptCliBgStatusClassifierMode === 'mock'
+                ? '本地模拟不访问上游；切回放行后恢复已保存的开关值。'
+                : '仅处理强特征命中的非 Haiku 状态分类请求；开启后同时补齐缺失的 billing/CCH 归因块。' }}
+            </p>
           </div>
         </div>
       </div>
