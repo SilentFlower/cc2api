@@ -3629,14 +3629,16 @@ fn inject_bootstrap_fable_profile(
         "additional_model_options".into(),
         serde_json::Value::Array(config.additional_model_options.clone()),
     );
-    if query_model_is_fable(query) {
-        if let Some(key) = version_profile.endpoints.bootstrap_fable_cwk_cfg_key {
-            obj.insert("cwk_cfg_key".into(), serde_json::json!(key));
-        }
-    } else if query_model_is_opus_5(query) {
-        if let Some(key) = version_profile.endpoints.bootstrap_opus_cwk_cfg_key {
-            obj.insert("cwk_cfg_key".into(), serde_json::json!(key));
-        }
+    if let Some(model_profile) = bootstrap_query_value(query, "model")
+        .and_then(|model| version_profile.endpoints.bootstrap_model(model))
+    {
+        obj.insert(
+            "cwk_cfg_key".into(),
+            model_profile
+                .cwk_cfg_key
+                .map(|key| serde_json::json!(key))
+                .unwrap_or(serde_json::Value::Null),
+        );
     }
 }
 
@@ -3676,31 +3678,27 @@ fn hide_bootstrap_fable_profile(
                 .unwrap_or(false)
         });
     }
-    if let Some(fable_key) = version_profile.endpoints.bootstrap_fable_cwk_cfg_key {
-        if obj.get("cwk_cfg_key").and_then(|value| value.as_str()) == Some(fable_key) {
-            obj.insert("cwk_cfg_key".into(), serde_json::Value::Null);
-        }
+    let current_cwk_cfg_key = obj.get("cwk_cfg_key").and_then(|value| value.as_str());
+    let uses_fable_cwk_cfg_key = version_profile
+        .endpoints
+        .bootstrap_models
+        .iter()
+        .filter(|profile| is_fable_model_id(profile.model_id))
+        .filter_map(|profile| profile.cwk_cfg_key)
+        .any(|key| Some(key) == current_cwk_cfg_key);
+    if uses_fable_cwk_cfg_key {
+        obj.insert("cwk_cfg_key".into(), serde_json::Value::Null);
     }
-}
-
-fn query_model_is_fable(query: &str) -> bool {
-    query.split('&').any(|part| {
-        part.strip_prefix("model=")
-            .map(|model| model.starts_with("claude-fable-5"))
-            .unwrap_or(false)
-    })
-}
-
-fn query_model_is_opus_5(query: &str) -> bool {
-    query.split('&').any(|part| {
-        part.strip_prefix("model=")
-            .map(|model| model.starts_with("claude-opus-5"))
-            .unwrap_or(false)
-    })
 }
 
 fn is_fable_model_id(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("claude-fable-")
+}
+
+fn query_model_is_fable(query: &str) -> bool {
+    bootstrap_query_value(query, "model")
+        .map(is_fable_model_id)
+        .unwrap_or(false)
 }
 
 fn request_slot_units(path: &str, body: &serde_json::Value) -> u32 {
@@ -10130,6 +10128,45 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_patch_21257_uses_marigold_for_fable_5() {
+        let mut body = bootstrap_body();
+
+        patch_bootstrap_json(
+            &mut body,
+            "entrypoint=cli&model=claude-fable-5",
+            &bootstrap_config(BootstrapModelOptionsMode::Configured),
+            profile_for_key("2.1.257").unwrap(),
+        );
+
+        assert_eq!(body["cwk_cfg_key"], "marigold");
+    }
+
+    #[test]
+    fn bootstrap_patch_21260_uses_exact_model_cwk_mapping() {
+        for (model, expected) in [
+            ("claude-opus-5", Some("belladonna")),
+            ("claude-sonnet-5", Some("pewter")),
+            ("claude-fable-5-1", Some("sorrel")),
+            ("claude-haiku-4-5-20251001", None),
+        ] {
+            let mut body = bootstrap_body();
+
+            patch_bootstrap_json(
+                &mut body,
+                format!("entrypoint=cli&model={model}").as_str(),
+                &bootstrap_config(BootstrapModelOptionsMode::Configured),
+                profile_for_key("2.1.260").unwrap(),
+            );
+
+            match expected {
+                Some(expected) => assert_eq!(body["cwk_cfg_key"], expected),
+                None => assert!(body["cwk_cfg_key"].is_null()),
+            }
+            assert_eq!(body["client_data"]["cedar_basin"], "2027-08-31");
+        }
+    }
+
+    #[test]
     fn bootstrap_patch_configured_uses_belladonna_for_opus_5() {
         let mut body = bootstrap_body();
 
@@ -11143,7 +11180,12 @@ mod tests {
         let system = captured["system"].as_array().unwrap();
         assert_eq!(system.len(), 3);
         let billing = system[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.257."));
+        assert!(
+            billing.starts_with(
+                format!("x-anthropic-billing-header: cc_version={DEFAULT_CLAUDE_CODE_VERSION}.")
+                    .as_str()
+            )
+        );
         assert!(billing.contains("; cc_entrypoint=cli; cch="));
         assert!(!billing.contains("cch=00000"));
         assert!(system[0].get("cache_control").is_none());

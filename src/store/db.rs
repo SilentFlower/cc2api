@@ -11,12 +11,14 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.195",
     "2.1.89-2.1.197",
     "2.1.89-2.1.220",
+    "2.1.89-2.1.257",
 ];
 const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
     ("2.1.187", "2.1.89-2.1.187"),
     ("2.1.195", "2.1.89-2.1.195"),
     ("2.1.197", "2.1.89-2.1.197"),
     ("2.1.220", "2.1.89-2.1.220"),
+    ("2.1.257", "2.1.89-2.1.257"),
 ];
 const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
 const PREVIOUS_DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
@@ -1061,6 +1063,7 @@ mod tests {
             ("2.1.195", "2.1.195", "2026-06-26T01:00:56Z"),
             ("2.1.197", "2.1.197", "2026-06-29T19:08:42Z"),
             ("2.1.220", "2.1.220", "2026-07-24T22:17:45Z"),
+            ("2.1.257", "2.1.257", "2026-09-01T05:28:54Z"),
         ] {
             sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
                 .bind(profile_key)

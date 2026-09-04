@@ -2309,7 +2309,7 @@ mod tests {
         assert_eq!(event["auth"]["organization_uuid"], "org-uuid");
         assert_eq!(
             event["betas"],
-            profile_for_key("2.1.257")
+            profile_for_key(DEFAULT_CLAUDE_CODE_VERSION)
                 .unwrap()
                 .telemetry
                 .base_beta_tokens

@@ -518,7 +518,7 @@ cc-bridge/
 
 网关通过全局 settings 控制客户端入口访问，校验发生在账号选择和上游请求之前：
 
-- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.257`
+- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.260`
 - `blocked_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认空；命中后优先拒绝
 - `allowed_user_agents`：只作用于非 Claude Code / CLI UA，默认允许 `AI-Hub-Monitor*` 和 `python-httpx*`
 - 版本规则支持精确版本、通配和闭区间，例如 `2.1.187`、`2.1.*`、`2.1.89-2.1.187`
@@ -590,10 +590,10 @@ cc-bridge/
 
 ### 请求头改写
 
-- 默认 Claude Code 指纹为 `2.1.257`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移会把仍使用历史默认组合的账号升级到当前画像
-- `/v1/messages` 使用所选画像的 `claude-cli/<version> (external, cli)`、Stainless package 和 Node runtime；2.1.257 为 `0.112.1` / `v26.3.0`
+- 默认 Claude Code 指纹为 `2.1.260`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移只把仍使用 2.1.257 历史默认 profile/range 组合的设置升级到当前画像
+- `/v1/messages` 使用所选画像的 `claude-cli/<version> (external, cli)`、Stainless package 和 Node runtime；2.1.260 为 `0.112.1` / `v26.3.0`
 - `/api/event_logging/v2/batch` 使用 `claude-code/<version>`、`anthropic-beta=oauth-2025-04-20`、`x-service-name=claude-code`
-- `/api/eval/*` 使用所选画像的 Bun UA；2.1.257 为 `Bun/1.4.1`
+- `/api/eval/*` 使用所选画像的 Bun UA；2.1.260 为 `Bun/1.4.1`
 - `/v1/code/triggers` / `/v1/mcp_servers` 使用各自 endpoint beta token
 - 注入/合并 `anthropic-beta`、固定必要 `anthropic-version`
 - 强制使用账号真实 `Authorization`
@@ -608,6 +608,11 @@ cc-bridge/
 | `/api/event_logging/v2/batch` / `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、`userType`、`rateLimitTier`、`entrypoint`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
+
+2.1.260 对 Opus 5、Sonnet 5、Fable 5.1 和 Haiku 使用精确模型画像，分别对齐
+`anthropic-beta`、`max_tokens`、`thinking`、`output_config.effort`、fallback、CCH 与
+bootstrap `cwk_cfg_key`。2.1.257 仍可作为回滚画像，其中 Fable 5 使用抓包确认的
+`fallbacks="default"`、`server-side-fallback-2026-07-01` 和 `marigold`。
 
 ### Thinking 签名错误重试
 
@@ -627,7 +632,7 @@ Anthropic `thinking.signature`，也不会使用 Gemini `thoughtSignature` 的 d
 
 ### 系统角色模型白名单
 
-Claude Code 2.1.257 的 Opus 5 / Fable 5 / Fable 5.1，以及旧版 `claude-opus-4-8` 请求，可能把运行时提醒放入
+当前兼容画像的 Opus 5 / Fable 5 / Fable 5.1，以及旧版 `claude-opus-4-8` 请求，可能把运行时提醒放入
 `messages[].role=system`。网关通过全局 settings key
 `allow_system_role_models` 控制哪些模型允许透传这种格式：
 

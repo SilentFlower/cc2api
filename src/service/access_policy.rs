@@ -353,13 +353,14 @@ mod tests {
         assert!(policy.check_user_agent("claude-code/2.1.197").is_ok());
         assert!(policy.check_user_agent("claude-code/2.1.220").is_ok());
         assert!(policy.check_user_agent("claude-code/2.1.257").is_ok());
+        assert!(policy.check_user_agent("claude-code/2.1.260").is_ok());
         assert!(
             policy
                 .check_user_agent("claude-cli/2.1.120 (external, cli)")
                 .is_ok()
         );
         assert!(policy.check_user_agent("claude-code/2.1.88").is_err());
-        assert!(policy.check_user_agent("claude-code/2.1.258").is_err());
+        assert!(policy.check_user_agent("claude-code/2.1.261").is_err());
         assert!(policy.check_user_agent("claude-code/").is_err());
         assert!(policy.check_user_agent("AI-Hub-Monitor/1.0.0").is_ok());
         assert!(policy.check_user_agent("python-httpx/0.28.1").is_ok());

@@ -372,18 +372,18 @@ mod tests {
     fn token_test_request_uses_selected_version_profile_headers() {
         let client = get_request_client("").expect("构造无代理请求客户端");
         let current =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.257"))
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.260"))
                 .expect("构造当前画像请求");
         let previous =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.220"))
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.257"))
                 .expect("构造上一画像请求");
         let rollback =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.197"))
+            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.220"))
                 .expect("构造回滚画像请求");
 
         assert_eq!(
             request_header(&current, "user-agent"),
-            "claude-cli/2.1.257 (external, cli)"
+            "claude-cli/2.1.260 (external, cli)"
         );
         assert_eq!(
             request_header(&current, "x-stainless-package-version"),
@@ -400,11 +400,11 @@ mod tests {
 
         assert_eq!(
             request_header(&previous, "user-agent"),
-            "claude-cli/2.1.220 (external, cli)"
+            "claude-cli/2.1.257 (external, cli)"
         );
         assert_eq!(
             request_header(&previous, "x-stainless-package-version"),
-            "0.94.0"
+            "0.112.1"
         );
         assert_eq!(
             request_header(&previous, "x-stainless-runtime-version"),
@@ -417,7 +417,7 @@ mod tests {
 
         assert_eq!(
             request_header(&rollback, "user-agent"),
-            "claude-cli/2.1.197 (external, cli)"
+            "claude-cli/2.1.220 (external, cli)"
         );
         assert_eq!(
             request_header(&rollback, "x-stainless-package-version"),
