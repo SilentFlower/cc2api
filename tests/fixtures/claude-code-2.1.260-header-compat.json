@@ -1,0 +1,31 @@
+{
+  "source": "根据 260 五份抓包手工构造的脱敏协议常量；路径为合成值，不含凭据或用户正文。257 基线已观察同类变体。",
+  "title_variants": [
+    {
+      "optional_beta": "",
+      "expected_beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07"
+    },
+    {
+      "optional_beta": "fallback-credit-2026-06-01",
+      "expected_beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,structured-outputs-2025-12-15,fallback-credit-2026-06-01,cache-diagnosis-2026-04-07"
+    },
+    {
+      "optional_beta": "server-side-fallback-2026-07-01,fallback-credit-2026-06-01",
+      "expected_beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,structured-outputs-2025-12-15,server-side-fallback-2026-07-01,fallback-credit-2026-06-01,cache-diagnosis-2026-04-07"
+    }
+  ],
+  "endpoints": [
+    {"path":"/v1/code/sessions","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/bridge","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/worker","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/worker/events","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/worker/events/stream","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/worker/internal-events","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/worker/heartbeat","user_agent":"claude-code/{version}","beta":null},
+    {"path":"/v1/code/sessions/synthetic/client/presence","user_agent":"axios/1.15.2","beta":null},
+    {"path":"/v1/sessions/synthetic","user_agent":"claude-code/{version}","beta":"ccr-byoc-2025-07-29"},
+    {"path":"/v1/sessions/synthetic/archive","user_agent":"claude-code/{version}","beta":"ccr-byoc-2025-07-29"},
+    {"path":"/api/claude_code/notification/preferences","user_agent":"claude-cli/{version} (external, cli)","beta":"oauth-2025-04-20"},
+    {"path":"/v1/ultrareview/quota","user_agent":"claude-cli/{version} (external, cli)","beta":null}
+  ]
+}

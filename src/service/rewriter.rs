@@ -13,10 +13,10 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    CchProfile, FableFallbackProfile, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
-    MessageBodyOrderProfile, OAUTH_BETA_TOKEN, RequestProfile, TelemetryShape, ThinkingProfile,
-    claude_cli_user_agent, claude_code_user_agent, exact_profile_for_version,
-    is_event_logging_path, normalize_version, profile_for_version,
+    CchProfile, ClaudeCodeProfile, EndpointHeaderProfile, FableFallbackProfile,
+    MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MessageBodyOrderProfile, OAUTH_BETA_TOKEN,
+    RequestProfile, TelemetryShape, ThinkingProfile, claude_cli_user_agent, claude_code_user_agent,
+    exact_profile_for_version, is_event_logging_path, normalize_version, profile_for_version,
 };
 use crate::store::cache::UpstreamSessionPoolResolve;
 
@@ -346,6 +346,79 @@ fn requires_exact_beta_profile(path: &str, model_id: &str, body: &serde_json::Va
             haiku_request_kind(model_id, body),
             Some(HaikuRequestKind::Probe | HaikuRequestKind::Title)
         )
+}
+
+/// 仅保留标题抓包已确认的可选 token，避免把父模型的整套 beta 合入辅助请求。
+fn title_beta_header(request_profile: &RequestProfile, incoming_beta: &str) -> String {
+    let incoming = incoming_beta
+        .split(',')
+        .map(str::trim)
+        .collect::<HashSet<_>>();
+    let mut tokens = request_profile
+        .haiku_streaming_title_beta_tokens
+        .split(',')
+        .collect::<Vec<_>>();
+    let index = tokens
+        .iter()
+        .position(|token| *token == "cache-diagnosis-2026-04-07")
+        .unwrap_or(tokens.len());
+    tokens.splice(
+        index..index,
+        request_profile
+            .haiku_title_optional_beta_tokens
+            .iter()
+            .copied()
+            .filter(|token| incoming.contains(token)),
+    );
+    tokens.join(",")
+}
+
+/// 按已验证的路径段选择后台 UA/beta；不把相似或新增路径自动纳入画像。
+fn auxiliary_endpoint_headers(
+    profile: &ClaudeCodeProfile,
+    path: &str,
+) -> Option<(String, Option<&'static str>)> {
+    if profile.endpoints.header_profile != EndpointHeaderProfile::ClaudeCode21257 {
+        return None;
+    }
+    let version = profile.identity.version;
+    let code_suffix = path
+        .strip_prefix("/v1/code/sessions/")
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(session_id, _)| !session_id.is_empty())
+        .map(|(_, suffix)| suffix);
+    if code_suffix == Some("client/presence") {
+        return Some(("axios/1.15.2".to_string(), None));
+    }
+    if path == "/v1/code/sessions"
+        || matches!(
+            code_suffix,
+            Some(
+                "bridge"
+                    | "worker"
+                    | "worker/events"
+                    | "worker/events/stream"
+                    | "worker/internal-events"
+                    | "worker/heartbeat"
+            )
+        )
+    {
+        return Some((claude_code_user_agent(version), None));
+    }
+    if let Some(rest) = path.strip_prefix("/v1/sessions/") {
+        let (session_id, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+        if !session_id.is_empty() && (rest == session_id || suffix == "archive") {
+            return Some((claude_code_user_agent(version), Some("ccr-byoc-2025-07-29")));
+        }
+    }
+    match path {
+        "/api/claude_code/notification/preferences" => Some((
+            claude_cli_user_agent(version),
+            Some(profile.request.oauth_beta_token),
+        )),
+        "/v1/ultrareview/quota" => Some((claude_cli_user_agent(version), None)),
+        _ => None,
+    }
 }
 
 fn is_streaming_messages_body(body: &serde_json::Value) -> bool {
@@ -1048,7 +1121,15 @@ impl Rewriter {
 
     // --- Header 改写 ---
 
-    /// 处理出站 header 的反检测改写。
+    /// 按所选版本画像改写出站请求头。
+    ///
+    /// @param headers 客户端请求头。
+    /// @param path 不含查询参数的请求路径。
+    /// @param account 已选择的上游账号。
+    /// @param client_type 客户端类型。
+    /// @param model_id 当前请求模型。
+    /// @param body_map 改写后的请求体，用于辅助请求分类。
+    /// @return 尚未注入上游 Authorization 的请求头。
     pub fn rewrite_headers(
         &self,
         headers: &HashMap<String, String>,
@@ -1305,6 +1386,28 @@ impl Rewriter {
                     MCP_CLIENT_CAPABILITIES.into(),
                 );
                 out.insert("mcp-protocol-version".into(), MCP_PROTOCOL_VERSION.into());
+            }
+        }
+
+        // 两种客户端入口共用末端规范化，避免 API 注入和原生客户端合并出现不同结果。
+        if path == "/v1/messages"
+            && haiku_request_kind(model_id, body_map) == Some(HaikuRequestKind::Title)
+        {
+            let incoming_beta = find_header_value(headers, "anthropic-beta")
+                .map(String::as_str)
+                .unwrap_or_default();
+            let filtered_beta = filter_account_beta_tokens(incoming_beta, account, model_id);
+            out.insert(
+                "anthropic-beta".into(),
+                title_beta_header(&version_profile.request, &filtered_beta),
+            );
+        }
+        if let Some((user_agent, beta)) = auxiliary_endpoint_headers(version_profile, path) {
+            out.insert("User-Agent".into(), user_agent);
+            if let Some(beta) = beta {
+                out.insert("anthropic-beta".into(), beta.to_string());
+            } else {
+                out.remove("anthropic-beta");
             }
         }
 
@@ -9879,7 +9982,7 @@ mod tests {
         let mut incoming = std::collections::HashMap::new();
         incoming.insert(
             "anthropic-beta".to_string(),
-            MESSAGE_BETA_TOKENS.to_string(),
+            MESSAGE_BETA_TOKENS.replace(",fallback-credit-2026-06-01", ""),
         );
 
         let headers = rewriter.rewrite_headers(
@@ -10920,6 +11023,201 @@ mod tests {
             parsed["messages"][0]["content"][1]["text"],
             "<system-reminder>Git user: real\nWorking directory: /home/user/project</system-reminder>"
         );
+    }
+
+    #[test]
+    fn title_fallback_beta_matches_capture_variants_in_both_client_modes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.260-header-compat.json"
+        ))
+        .unwrap();
+        let rewriter = Rewriter::new();
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 32000,
+            "stream": true,
+            "tools": [],
+            "thinking": {"type": "disabled"},
+            "output_config": {"format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                    "additionalProperties": false
+                }
+            }},
+            "messages": [{"role": "user", "content": "合成标题样本"}]
+        });
+        for version in ["2.1.257", "2.1.260"] {
+            let mut account = test_account_with_profile(version);
+            account.allow_fast_mode = true;
+            account.allow_1m_models = "*".to_string();
+            for case in fixture["title_variants"].as_array().unwrap() {
+                let optional = case["optional_beta"].as_str().unwrap();
+                let reversed = optional.split(',').rev().collect::<Vec<_>>().join(", ");
+                // 刻意混入重复、乱序、相似未知 token 及已放行的能力，验证标题窄画像边界。
+                let incoming = HashMap::from([(
+                    "AnThRoPiC-BeTa".to_string(),
+                    format!(
+                        "{reversed}, {optional},claude-code-20250219,{FAST_MODE},{CTX_1M},server-side-fallback-2026-06-01,fallback-credit-2026-06-01-extra,client-extra"
+                    ),
+                )]);
+                for client_type in [ClientType::ClaudeCode, ClientType::API] {
+                    let headers = rewriter.rewrite_headers(
+                        &incoming,
+                        "/v1/messages",
+                        &account,
+                        client_type,
+                        "claude-haiku-4-5-20251001",
+                        &body,
+                    );
+                    assert_eq!(
+                        headers.get("anthropic-beta").map(String::as_str),
+                        case["expected_beta"].as_str(),
+                        "{version} {client_type:?} {optional}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn title_fallback_fix_keeps_probe_and_rollback_profiles_narrow() {
+        let rewriter = Rewriter::new();
+        let incoming = HashMap::from([(
+            "anthropic-beta".to_string(),
+            "server-side-fallback-2026-07-01,fallback-credit-2026-06-01".to_string(),
+        )]);
+        for version in [
+            "2.1.173", "2.1.185", "2.1.187", "2.1.195", "2.1.197", "2.1.220", "2.1.257", "2.1.260",
+        ] {
+            let account = test_account_with_profile(version);
+            for client_type in [ClientType::ClaudeCode, ClientType::API] {
+                let probe = rewriter.rewrite_headers(
+                    &incoming,
+                    "/v1/messages",
+                    &account,
+                    client_type,
+                    "claude-haiku-4-5-20251001",
+                    &json!({"max_tokens": 1, "messages": [{"role": "user", "content": "合成探针"}]}),
+                );
+                assert_eq!(probe["anthropic-beta"], HAIKU_PROBE_BETA_TOKENS);
+                if !matches!(version, "2.1.257" | "2.1.260") {
+                    let title = rewriter.rewrite_headers(
+                        &incoming,
+                        "/v1/messages",
+                        &account,
+                        client_type,
+                        "claude-haiku-4-5-20251001",
+                        &json!({
+                            "max_tokens": 32000,
+                            "system": "Generate a concise, sentence-case title (3-7 words)",
+                            "messages": [{"role": "user", "content": "合成标题样本"}]
+                        }),
+                    );
+                    assert_eq!(title["anthropic-beta"], HAIKU_STREAMING_TITLE_BETA_TOKENS);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_endpoint_ua_and_beta_match_capture_in_both_client_modes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.260-header-compat.json"
+        ))
+        .unwrap();
+        let rewriter = Rewriter::new();
+        let incoming = HashMap::from([
+            ("User-Agent".to_string(), "claude-cli/2.1.173".to_string()),
+            (
+                "AnThRoPiC-BeTa".to_string(),
+                format!("{MESSAGE_BETA_TOKENS},client-extra"),
+            ),
+        ]);
+        for version in ["2.1.257", "2.1.260"] {
+            let account = test_account_with_profile(version);
+            for case in fixture["endpoints"].as_array().unwrap() {
+                let path = case["path"].as_str().unwrap();
+                for client_type in [ClientType::ClaudeCode, ClientType::API] {
+                    let headers = rewriter.rewrite_headers(
+                        &incoming,
+                        path,
+                        &account,
+                        client_type,
+                        "",
+                        &json!({}),
+                    );
+                    assert_eq!(
+                        headers["User-Agent"],
+                        case["user_agent"]
+                            .as_str()
+                            .unwrap()
+                            .replace("{version}", version),
+                        "{path} {version} {client_type:?}"
+                    );
+                    assert_eq!(
+                        headers.get("anthropic-beta").map(String::as_str),
+                        case["beta"].as_str(),
+                        "{path} {version} {client_type:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_endpoint_fix_preserves_unknown_paths_and_rollback() {
+        let rewriter = Rewriter::new();
+        let account = test_account();
+        for path in [
+            "/v1/code/sessions-extra",
+            "/v1/code/sessions/synthetic/worker/new-feature",
+            "/v1/code/sessions/synthetic/client/presence-extra",
+            "/v1/code/sessions//worker",
+            "/v1/sessions/",
+            "/v1/sessions/synthetic/",
+            "/v1/sessions/synthetic/new-feature",
+            "/v1/sessions/synthetic/archive/extra",
+            "/api/claude_code/notification/preferences-extra",
+            "/v1/ultrareview/quota-extra",
+        ] {
+            let headers = rewriter.rewrite_headers(
+                &HashMap::new(),
+                path,
+                &account,
+                ClientType::API,
+                "",
+                &json!({}),
+            );
+            assert_eq!(
+                headers["User-Agent"],
+                claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION)
+            );
+            assert_eq!(headers["anthropic-beta"], MESSAGE_BETA_TOKENS, "{path}");
+        }
+        for version in [
+            "2.1.173", "2.1.185", "2.1.187", "2.1.195", "2.1.197", "2.1.220",
+        ] {
+            let account = test_account_with_profile(version);
+            let headers = rewriter.rewrite_headers(
+                &HashMap::new(),
+                "/v1/sessions/synthetic",
+                &account,
+                ClientType::API,
+                "",
+                &json!({}),
+            );
+            assert_eq!(headers["User-Agent"], claude_cli_user_agent(version));
+            assert_eq!(
+                headers["anthropic-beta"],
+                profile_for_key(version)
+                    .unwrap()
+                    .request
+                    .message_beta_tokens
+            );
+        }
     }
 
     #[test]

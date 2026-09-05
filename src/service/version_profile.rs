@@ -39,6 +39,11 @@ pub const SONNET_5_MESSAGE_BETA_TOKENS_2_1_260: &str = "claude-code-20250219,oau
 pub const HAIKU_PROBE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 /// Claude Code 2.1.195 Haiku 流式标题请求使用的窄 beta token 集合。
 pub const HAIKU_STREAMING_TITLE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07";
+/// 2.1.257/2.1.260 标题请求允许保留的客户端 fallback token，顺序来自抓包。
+const HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257: &[&str] = &[
+    "server-side-fallback-2026-07-01",
+    "fallback-credit-2026-06-01",
+];
 /// Claude Code 2.1.195 Fable 主请求额外启用的 fallback beta token 集合。
 pub const FABLE_FALLBACK_BETA_TOKENS: &str =
     "server-side-fallback-2026-06-01,fallback-credit-2026-06-01";
@@ -115,6 +120,7 @@ pub struct RequestProfile {
     pub fable_models: &'static [FableRequestProfile],
     pub haiku_probe_beta_tokens: &'static str,
     pub haiku_streaming_title_beta_tokens: &'static str,
+    pub haiku_title_optional_beta_tokens: &'static [&'static str],
     pub haiku_main_beta_tokens: &'static str,
     pub haiku_main_no_diagnostics_beta_tokens: &'static str,
     pub haiku_non_stream_aux_beta_tokens: &'static str,
@@ -247,10 +253,18 @@ impl TelemetryShape {
 /// endpoint 子画像入口，后续新增 endpoint 差异时在此扩展。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointProfile {
+    pub header_profile: EndpointHeaderProfile,
     pub event_logging_path: &'static str,
     pub event_logging_legacy_path: &'static str,
     pub bootstrap_cedar_basin: Option<&'static str>,
     pub bootstrap_models: &'static [BootstrapModelProfile],
+}
+
+/// 后台端点 UA/beta 的已验证版本画像，不据版本号推导未观察行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointHeaderProfile {
+    Legacy,
+    ClaudeCode21257,
 }
 
 impl EndpointProfile {
@@ -359,6 +373,7 @@ const ROLLBACK_REQUEST_PROFILE: RequestProfile = RequestProfile {
     fable_models: &FABLE_MODELS_ROLLBACK,
     haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
     haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
+    haiku_title_optional_beta_tokens: &[],
     haiku_main_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
     haiku_main_no_diagnostics_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
     haiku_non_stream_aux_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
@@ -441,6 +456,7 @@ const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
         fable_models: &FABLE_MODELS_2_1_260,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
+        haiku_title_optional_beta_tokens: HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257,
         haiku_main_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_260,
         haiku_main_no_diagnostics_beta_tokens: HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_260,
         haiku_non_stream_aux_beta_tokens: HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
@@ -468,6 +484,7 @@ const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: Some("2027-08-31"),
         bootstrap_models: &BOOTSTRAP_MODELS_2_1_260,
+        header_profile: EndpointHeaderProfile::ClaudeCode21257,
     },
 };
 
@@ -489,6 +506,7 @@ const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
         fable_models: &FABLE_MODELS_2_1_257,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
+        haiku_title_optional_beta_tokens: HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257,
         haiku_main_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_257,
         haiku_main_no_diagnostics_beta_tokens: HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_257,
         haiku_non_stream_aux_beta_tokens: HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
@@ -516,6 +534,7 @@ const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: Some("2027-08-31"),
         bootstrap_models: &BOOTSTRAP_MODELS_2_1_257,
+        header_profile: EndpointHeaderProfile::ClaudeCode21257,
     },
 };
 
@@ -537,6 +556,7 @@ const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
         fable_models: &FABLE_MODELS_2_1_220,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
+        haiku_title_optional_beta_tokens: &[],
         haiku_main_beta_tokens: MESSAGE_BETA_TOKENS,
         haiku_main_no_diagnostics_beta_tokens: MESSAGE_BETA_TOKENS,
         haiku_non_stream_aux_beta_tokens: MESSAGE_BETA_TOKENS,
@@ -562,6 +582,7 @@ const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: Some("2026-08-31"),
         bootstrap_models: &BOOTSTRAP_MODELS_2_1_220,
+        header_profile: EndpointHeaderProfile::Legacy,
     },
 };
 
@@ -593,6 +614,7 @@ const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: None,
         bootstrap_models: &BOOTSTRAP_MODELS_ROLLBACK,
+        header_profile: EndpointHeaderProfile::Legacy,
     },
 };
 
@@ -624,6 +646,7 @@ const PROFILE_2_1_195: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: None,
         bootstrap_models: &BOOTSTRAP_MODELS_ROLLBACK,
+        header_profile: EndpointHeaderProfile::Legacy,
     },
 };
 
@@ -655,6 +678,7 @@ const PROFILE_2_1_187: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: None,
         bootstrap_models: &BOOTSTRAP_MODELS_ROLLBACK,
+        header_profile: EndpointHeaderProfile::Legacy,
     },
 };
 
@@ -686,6 +710,7 @@ const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: None,
         bootstrap_models: &BOOTSTRAP_MODELS_ROLLBACK,
+        header_profile: EndpointHeaderProfile::Legacy,
     },
 };
 
@@ -717,6 +742,7 @@ const PROFILE_2_1_197: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: None,
         bootstrap_models: &BOOTSTRAP_MODELS_ROLLBACK,
+        header_profile: EndpointHeaderProfile::Legacy,
     },
 };
 
