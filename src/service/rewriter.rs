@@ -5343,9 +5343,48 @@ fn ensure_api_model_profile(body: &mut serde_json::Value, request_profile: &Requ
     };
 
     if let Some(profile) = main_profile {
+        // 显式关闭思考时不能补 display/budget，也不能补与 disabled 冲突的 max effort。
+        if obj
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(|kind| kind.as_str())
+            == Some("disabled")
+        {
+            return;
+        }
+        let thinking_profile = match profile.thinking {
+            ThinkingProfile::Enabled {
+                budget_tokens,
+                display,
+            } => {
+                // 手动思考与强制工具调用不兼容，保留调用方的工具策略。
+                if matches!(
+                    obj.get("tool_choice")
+                        .and_then(|choice| choice.get("type"))
+                        .and_then(|kind| kind.as_str()),
+                    Some("any" | "tool")
+                ) {
+                    return;
+                }
+                let Some(max_tokens) = obj.get("max_tokens").and_then(|value| value.as_u64())
+                else {
+                    return;
+                };
+                // 思考至少需要 1024 token，且必须给最终回答留出空间；不扩大用户输出上限。
+                let budget_tokens = budget_tokens.min(max_tokens.saturating_sub(1));
+                if budget_tokens < 1_024 {
+                    return;
+                }
+                ThinkingProfile::Enabled {
+                    budget_tokens,
+                    display,
+                }
+            }
+            adaptive => adaptive,
+        };
         let thinking = obj
             .entry("thinking")
-            .or_insert_with(|| match profile.thinking {
+            .or_insert_with(|| match thinking_profile {
                 ThinkingProfile::Adaptive { display } => serde_json::json!({
                     "type": "adaptive",
                     "display": display,
@@ -5360,7 +5399,7 @@ fn ensure_api_model_profile(body: &mut serde_json::Value, request_profile: &Requ
                 }),
             });
         if let Some(thinking) = thinking.as_object_mut() {
-            match profile.thinking {
+            match thinking_profile {
                 ThinkingProfile::Adaptive { display } => {
                     thinking
                         .entry("type")
@@ -9366,6 +9405,192 @@ mod tests {
         assert_eq!(parsed["thinking"]["type"], json!("enabled"));
         assert_eq!(parsed["thinking"]["display"], json!("updates"));
         assert!(parsed.get("output_config").is_none());
+    }
+
+    #[test]
+    fn api_model_profile_haiku_budget_respects_output_limit() {
+        for (max_tokens, expected_budget) in [
+            (Some(1_u64), None),
+            (Some(512), None),
+            (Some(1_024), None),
+            (Some(1_025), Some(1_024)),
+            (Some(2_048), Some(2_047)),
+            (Some(4_096), Some(4_095)),
+            (Some(8_192), Some(8_191)),
+            (Some(31_999), Some(31_998)),
+            (Some(32_000), Some(31_999)),
+            (Some(64_000), Some(31_999)),
+            (None, Some(31_999)),
+        ] {
+            let mut body = json!({
+                "model": "claude-haiku-4-5-20251001",
+                "messages": [{"role": "user", "content": "合成预算回归请求"}]
+            });
+            if let Some(max_tokens) = max_tokens {
+                body["max_tokens"] = json!(max_tokens);
+            }
+
+            let out = rewrite_messages_body(body, ClientType::API);
+
+            assert_eq!(out["max_tokens"], json!(max_tokens.unwrap_or(32_000)));
+            if let Some(expected_budget) = expected_budget {
+                assert_eq!(out["thinking"]["budget_tokens"], json!(expected_budget));
+                assert_eq!(out["thinking"]["type"], "enabled");
+                assert_eq!(out["thinking"]["display"], "updates");
+                assert!(expected_budget >= 1_024);
+                assert!(expected_budget < out["max_tokens"].as_u64().unwrap());
+            } else {
+                assert!(out.get("thinking").is_none());
+            }
+            assert!(out.get("output_config").is_none());
+        }
+    }
+
+    #[test]
+    fn api_model_profile_preserves_explicit_thinking_budget_and_display() {
+        for display in [None, Some("omitted")] {
+            let mut body = json!({
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 4096,
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "messages": [{"role": "user", "content": "合成显式预算回归请求"}]
+            });
+            if let Some(display) = display {
+                body["thinking"]["display"] = json!(display);
+            }
+
+            let out = rewrite_messages_body(body, ClientType::API);
+
+            assert_eq!(out["max_tokens"], 4096);
+            assert_eq!(out["thinking"]["budget_tokens"], 2048);
+            assert_eq!(out["thinking"]["type"], "enabled");
+            assert_eq!(out["thinking"]["display"], display.unwrap_or("updates"));
+        }
+    }
+
+    #[test]
+    fn api_model_profile_disabled_thinking_does_not_gain_defaults() {
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ] {
+            for output_config in [None, Some(json!({"effort": "low"}))] {
+                let mut body = json!({
+                    "model": model,
+                    "max_tokens": 4096,
+                    "thinking": {"type": "disabled"},
+                    "messages": [{"role": "user", "content": "合成关闭思考回归请求"}]
+                });
+                if let Some(output_config) = &output_config {
+                    body["output_config"] = output_config.clone();
+                }
+
+                let out = rewrite_messages_body(body, ClientType::API);
+
+                assert_eq!(out["thinking"], json!({"type": "disabled"}), "{model}");
+                assert_eq!(out.get("output_config"), output_config.as_ref(), "{model}");
+                assert_eq!(out["max_tokens"], 4096);
+            }
+        }
+    }
+
+    #[test]
+    fn api_model_profile_haiku_tool_choice_keeps_compatible_thinking() {
+        for tool_choice in [
+            json!({"type": "auto"}),
+            json!({"type": "none"}),
+            json!({"type": "any"}),
+            json!({"type": "tool", "name": "Read"}),
+        ] {
+            for disabled in [false, true] {
+                let mut body = json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 32000,
+                    "tool_choice": tool_choice,
+                    "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                    "messages": [{"role": "user", "content": "合成工具调用回归请求"}]
+                });
+                if disabled {
+                    body["thinking"] = json!({"type": "disabled"});
+                }
+
+                let out = rewrite_messages_body(body.clone(), ClientType::API);
+
+                assert_eq!(out["tool_choice"], tool_choice);
+                assert_eq!(out["tools"], body["tools"]);
+                assert_eq!(out["max_tokens"], 32000);
+                if disabled {
+                    assert_eq!(out["thinking"], json!({"type": "disabled"}));
+                } else if matches!(tool_choice["type"].as_str(), Some("any" | "tool")) {
+                    assert!(out.get("thinking").is_none(), "{tool_choice}");
+                } else {
+                    assert_eq!(out["thinking"]["type"], "enabled");
+                    assert_eq!(out["thinking"]["budget_tokens"], 31999);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn api_model_profile_adaptive_thinking_supports_forced_tools() {
+        for model in ["claude-opus-5", "claude-sonnet-5"] {
+            for tool_choice in [
+                json!({"type": "any"}),
+                json!({"type": "tool", "name": "Read"}),
+            ] {
+                let out = rewrite_messages_body(
+                    json!({
+                        "model": model,
+                        "max_tokens": 4096,
+                        "tool_choice": tool_choice,
+                        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                        "messages": [{"role": "user", "content": "合成自适应思考回归请求"}]
+                    }),
+                    ClientType::API,
+                );
+
+                assert_eq!(out["tool_choice"], tool_choice);
+                assert_eq!(out["thinking"]["type"], "adaptive");
+                assert_eq!(out["thinking"]["display"], "updates");
+                assert_eq!(out["output_config"]["effort"], "max");
+            }
+        }
+    }
+
+    #[test]
+    fn api_model_profile_fix_keeps_rollback_and_claude_code_parameters() {
+        for (client_type, version) in [
+            (ClientType::API, "2.1.257"),
+            (ClientType::ClaudeCode, "2.1.260"),
+        ] {
+            for model in [
+                "claude-haiku-4-5-20251001",
+                "claude-opus-5",
+                "claude-sonnet-5",
+            ] {
+                for parameters in [
+                    json!({"max_tokens": 4096}),
+                    json!({"max_tokens": 32000, "thinking": {"type": "disabled"}}),
+                    json!({"max_tokens": 32000, "tool_choice": {"type": "tool", "name": "Read"}}),
+                ] {
+                    let mut body = parameters.clone();
+                    body["model"] = json!(model);
+                    body["tools"] = json!([{"name": "Read", "input_schema": {"type": "object"}}]);
+                    body["messages"] = json!([{"role": "user", "content": "合成模式边界回归请求"}]);
+
+                    let out = rewrite_messages_body_for_profile(body, client_type, version);
+
+                    for key in ["max_tokens", "thinking", "tool_choice", "output_config"] {
+                        assert_eq!(
+                            out.get(key),
+                            parameters.get(key),
+                            "{client_type:?} {model} {key}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
