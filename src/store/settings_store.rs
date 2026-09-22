@@ -11,7 +11,7 @@ use crate::service::version_profile::{ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_VER
 
 /// 允许 `messages[].role=system` 的默认模型列表。
 pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str =
-    "claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8";
+    "claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8";
 /// 默认允许的 Claude Code / Claude CLI 版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS;
 /// 默认禁止的 Claude Code / Claude CLI 版本范围。

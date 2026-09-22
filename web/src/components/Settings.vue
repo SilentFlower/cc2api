@@ -33,11 +33,11 @@ const primeHours = ref('4,5,6');
 const primeModel = ref('claude-haiku-4-5-20251001');
 
 /** 允许 messages[].role=system 的模型列表 */
-const allowSystemRoleModels = ref('claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8');
+const allowSystemRoleModels = ref('claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const claudeCodeVersionProfile = ref('2.1.260');
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.260');
+const claudeCodeVersionProfile = ref('2.1.280');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.280');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
@@ -131,6 +131,15 @@ interface ClaudeCodeVersionProfileOption {
 
 /** Claude Code 版本画像选项 */
 const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
+  {
+    key: '2.1.280',
+    version: '2.1.280',
+    version_base: '2.1.280',
+    build_time: '2026-09-21T20:40:17Z',
+    allowed_claude_code_versions: '2.1.89-2.1.280',
+    growthbook_user_agent: 'Bun/1.4.3',
+    telemetry_shape: 'claude_code_2_1_185',
+  },
   {
     key: '2.1.260',
     version: '2.1.260',
@@ -437,10 +446,10 @@ async function loadSettings() {
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
     primeHours.value = data.peak_prime_hours ?? '4,5,6';
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
-    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8';
+    allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8';
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
-    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.260';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.260';
+    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.280';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.280';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     const contextSanitizerMode = data.claude_code_context_sanitizer_mode ?? 'report_only';
@@ -1209,7 +1218,7 @@ onMounted(async () => {
           <Label class="text-[#5c5647] text-sm">允许模型 (逗号分隔)</Label>
           <Input
             v-model="allowSystemRoleModels"
-            placeholder="claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8"
+            placeholder="claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8"
             class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
             :class="isValidSystemRoleModels ? '' : 'border-red-400'"
           />
@@ -1217,9 +1226,9 @@ onMounted(async () => {
             <span class="text-xs text-[#b5b0a6] self-center">预设:</span>
             <button
               type="button"
-              @click="allowSystemRoleModels = 'claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8'"
+              @click="allowSystemRoleModels = 'claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8'"
               class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-            >2.1.260 默认</button>
+            >2.1.280 默认</button>
             <button
               type="button"
               @click="allowSystemRoleModels = ''"
@@ -1595,7 +1604,7 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.260"
+              placeholder="2.1.89-2.1.280"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm bg-[#f9f6f1]"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
               readonly

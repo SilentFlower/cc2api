@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn hello_user_agent_follows_selected_account_profile() {
         let current = test_account();
-        assert_eq!(hello_user_agent_for_account(&current), "Bun/1.4.1");
+        assert_eq!(hello_user_agent_for_account(&current), "Bun/1.4.3");
 
         let mut rollback = test_account();
         let profile = crate::service::version_profile::profile_for_key("2.1.220").unwrap();

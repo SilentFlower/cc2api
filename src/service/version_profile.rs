@@ -3,16 +3,16 @@ use serde_json::Value;
 use crate::error::AppError;
 
 /// 默认 Claude Code 版本画像 key。
-pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.260";
+pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.280";
 /// Claude Code 默认兼容版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_260.identity.version;
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_280.identity.version;
 /// Claude Code 默认基础版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_260.identity.version_base;
+pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_280.identity.version_base;
 /// 当前默认 Claude Code 抓包对应的构建时间。
-pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_260.identity.build_time;
+pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_280.identity.build_time;
 /// 默认画像对应的 Claude Code / Claude CLI 允许版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str =
-    PROFILE_2_1_260.access_policy.allowed_claude_code_versions;
+    PROFILE_2_1_280.access_policy.allowed_claude_code_versions;
 /// 当前默认 Claude Code 使用的 Stainless SDK 版本。
 pub const STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
 /// Claude Code 2.1.220 及旧回滚画像使用的 Stainless SDK 版本。
@@ -35,6 +35,21 @@ pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,int
 pub const OPUS_5_MESSAGE_BETA_TOKENS_2_1_260: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code 2.1.260 Sonnet 5 主请求使用的 message beta token 集合。
 pub const SONNET_5_MESSAGE_BETA_TOKENS_2_1_260: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.280 Opus 5.5 与 Fable 5.1 主请求使用的 message beta token 集合。
+///
+/// `context-1m-2025-08-07` 与 fallback token 仍由请求能力动态插入。
+pub const OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.280 Sonnet 5 主请求使用的 message beta token 集合。
+pub const SONNET_5_MESSAGE_BETA_TOKENS_2_1_280: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// Claude Code 2.1.280 Opus 4.8 主请求使用的 message beta token 集合。
+pub const OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// Claude Code 2.1.280 Sonnet 4.5 主请求使用的 message beta token 集合。
+pub const SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.280 带 `fallbacks` 的消息请求动态加入的 beta token。
+pub const MESSAGE_FALLBACK_BETA_TOKENS_2_1_280: &[&str] = &[
+    "server-side-fallback-2026-07-01",
+    "fallback-credit-2026-06-01",
+];
 /// Claude Code 2.1.195 Haiku 非流式标题/探测请求使用的窄 beta token 集合。
 pub const HAIKU_PROBE_BETA_TOKENS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 /// Claude Code 2.1.195 Haiku 流式标题请求使用的窄 beta token 集合。
@@ -63,6 +78,10 @@ pub const HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_257: &str = "oauth-2025-04-2
 pub const HAIKU_MAIN_BETA_TOKENS_2_1_260: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code 2.1.260 无 diagnostics 的 Haiku 主请求 beta token 集合。
 pub const HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_260: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.280 Haiku 主请求使用的 beta token 集合。
+pub const HAIKU_MAIN_BETA_TOKENS_2_1_280: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// Claude Code 2.1.280 无 diagnostics 的 Haiku 主请求 beta token 集合。
+pub const HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 /// Claude Code 2.1.257 Haiku 非流式 1024 token 辅助请求 beta token 集合。
 pub const HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,extended-cache-ttl-2025-04-11";
 /// Claude Code OAuth 相关端点使用的 beta token。
@@ -116,6 +135,7 @@ pub struct AccessPolicyProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestProfile {
     pub message_beta_tokens: &'static str,
+    pub message_fallback_beta_tokens: &'static [&'static str],
     pub main_models: &'static [MainRequestProfile],
     pub fable_models: &'static [FableRequestProfile],
     pub haiku_probe_beta_tokens: &'static str,
@@ -189,6 +209,7 @@ pub struct FableRequestProfile {
 /// Fable 顶层 `fallbacks` 字段的 JSON 形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FableFallbackProfile {
+    None,
     Model(&'static str),
     Default,
 }
@@ -220,6 +241,7 @@ pub enum CchProfile {
     ClaudeCodeModelAware {
         preserve_fallback_models: &'static [&'static str],
     },
+    ClaudeCodeAllModelValues,
 }
 
 /// telemetry 和 GrowthBook 子画像。
@@ -286,6 +308,75 @@ pub struct BootstrapModelProfile {
     pub cwk_cfg_key: Option<&'static str>,
 }
 
+const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
+    MainRequestProfile {
+        model_id: "claude-opus-5-5",
+        message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+        default_max_tokens: 128_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("max"),
+    },
+    MainRequestProfile {
+        model_id: "claude-sonnet-5",
+        message_beta_tokens: SONNET_5_MESSAGE_BETA_TOKENS_2_1_280,
+        default_max_tokens: 64_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("max"),
+    },
+    MainRequestProfile {
+        model_id: "claude-fable-5-1",
+        message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+        default_max_tokens: 64_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("max"),
+    },
+    MainRequestProfile {
+        model_id: "claude-haiku-4-5-20251001",
+        message_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_280,
+        default_max_tokens: 32_000,
+        thinking: ThinkingProfile::Enabled {
+            budget_tokens: 31_999,
+            display: Some("updates"),
+        },
+        output_effort: None,
+    },
+    MainRequestProfile {
+        model_id: "claude-opus-4-8",
+        message_beta_tokens: OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280,
+        default_max_tokens: 64_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("max"),
+    },
+    MainRequestProfile {
+        model_id: "claude-sonnet-4-5",
+        message_beta_tokens: SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280,
+        default_max_tokens: 32_000,
+        thinking: ThinkingProfile::Enabled {
+            budget_tokens: 31_999,
+            display: Some("updates"),
+        },
+        output_effort: None,
+    },
+    // 2.1.280 样本未再出现 Opus 5；保留 2.1.260 的精确画像以维持显式旧模型兼容。
+    MainRequestProfile {
+        model_id: "claude-opus-5",
+        message_beta_tokens: OPUS_5_MESSAGE_BETA_TOKENS_2_1_260,
+        default_max_tokens: 64_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("max"),
+    },
+];
+
 const MAIN_MODELS_2_1_260: [MainRequestProfile; 4] = [
     MainRequestProfile {
         model_id: "claude-opus-5",
@@ -351,6 +442,14 @@ const FABLE_MODELS_2_1_260: [FableRequestProfile; 1] = [FableRequestProfile {
     thinking_display: Some("updates"),
 }];
 
+const FABLE_MODELS_2_1_280: [FableRequestProfile; 1] = [FableRequestProfile {
+    model_id: "claude-fable-5-1",
+    message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+    fallback: FableFallbackProfile::None,
+    default_max_tokens: 64_000,
+    thinking_display: Some("updates"),
+}];
+
 const FABLE_MODELS_2_1_220: [FableRequestProfile; 1] = [FableRequestProfile {
     model_id: "claude-fable-5",
     message_beta_tokens: FABLE_MESSAGE_BETA_TOKENS,
@@ -369,6 +468,7 @@ const FABLE_MODELS_ROLLBACK: [FableRequestProfile; 1] = [FableRequestProfile {
 
 const ROLLBACK_REQUEST_PROFILE: RequestProfile = RequestProfile {
     message_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
+    message_fallback_beta_tokens: &[],
     main_models: &[],
     fable_models: &FABLE_MODELS_ROLLBACK,
     haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
@@ -407,6 +507,38 @@ const BOOTSTRAP_MODELS_2_1_260: [BootstrapModelProfile; 4] = [
     },
 ];
 
+const BOOTSTRAP_MODELS_2_1_280: [BootstrapModelProfile; 7] = [
+    BootstrapModelProfile {
+        model_id: "claude-opus-5-5",
+        cwk_cfg_key: Some("saffron"),
+    },
+    BootstrapModelProfile {
+        model_id: "claude-sonnet-5",
+        cwk_cfg_key: Some("pewter"),
+    },
+    BootstrapModelProfile {
+        model_id: "claude-fable-5-1",
+        cwk_cfg_key: Some("sorrel"),
+    },
+    BootstrapModelProfile {
+        model_id: "claude-haiku-4-5-20251001",
+        cwk_cfg_key: None,
+    },
+    BootstrapModelProfile {
+        model_id: "claude-opus-4-8",
+        cwk_cfg_key: None,
+    },
+    BootstrapModelProfile {
+        model_id: "claude-sonnet-4-5",
+        cwk_cfg_key: None,
+    },
+    // 旧模型沿用最近一个已验证画像，避免管理员显式选择后丢失 bootstrap 映射。
+    BootstrapModelProfile {
+        model_id: "claude-opus-5",
+        cwk_cfg_key: Some("belladonna"),
+    },
+];
+
 const BOOTSTRAP_MODELS_2_1_257: [BootstrapModelProfile; 3] = [
     BootstrapModelProfile {
         model_id: "claude-opus-5",
@@ -438,6 +570,55 @@ const BOOTSTRAP_MODELS_ROLLBACK: [BootstrapModelProfile; 1] = [BootstrapModelPro
     cwk_cfg_key: Some("marigold"),
 }];
 
+const PROFILE_2_1_280: ClaudeCodeProfile = ClaudeCodeProfile {
+    key: "2.1.280",
+    identity: IdentityProfile {
+        version: "2.1.280",
+        version_base: "2.1.280",
+        build_time: "2026-09-21T20:40:17Z",
+        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
+    },
+    access_policy: AccessPolicyProfile {
+        allowed_claude_code_versions: "2.1.89-2.1.280",
+    },
+    request: RequestProfile {
+        message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+        message_fallback_beta_tokens: MESSAGE_FALLBACK_BETA_TOKENS_2_1_280,
+        main_models: &MAIN_MODELS_2_1_280,
+        fable_models: &FABLE_MODELS_2_1_280,
+        haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+        haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
+        haiku_title_optional_beta_tokens: HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257,
+        haiku_main_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_280,
+        haiku_main_no_diagnostics_beta_tokens: HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280,
+        haiku_non_stream_aux_beta_tokens: HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
+        count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
+        oauth_beta_token: OAUTH_BETA_TOKEN,
+        code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
+        mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        opus_default_max_tokens_model: "claude-opus-5-5",
+        message_body_order: MessageBodyOrderProfile::ClaudeCode21220,
+    },
+    billing: BillingProfile {
+        cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
+        cch_profile: CchProfile::ClaudeCodeAllModelValues,
+    },
+    telemetry: TelemetryProfile {
+        shape: TelemetryShape::ClaudeCode2185,
+        growthbook_user_agent: "Bun/1.4.3",
+        default_model: "claude-opus-5-5",
+        base_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+    },
+    endpoints: EndpointProfile {
+        event_logging_path: EVENT_LOGGING_V2_PATH,
+        event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: Some("2027-08-31"),
+        bootstrap_models: &BOOTSTRAP_MODELS_2_1_280,
+        header_profile: EndpointHeaderProfile::ClaudeCode21257,
+    },
+};
+
 const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.260",
     identity: IdentityProfile {
@@ -452,6 +633,7 @@ const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
     },
     request: RequestProfile {
         message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_fallback_beta_tokens: &[],
         main_models: &MAIN_MODELS_2_1_260,
         fable_models: &FABLE_MODELS_2_1_260,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
@@ -502,6 +684,7 @@ const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
     },
     request: RequestProfile {
         message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_fallback_beta_tokens: &[],
         main_models: &[],
         fable_models: &FABLE_MODELS_2_1_257,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
@@ -552,6 +735,7 @@ const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
     },
     request: RequestProfile {
         message_beta_tokens: MESSAGE_BETA_TOKENS,
+        message_fallback_beta_tokens: &[],
         main_models: &[],
         fable_models: &FABLE_MODELS_2_1_220,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
@@ -746,7 +930,8 @@ const PROFILE_2_1_197: ClaudeCodeProfile = ClaudeCodeProfile {
     },
 };
 
-static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 8] = [
+static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 9] = [
+    &PROFILE_2_1_280,
     &PROFILE_2_1_260,
     &PROFILE_2_1_257,
     &PROFILE_2_1_220,
@@ -761,7 +946,7 @@ static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 8] = [
 ///
 /// @return 默认版本画像。
 pub fn default_profile() -> &'static ClaudeCodeProfile {
-    &PROFILE_2_1_260
+    &PROFILE_2_1_280
 }
 
 /// 返回所有内置 Claude Code 版本画像。
@@ -893,7 +1078,7 @@ mod tests {
             profile.access_policy.allowed_claude_code_versions,
             DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS
         );
-        assert_eq!(growthbook_user_agent(), "Bun/1.4.1");
+        assert_eq!(growthbook_user_agent(), "Bun/1.4.3");
     }
 
     #[test]
@@ -963,12 +1148,12 @@ mod tests {
 
     #[test]
     fn profile_declares_known_telemetry_differences() {
-        let current = profile_for_key("2.1.260").unwrap();
+        let current = profile_for_key("2.1.280").unwrap();
         assert_eq!(current.telemetry.shape, TelemetryShape::ClaudeCode2185);
-        assert_eq!(current.telemetry.growthbook_user_agent, "Bun/1.4.1");
+        assert_eq!(current.telemetry.growthbook_user_agent, "Bun/1.4.3");
         assert_eq!(
             current.access_policy.allowed_claude_code_versions,
-            "2.1.89-2.1.260"
+            "2.1.89-2.1.280"
         );
         assert_eq!(
             current.identity.stainless_runtime_version,
@@ -981,25 +1166,37 @@ mod tests {
                 .fable_model("claude-fable-5-1")
                 .unwrap()
                 .fallback,
-            FableFallbackProfile::Default
+            FableFallbackProfile::None
         );
         assert_eq!(
             current
                 .request
-                .main_model("claude-sonnet-5")
+                .main_model("claude-opus-5-5")
                 .unwrap()
                 .default_max_tokens,
-            64_000
+            128_000
         );
         assert_eq!(
             current
                 .endpoints
-                .bootstrap_model("claude-sonnet-5")
+                .bootstrap_model("claude-opus-5-5")
                 .unwrap()
                 .cwk_cfg_key,
-            Some("pewter")
+            Some("saffron")
         );
-        assert_eq!(current.telemetry.default_model, "claude-opus-5");
+        assert_eq!(current.telemetry.default_model, "claude-opus-5-5");
+
+        let previous = profile_for_key("2.1.260").unwrap();
+        assert_eq!(previous.telemetry.growthbook_user_agent, "Bun/1.4.1");
+        assert_eq!(
+            previous
+                .request
+                .fable_model("claude-fable-5-1")
+                .unwrap()
+                .fallback,
+            FableFallbackProfile::Default
+        );
+        assert_eq!(previous.telemetry.default_model, "claude-opus-5");
 
         let previous = profile_for_key("2.1.257").unwrap();
         assert_eq!(

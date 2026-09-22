@@ -12,6 +12,7 @@ const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
     "2.1.89-2.1.197",
     "2.1.89-2.1.220",
     "2.1.89-2.1.257",
+    "2.1.89-2.1.260",
 ];
 const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
     ("2.1.187", "2.1.89-2.1.187"),
@@ -19,8 +20,11 @@ const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
     ("2.1.197", "2.1.89-2.1.197"),
     ("2.1.220", "2.1.89-2.1.220"),
     ("2.1.257", "2.1.89-2.1.257"),
+    ("2.1.260", "2.1.89-2.1.260"),
 ];
 const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
+const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS_2_1_260: &str =
+    "claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8";
 const PREVIOUS_DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS: &str = r#"[{"model":"claude-fable-5[1m]","name":"Fable","description":"Most capable for your hardest and longest-running tasks","disabled_reason":null}]"#;
 const PREVIOUS_DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
     "claude-fable-5,claude-opus-4-8,claude-opus-4-7";
@@ -518,6 +522,11 @@ async fn upgrade_default_model_settings(pool: &AnyPool) -> Result<(), sqlx::Erro
             crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
         ),
         (
+            "allow_system_role_models",
+            PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS_2_1_260,
+            crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+        ),
+        (
             "intercept_assistant_prefill_models",
             PREVIOUS_DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
             crate::store::settings_store::DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
@@ -898,6 +907,11 @@ mod tests {
             (
                 "allow_system_role_models",
                 PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+                crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
+            ),
+            (
+                "allow_system_role_models",
+                PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS_2_1_260,
                 crate::store::settings_store::DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
             ),
             (

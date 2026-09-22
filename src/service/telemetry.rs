@@ -2318,7 +2318,7 @@ mod tests {
             event["betas"]
                 .as_str()
                 .unwrap()
-                .contains("fallback-credit-2026-06-01")
+                .contains("thinking-binding-controls-2026-08-01")
         );
         assert_eq!(event["env"]["version"], DEFAULT_CLAUDE_CODE_VERSION);
         assert_eq!(
@@ -2351,7 +2351,7 @@ mod tests {
     #[test]
     fn startup_events_use_profile_default_model() {
         let current = startup_events(&test_account());
-        assert!(current.iter().all(|event| event.model == "claude-opus-5"));
+        assert!(current.iter().all(|event| event.model == "claude-opus-5-5"));
 
         let rollback = startup_events(&test_account_with_profile("2.1.197"));
         assert!(

@@ -10167,6 +10167,33 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_patch_21280_uses_exact_model_cwk_mapping() {
+        for (model, expected) in [
+            ("claude-opus-5-5", Some("saffron")),
+            ("claude-sonnet-5", Some("pewter")),
+            ("claude-fable-5-1", Some("sorrel")),
+            ("claude-haiku-4-5-20251001", None),
+            ("claude-opus-4-8", None),
+            ("claude-sonnet-4-5", None),
+        ] {
+            let mut body = bootstrap_body();
+
+            patch_bootstrap_json(
+                &mut body,
+                format!("entrypoint=cli&model={model}").as_str(),
+                &bootstrap_config(BootstrapModelOptionsMode::Configured),
+                profile_for_key("2.1.280").unwrap(),
+            );
+
+            match expected {
+                Some(expected) => assert_eq!(body["cwk_cfg_key"], expected),
+                None => assert!(body["cwk_cfg_key"].is_null()),
+            }
+            assert_eq!(body["client_data"]["cedar_basin"], "2027-08-31");
+        }
+    }
+
+    #[test]
     fn bootstrap_patch_configured_uses_belladonna_for_opus_5() {
         let mut body = bootstrap_body();
 

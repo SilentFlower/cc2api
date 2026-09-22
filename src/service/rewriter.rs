@@ -260,7 +260,7 @@ fn beta_header_for_path(
     model_id: &str,
     body: &serde_json::Value,
 ) -> String {
-    if path == "/v1/messages/count_tokens" {
+    let beta = if path == "/v1/messages/count_tokens" {
         request_profile.count_tokens_beta_tokens.to_string()
     } else if is_event_logging_path(path)
         || path.starts_with("/api/eval/")
@@ -309,7 +309,44 @@ fn beta_header_for_path(
         }
     } else {
         beta_header_for_model(request_profile, model_id)
+    };
+    if path == "/v1/messages"
+        && body.get("fallbacks").is_some_and(|value| !value.is_null())
+        && !request_profile.message_fallback_beta_tokens.is_empty()
+    {
+        let fallback_beta = request_profile.message_fallback_beta_tokens.join(",");
+        order_message_fallback_beta_tokens(
+            merge_anthropic_beta(&beta, &fallback_beta),
+            request_profile.message_fallback_beta_tokens,
+        )
+    } else {
+        beta
     }
+}
+
+fn order_message_fallback_beta_tokens(beta: String, fallback_tokens: &[&str]) -> String {
+    let tokens = beta
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut ordered = tokens
+        .iter()
+        .copied()
+        .filter(|token| !fallback_tokens.contains(token))
+        .collect::<Vec<_>>();
+    let insert_at = ordered
+        .iter()
+        .position(|token| *token == "thinking-binding-controls-2026-08-01")
+        .or_else(|| {
+            ordered
+                .iter()
+                .position(|token| *token == "extended-cache-ttl-2025-04-11")
+        })
+        .unwrap_or(ordered.len());
+    // fallback token 的相对位置属于 wire 指纹，固定插在 thinking-binding/缓存 token 前。
+    ordered.splice(insert_at..insert_at, fallback_tokens.iter().copied());
+    ordered.join(",")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2238,7 +2275,12 @@ fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
             None => return body.to_vec(),
         },
     };
-    let mut normalized = replace_top_level_string_value(body, "model", b"\"\"");
+    let mut normalized = match profile {
+        CchProfile::ClaudeCodeAllModelValues => {
+            replace_all_exact_string_field_values(body, "model", b"\"\"")
+        }
+        _ => replace_top_level_string_value(body, "model", b"\"\""),
+    };
     normalized = remove_top_level_field(&normalized, "max_tokens");
     match profile {
         CchProfile::ClaudeCode2172DropFallbacks => remove_top_level_field(&normalized, "fallbacks"),
@@ -2252,6 +2294,7 @@ fn cch_attestation_input(body: &[u8], version: &str) -> Vec<u8> {
             normalized
         }
         CchProfile::ClaudeCodeModelAware { .. } => remove_top_level_field(&normalized, "fallbacks"),
+        CchProfile::ClaudeCodeAllModelValues => normalized,
     }
 }
 
@@ -2320,7 +2363,7 @@ fn build_claude_code_identity_system_block() -> serde_json::Value {
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
         "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195"
-        | "2.1.197" | "2.1.220" | "2.1.257" | "2.1.260" => CCH_ATTESTATION_SEED_2156,
+        | "2.1.197" | "2.1.220" | "2.1.257" | "2.1.260" | "2.1.280" => CCH_ATTESTATION_SEED_2156,
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -2335,6 +2378,46 @@ fn replace_top_level_string_value(body: &[u8], field: &str, replacement: &[u8]) 
     } else {
         body.to_vec()
     }
+}
+
+fn replace_all_exact_string_field_values(body: &[u8], field: &str, replacement: &[u8]) -> Vec<u8> {
+    let exact_key = format!("\"{}\"", field);
+    let mut ranges = Vec::new();
+    let mut idx = 0usize;
+    while idx < body.len() {
+        if body[idx] != b'"' {
+            idx += 1;
+            continue;
+        }
+        let Some(string_end) = scan_json_string_end(body, idx) else {
+            return body.to_vec();
+        };
+        if &body[idx..string_end] == exact_key.as_bytes() {
+            let colon = skip_json_ws(body, string_end);
+            if body.get(colon) == Some(&b':') {
+                let value_start = skip_json_ws(body, colon + 1);
+                if body.get(value_start) == Some(&b'"') {
+                    let Some(value_end) = scan_json_string_end(body, value_start) else {
+                        return body.to_vec();
+                    };
+                    ranges.push(value_start..value_end);
+                    idx = value_end;
+                    continue;
+                }
+            }
+        }
+        idx = string_end;
+    }
+    if ranges.is_empty() {
+        return body.to_vec();
+    }
+
+    // 从后向前替换可保持前面已记录的字节下标，且不改变其余序列化字节。
+    let mut normalized = body.to_vec();
+    for range in ranges.into_iter().rev() {
+        normalized.splice(range, replacement.iter().copied());
+    }
+    normalized
 }
 
 fn remove_top_level_field(body: &[u8], field: &str) -> Vec<u8> {
@@ -5317,14 +5400,15 @@ fn ensure_fable_fallbacks(body: &mut serde_json::Value, request_profile: &Reques
     let Some(fable) = request_profile.fable_model(model) else {
         return;
     };
+    let fallback = match fable.fallback {
+        FableFallbackProfile::None => return,
+        FableFallbackProfile::Model(model) => serde_json::json!([{ "model": model }]),
+        FableFallbackProfile::Default => serde_json::Value::String("default".into()),
+    };
     let Some(obj) = body.as_object_mut() else {
         return;
     };
-    obj.entry("fallbacks")
-        .or_insert_with(|| match fable.fallback {
-            FableFallbackProfile::Model(model) => serde_json::json!([{ "model": model }]),
-            FableFallbackProfile::Default => serde_json::Value::String("default".into()),
-        });
+    obj.entry("fallbacks").or_insert(fallback);
 }
 
 /// 为 API mimicry 补齐精确模型画像中已确认的 thinking 和 effort 字段。
@@ -5988,13 +6072,13 @@ mod tests {
     use crate::model::identity::device_profile;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_5_1_MESSAGE_BETA_TOKENS_2_1_260,
-        FABLE_5_MESSAGE_BETA_TOKENS_2_1_257, HAIKU_MAIN_BETA_TOKENS_2_1_260,
-        HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_260, HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
-        HAIKU_PROBE_BETA_TOKENS, HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES,
-        MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS, STAINLESS_PACKAGE_VERSION,
-        STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json, claude_cli_user_agent,
-        claude_code_user_agent, profile_for_key,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_5_MESSAGE_BETA_TOKENS_2_1_257,
+        HAIKU_MAIN_BETA_TOKENS_2_1_280, HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280,
+        HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257, HAIKU_PROBE_BETA_TOKENS,
+        HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
+        MESSAGE_BETA_TOKENS, OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280,
+        OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
+        apply_identity_to_env_json, claude_cli_user_agent, claude_code_user_agent, profile_for_key,
     };
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use base64::Engine;
@@ -9343,6 +9427,22 @@ mod tests {
     }
 
     #[test]
+    fn api_messages_opus_5_5_uses_21280_capture_profile() {
+        let parsed = rewrite_messages_body(
+            json!({
+                "model": "claude-opus-5-5",
+                "messages": []
+            }),
+            ClientType::API,
+        );
+
+        assert_eq!(parsed["max_tokens"], json!(128000));
+        assert_eq!(parsed["thinking"]["type"], json!("adaptive"));
+        assert_eq!(parsed["thinking"]["display"], json!("updates"));
+        assert_eq!(parsed["output_config"]["effort"], json!("max"));
+    }
+
+    #[test]
     fn api_messages_21257_fable_5_uses_corrected_capture_profile() {
         let parsed = rewrite_messages_body_for_profile(
             json!({
@@ -9358,7 +9458,7 @@ mod tests {
     }
 
     #[test]
-    fn api_messages_sonnet_5_uses_21260_capture_profile() {
+    fn api_messages_sonnet_5_uses_21280_capture_profile() {
         let parsed = rewrite_messages_body(
             json!({
                 "model": "claude-sonnet-5",
@@ -9374,7 +9474,7 @@ mod tests {
     }
 
     #[test]
-    fn api_messages_fable_5_1_uses_default_fallback_and_display_updates() {
+    fn api_messages_fable_5_1_uses_21280_profile_without_forced_fallback() {
         let parsed = rewrite_messages_body(
             json!({
                 "model": "claude-fable-5-1",
@@ -9384,14 +9484,14 @@ mod tests {
         );
 
         assert_eq!(parsed["max_tokens"], json!(64000));
-        assert_eq!(parsed["fallbacks"], json!("default"));
+        assert!(parsed.get("fallbacks").is_none());
         assert_eq!(parsed["thinking"]["type"], json!("adaptive"));
         assert_eq!(parsed["thinking"]["display"], json!("updates"));
         assert_eq!(parsed["output_config"]["effort"], json!("max"));
     }
 
     #[test]
-    fn api_messages_haiku_main_uses_21260_capture_profile() {
+    fn api_messages_haiku_main_uses_21280_capture_profile() {
         let parsed = rewrite_messages_body(
             json!({
                 "model": "claude-haiku-4-5-20251001",
@@ -9472,6 +9572,7 @@ mod tests {
     fn api_model_profile_disabled_thinking_does_not_gain_defaults() {
         for model in [
             "claude-haiku-4-5-20251001",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-sonnet-5",
         ] {
@@ -9534,7 +9635,7 @@ mod tests {
 
     #[test]
     fn api_model_profile_adaptive_thinking_supports_forced_tools() {
-        for model in ["claude-opus-5", "claude-sonnet-5"] {
+        for model in ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"] {
             for tool_choice in [
                 json!({"type": "any"}),
                 json!({"type": "tool", "name": "Read"}),
@@ -9917,7 +10018,10 @@ mod tests {
             headers.get("User-Agent").unwrap(),
             claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
         );
-        assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280
+        );
         assert_eq!(
             headers.get("X-Stainless-Package-Version").unwrap(),
             STAINLESS_PACKAGE_VERSION
@@ -9951,7 +10055,7 @@ mod tests {
 
         assert_eq!(
             beta,
-            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
+            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
         );
     }
 
@@ -10042,7 +10146,7 @@ mod tests {
         );
         let beta = headers.get("anthropic-beta").unwrap();
 
-        assert_eq!(beta, MESSAGE_BETA_TOKENS);
+        assert_eq!(beta, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280);
         assert!(!beta.contains(CTX_1M));
     }
 
@@ -10111,7 +10215,7 @@ mod tests {
     }
 
     #[test]
-    fn fable_5_1_headers_use_21260_profile_without_context_1m() {
+    fn fable_5_1_headers_use_21280_profile_without_context_1m() {
         let account = test_account();
         let rewriter = Rewriter::new();
 
@@ -10125,12 +10229,66 @@ mod tests {
         );
         let beta = headers.get("anthropic-beta").unwrap();
 
-        assert_eq!(beta, FABLE_5_1_MESSAGE_BETA_TOKENS_2_1_260);
+        assert_eq!(beta, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280);
         assert!(!beta.contains("redact-thinking-2026-02-12"));
         assert!(beta.contains("per-turn-control-2026-07-01"));
-        assert!(beta.contains("server-side-fallback-2026-07-01"));
+        assert!(beta.contains("mid-conversation-tool-changes-2026-07-01"));
+        assert!(!beta.contains("server-side-fallback-2026-07-01"));
         assert!(beta.contains("thinking-display-updates-2026-08-18"));
         assert!(!beta.contains(CTX_1M));
+    }
+
+    #[test]
+    fn opus_5_5_fallback_beta_uses_21280_capture_order_in_both_client_modes() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({"fallbacks": "default"});
+
+        for client_type in [ClientType::API, ClientType::ClaudeCode] {
+            let headers = rewriter.rewrite_headers(
+                &std::collections::HashMap::new(),
+                "/v1/messages",
+                &account,
+                client_type,
+                "claude-opus-5-5",
+                &body,
+            );
+            let beta = headers.get("anthropic-beta").unwrap();
+
+            assert!(beta.contains(
+                "effort-2025-11-24,server-side-fallback-2026-07-01,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01"
+            ));
+            assert_eq!(
+                beta.split(',')
+                    .filter(|token| *token == "server-side-fallback-2026-07-01")
+                    .count(),
+                1,
+                "{client_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_tokens_does_not_inherit_message_fallback_beta() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let body = json!({"fallbacks": "default"});
+
+        for client_type in [ClientType::API, ClientType::ClaudeCode] {
+            let headers = rewriter.rewrite_headers(
+                &std::collections::HashMap::new(),
+                "/v1/messages/count_tokens",
+                &account,
+                client_type,
+                "claude-opus-5-5",
+                &body,
+            );
+            let beta = headers.get("anthropic-beta").unwrap();
+
+            assert!(!beta.contains("server-side-fallback-2026-07-01"));
+            assert!(!beta.contains("fallback-credit-2026-06-01"));
+            assert!(beta.contains("token-counting-2024-11-01"));
+        }
     }
 
     #[test]
@@ -10266,7 +10424,7 @@ mod tests {
     }
 
     #[test]
-    fn haiku_main_request_uses_21260_beta() {
+    fn haiku_main_request_uses_21280_beta() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let body = json!({
@@ -10289,7 +10447,7 @@ mod tests {
 
         assert_eq!(
             headers.get("anthropic-beta").unwrap(),
-            HAIKU_MAIN_BETA_TOKENS_2_1_260
+            HAIKU_MAIN_BETA_TOKENS_2_1_280
         );
     }
 
@@ -10316,7 +10474,7 @@ mod tests {
 
         assert_eq!(
             headers.get("anthropic-beta").unwrap(),
-            HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_260
+            HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280
         );
         assert!(
             !headers
@@ -10347,7 +10505,10 @@ mod tests {
             &body,
         );
 
-        assert_eq!(headers.get("anthropic-beta").unwrap(), MESSAGE_BETA_TOKENS);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280
+        );
     }
 
     #[test]
@@ -11059,10 +11220,12 @@ mod tests {
             vec![
                 "metadata",
                 "stream",
-                "tools",
+                "output_config",
                 "max_tokens",
                 "model",
                 "system",
+                "tools",
+                "thinking",
                 "messages",
             ]
         );
@@ -11154,6 +11317,8 @@ mod tests {
                 "tools",
                 "metadata",
                 "max_tokens",
+                "thinking",
+                "output_config",
                 "stream",
             ]
         );
@@ -11420,7 +11585,10 @@ mod tests {
                 headers["User-Agent"],
                 claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION)
             );
-            assert_eq!(headers["anthropic-beta"], MESSAGE_BETA_TOKENS, "{path}");
+            assert_eq!(
+                headers["anthropic-beta"], OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+                "{path}"
+            );
         }
         for version in [
             "2.1.173", "2.1.185", "2.1.187", "2.1.195", "2.1.197", "2.1.220",
@@ -11491,7 +11659,7 @@ mod tests {
             "",
             &body,
         );
-        assert_eq!(eval_headers.get("User-Agent").unwrap(), "Bun/1.4.1");
+        assert_eq!(eval_headers.get("User-Agent").unwrap(), "Bun/1.4.3");
 
         let trigger_headers = rewriter.rewrite_headers(
             &empty,
@@ -12097,6 +12265,7 @@ mod tests {
         assert_eq!(cch_attestation_seed("2.1.220"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.257"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.260"), 0x4D659218E32A3268);
+        assert_eq!(cch_attestation_seed("2.1.280"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
     }
@@ -12169,6 +12338,51 @@ mod tests {
         let output = String::from_utf8(compute_cch_attestation(body.to_vec(), "2.1.257"))
             .expect("cch output");
         assert!(!output.contains("cch=00000"));
+    }
+
+    #[test]
+    fn cch_21280_clears_every_exact_string_model_value_only() {
+        let body = br#"{"model":"top","max_tokens":128000,"tools":[{"model":"advisor"},{"description":"literal \"model\":\"keep\"","model":42},{"\u006dodel":"escaped-key"}],"fallbacks":[{"model":"fallback"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.90c; cc_entrypoint=cli; cch=00000;"}],"messages":[]}"#;
+
+        let normalized = String::from_utf8(cch_attestation_input(body, "2.1.280")).unwrap();
+
+        assert_eq!(normalized.matches(r#""model":"""#).count(), 3);
+        assert!(!normalized.contains("max_tokens"));
+        assert!(normalized.contains(r#""description":"literal \"model\":\"keep\"""#));
+        assert!(normalized.contains(r#""model":42"#));
+        assert!(normalized.contains(r#""\u006dodel":"escaped-key""#));
+        assert!(normalized.contains(r#""fallbacks":[{"model":""}]"#));
+    }
+
+    #[test]
+    fn cch_capture_fixture_matches_21280_nested_model_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.280-profile.json"
+        ))
+        .expect("fixture json");
+        let cases = fixture["hash_cases"].as_array().expect("hash cases");
+
+        for case in cases {
+            let version = case["version"].as_str().expect("version");
+            let body = case["body"].as_str().expect("body");
+            let parsed: serde_json::Value = serde_json::from_str(body).expect("body json");
+            assert_eq!(
+                compute_cc_version_suffix(&extract_first_user_message(&parsed), version),
+                case["expected_cc_version_suffix"]
+                    .as_str()
+                    .expect("cc_version suffix")
+            );
+
+            let output =
+                String::from_utf8(compute_cch_attestation(body.as_bytes().to_vec(), version))
+                    .expect("cch output");
+            let expected_cch = case["expected_cch"].as_str().expect("cch");
+            assert!(
+                output.contains(format!("cch={expected_cch}").as_str()),
+                "2.1.280 fixture CCH 不匹配: model={}",
+                case["model"].as_str().unwrap_or_default()
+            );
+        }
     }
 
     #[test]
