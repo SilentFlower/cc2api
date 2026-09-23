@@ -1,0 +1,199 @@
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -1,3 +1,4 @@
++use hyper::ext::HeaderCaseMap;
+ #[cfg(any(feature = "native-tls", feature = "__rustls",))]
+ use std::any::Any;
+ use std::net::IpAddr;
+@@ -1970,7 +1971,7 @@
+     }
+ 
+     pub(super) fn execute_request(&self, req: Request) -> Pending {
+-        let (method, url, mut headers, body, timeout, version) = req.pieces();
++        let (method, url, mut headers, body, timeout, version, header_case_map) = req.pieces();
+         if url.scheme() != "http" && url.scheme() != "https" {
+             return Pending::new_err(error::url_bad_scheme(url));
+         }
+@@ -2031,11 +2032,17 @@
+             http::Version::HTTP_3 if self.inner.h3_client.is_some() => {
+                 let mut req = builder.body(body).expect("valid request parts");
+                 *req.headers_mut() = headers.clone();
++                if let Some(map) = &header_case_map {
++                    req.extensions_mut().insert(map.clone());
++                }
+                 ResponseFuture::H3(self.inner.h3_client.as_ref().unwrap().request(req))
+             }
+             _ => {
+                 let mut req = builder.body(body).expect("valid request parts");
+                 *req.headers_mut() = headers.clone();
++                if let Some(map) = &header_case_map {
++                    req.extensions_mut().insert(map.clone());
++                }
+                 ResponseFuture::Default(self.inner.hyper.request(req))
+             }
+         };
+@@ -2056,6 +2063,7 @@
+                 method,
+                 url,
+                 headers,
++                header_case_map,
+                 body: reusable,
+ 
+                 urls: Vec::new(),
+@@ -2334,6 +2342,7 @@
+         method: Method,
+         url: Url,
+         headers: HeaderMap,
++        header_case_map: Option<HeaderCaseMap>,
+         body: Option<Option<Bytes>>,
+ 
+         urls: Vec<Url>,
+@@ -2416,6 +2425,9 @@
+                     .body(body)
+                     .expect("valid request parts");
+                 *req.headers_mut() = self.headers.clone();
++                if let Some(map) = &self.header_case_map {
++                    req.extensions_mut().insert(map.clone());
++                }
+                 ResponseFuture::H3(
+                     self.client
+                         .h3_client
+@@ -2431,6 +2443,9 @@
+                     .body(body)
+                     .expect("valid request parts");
+                 *req.headers_mut() = self.headers.clone();
++                if let Some(map) = &self.header_case_map {
++                    req.extensions_mut().insert(map.clone());
++                }
+                 ResponseFuture::Default(self.client.hyper.request(req))
+             }
+         };
+@@ -2671,6 +2686,9 @@
+                                             .body(body)
+                                             .expect("valid request parts");
+                                         *req.headers_mut() = headers.clone();
++                                        if let Some(map) = &self.header_case_map {
++                                            req.extensions_mut().insert(map.clone());
++                                        }
+                                         std::mem::swap(self.as_mut().headers(), &mut headers);
+                                         ResponseFuture::H3(self.client.h3_client
+                         .as_ref()
+@@ -2684,6 +2702,9 @@
+                                             .body(body)
+                                             .expect("valid request parts");
+                                         *req.headers_mut() = headers.clone();
++                                        if let Some(map) = &self.header_case_map {
++                                            req.extensions_mut().insert(map.clone());
++                                        }
+                                         std::mem::swap(self.as_mut().headers(), &mut headers);
+                                         ResponseFuture::Default(self.client.hyper.request(req))
+                                     }
+--- a/src/async_impl/request.rs
++++ b/src/async_impl/request.rs
+@@ -17,6 +17,7 @@
+ use crate::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+ use crate::{Method, Url};
+ use http::{request::Parts, Request as HttpRequest, Version};
++use hyper::ext::HeaderCaseMap;
+ 
+ /// A request which can be executed with `Client::execute()`.
+ pub struct Request {
+@@ -26,6 +27,7 @@
+     body: Option<Body>,
+     timeout: Option<Duration>,
+     version: Version,
++    header_case_map: Option<HeaderCaseMap>,
+ }
+ 
+ /// A builder to construct the properties of a `Request`.
+@@ -48,6 +50,7 @@
+             body: None,
+             timeout: None,
+             version: Version::default(),
++            header_case_map: None,
+         }
+     }
+ 
+@@ -136,6 +139,7 @@
+         *req.headers_mut() = self.headers().clone();
+         *req.version_mut() = self.version();
+         req.body = body;
++        req.header_case_map = self.header_case_map.clone();
+         Some(req)
+     }
+ 
+@@ -148,6 +152,7 @@
+         Option<Body>,
+         Option<Duration>,
+         Version,
++        Option<HeaderCaseMap>,
+     ) {
+         (
+             self.method,
+@@ -156,11 +161,32 @@
+             self.body,
+             self.timeout,
+             self.version,
++            self.header_case_map,
+         )
+     }
+ }
+ 
+ impl RequestBuilder {
++    /// 为本请求显式指定 HTTP/1 名称大小写，不改变名称对应的值与 HTTP/2 行为。
++    ///
++    /// @param names 已校验画像的头名；也可指定发送层自动补入的 Content-Length。
++    /// @return 当前构建器；名称非法时，build/send 返回构建错误。
++    pub fn http1_header_casing<I, S>(mut self, names: I) -> RequestBuilder
++    where
++        I: IntoIterator<Item = S>,
++        S: AsRef<str>,
++    {
++        match HeaderCaseMap::from_names(names) {
++            Ok(map) => {
++                if let Ok(ref mut request) = self.request {
++                    request.header_case_map = Some(map);
++                }
++            }
++            Err(error) => self.request = Err(crate::error::builder(error)),
++        }
++        self
++    }
++
+     pub(super) fn new(client: Client, request: crate::Result<Request>) -> RequestBuilder {
+         let mut builder = RequestBuilder { client, request };
+ 
+@@ -608,6 +634,7 @@
+             uri,
+             headers,
+             version,
++            extensions,
+             ..
+         } = parts;
+         let url = Url::parse(&uri.to_string()).map_err(crate::error::builder)?;
+@@ -618,6 +645,7 @@
+             body: Some(body.into()),
+             timeout: None,
+             version,
++            header_case_map: extensions.get::<HeaderCaseMap>().cloned(),
+         })
+     }
+ }
+@@ -632,6 +660,7 @@
+             headers,
+             body,
+             version,
++            header_case_map,
+             ..
+         } = req;
+ 
+@@ -643,6 +672,9 @@
+             .map_err(crate::error::builder)?;
+ 
+         *req.headers_mut() = headers;
++        if let Some(map) = header_case_map {
++            req.extensions_mut().insert(map);
++        }
+         Ok(req)
+     }
+ }

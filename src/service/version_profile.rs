@@ -192,6 +192,8 @@ impl RequestProfile {
 /// 单个精确模型的主请求画像。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainRequestProfile {
+    /// 原生客户端决定是否携带的 beta；API 默认画像仍使用完整集合。
+    pub client_optional_beta_tokens: &'static [&'static str],
     pub model_id: &'static str,
     pub message_beta_tokens: &'static str,
     pub default_max_tokens: u64,
@@ -309,9 +311,22 @@ pub struct EndpointProfile {
 pub enum EndpointHeaderProfile {
     Legacy,
     ClaudeCode21257,
+    ClaudeCode21280,
 }
 
 impl EndpointProfile {
+    /// 返回当前版本 MCP server 列表声明的客户端能力。
+    ///
+    /// @return 与已验证端点画像对应的 Base64 JSON。
+    pub fn mcp_client_capabilities(&self) -> &'static str {
+        match self.header_profile {
+            EndpointHeaderProfile::ClaudeCode21280 => {
+                "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0="
+            }
+            _ => MCP_CLIENT_CAPABILITIES,
+        }
+    }
+
     /// 按精确模型 ID 返回 bootstrap 子画像。
     ///
     /// @param model_id bootstrap query 中的模型 ID。
@@ -332,6 +347,7 @@ pub struct BootstrapModelProfile {
 
 const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-opus-5-5",
         message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
         default_max_tokens: 128_000,
@@ -341,6 +357,7 @@ const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-sonnet-5",
         message_beta_tokens: SONNET_5_MESSAGE_BETA_TOKENS_2_1_280,
         default_max_tokens: 64_000,
@@ -350,6 +367,7 @@ const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-fable-5-1",
         message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
         default_max_tokens: 64_000,
@@ -359,6 +377,7 @@ const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-haiku-4-5-20251001",
         message_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_280,
         default_max_tokens: 32_000,
@@ -369,6 +388,7 @@ const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
         output_effort: None,
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-opus-4-8",
         message_beta_tokens: OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280,
         default_max_tokens: 64_000,
@@ -378,6 +398,7 @@ const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &["message-threads-2026-08-12"],
         model_id: "claude-sonnet-4-5",
         message_beta_tokens: SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280,
         default_max_tokens: 32_000,
@@ -389,6 +410,7 @@ const MAIN_MODELS_2_1_280: [MainRequestProfile; 7] = [
     },
     // 2.1.280 样本未再出现 Opus 5；保留 2.1.260 的精确画像以维持显式旧模型兼容。
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-opus-5",
         message_beta_tokens: OPUS_5_MESSAGE_BETA_TOKENS_2_1_260,
         default_max_tokens: 64_000,
@@ -412,6 +434,7 @@ const SAFEGUARD_MODELS_2_1_280: [SafeguardRequestProfile; 2] = [
 
 const MAIN_MODELS_2_1_260: [MainRequestProfile; 4] = [
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-opus-5",
         message_beta_tokens: OPUS_5_MESSAGE_BETA_TOKENS_2_1_260,
         default_max_tokens: 64_000,
@@ -421,6 +444,7 @@ const MAIN_MODELS_2_1_260: [MainRequestProfile; 4] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-sonnet-5",
         message_beta_tokens: SONNET_5_MESSAGE_BETA_TOKENS_2_1_260,
         default_max_tokens: 64_000,
@@ -430,6 +454,7 @@ const MAIN_MODELS_2_1_260: [MainRequestProfile; 4] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-fable-5-1",
         message_beta_tokens: FABLE_5_1_MESSAGE_BETA_TOKENS_2_1_260,
         default_max_tokens: 64_000,
@@ -439,6 +464,7 @@ const MAIN_MODELS_2_1_260: [MainRequestProfile; 4] = [
         output_effort: Some("max"),
     },
     MainRequestProfile {
+        client_optional_beta_tokens: &[],
         model_id: "claude-haiku-4-5-20251001",
         message_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_260,
         default_max_tokens: 32_000,
@@ -650,7 +676,7 @@ const PROFILE_2_1_280: ClaudeCodeProfile = ClaudeCodeProfile {
         event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
         bootstrap_cedar_basin: Some("2027-08-31"),
         bootstrap_models: &BOOTSTRAP_MODELS_2_1_280,
-        header_profile: EndpointHeaderProfile::ClaudeCode21257,
+        header_profile: EndpointHeaderProfile::ClaudeCode21280,
     },
 };
 

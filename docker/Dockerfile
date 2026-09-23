@@ -20,9 +20,10 @@ RUN case "$TARGETPLATFORM" in \
         ;; \
     esac
 
-# ---- 依赖缓存层：先只复制 Cargo 清单和 craftls，构建空壳项目缓存依赖 ----
+# ---- 依赖缓存层：复制 Cargo 清单、craftls 和 vendor，构建空壳项目缓存依赖 ----
 COPY Cargo.toml Cargo.lock ./
 COPY craftls/ ./craftls/
+COPY vendor/ ./vendor/
 # 创建空壳 src，让 cargo build 能解析并下载+编译所有依赖
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && \
     case "$TARGETPLATFORM" in \

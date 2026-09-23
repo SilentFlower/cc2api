@@ -1,0 +1,41 @@
+--- a/src/ext/mod.rs
++++ b/src/ext/mod.rs
+@@ -43,7 +43,7 @@
+ ))]
+ use http::header::HeaderName;
+ #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+-use http::header::{HeaderMap, IntoHeaderName, ValueIter};
++use http::header::{HeaderMap, IntoHeaderName, InvalidHeaderName, ValueIter};
+ #[cfg(feature = "ffi")]
+ use std::collections::HashMap;
+ #[cfg(feature = "http2")]
+@@ -158,10 +158,28 @@
+ /// [`preserve_header_case`]: /client/struct.Client.html#method.preserve_header_case
+ #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+ #[derive(Clone, Debug)]
+-pub(crate) struct HeaderCaseMap(HeaderMap<Bytes>);
++pub struct HeaderCaseMap(HeaderMap<Bytes>);
+ 
+ #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+ impl HeaderCaseMap {
++    /// 从显式名称构造 HTTP/1 大小写映射，同时校验名称以阻止头部注入。
++    ///
++    /// @param names 名称序列；同名的多种拼写按出现顺序记录。
++    /// @return 校验后的映射，或第一个非法名称错误。
++    pub fn from_names<I, S>(names: I) -> Result<Self, InvalidHeaderName>
++    where
++        I: IntoIterator<Item = S>,
++        S: AsRef<str>,
++    {
++        let mut map = Self::default();
++        for spelling in names {
++            let bytes = spelling.as_ref().as_bytes();
++            let name = HeaderName::from_bytes(bytes)?;
++            map.append(name, Bytes::copy_from_slice(bytes));
++        }
++        Ok(map)
++    }
++
+     /// Returns a view of all spellings associated with that header name,
+     /// in the order they were found.
+     #[cfg(feature = "client")]

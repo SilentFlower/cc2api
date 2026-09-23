@@ -14,8 +14,8 @@ use crate::model::identity::{
 };
 use crate::service::version_profile::{
     CchProfile, ClaudeCodeProfile, EndpointHeaderProfile, FableFallbackProfile,
-    MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION, MessageBodyOrderProfile, OAUTH_BETA_TOKEN,
-    RequestProfile, TelemetryShape, ThinkingProfile, claude_cli_user_agent, claude_code_user_agent,
+    MCP_PROTOCOL_VERSION, MessageBodyOrderProfile, OAUTH_BETA_TOKEN, RequestProfile,
+    TelemetryShape, ThinkingProfile, claude_cli_user_agent, claude_code_user_agent,
     exact_profile_for_version, is_event_logging_path, normalize_version, profile_for_version,
 };
 use crate::store::cache::UpstreamSessionPoolResolve;
@@ -57,6 +57,18 @@ static HEADER_WIRE_CASING: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     m.insert("authorization", "authorization");
     m.insert("x-claude-code-session-id", "X-Claude-Code-Session-Id");
     m.insert("x-client-request-id", "x-client-request-id");
+    m.insert("x-claude-code-request-class", "x-claude-code-request-class");
+    m.insert(
+        "x-claude-code-prev-tool-durations",
+        "x-claude-code-prev-tool-durations",
+    );
+    m.insert("x-frame-cp", "X-Frame-CP");
+    m.insert("x-frame-surface", "X-Frame-Surface");
+    m.insert("x-frame-platform", "X-Frame-Platform");
+    m.insert("x-frame-client-version", "X-Frame-Client-Version");
+    m.insert("x-frame-session-id", "X-Frame-Session-Id");
+    m.insert("x-mcp-client-session-id", "X-Mcp-Client-Session-Id");
+    m.insert("mcp-method", "mcp-method");
     m.insert("content-length", "content-length");
     m
 });
@@ -448,15 +460,82 @@ fn title_beta_header(request_profile: &RequestProfile, incoming_beta: &str) -> S
     tokens.join(",")
 }
 
+/// 2.1.280 抓包已验证的非遥测后台端点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusinessEndpoint {
+    Frame,
+    Mcp,
+    OrganizationResource,
+}
+
+/// 精确匹配路径段，避免把同前缀的新接口误套为不带 beta 的画像。
+fn business_endpoint(path: &str) -> Option<BusinessEndpoint> {
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "frame", "contract", "latest"] => Some(BusinessEndpoint::Frame),
+        ["", "v1", "mcp", id] if !id.is_empty() => Some(BusinessEndpoint::Mcp),
+        ["", "api", "organizations", id, "model_selector", "cc"] if !id.is_empty() => {
+            Some(BusinessEndpoint::OrganizationResource)
+        }
+        ["", "api", "oauth", "organizations", id, "marketplaces"]
+        | [
+            "",
+            "api",
+            "oauth",
+            "organizations",
+            id,
+            "plugins",
+            "list-plugins",
+        ]
+        | [
+            "",
+            "api",
+            "oauth",
+            "organizations",
+            id,
+            "skills",
+            "list-skills",
+        ] if !id.is_empty() => Some(BusinessEndpoint::OrganizationResource),
+        [
+            "",
+            "api",
+            "oauth",
+            "organizations",
+            id,
+            "skills",
+            skill,
+            "download",
+        ] if !id.is_empty() && !skill.is_empty() => Some(BusinessEndpoint::OrganizationResource),
+        _ => None,
+    }
+}
+
 /// 按已验证的路径段选择后台 UA/beta；不把相似或新增路径自动纳入画像。
 fn auxiliary_endpoint_headers(
     profile: &ClaudeCodeProfile,
     path: &str,
 ) -> Option<(String, Option<&'static str>)> {
-    if profile.endpoints.header_profile != EndpointHeaderProfile::ClaudeCode21257 {
+    if profile.endpoints.header_profile == EndpointHeaderProfile::Legacy {
         return None;
     }
     let version = profile.identity.version;
+    if profile.endpoints.header_profile == EndpointHeaderProfile::ClaudeCode21280 {
+        match business_endpoint(path) {
+            Some(BusinessEndpoint::Frame) => {
+                return Some((
+                    claude_cli_user_agent(version),
+                    Some(profile.request.oauth_beta_token),
+                ));
+            }
+            Some(BusinessEndpoint::Mcp) => {
+                return Some((format!("{} (cli)", claude_code_user_agent(version)), None));
+            }
+            Some(BusinessEndpoint::OrganizationResource) => {
+                return Some((claude_cli_user_agent(version), None));
+            }
+            None => {}
+        }
+    }
     let code_suffix = path
         .strip_prefix("/v1/code/sessions/")
         .and_then(|rest| rest.split_once('/'))
@@ -779,8 +858,11 @@ fn requires_json_content_type(path: &str) -> bool {
 
 /// 按当前 Claude Code 抓包中的 endpoint wire 顺序组织上游 header。
 ///
-/// reqwest/hyper 是否保留大小写仍取决于底层 HTTP 实现；这里至少保证应用层
-/// profile 的集合和插入顺序稳定，避免继续依赖 HashMap 的随机遍历顺序。
+/// 调用方通过请求级 http1_header_casing 将本列表的大小写交给发送层。
+///
+/// @param path 上游端点路径。
+/// @param headers 已完成画像改写的请求头。
+/// @return 按抓包大小写和顺序排列的名称与值。
 pub fn ordered_anthropic_headers(
     path: &str,
     headers: &HashMap<String, String>,
@@ -846,10 +928,53 @@ fn wire_header_order(path: &str) -> &'static [&'static str] {
             "anthropic-dangerous-direct-browser-access",
             "anthropic-version",
             "x-app",
+            "x-claude-code-prev-tool-durations",
+            "x-claude-code-request-class",
             "x-client-request-id",
             "Connection",
             "Host",
             "Accept-Encoding",
+        ]
+    } else if business_endpoint(path) == Some(BusinessEndpoint::Frame) {
+        &[
+            "Accept",
+            "User-Agent",
+            "Authorization",
+            "anthropic-beta",
+            "X-Frame-CP",
+            "X-Frame-Surface",
+            "X-Frame-Platform",
+            "X-Frame-Client-Version",
+            "X-Frame-Session-Id",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ]
+    } else if business_endpoint(path) == Some(BusinessEndpoint::Mcp) {
+        &[
+            "Accept",
+            "Accept-Encoding",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "X-Mcp-Client-Session-Id",
+            "mcp-method",
+            "mcp-protocol-version",
+            "Connection",
+            "Host",
+        ]
+    } else if business_endpoint(path) == Some(BusinessEndpoint::OrganizationResource) {
+        &[
+            "Accept",
+            "Content-Type",
+            "User-Agent",
+            "Authorization",
+            "anthropic-version",
+            "anthropic-client-platform",
+            "x-organization-uuid",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
         ]
     } else if path.starts_with("/api/eval/") {
         &[
@@ -1218,6 +1343,10 @@ impl Rewriter {
         let env = &profile.env;
         let version = normalize_version(&env.version);
         let version_profile = profile_for_version(version);
+        let business = (version_profile.endpoints.header_profile
+            == EndpointHeaderProfile::ClaudeCode21280)
+            .then(|| business_endpoint(path))
+            .flatten();
 
         let mut out = HashMap::new();
 
@@ -1279,7 +1408,7 @@ impl Rewriter {
                 out.insert("User-Agent".into(), "axios/1.15.2".into());
                 out.insert(
                     "anthropic-mcp-client-capabilities".into(),
-                    MCP_CLIENT_CAPABILITIES.into(),
+                    version_profile.endpoints.mcp_client_capabilities().into(),
                 );
                 out.insert("anthropic-version".into(), "2023-06-01".into());
                 out.insert("mcp-protocol-version".into(), MCP_PROTOCOL_VERSION.into());
@@ -1365,11 +1494,28 @@ impl Rewriter {
             let stainless_os = stainless_os_from_platform(&env.platform);
             for (k, v) in headers {
                 let lower = k.to_lowercase();
-                if !allowed.contains(lower.as_str()) {
+                let endpoint_header = match lower.as_str() {
+                    "x-claude-code-request-class" | "x-claude-code-prev-tool-durations" => {
+                        path == "/v1/messages"
+                    }
+                    "x-frame-cp"
+                    | "x-frame-surface"
+                    | "x-frame-platform"
+                    | "x-frame-client-version"
+                    | "x-frame-session-id" => business == Some(BusinessEndpoint::Frame),
+                    "x-mcp-client-session-id" | "mcp-method" => {
+                        business == Some(BusinessEndpoint::Mcp)
+                    }
+                    _ => false,
+                };
+                if !allowed.contains(lower.as_str()) && !endpoint_header {
                     continue;
                 }
                 let wire_key = resolve_wire_casing(k);
                 match lower.as_str() {
+                    "x-frame-client-version" => {
+                        out.insert(wire_key, version.to_string());
+                    }
                     "user-agent" => {
                         let user_agent = if path.starts_with("/api/eval/") {
                             version_profile.telemetry.growthbook_user_agent.to_string()
@@ -1431,8 +1577,18 @@ impl Rewriter {
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             let filtered_existing = filter_account_beta_tokens(&existing_beta, account, model_id);
             if requires_anthropic_beta(path) {
-                let required_beta =
+                let mut required_beta =
                     beta_header_for_path(&version_profile.request, path, model_id, body_map);
+                if path == "/v1/messages" {
+                    if let Some(model) = version_profile.request.main_model(model_id) {
+                        // 客户端掌握 feature flag 和会话条件；只保留其显式携带的可选 token。
+                        required_beta = required_beta
+                            .split(',')
+                            .filter(|token| !model.client_optional_beta_tokens.contains(token))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                    }
+                }
                 let beta = if requires_exact_beta_profile(
                     &version_profile.request,
                     path,
@@ -1463,7 +1619,7 @@ impl Rewriter {
             if path.starts_with("/v1/mcp_servers") {
                 out.insert(
                     "anthropic-mcp-client-capabilities".into(),
-                    MCP_CLIENT_CAPABILITIES.into(),
+                    version_profile.endpoints.mcp_client_capabilities().into(),
                 );
                 out.insert("mcp-protocol-version".into(), MCP_PROTOCOL_VERSION.into());
             }
@@ -1489,6 +1645,10 @@ impl Rewriter {
             } else {
                 out.remove("anthropic-beta");
             }
+        }
+        if client_type == ClientType::API && business == Some(BusinessEndpoint::Frame) {
+            // Frame 合同 GET 的原始请求没有 JSON 正文，也没有 Content-Type。
+            out.remove("content-type");
         }
 
         out
@@ -6159,12 +6319,12 @@ mod tests {
         DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_5_MESSAGE_BETA_TOKENS_2_1_257,
         HAIKU_MAIN_BETA_TOKENS_2_1_280, HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280,
         HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257, HAIKU_PROBE_BETA_TOKENS,
-        HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
-        MESSAGE_BETA_TOKENS, OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280,
-        OPUS_4_8_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
-        OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280, SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280,
-        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json,
-        claude_cli_user_agent, claude_code_user_agent, profile_for_key,
+        HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS,
+        OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280, OPUS_4_8_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280,
+        OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280,
+        SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280, STAINLESS_PACKAGE_VERSION,
+        STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json, claude_cli_user_agent,
+        claude_code_user_agent, profile_for_key,
     };
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use base64::Engine;
@@ -10180,7 +10340,7 @@ mod tests {
     }
 
     #[test]
-    fn sonnet_4_5_uses_observed_message_threads_beta_without_safeguards() {
+    fn sonnet_4_5_does_not_invent_message_threads_beta_without_safeguards() {
         let account = test_account();
         let rewriter = Rewriter::new();
         let ordinary_headers = rewriter.rewrite_headers(
@@ -10194,9 +10354,9 @@ mod tests {
 
         assert_eq!(
             ordinary_headers["anthropic-beta"],
-            SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280
+            SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280.trim_end_matches(",message-threads-2026-08-12")
         );
-        assert!(ordinary_headers["anthropic-beta"].ends_with("message-threads-2026-08-12"));
+        assert!(!ordinary_headers["anthropic-beta"].contains("message-threads-2026-08-12"));
         assert!(!ordinary_headers["anthropic-beta"].contains("dangerous-tool-use-2026-09-03"));
 
         let safeguard_headers = rewriter.rewrite_headers(
@@ -10208,6 +10368,273 @@ mod tests {
             &json!({"safeguards": [{"type": "dangerous_tool_use"}]}),
         );
         assert_eq!(safeguard_headers, ordinary_headers);
+    }
+
+    #[test]
+    fn messages_observed_headers_are_preserved_only_on_messages() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        for class in ["main", "auxiliary"] {
+            let incoming = HashMap::from([
+                ("X-Claude-Code-Request-Class".into(), class.into()),
+                ("X-Claude-Code-Prev-Tool-Durations".into(), "Bash=54".into()),
+                ("x-untrusted-header".into(), "discard".into()),
+            ]);
+            for path in [
+                "/v1/messages",
+                "/v1/messages/count_tokens",
+                "/api/oauth/account/settings",
+            ] {
+                let headers = rewriter.rewrite_headers(
+                    &incoming,
+                    path,
+                    &account,
+                    ClientType::ClaudeCode,
+                    "claude-sonnet-4-5",
+                    &json!({}),
+                );
+                if path == "/v1/messages" {
+                    assert_eq!(headers["x-claude-code-request-class"], class);
+                    assert_eq!(headers["x-claude-code-prev-tool-durations"], "Bash=54");
+                    let order = ordered_anthropic_headers(path, &headers);
+                    let names: Vec<_> = order.iter().map(|(name, _)| name.as_str()).collect();
+                    assert!(
+                        names
+                            .iter()
+                            .position(|name| *name == "x-claude-code-prev-tool-durations")
+                            < names
+                                .iter()
+                                .position(|name| *name == "x-claude-code-request-class")
+                    );
+                } else {
+                    assert!(!headers.contains_key("x-claude-code-request-class"));
+                    assert!(!headers.contains_key("x-claude-code-prev-tool-durations"));
+                }
+                assert!(!headers.contains_key("x-untrusted-header"));
+            }
+        }
+        let generated = rewriter.rewrite_headers(
+            &HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            "claude-sonnet-4-5",
+            &json!({}),
+        );
+        assert!(!generated.contains_key("x-claude-code-prev-tool-durations"));
+    }
+
+    #[test]
+    fn sonnet_4_5_threads_beta_follows_native_client_and_keeps_api_default() {
+        let mut account = test_account();
+        let rewriter = Rewriter::new();
+        let token = "message-threads-2026-08-12";
+        for present in [false, true] {
+            for allow_fast in [false, true] {
+                account.allow_fast_mode = allow_fast;
+                let beta = format!(
+                    "{FAST_MODE},{CTX_1M},client-extra-2099-01-01{}",
+                    if present {
+                        format!(",{token},{token}")
+                    } else {
+                        String::new()
+                    }
+                );
+                let incoming = HashMap::from([("anthropic-beta".into(), beta)]);
+                // 是否携带 thread 正文不由网关推测：只有 header 是客户端选择的依据。
+                for body in [json!({}), json!({"thread": {"id": "synthetic-thread"}})] {
+                    let headers = rewriter.rewrite_headers(
+                        &incoming,
+                        "/v1/messages",
+                        &account,
+                        ClientType::ClaudeCode,
+                        "claude-sonnet-4-5",
+                        &body,
+                    );
+                    let tokens: Vec<_> = headers["anthropic-beta"].split(',').collect();
+                    assert_eq!(
+                        tokens.iter().filter(|value| **value == token).count(),
+                        usize::from(present)
+                    );
+                    assert_eq!(tokens.contains(&FAST_MODE), allow_fast);
+                    assert!(!tokens.contains(&CTX_1M));
+                    assert!(tokens.contains(&"client-extra-2099-01-01"));
+                    let generated = rewriter.rewrite_headers(
+                        &incoming,
+                        "/v1/messages",
+                        &account,
+                        ClientType::API,
+                        "claude-sonnet-4-5",
+                        &body,
+                    );
+                    assert_eq!(
+                        generated["anthropic-beta"],
+                        SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn business_21280_profiles_preserve_scoped_headers_and_exact_betas() {
+        let rewriter = Rewriter::new();
+        let account = test_account();
+        let incoming = HashMap::from([
+            (
+                "user-agent".into(),
+                "claude-cli/2.1.280 (external, cli)".into(),
+            ),
+            ("anthropic-beta".into(), "client-extra-2099-01-01".into()),
+            ("x-frame-cp".into(), "go".into()),
+            ("x-frame-surface".into(), "code".into()),
+            ("x-frame-platform".into(), "cli".into()),
+            ("x-frame-client-version".into(), "2.1.260".into()),
+            (
+                "x-frame-session-id".into(),
+                "synthetic-frame-session".into(),
+            ),
+            (
+                "x-mcp-client-session-id".into(),
+                "synthetic-mcp-session".into(),
+            ),
+            ("Mcp-Method".into(), "tools/list".into()),
+        ]);
+        for (path, beta, ua) in [
+            (
+                "/api/frame/contract/latest",
+                Some("oauth-2025-04-20"),
+                "claude-cli/2.1.280 (external, cli)",
+            ),
+            ("/v1/mcp/synthetic", None, "claude-code/2.1.280 (cli)"),
+            (
+                "/api/organizations/synthetic/model_selector/cc",
+                None,
+                "claude-cli/2.1.280 (external, cli)",
+            ),
+            (
+                "/api/oauth/organizations/synthetic/marketplaces",
+                None,
+                "claude-cli/2.1.280 (external, cli)",
+            ),
+            (
+                "/api/oauth/organizations/synthetic/plugins/list-plugins",
+                None,
+                "claude-cli/2.1.280 (external, cli)",
+            ),
+            (
+                "/api/oauth/organizations/synthetic/skills/list-skills",
+                None,
+                "claude-cli/2.1.280 (external, cli)",
+            ),
+            (
+                "/api/oauth/organizations/synthetic/skills/synthetic-skill/download",
+                None,
+                "claude-cli/2.1.280 (external, cli)",
+            ),
+        ] {
+            for client in [ClientType::ClaudeCode, ClientType::API] {
+                let headers =
+                    rewriter.rewrite_headers(&incoming, path, &account, client, "", &json!({}));
+                assert_eq!(
+                    headers.get("anthropic-beta").map(String::as_str),
+                    beta,
+                    "{path}"
+                );
+                assert_eq!(headers["User-Agent"], ua, "{path}");
+                let frame =
+                    client == ClientType::ClaudeCode && path == "/api/frame/contract/latest";
+                for key in [
+                    "X-Frame-CP",
+                    "X-Frame-Surface",
+                    "X-Frame-Platform",
+                    "X-Frame-Client-Version",
+                    "X-Frame-Session-Id",
+                ] {
+                    assert_eq!(headers.contains_key(key), frame, "{path}: {key}");
+                }
+                if frame {
+                    assert_eq!(headers["X-Frame-Client-Version"], "2.1.280");
+                    assert_eq!(headers["X-Frame-Session-Id"], "synthetic-frame-session");
+                }
+                let mcp = client == ClientType::ClaudeCode && path == "/v1/mcp/synthetic";
+                assert_eq!(headers.contains_key("X-Mcp-Client-Session-Id"), mcp);
+                assert_eq!(headers.contains_key("mcp-method"), mcp);
+                if mcp {
+                    assert_eq!(headers["X-Mcp-Client-Session-Id"], "synthetic-mcp-session");
+                    assert_eq!(headers["mcp-method"], "tools/list");
+                }
+            }
+        }
+        for path in [
+            "/v1/messages",
+            "/api/frame/contract/latest/extra",
+            "/v1/mcp/",
+            "/v1/mcp/synthetic/extra",
+            "/api/organizations//model_selector/cc",
+            "/api/oauth/organizations/synthetic/skills/new-operation",
+            "/api/oauth/organizations/synthetic/marketplaces/extra",
+        ] {
+            let headers = rewriter.rewrite_headers(
+                &incoming,
+                path,
+                &account,
+                ClientType::ClaudeCode,
+                "",
+                &json!({}),
+            );
+            assert!(headers.contains_key("anthropic-beta"), "{path}");
+            assert!(!headers.contains_key("X-Frame-CP"), "{path}");
+            assert!(!headers.contains_key("X-Mcp-Client-Session-Id"), "{path}");
+        }
+    }
+
+    #[test]
+    fn business_profiles_keep_rollback_and_versioned_mcp_capabilities() {
+        let rewriter = Rewriter::new();
+        for version in ["2.1.257", "2.1.260", "2.1.280"] {
+            let account = test_account_with_profile(version);
+            for client in [ClientType::ClaudeCode, ClientType::API] {
+                let headers = rewriter.rewrite_headers(
+                    &HashMap::new(),
+                    "/v1/mcp_servers",
+                    &account,
+                    client,
+                    "",
+                    &json!({}),
+                );
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&headers["anthropic-mcp-client-capabilities"])
+                    .unwrap();
+                let capabilities: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    capabilities["roots"],
+                    if version == "2.1.280" {
+                        json!({"listChanged":true})
+                    } else {
+                        json!({})
+                    }
+                );
+                for path in [
+                    "/api/frame/contract/latest",
+                    "/v1/mcp/synthetic",
+                    "/api/organizations/synthetic/model_selector/cc",
+                    "/api/oauth/organizations/synthetic/marketplaces",
+                ] {
+                    let headers = rewriter.rewrite_headers(
+                        &HashMap::new(),
+                        path,
+                        &account,
+                        client,
+                        "",
+                        &json!({}),
+                    );
+                    if version != "2.1.280" {
+                        assert!(headers.contains_key("anthropic-beta"), "{version}: {path}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11873,7 +12300,10 @@ mod tests {
             mcp_headers
                 .get("anthropic-mcp-client-capabilities")
                 .unwrap(),
-            MCP_CLIENT_CAPABILITIES
+            profile_for_key("2.1.280")
+                .unwrap()
+                .endpoints
+                .mcp_client_capabilities()
         );
         assert_eq!(
             mcp_headers.get("mcp-protocol-version").unwrap(),
@@ -11895,7 +12325,10 @@ mod tests {
             cc_mcp_headers
                 .get("anthropic-mcp-client-capabilities")
                 .unwrap(),
-            MCP_CLIENT_CAPABILITIES
+            profile_for_key("2.1.280")
+                .unwrap()
+                .endpoints
+                .mcp_client_capabilities()
         );
         assert_eq!(
             cc_mcp_headers.get("mcp-protocol-version").unwrap(),

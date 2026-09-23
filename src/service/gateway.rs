@@ -11,6 +11,7 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
+use std::iter::once;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -2443,7 +2444,16 @@ impl GatewayService {
             _ => client.post(&target_url),
         };
 
-        for (k, v) in ordered_anthropic_headers(path, headers) {
+        let ordered_headers = ordered_anthropic_headers(path, headers);
+        if !is_event_logging_path(path) && !path.starts_with("/api/eval/") {
+            req_builder = req_builder.http1_header_casing(
+                ordered_headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .chain(once("Content-Length")),
+            );
+        }
+        for (k, v) in ordered_headers {
             debug!("upstream header: {}: {}", k, safe_header_log_value(&k, &v));
             req_builder = req_builder.header(k, v);
         }
@@ -2731,7 +2741,14 @@ impl GatewayService {
 
         let client = upstream_request_client(account)?;
         let mut req_builder = client.post(&target_url);
-        for (k, v) in ordered_anthropic_headers(COUNT_TOKENS_PATH, headers) {
+        let ordered_headers = ordered_anthropic_headers(COUNT_TOKENS_PATH, headers);
+        req_builder = req_builder.http1_header_casing(
+            ordered_headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .chain(once("Content-Length")),
+        );
+        for (k, v) in ordered_headers {
             debug!(
                 "count_tokens upstream header: {}: {}",
                 k,
@@ -7062,7 +7079,8 @@ mod tests {
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
     use crate::service::account::{
-        AccountService, DEFAULT_REQUEST_SLOT_UNITS, HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
+        AccountSelectionContext, AccountService, DEFAULT_REQUEST_SLOT_UNITS,
+        HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
     };
     use crate::service::rewriter::{
         CLAUDE_CODE_SYSTEM_PROMPT, ClientType, StatefulCacheUsage, UpstreamSessionRewrite,
@@ -7102,7 +7120,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+    use tokio::time::timeout;
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -7919,6 +7940,120 @@ mod tests {
             crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn business_forwarding_preserves_actual_http1_casing_and_telemetry_default() {
+        for path in [
+            "/v1/messages",
+            COUNT_TOKENS_PATH,
+            "/api/frame/contract/latest",
+            "/v1/mcp/synthetic",
+            "/api/event_logging/v2/batch",
+            "/api/eval/synthetic",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let received = tokio::spawn(async move {
+                timeout(Duration::from_secs(10), async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut raw = Vec::new();
+                    loop {
+                        let mut buf = [0; 4096];
+                        let count = socket.read(&mut buf).await.unwrap();
+                        assert!(count > 0);
+                        raw.extend_from_slice(&buf[..count]);
+                        assert!(raw.len() < 64 * 1024);
+                        if let Some(end) = raw.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&raw[..end]);
+                            let length = head
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                                .unwrap_or(0);
+                            if raw.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                    String::from_utf8(raw).unwrap()
+                })
+                .await
+                .expect("业务请求原始字节接收超时")
+            });
+            let service = test_gateway_service_with_urls(base, String::new()).await;
+            let account = test_account();
+            let incoming = HashMap::from([
+                (
+                    "User-Agent".into(),
+                    "claude-cli/2.1.280 (external, cli)".into(),
+                ),
+                ("x-claude-code-request-class".into(), "main".into()),
+                ("x-frame-session-id".into(), "synthetic-frame".into()),
+                ("x-mcp-client-session-id".into(), "synthetic-mcp".into()),
+            ]);
+            let headers = service.rewriter.rewrite_headers(
+                &incoming,
+                path,
+                &account,
+                ClientType::ClaudeCode,
+                "claude-sonnet-4-5",
+                &json!({}),
+            );
+            let response = if path == COUNT_TOKENS_PATH {
+                service
+                    .forward_count_tokens_request(&headers, b"{}", &account)
+                    .await
+                    .unwrap()
+            } else {
+                service
+                    .forward_request(
+                        "POST",
+                        path,
+                        "",
+                        &headers,
+                        b"{}",
+                        &account,
+                        &AccountSelectionContext::disabled(),
+                        RequestCapturePolicy::SummaryOnly,
+                    )
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(
+                body::to_bytes(response.into_body(), 1024).await.unwrap(),
+                "{}"
+            );
+            let raw = received.await.unwrap();
+            if path.starts_with("/api/event_logging/") || path.starts_with("/api/eval/") {
+                assert!(raw.contains("\r\nuser-agent: "), "{path}");
+                assert!(!raw.contains("\r\nUser-Agent: "), "{path}");
+            } else {
+                assert!(raw.contains("\r\nUser-Agent: "), "{path}");
+                assert!(raw.contains("\r\nContent-Length: 2\r\n"), "{path}");
+            }
+            match path {
+                "/v1/messages" => {
+                    assert!(raw.contains("\r\nx-claude-code-request-class: main\r\n"))
+                }
+                "/api/frame/contract/latest" => {
+                    assert!(raw.contains("\r\nX-Frame-Session-Id: synthetic-frame\r\n"))
+                }
+                "/v1/mcp/synthetic" => {
+                    assert!(raw.contains("\r\nUser-Agent: claude-code/2.1.280 (cli)\r\n"));
+                    assert!(raw.contains("\r\nX-Mcp-Client-Session-Id: synthetic-mcp\r\n"));
+                    assert!(!raw.contains("anthropic-beta:"));
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn test_gateway_service_with_urls(
