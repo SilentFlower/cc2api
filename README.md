@@ -600,6 +600,12 @@ cc-bridge/
 - 追加 `beta=true` 查询参数
 - 还原 header wire casing
 
+Claude Code 2.1.280 的 Opus Auto 与 Plan 模式会把 `dangerous_tool_use` 分类器放进主请求的
+`safeguards` 字段。网关据此按 Opus 5.5 / Opus 4.8 选择对应的精确 beta 画像，保留该字段，
+并原样转发流式 `message_delta.delta.safeguard_results`；其中 tool-use 结果位于
+`status.tool_uses`。Sonnet 4.5 当前不发送该字段，使用带 `message-threads-2026-08-12`
+的普通主请求画像。
+
 ### 请求体改写
 
 | 路径 | 改写内容 |

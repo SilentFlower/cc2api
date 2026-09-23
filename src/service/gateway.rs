@@ -10557,6 +10557,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stable_stream_preserves_safeguard_results_event() {
+        let event = Bytes::from_static(
+            br#"event: message_delta
+data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_tool_use","status":{"type":"available","tool_uses":{"toolu_1":{"type":"evaluated","outcome":"not_flagged"}}}}]}}
+
+"#,
+        );
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+        tx.send(Ok(event.clone()))
+            .await
+            .expect("send safeguard event");
+        drop(tx);
+        let mut stream = Box::pin(stable_upstream_stream(
+            ReceiverStream::new(rx),
+            "测试账号".into(),
+            Some("req_safeguard".into()),
+            StreamStabilityConfig {
+                keepalive_enabled: false,
+                keepalive_interval: Duration::from_millis(10),
+                upstream_idle_timeout: Duration::from_secs(1),
+            },
+        ));
+
+        let forwarded = stream
+            .next()
+            .await
+            .expect("safeguard event item")
+            .expect("safeguard event chunk");
+
+        assert_eq!(forwarded, event);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn stable_stream_keepalive_still_times_out_by_upstream_idle_deadline() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         tx.send(Ok(Bytes::from_static(b"data: first\n\n")))

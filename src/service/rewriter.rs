@@ -260,6 +260,9 @@ fn beta_header_for_path(
     model_id: &str,
     body: &serde_json::Value,
 ) -> String {
+    let safeguard_beta = (path == "/v1/messages")
+        .then(|| safeguard_beta_header(request_profile, model_id, body))
+        .flatten();
     let beta = if path == "/v1/messages/count_tokens" {
         request_profile.count_tokens_beta_tokens.to_string()
     } else if is_event_logging_path(path)
@@ -275,42 +278,49 @@ fn beta_header_for_path(
     } else if path.starts_with("/v1/mcp_servers") {
         request_profile.mcp_servers_beta_token.to_string()
     } else if path.starts_with("/v1/messages") {
-        match haiku_request_kind(model_id, body) {
-            Some(HaikuRequestKind::Probe) => request_profile.haiku_probe_beta_tokens.to_string(),
-            Some(HaikuRequestKind::Title) => request_profile
-                .haiku_streaming_title_beta_tokens
-                .to_string(),
-            Some(HaikuRequestKind::NonStreamAux) => {
-                request_profile.haiku_non_stream_aux_beta_tokens.to_string()
-            }
-            Some(HaikuRequestKind::Main) => {
-                if let Some(profile) = request_profile.main_model(model_id) {
-                    if body.get("diagnostics").is_none() {
-                        request_profile
-                            .haiku_main_no_diagnostics_beta_tokens
-                            .to_string()
-                    } else {
-                        profile.message_beta_tokens.to_string()
-                    }
-                } else if request_profile.main_models.is_empty() {
-                    // 旧画像没有精确主模型表，继续保留已经验证过的 Haiku 族分类行为。
-                    if body.get("diagnostics").is_none() {
-                        request_profile
-                            .haiku_main_no_diagnostics_beta_tokens
-                            .to_string()
-                    } else {
-                        request_profile.haiku_main_beta_tokens.to_string()
-                    }
-                } else {
-                    beta_header_for_model(request_profile, model_id)
+        if let Some(beta) = safeguard_beta {
+            beta.to_string()
+        } else {
+            match haiku_request_kind(model_id, body) {
+                Some(HaikuRequestKind::Probe) => {
+                    request_profile.haiku_probe_beta_tokens.to_string()
                 }
+                Some(HaikuRequestKind::Title) => request_profile
+                    .haiku_streaming_title_beta_tokens
+                    .to_string(),
+                Some(HaikuRequestKind::NonStreamAux) => {
+                    request_profile.haiku_non_stream_aux_beta_tokens.to_string()
+                }
+                Some(HaikuRequestKind::Main) => {
+                    if let Some(profile) = request_profile.main_model(model_id) {
+                        if body.get("diagnostics").is_none() {
+                            request_profile
+                                .haiku_main_no_diagnostics_beta_tokens
+                                .to_string()
+                        } else {
+                            profile.message_beta_tokens.to_string()
+                        }
+                    } else if request_profile.main_models.is_empty() {
+                        // 旧画像没有精确主模型表，继续保留已经验证过的 Haiku 族分类行为。
+                        if body.get("diagnostics").is_none() {
+                            request_profile
+                                .haiku_main_no_diagnostics_beta_tokens
+                                .to_string()
+                        } else {
+                            request_profile.haiku_main_beta_tokens.to_string()
+                        }
+                    } else {
+                        beta_header_for_model(request_profile, model_id)
+                    }
+                }
+                None => beta_header_for_model(request_profile, model_id),
             }
-            None => beta_header_for_model(request_profile, model_id),
         }
     } else {
         beta_header_for_model(request_profile, model_id)
     };
-    if path == "/v1/messages"
+    if safeguard_beta.is_none()
+        && path == "/v1/messages"
         && body.get("fallbacks").is_some_and(|value| !value.is_null())
         && !request_profile.message_fallback_beta_tokens.is_empty()
     {
@@ -322,6 +332,28 @@ fn beta_header_for_path(
     } else {
         beta
     }
+}
+
+fn has_dangerous_tool_use_safeguard(body: &serde_json::Value) -> bool {
+    body.get("safeguards")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|safeguards| {
+            safeguards.iter().any(|safeguard| {
+                safeguard.get("type").and_then(serde_json::Value::as_str)
+                    == Some("dangerous_tool_use")
+            })
+        })
+}
+
+fn safeguard_beta_header<'a>(
+    request_profile: &'a RequestProfile,
+    model_id: &str,
+    body: &serde_json::Value,
+) -> Option<&'a str> {
+    has_dangerous_tool_use_safeguard(body)
+        .then(|| request_profile.safeguard_model(model_id))
+        .flatten()
+        .map(|profile| profile.message_beta_tokens)
 }
 
 fn order_message_fallback_beta_tokens(beta: String, fallback_tokens: &[&str]) -> String {
@@ -377,12 +409,18 @@ fn haiku_request_kind(model_id: &str, body: &serde_json::Value) -> Option<HaikuR
     Some(HaikuRequestKind::Main)
 }
 
-fn requires_exact_beta_profile(path: &str, model_id: &str, body: &serde_json::Value) -> bool {
+fn requires_exact_beta_profile(
+    request_profile: &RequestProfile,
+    path: &str,
+    model_id: &str,
+    body: &serde_json::Value,
+) -> bool {
     path.starts_with("/v1/messages")
-        && matches!(
-            haiku_request_kind(model_id, body),
-            Some(HaikuRequestKind::Probe | HaikuRequestKind::Title)
-        )
+        && (safeguard_beta_header(request_profile, model_id, body).is_some()
+            || matches!(
+                haiku_request_kind(model_id, body),
+                Some(HaikuRequestKind::Probe | HaikuRequestKind::Title)
+            ))
 }
 
 /// 仅保留标题抓包已确认的可选 token，避免把父模型的整套 beta 合入辅助请求。
@@ -1395,7 +1433,12 @@ impl Rewriter {
             if requires_anthropic_beta(path) {
                 let required_beta =
                     beta_header_for_path(&version_profile.request, path, model_id, body_map);
-                let beta = if requires_exact_beta_profile(path, model_id, body_map) {
+                let beta = if requires_exact_beta_profile(
+                    &version_profile.request,
+                    path,
+                    model_id,
+                    body_map,
+                ) {
                     required_beta
                 } else {
                     order_context_1m_after_oauth(merge_anthropic_beta(
@@ -2000,14 +2043,7 @@ impl Rewriter {
 
         // CCH hash 计算
         let cch_hash = if rewrite_billing {
-            let first_msg = extract_first_user_message(body);
-            if !first_msg.is_empty() {
-                compute_cc_version_suffix(&first_msg, version)
-            } else {
-                let mut bytes = [0u8; 2];
-                rand::thread_rng().fill(&mut bytes);
-                random_cc_version_suffix(bytes)
-            }
+            cc_version_suffix_for_body(body, version)
         } else {
             String::new()
         };
@@ -2209,6 +2245,8 @@ static BILLING_REGEX: Lazy<Regex> =
 /// 仅匹配 cc_version 值部分，用于 Rewrite 模式保留 cc_entrypoint。
 static BILLING_VERSION_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3}").unwrap());
+static BILLING_VERSION_SUFFIX_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.([a-f0-9]{3})").unwrap());
 static CCH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
 static CLAUDE_CODE_BILLING_BLOCK_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -2336,6 +2374,52 @@ fn compute_cc_version_suffix(first_user_message_text: &str, version: &str) -> St
 
 fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
     format!("{:04x}", u16::from_be_bytes(bytes))[..3].to_string()
+}
+
+fn is_cc_version_thread_followup(body: &serde_json::Value, version: &str) -> bool {
+    version == "2.1.280"
+        && body
+            .get("thread")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|thread| thread.get("previous_message_id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+fn existing_cc_version_suffix(body: &serde_json::Value) -> Option<String> {
+    let suffix_from_text = |text: &str| {
+        BILLING_VERSION_SUFFIX_REGEX
+            .captures(text)
+            .and_then(|captures| captures.get(1))
+            .map(|suffix| suffix.as_str().to_string())
+    };
+    match body.get("system") {
+        Some(serde_json::Value::String(text)) => suffix_from_text(text),
+        Some(serde_json::Value::Array(blocks)) => blocks.iter().find_map(|block| {
+            block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .and_then(&suffix_from_text)
+        }),
+        _ => None,
+    }
+}
+
+fn cc_version_suffix_for_body(body: &serde_json::Value, version: &str) -> String {
+    if is_cc_version_thread_followup(body, version) {
+        // 官方 2.1.280 在线程续轮复用会话已有后缀，即使 tool_result 后重新带入 text block。
+        if let Some(suffix) = existing_cc_version_suffix(body) {
+            return suffix;
+        }
+    } else {
+        let text = extract_first_user_message(body);
+        if !text.is_empty() {
+            return compute_cc_version_suffix(&text, version);
+        }
+    }
+    let mut bytes = [0u8; 2];
+    rand::thread_rng().fill(&mut bytes);
+    random_cc_version_suffix(bytes)
 }
 
 fn build_claude_code_billing_system_block(
@@ -6077,8 +6161,10 @@ mod tests {
         HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257, HAIKU_PROBE_BETA_TOKENS,
         HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_CLIENT_CAPABILITIES, MCP_PROTOCOL_VERSION,
         MESSAGE_BETA_TOKENS, OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280,
-        OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280, STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION,
-        apply_identity_to_env_json, claude_cli_user_agent, claude_code_user_agent, profile_for_key,
+        OPUS_4_8_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+        OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280, SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280,
+        STAINLESS_PACKAGE_VERSION, STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json,
+        claude_cli_user_agent, claude_code_user_agent, profile_for_key,
     };
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use base64::Engine;
@@ -10037,6 +10123,94 @@ mod tests {
     }
 
     #[test]
+    fn integrated_safeguards_use_exact_beta_and_survive_body_rewrite() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let mut incoming = std::collections::HashMap::new();
+        incoming.insert(
+            "anthropic-beta".to_string(),
+            "client-extra-2099-01-01".to_string(),
+        );
+        for permission_mode in ["auto", "plan"] {
+            let safeguards = json!([{
+                "type": "dangerous_tool_use",
+                "classifier_context": {
+                    "v": 1,
+                    "permission_mode": permission_mode,
+                    "auto_mode": {
+                        "allow": [],
+                        "soft_deny": [],
+                        "hard_deny": [],
+                        "environment": []
+                    }
+                }
+            }]);
+            let body = json!({
+                "model": "claude-opus-5-5",
+                "messages": [{"role": "user", "content": "检查当前目录"}],
+                "safeguards": safeguards.clone()
+            });
+            let rewritten = rewrite_messages_body(body, ClientType::ClaudeCode);
+
+            assert_eq!(rewritten["safeguards"], safeguards);
+
+            for (model_id, expected_beta) in [
+                (
+                    "claude-opus-5-5",
+                    OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280,
+                ),
+                (
+                    "claude-opus-4-8",
+                    OPUS_4_8_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280,
+                ),
+            ] {
+                let headers = rewriter.rewrite_headers(
+                    &incoming,
+                    "/v1/messages",
+                    &account,
+                    ClientType::ClaudeCode,
+                    model_id,
+                    &json!({"safeguards": safeguards}),
+                );
+
+                assert_eq!(headers["anthropic-beta"], expected_beta);
+                assert!(!headers["anthropic-beta"].contains("client-extra-2099-01-01"));
+            }
+        }
+    }
+
+    #[test]
+    fn sonnet_4_5_uses_observed_message_threads_beta_without_safeguards() {
+        let account = test_account();
+        let rewriter = Rewriter::new();
+        let ordinary_headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-sonnet-4-5",
+            &json!({}),
+        );
+
+        assert_eq!(
+            ordinary_headers["anthropic-beta"],
+            SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280
+        );
+        assert!(ordinary_headers["anthropic-beta"].ends_with("message-threads-2026-08-12"));
+        assert!(!ordinary_headers["anthropic-beta"].contains("dangerous-tool-use-2026-09-03"));
+
+        let safeguard_headers = rewriter.rewrite_headers(
+            &std::collections::HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-sonnet-4-5",
+            &json!({"safeguards": [{"type": "dangerous_tool_use"}]}),
+        );
+        assert_eq!(safeguard_headers, ordinary_headers);
+    }
+
+    #[test]
     fn sonnet5_context_1m_beta_keeps_claude_code_order_when_allowed_by_default() {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -12226,6 +12400,44 @@ mod tests {
         assert_eq!(
             compute_cc_version_suffix(&extract_first_user_message(&body), "2.1.260"),
             "e3f"
+        );
+    }
+
+    #[test]
+    fn cc_version_thread_followup_preserves_existing_session_suffix() {
+        let initial = json!({
+            "thread": {"type": "request"},
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "初始请求文本"}]
+            }]
+        });
+        let followup = json!({
+            "thread": {"type": "request", "previous_message_id": "msg_previous"},
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.280.a7c; cc_entrypoint=cli; cch=00000;"
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_previous", "content": "ok"},
+                    {"type": "text", "text": "续轮重新带入的文本"}
+                ]
+            }]
+        });
+
+        assert_eq!(
+            super::cc_version_suffix_for_body(&initial, "2.1.280"),
+            compute_cc_version_suffix("初始请求文本", "2.1.280")
+        );
+        assert_eq!(
+            super::cc_version_suffix_for_body(&followup, "2.1.280"),
+            "a7c"
+        );
+        assert_eq!(
+            super::cc_version_suffix_for_body(&followup, "2.1.260"),
+            compute_cc_version_suffix("续轮重新带入的文本", "2.1.260")
         );
     }
 
