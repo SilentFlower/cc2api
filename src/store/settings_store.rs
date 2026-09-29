@@ -54,6 +54,8 @@ pub const DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE: &str = "passthroug
 pub const DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE: &str = "passthrough";
 /// Claude Code 后台状态分类请求默认真实转发,仅绕过会改变正文指纹的通用改写。
 pub const DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE: &str = "passthrough";
+/// Claude Code 后台状态分类请求允许本地模拟的默认模型列表。
+pub const DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS: &str = "claude-fable-5,claude-fable-5-1,claude-opus-5,claude-opus-5-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5";
 /// Claude Code 后台状态分类请求默认不补齐 billing/CCH 与身份块。
 pub const DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED: &str = "false";
 /// `thinking.type=disabled` 自动改写默认关闭,避免升级后改变请求体语义。

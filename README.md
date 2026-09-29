@@ -686,7 +686,8 @@ CCH attestation 重新计算之前完成。
 
 ### Claude Code 后台状态分类
 
-- `intercept_cli_bg_status_classifier_mode=passthrough|mock` 控制已确认的 Fable 5.1 `cli-bg` 事故画像是继续真实转发，还是在账号选择前返回本地状态 JSON；默认 `passthrough`。
+- `intercept_cli_bg_status_classifier_mode=passthrough|mock` 控制命中后台状态分类特征的 `cli-bg` 请求是继续真实转发，还是在账号选择前返回本地状态 JSON；默认 `passthrough`。
+- `intercept_cli_bg_status_classifier_models` 是逗号分隔的完整模型 ID 白名单，默认 `claude-fable-5,claude-fable-5-1,claude-opus-5,claude-opus-5-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5`；空列表不命中本地模拟。
 - `intercept_cli_bg_status_classifier_identity_injection_enabled=true|false` 是独立开关，默认 `false`，只在 `passthrough` 下作用于强特征命中的非 Haiku 状态分类请求。
 - 开启身份注入后，缺少 billing 的请求会按所选账号 Claude Code 版本画像生成 billing 与 CCH，缺少 identity 时补入官方身份块；最终 system 顺序为 billing、identity、classifier。
 - Haiku 请求、普通 `/v1/messages`、未知 system 结构和本地 mock 不进入该补齐分支。命中请求仍使用账号 OAuth、代理/TLS、RPM、并发与上游重试链路，并只记录脱敏摘要。

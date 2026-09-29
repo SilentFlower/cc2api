@@ -81,6 +81,7 @@ const bootstrapAdditionalModelOptions = ref('[{"model":"claude-fable-5-1[1m]","n
 
 type AutoModeClassifierMode = 'passthrough' | 'mock_allow' | 'mock_block' | 'error';
 type CliBgStatusClassifierMode = 'passthrough' | 'mock';
+const defaultCliBgStatusClassifierModels = 'claude-fable-5,claude-fable-5-1,claude-opus-5,claude-opus-5-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5';
 
 /** 代理 HTTP 客户端连接池复用开关 */
 const proxyClientPoolEnabled = ref(true);
@@ -99,6 +100,7 @@ const interceptWarmupHaikuProbeEnabled = ref(false);
 const interceptAutoModeClassifierStage1Mode = ref<AutoModeClassifierMode>('passthrough');
 const interceptAutoModeClassifierStage2Mode = ref<AutoModeClassifierMode>('passthrough');
 const interceptCliBgStatusClassifierMode = ref<CliBgStatusClassifierMode>('passthrough');
+const interceptCliBgStatusClassifierModels = ref(defaultCliBgStatusClassifierModels);
 const interceptCliBgStatusClassifierIdentityInjectionEnabled = ref(false);
 
 /** 预热历史记录 */
@@ -369,6 +371,16 @@ const isValidInterceptAssistantPrefillModels = computed(() => {
   });
 });
 
+/** 后台状态分类本地模拟模型列表是否合法 */
+const isValidInterceptCliBgStatusClassifierModels = computed(() => {
+  const raw = trimFormString(interceptCliBgStatusClassifierModels.value);
+  if (!raw) return true;
+  return raw.split(',').every((s) => {
+    const model = s.trim();
+    return !model || /^[A-Za-z0-9._:-]+$/.test(model);
+  });
+});
+
 /** 429 请求体日志字符上限是否合法 */
 const isValidLog429RequestBodyLimit = computed(() => {
   const raw = trimFormString(log429RequestBodyLimit.value);
@@ -494,6 +506,7 @@ async function loadSettings() {
     interceptAutoModeClassifierStage1Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage1_mode);
     interceptAutoModeClassifierStage2Mode.value = parseAutoModeClassifierMode(data.intercept_auto_mode_classifier_stage2_mode);
     interceptCliBgStatusClassifierMode.value = data.intercept_cli_bg_status_classifier_mode === 'mock' ? 'mock' : 'passthrough';
+    interceptCliBgStatusClassifierModels.value = data.intercept_cli_bg_status_classifier_models ?? defaultCliBgStatusClassifierModels;
     interceptCliBgStatusClassifierIdentityInjectionEnabled.value =
       (data.intercept_cli_bg_status_classifier_identity_injection_enabled ?? 'false') === 'true';
     loaded.value = true;
@@ -554,6 +567,10 @@ async function saveSettings() {
   }
   if (!isValidInterceptAssistantPrefillModels.value) {
     toast('assistant prefill 拦截模型列表包含非法字符');
+    return;
+  }
+  if (!isValidInterceptCliBgStatusClassifierModels.value) {
+    toast('后台状态分类模型列表包含非法字符');
     return;
   }
   if (!isValidLog429RequestBodyLimit.value) {
@@ -632,6 +649,7 @@ async function saveSettings() {
       intercept_auto_mode_classifier_stage1_mode: interceptAutoModeClassifierStage1Mode.value,
       intercept_auto_mode_classifier_stage2_mode: interceptAutoModeClassifierStage2Mode.value,
       intercept_cli_bg_status_classifier_mode: interceptCliBgStatusClassifierMode.value,
+      intercept_cli_bg_status_classifier_models: trimFormString(interceptCliBgStatusClassifierModels.value),
       intercept_cli_bg_status_classifier_identity_injection_enabled:
         interceptCliBgStatusClassifierIdentityInjectionEnabled.value ? 'true' : 'false',
     });
@@ -903,7 +921,7 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">Claude Code 后台状态分类</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              仅处理 Fable 5.1 的 cli-bg 状态请求。放行保留账号代理链路并绕过正文指纹改写；模拟在本地返回状态 JSON。
+              仅处理匹配完整状态分类特征且模型在下方列表中的 cli-bg 请求。放行保留账号代理链路；模拟在本地返回状态 JSON。
             </p>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -925,6 +943,15 @@ onMounted(async () => {
               />
               <span class="text-sm text-[#29261e]">本地模拟</span>
             </label>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">适用模型 (逗号分隔)</Label>
+            <Input
+              v-model="interceptCliBgStatusClassifierModels"
+              class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm"
+              :class="isValidInterceptCliBgStatusClassifierModels ? '' : 'border-red-400'"
+            />
+            <p class="text-[11px] text-[#b5b0a6]">按完整模型 ID 匹配；空列表表示不在本地模拟任何模型。</p>
           </div>
           <div class="space-y-1.5">
             <Label class="text-[#5c5647] text-sm">Claude Code 身份块</Label>

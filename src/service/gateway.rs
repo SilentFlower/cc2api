@@ -55,12 +55,14 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
-    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
-    DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
-    DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
-    DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
-    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS,
+    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
+    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
+    DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PASSTHROUGH_OS_VERSION,
+    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
     DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
@@ -295,10 +297,11 @@ impl CliBgStatusClassifierMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CliBgStatusClassifierConfig {
     mode: CliBgStatusClassifierMode,
     identity_injection_enabled: bool,
+    models: Vec<String>,
 }
 
 impl AutoModeClassifierMode {
@@ -867,7 +870,7 @@ impl GatewayService {
 
     /// 从全局设置刷新 Claude Code 后台状态分类请求处理配置。
     ///
-    /// 处理模式与身份注入开关以同一快照写入内存,命中请求时不查询数据库。
+    /// 处理模式、身份注入开关和模型列表以同一快照写入内存,命中请求时不查询数据库。
     ///
     /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析模式失败时返回业务错误。
     pub async fn reload_cli_bg_status_classifier_config(&self) -> Result<(), AppError> {
@@ -885,9 +888,17 @@ impl GatewayService {
                 DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
             )
             .await?;
+        let models = self
+            .settings_store
+            .get_value(
+                "intercept_cli_bg_status_classifier_models",
+                DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS,
+            )
+            .await?;
         *self.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
             mode: CliBgStatusClassifierMode::parse(&mode)?,
             identity_injection_enabled: parse_setting_flag(&identity_injection_enabled),
+            models: parse_system_role_model_list(&models),
         };
         Ok(())
     }
@@ -1161,6 +1172,18 @@ impl GatewayService {
     #[cfg(test)]
     pub(crate) async fn cli_bg_status_classifier_mode_for_test(&self) -> CliBgStatusClassifierMode {
         self.cli_bg_status_classifier_config.read().await.mode
+    }
+
+    /// 返回测试使用的后台状态分类模型列表。
+    ///
+    /// @return 当前热加载的完整模型 ID 列表。
+    #[cfg(test)]
+    pub(crate) async fn cli_bg_status_classifier_models_for_test(&self) -> Vec<String> {
+        self.cli_bg_status_classifier_config
+            .read()
+            .await
+            .models
+            .clone()
     }
 
     /// 返回测试使用的后台状态分类身份注入开关。
@@ -1574,24 +1597,33 @@ impl GatewayService {
         // 检测客户端类型
         let client_type = detect_client_type(&ua, &path, &body_map);
 
-        let is_narrow_cli_bg_status_classifier =
-            is_cli_bg_status_classifier_request(&path, &headers, &body_map, client_type);
+        let (
+            is_narrow_cli_bg_status_classifier,
+            cli_bg_status_classifier_mode_setting,
+            identity_injection_enabled,
+        ) = {
+            let config = self.cli_bg_status_classifier_config.read().await;
+            (
+                is_cli_bg_status_classifier_request(
+                    &path,
+                    &headers,
+                    &body_map,
+                    client_type,
+                    &config.models,
+                ),
+                config.mode,
+                config.identity_injection_enabled,
+            )
+        };
         let generic_cli_status_classifier =
             detect_claude_code_status_classifier_request(&path, &headers, &body_map, client_type);
-        let is_cli_status_classifier =
-            is_narrow_cli_bg_status_classifier || generic_cli_status_classifier.is_some();
-        let cli_bg_status_classifier_config = if is_cli_status_classifier {
-            *self.cli_bg_status_classifier_config.read().await
-        } else {
-            default_cli_bg_status_classifier_config()
-        };
         let cli_bg_status_classifier_mode =
-            is_narrow_cli_bg_status_classifier.then_some(cli_bg_status_classifier_config.mode);
+            is_narrow_cli_bg_status_classifier.then_some(cli_bg_status_classifier_mode_setting);
         let complete_cli_status_classifier_attribution = matches!(
             generic_cli_status_classifier,
             Some(matched)
-                if cli_bg_status_classifier_config.mode == CliBgStatusClassifierMode::Passthrough
-                    && cli_bg_status_classifier_config.identity_injection_enabled
+                if cli_bg_status_classifier_mode_setting == CliBgStatusClassifierMode::Passthrough
+                    && identity_injection_enabled
                     && !matched.is_haiku
         );
         let cli_status_classifier_summary_only = complete_cli_status_classifier_attribution
@@ -4357,12 +4389,19 @@ fn is_cli_bg_status_classifier_request(
     headers: &std::collections::HashMap<String, String>,
     body: &serde_json::Value,
     client_type: ClientType,
+    models: &[String],
 ) -> bool {
     if path != "/v1/messages"
         || client_type != ClientType::ClaudeCode
         || request_header_value(headers, "x-app") != Some("cli-bg")
-        || body.get("model").and_then(|model| model.as_str()) != Some("claude-fable-5-1")
-        || body.get("stream").and_then(|stream| stream.as_bool()) != Some(false)
+        || !body
+            .get("model")
+            .and_then(|model| model.as_str())
+            .is_some_and(|model| models.iter().any(|allowed| allowed == model))
+        || !matches!(
+            body.get("stream"),
+            None | Some(serde_json::Value::Bool(false))
+        )
         || body.get("max_tokens").and_then(|tokens| tokens.as_u64()) != Some(3072)
     {
         return false;
@@ -5707,6 +5746,7 @@ fn default_cli_bg_status_classifier_config() -> CliBgStatusClassifierConfig {
         identity_injection_enabled: parse_setting_flag(
             DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
         ),
+        models: parse_system_role_model_list(DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS),
     }
 }
 
@@ -7051,10 +7091,10 @@ mod tests {
         buffered_response_body_for_downstream, build_message_telemetry_context,
         build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
         classify_cli_bg_status, classify_non_stream_probe_text, cli_bg_status_json,
-        default_fable_weekly_usage_limit_percent, detect_auto_mode_classifier_request,
-        detect_claude_code_status_classifier_request, detect_non_stream_probe_type,
-        detect_warmup_intercept, extract_message_session_id, extract_passive_usage,
-        extract_rejected_passive_usage_windows, extract_upstream_request_id,
+        default_cli_bg_status_classifier_config, default_fable_weekly_usage_limit_percent,
+        detect_auto_mode_classifier_request, detect_claude_code_status_classifier_request,
+        detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
+        extract_passive_usage, extract_rejected_passive_usage_windows, extract_upstream_request_id,
         flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
         has_system_role_message, is_cacheable_non_stream_probe_response,
         is_cli_bg_status_classifier_request, is_signature_related_error_body,
@@ -10835,12 +10875,14 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
     fn cli_bg_status_classifier_detector_matches_only_strong_shape() {
         let headers = cli_bg_status_classifier_headers();
         let body = cli_bg_status_classifier_body("working (for 21m)", "文档组还在跑");
+        let models = default_cli_bg_status_classifier_config().models;
 
         assert!(is_cli_bg_status_classifier_request(
             "/v1/messages",
             &headers,
             &body,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut wrong_headers = headers.clone();
@@ -10849,31 +10891,54 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &wrong_headers,
             &body,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
         assert!(!is_cli_bg_status_classifier_request(
             "/v1/messages/count_tokens",
             &headers,
             &body,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
         assert!(!is_cli_bg_status_classifier_request(
             "/v1/messages",
             &headers,
             &body,
-            ClientType::API
+            ClientType::API,
+            &models
         ));
 
-        for model in ["claude-fable-5", "claude-fable-5-1[1m]"] {
+        for model in &models {
+            let mut changed = body.clone();
+            changed["model"] = json!(model);
+            assert!(is_cli_bg_status_classifier_request(
+                "/v1/messages",
+                &headers,
+                &changed,
+                ClientType::ClaudeCode,
+                &models
+            ));
+        }
+
+        for model in ["claude-sonnet-4-6", "claude-fable-5-1[1m]"] {
             let mut changed = body.clone();
             changed["model"] = json!(model);
             assert!(!is_cli_bg_status_classifier_request(
                 "/v1/messages",
                 &headers,
                 &changed,
-                ClientType::ClaudeCode
+                ClientType::ClaudeCode,
+                &models
             ));
         }
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &body,
+            ClientType::ClaudeCode,
+            &[]
+        ));
 
         let mut streaming = body.clone();
         streaming["stream"] = json!(true);
@@ -10881,7 +10946,25 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &streaming,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
+        ));
+        let mut non_stream = body.clone();
+        non_stream.as_object_mut().unwrap().remove("stream");
+        assert!(is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &non_stream,
+            ClientType::ClaudeCode,
+            &models
+        ));
+        non_stream["stream"] = serde_json::Value::Null;
+        assert!(!is_cli_bg_status_classifier_request(
+            "/v1/messages",
+            &headers,
+            &non_stream,
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut wrong_tokens = body.clone();
@@ -10890,7 +10973,8 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &wrong_tokens,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut missing_system_marker = body.clone();
@@ -10899,7 +10983,8 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &missing_system_marker,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut missing_user_marker = body.clone();
@@ -10908,7 +10993,8 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &missing_user_marker,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut multiple_system_blocks = body.clone();
@@ -10920,7 +11006,8 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &multiple_system_blocks,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut multiple_messages = body.clone();
@@ -10932,7 +11019,8 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &multiple_messages,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         let mut multiple_user_blocks = body.clone();
@@ -10944,14 +11032,16 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             "/v1/messages",
             &headers,
             &multiple_user_blocks,
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
 
         assert!(!is_cli_bg_status_classifier_request(
             "/v1/messages",
             &headers,
             &classifier_body(256, "<block> immediately"),
-            ClientType::ClaudeCode
+            ClientType::ClaudeCode,
+            &models
         ));
     }
 
@@ -11229,6 +11319,7 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
             mode: CliBgStatusClassifierMode::Mock,
             identity_injection_enabled: true,
+            ..default_cli_bg_status_classifier_config()
         };
 
         let response = service
@@ -11251,6 +11342,44 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         assert_eq!(status["tempo"], "blocked");
         assert!(status.get("needs").is_some());
         assert!(status["output"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cli_bg_status_classifier_mock_accepts_configured_opus_without_account() {
+        let service = test_gateway_service().await;
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Mock,
+            models: vec!["claude-opus-5-5".into()],
+            ..default_cli_bg_status_classifier_config()
+        };
+        let mut body = cli_bg_status_classifier_body("working", "Now let me check the logs.");
+        body["model"] = json!("claude-opus-5-5");
+        body.as_object_mut().unwrap().remove("stream");
+        body["system"][0]["cache_control"]["ttl"] = json!("1h");
+        let user_text = body["messages"][0]["content"].as_str().unwrap().to_string();
+        body["messages"][0]["content"] = json!([{
+            "type": "text",
+            "text": user_text,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        }]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("user-agent", "claude-cli/2.1.280 (external, cli)")
+            .header("x-app", "cli-bg")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = service.handle_request(request, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(envelope["id"], "msg_mock_cli_bg_status_classifier");
+        assert_eq!(envelope["model"], "claude-opus-5-5");
     }
 
     #[tokio::test]
@@ -11348,6 +11477,7 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
             mode: CliBgStatusClassifierMode::Passthrough,
             identity_injection_enabled: true,
+            ..default_cli_bg_status_classifier_config()
         };
         let mut account = create_gateway_account(&service, "cli-bg-prefix@example.com", 1, 0).await;
         account.proxy_url = proxy_url;
@@ -11407,6 +11537,7 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
             mode: CliBgStatusClassifierMode::Passthrough,
             identity_injection_enabled: false,
+            ..default_cli_bg_status_classifier_config()
         };
         let mut account = create_gateway_account(&service, "cli-bg-haiku@example.com", 1, 0).await;
         account.proxy_url = proxy_url;
@@ -11442,6 +11573,7 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
             mode: CliBgStatusClassifierMode::Passthrough,
             identity_injection_enabled: true,
+            ..default_cli_bg_status_classifier_config()
         };
         let enabled_response = service
             .handle_request(cli_status_classifier_request(request_body, "cli"), None)
@@ -11479,6 +11611,7 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
             mode: CliBgStatusClassifierMode::Passthrough,
             identity_injection_enabled: true,
+            ..default_cli_bg_status_classifier_config()
         };
         let mut account =
             create_gateway_account(&service, "cli-bg-existing-identity@example.com", 1, 0).await;

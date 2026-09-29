@@ -309,6 +309,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
         ),
         (
+            "intercept_cli_bg_status_classifier_models",
+            crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS,
+        ),
+        (
             "intercept_cli_bg_status_classifier_identity_injection_enabled",
             crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
         ),
@@ -1311,6 +1315,15 @@ mod tests {
             mode,
             crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE
         );
+        let models: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_cli_bg_status_classifier_models")
+            .fetch_one(&pool)
+            .await
+            .expect("cli-bg status classifier model list");
+        assert_eq!(
+            models,
+            crate::store::settings_store::DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS
+        );
 
         sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
             .bind("mock")
@@ -1318,6 +1331,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("update cli-bg status classifier setting");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("claude-opus-5-5")
+            .bind("intercept_cli_bg_status_classifier_models")
+            .execute(&pool)
+            .await
+            .expect("update cli-bg status classifier model list");
         migrate(&pool, "sqlite").await.expect("second migrate");
 
         let retained: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
@@ -1326,6 +1345,12 @@ mod tests {
             .await
             .expect("retained cli-bg status classifier setting");
         assert_eq!(retained, "mock");
+        let retained_models: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("intercept_cli_bg_status_classifier_models")
+            .fetch_one(&pool)
+            .await
+            .expect("retained cli-bg status classifier model list");
+        assert_eq!(retained_models, "claude-opus-5-5");
     }
 
     #[tokio::test]

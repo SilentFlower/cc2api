@@ -45,17 +45,19 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
     DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED,
-    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE, DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED,
-    DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED, DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED,
-    DEFAULT_LOG_429_REQUEST_BODY_LIMIT, DEFAULT_LOG_429_REQUEST_ENABLED,
-    DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED, DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
-    DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
-    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, DEFAULT_SESSION_HELLO_PROBE_ENABLED,
-    DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS, DEFAULT_SESSION_HELLO_PROBE_STRICT,
-    DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS, DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
-    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
-    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE,
+    DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS,
+    DEFAULT_INTERCEPT_WARMUP_HAIKU_PROBE_ENABLED, DEFAULT_INTERCEPT_WARMUP_SUGGESTION_ENABLED,
+    DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
+    DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
+    DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
+    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
+    DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
+    DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
+    DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
+    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
+    SettingsStore,
 };
 use crate::store::token_store::TokenStore;
 
@@ -958,6 +960,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
         .entry("intercept_cli_bg_status_classifier_mode".into())
         .or_insert_with(|| DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODE.to_string());
     settings
+        .entry("intercept_cli_bg_status_classifier_models".into())
+        .or_insert_with(|| DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS.to_string());
+    settings
         .entry("intercept_cli_bg_status_classifier_identity_injection_enabled".into())
         .or_insert_with(|| {
             DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_IDENTITY_INJECTION_ENABLED.to_string()
@@ -1182,6 +1187,9 @@ async fn update_settings(
     if let Some(val) = body.get("intercept_assistant_prefill_models") {
         validate_model_id_list("intercept_assistant_prefill_models", val)?;
     }
+    if let Some(val) = body.get("intercept_cli_bg_status_classifier_models") {
+        validate_model_id_list("intercept_cli_bg_status_classifier_models", val)?;
+    }
     if let Some(val) = body.get("log_429_request_body_limit") {
         validate_usize_range("log_429_request_body_limit", val, 0, 1_048_576)?;
     }
@@ -1283,6 +1291,7 @@ async fn update_settings(
         state.gateway_svc.reload_warmup_intercept_config().await?;
     }
     if body.contains_key("intercept_cli_bg_status_classifier_mode")
+        || body.contains_key("intercept_cli_bg_status_classifier_models")
         || body.contains_key("intercept_cli_bg_status_classifier_identity_injection_enabled")
     {
         state
@@ -1394,8 +1403,9 @@ async fn get_prime_logs(
 mod tests {
     use super::{
         ClaudeCodeContextSanitizerMode, CliBgStatusClassifierMode,
-        MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS, MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, build_router,
-        hello_get, hello_head, normalize_oauth_credential_validity_seconds, validate_model_id_list,
+        DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS, MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS,
+        MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, build_router, hello_get, hello_head,
+        normalize_oauth_credential_validity_seconds, validate_model_id_list,
     };
     use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
     use crate::service::account::AccountService;
@@ -1632,6 +1642,10 @@ mod tests {
             "passthrough"
         );
         assert_eq!(
+            value["intercept_cli_bg_status_classifier_models"],
+            DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS
+        );
+        assert_eq!(
             value["intercept_cli_bg_status_classifier_identity_injection_enabled"],
             "false"
         );
@@ -1660,6 +1674,29 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "value={value}");
         }
+    }
+
+    #[tokio::test]
+    async fn settings_reject_invalid_cli_bg_status_classifier_models() {
+        let response = test_router()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/admin/settings")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "intercept_cli_bg_status_classifier_models": "claude-opus-5-5,bad/model"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1700,6 +1737,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "intercept_cli_bg_status_classifier_mode": "mock",
+                            "intercept_cli_bg_status_classifier_models": "claude-opus-5-5",
                             "intercept_cli_bg_status_classifier_identity_injection_enabled": "true"
                         })
                         .to_string(),
@@ -1713,6 +1751,10 @@ mod tests {
         assert_eq!(
             gateway_svc.cli_bg_status_classifier_mode_for_test().await,
             CliBgStatusClassifierMode::Mock
+        );
+        assert_eq!(
+            gateway_svc.cli_bg_status_classifier_models_for_test().await,
+            ["claude-opus-5-5"]
         );
         assert!(
             gateway_svc
