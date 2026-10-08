@@ -117,13 +117,9 @@ async fn main() {
         .await
         .expect("load system role models failed");
     gateway_svc
-        .reload_access_policy()
+        .reload_access_profile_config()
         .await
-        .expect("load access policy failed");
-    gateway_svc
-        .reload_profile_selection_config()
-        .await
-        .expect("load profile selection config failed");
+        .expect("load access/profile config failed");
     gateway_svc
         .reload_env_passthrough()
         .await

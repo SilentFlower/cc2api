@@ -1,19 +1,7 @@
-use sqlx::AnyPool;
+use crate::service::version_profile::ClaudeCodeProfile;
+use sqlx::{AnyConnection, AnyPool};
 use std::path::Path;
 
-const PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS: &[&str] = &[
-    "2.1.89-2.1.156",
-    "2.1.89-2.1.169",
-    "2.1.89-2.1.172",
-    "2.1.89-2.1.173",
-    "2.1.89-2.1.185",
-    "2.1.89-2.1.187",
-    "2.1.89-2.1.195",
-    "2.1.89-2.1.197",
-    "2.1.89-2.1.220",
-    "2.1.89-2.1.257",
-    "2.1.89-2.1.260",
-];
 const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
     ("2.1.187", "2.1.89-2.1.187"),
     ("2.1.195", "2.1.89-2.1.195"),
@@ -21,6 +9,7 @@ const PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS: &[(&str, &str)] = &[
     ("2.1.220", "2.1.89-2.1.220"),
     ("2.1.257", "2.1.89-2.1.257"),
     ("2.1.260", "2.1.89-2.1.260"),
+    ("2.1.280", "2.1.89-2.1.280"),
 ];
 const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str = "claude-opus-4-8";
 const PREVIOUS_DEFAULT_ALLOW_SYSTEM_ROLE_MODELS_2_1_260: &str =
@@ -411,15 +400,12 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             .await
             .ok();
     }
-    upgrade_default_profile_setting(pool).await?;
-    let claude_code_profile = selected_claude_code_profile(pool).await?;
-    upgrade_default_settings(pool, claude_code_profile).await?;
+    upgrade_default_profile_setting(pool, driver).await?;
     upgrade_default_model_settings(pool).await?;
     upgrade_system_role_models_for_fable_5_1(pool).await?;
     upgrade_default_bootstrap_model_options(pool).await?;
     upgrade_default_allow_1m_models(pool).await?;
     remove_obsolete_settings(pool).await?;
-    upgrade_account_claude_code_profile(pool, driver, claude_code_profile).await?;
 
     // prime_logs 表（峰值预热调用日志）
     let prime_logs_schema = if driver == "sqlite" {
@@ -439,34 +425,16 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
 }
 
 async fn selected_claude_code_profile(
-    pool: &AnyPool,
-) -> Result<&'static crate::service::version_profile::ClaudeCodeProfile, sqlx::Error> {
+    connection: &mut AnyConnection,
+) -> Result<&'static ClaudeCodeProfile, sqlx::Error> {
     let configured: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
         .bind("claude_code_version_profile")
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await?;
     Ok(configured
         .as_deref()
         .and_then(|key| crate::service::version_profile::profile_for_key(key).ok())
         .unwrap_or_else(crate::service::version_profile::default_profile))
-}
-
-async fn upgrade_default_settings(
-    pool: &AnyPool,
-    profile: &crate::service::version_profile::ClaudeCodeProfile,
-) -> Result<(), sqlx::Error> {
-    if profile.key != crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING {
-        return Ok(());
-    }
-    for previous in PREVIOUS_ALLOWED_CLAUDE_CODE_VERSIONS_SETTINGS {
-        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
-            .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
-            .bind("allowed_claude_code_versions")
-            .bind(previous)
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
 }
 
 async fn upgrade_default_allow_1m_models(pool: &AnyPool) -> Result<(), sqlx::Error> {
@@ -495,9 +463,11 @@ async fn upgrade_default_allow_1m_models(pool: &AnyPool) -> Result<(), sqlx::Err
     Ok(())
 }
 
-async fn upgrade_default_profile_setting(pool: &AnyPool) -> Result<(), sqlx::Error> {
+// 只有精确旧出厂 profile/range 配对会升级，管理员自定义禁止列表和 UA 不参与改写。
+async fn upgrade_default_profile_setting(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     for (previous_profile, previous_allowed) in PREVIOUS_DEFAULT_CLAUDE_CODE_PROFILE_SETTINGS {
-        sqlx::query(
+        let changed = sqlx::query(
             r#"
             UPDATE settings
             SET value=$1
@@ -509,6 +479,12 @@ async fn upgrade_default_profile_setting(pool: &AnyPool) -> Result<(), sqlx::Err
                   WHERE allowed_versions.key=$4
                     AND allowed_versions.value=$5
               )
+              AND EXISTS (
+                  SELECT 1
+                  FROM settings selection_mode
+                  WHERE selection_mode.key=$6
+                    AND selection_mode.value=$7
+              )
             "#,
         )
         .bind(crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING)
@@ -516,10 +492,22 @@ async fn upgrade_default_profile_setting(pool: &AnyPool) -> Result<(), sqlx::Err
         .bind(previous_profile)
         .bind("allowed_claude_code_versions")
         .bind(previous_allowed)
-        .execute(pool)
+        .bind("claude_code_profile_selection_mode")
+        .bind("client_version")
+        .execute(&mut *tx)
         .await?;
+        if changed.rows_affected() > 0 {
+            sqlx::query("UPDATE settings SET value=$1 WHERE key=$2 AND value=$3")
+                .bind(crate::store::settings_store::DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING)
+                .bind("allowed_claude_code_versions")
+                .bind(previous_allowed)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
-    Ok(())
+    let profile = selected_claude_code_profile(&mut tx).await?;
+    upgrade_account_claude_code_profile(&mut tx, driver, profile).await?;
+    tx.commit().await
 }
 
 async fn upgrade_default_model_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
@@ -620,9 +608,9 @@ async fn remove_obsolete_settings(pool: &AnyPool) -> Result<(), sqlx::Error> {
 }
 
 async fn upgrade_account_claude_code_profile(
-    pool: &AnyPool,
+    connection: &mut AnyConnection,
     driver: &str,
-    profile: &crate::service::version_profile::ClaudeCodeProfile,
+    profile: &ClaudeCodeProfile,
 ) -> Result<(), sqlx::Error> {
     let identity = &profile.identity;
     let sql = if driver == "sqlite" {
@@ -659,7 +647,7 @@ async fn upgrade_account_claude_code_profile(
         .bind(identity.version_base)
         .bind(identity.build_time)
         .bind(identity.stainless_runtime_version)
-        .execute(pool)
+        .execute(connection)
         .await?;
     Ok(())
 }

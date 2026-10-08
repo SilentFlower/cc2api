@@ -8,7 +8,7 @@ use crate::service::access_policy::{
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
 };
 use crate::service::version_profile::{
-    ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE,
+    ClaudeCodeProfile, ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE,
     DEFAULT_CLAUDE_CODE_VERSION_PROFILE,
 };
 
@@ -159,20 +159,12 @@ impl SettingsStore {
             .unwrap_or_else(|| default_value.to_string()))
     }
 
-    /// 批量更新设置项（upsert）。
+    /// 以同一事务批量更新设置。
+    ///
+    /// @param items 已验证的设置字符串。
+    /// @return 全部提交成功返回 Ok，失败时整体回滚。
     pub async fn upsert_many(&self, items: &HashMap<String, String>) -> Result<(), AppError> {
-        for (key, value) in items {
-            sqlx::query(
-                "INSERT INTO settings (key, value) VALUES ($1, $2) \
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            )
-            .bind(key)
-            .bind(value)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("upsert setting '{}': {}", key, e)))?;
-        }
-        Ok(())
+        self.upsert_many_with_profile(items, None).await
     }
 
     /// 以事务方式应用 Claude Code 版本画像设置。
@@ -187,9 +179,39 @@ impl SettingsStore {
         &self,
         profile: &'static ClaudeCodeProfile,
     ) -> Result<(), AppError> {
-        let identity = &profile.identity;
-        let account_sql = if self.driver == "postgres" {
-            r#"
+        let items = HashMap::from([
+            ("claude_code_version_profile".into(), profile.key.into()),
+            (
+                "allowed_claude_code_versions".into(),
+                profile.access_policy.allowed_claude_code_versions.into(),
+            ),
+        ]);
+        self.upsert_many_with_profile(&items, Some(profile)).await
+    }
+
+    /// 原子保存设置和管理员主动选择画像时的账号软件环境。
+    ///
+    /// 客户端模式保存显式准入范围；账号模式沿用目标画像范围。仅同步四项软件身份，
+    /// 设备、凭据、容量及未知环境字段均保留，任一设置写入失败会回滚整个事务。
+    ///
+    /// @param items 本次已验证的设置值。
+    /// @param profile 管理员主动选择的画像；None 表示仅保存设置。
+    /// @return 提交成功返回 Ok，失败返回业务错误。
+    pub async fn upsert_many_with_profile(
+        &self,
+        items: &HashMap<String, String>,
+        profile: Option<&'static ClaudeCodeProfile>,
+    ) -> Result<(), AppError> {
+        let mut items = items.clone();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(format!("begin settings transaction: {}", e)))?;
+        if let Some(profile) = profile {
+            let identity = &profile.identity;
+            let account_sql = if self.driver == "postgres" {
+                r#"
             UPDATE accounts
             SET canonical_env = jsonb_set(
                     jsonb_set(
@@ -203,8 +225,8 @@ impl SettingsStore {
                 ),
                 updated_at=NOW()
             "#
-        } else {
-            r#"
+            } else {
+                r#"
             UPDATE accounts
             SET canonical_env = json_set(
                 CASE
@@ -218,45 +240,45 @@ impl SettingsStore {
             ),
             updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
             "#
-        };
+            };
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Internal(format!("begin profile transaction: {}", e)))?;
-        sqlx::query(account_sql)
-            .bind(identity.version)
-            .bind(identity.version_base)
-            .bind(identity.build_time)
-            .bind(identity.stainless_runtime_version)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("update account profile: {}", e)))?;
-
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) \
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        )
-        .bind("claude_code_version_profile")
-        .bind(profile.key)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(format!("upsert profile setting: {}", e)))?;
-
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) \
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        )
-        .bind("allowed_claude_code_versions")
-        .bind(profile.access_policy.allowed_claude_code_versions)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(format!("upsert allowed versions setting: {}", e)))?;
-
+            sqlx::query(account_sql)
+                .bind(identity.version)
+                .bind(identity.version_base)
+                .bind(identity.build_time)
+                .bind(identity.stainless_runtime_version)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Internal(format!("update account profile: {}", e)))?;
+            let mode = match items.get("claude_code_profile_selection_mode") {
+                Some(value) => value.clone(),
+                None => sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key=$1")
+                    .bind("claude_code_profile_selection_mode")
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("query selection mode: {}", e)))?
+                    .unwrap_or_else(|| DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING.into()),
+            };
+            if ClaudeCodeProfileSelectionMode::parse(&mode)
+                .unwrap_or(ClaudeCodeProfileSelectionMode::ClientVersion)
+                == ClaudeCodeProfileSelectionMode::Account
+            {
+                items.insert(
+                    "allowed_claude_code_versions".into(),
+                    profile.access_policy.allowed_claude_code_versions.into(),
+                );
+            }
+            // 客户端模式只切换回退画像时保留存量准入，不把 293 范围缩回 280。
+            items.insert("claude_code_version_profile".into(), profile.key.into());
+        }
+        for (key, value) in &items {
+            sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value=excluded.value")
+                .bind(key).bind(value).execute(&mut *tx).await
+                .map_err(|e| AppError::Internal(format!("upsert setting '{}': {}", key, e)))?;
+        }
         tx.commit()
             .await
-            .map_err(|e| AppError::Internal(format!("commit profile transaction: {}", e)))
+            .map_err(|e| AppError::Internal(format!("commit settings transaction: {}", e)))
     }
 }
 

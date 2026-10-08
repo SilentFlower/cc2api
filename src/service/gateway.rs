@@ -33,8 +33,9 @@ use crate::service::rewriter::{
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
     StatefulCacheUsage, UpstreamSessionRewrite, collect_telemetry_session_ids, detect_client_type,
     filter_account_beta_tokens, is_claude_code_billing_system_block,
-    is_claude_code_identity_system_block, is_structured_haiku_title_request, merge_anthropic_beta,
-    order_context_1m_after_oauth, ordered_anthropic_headers, strip_empty_text_blocks,
+    is_claude_code_identity_system_block, is_structured_haiku_title_request_for_profile,
+    merge_anthropic_beta, order_context_1m_after_oauth, ordered_anthropic_headers,
+    strip_empty_text_blocks,
 };
 use crate::service::session_hello_probe::{
     SessionHelloProbeConfig, SessionHelloProbeDecision, SessionHelloProbeService,
@@ -468,6 +469,12 @@ impl WarmupInterceptType {
     }
 }
 
+/// 同一次配置快照中包含准入与画像选择，禁止热刷新拆分两者。
+struct AccessProfileConfig {
+    policy: AccessPolicy,
+    selection: ClaudeCodeProfileSelectionConfig,
+}
+
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
@@ -475,8 +482,7 @@ pub struct GatewayService {
     settings_store: Arc<SettingsStore>,
     upstream_base: String,
     system_role_models: RwLock<Vec<String>>,
-    access_policy: RwLock<AccessPolicy>,
-    profile_selection_config: RwLock<ClaudeCodeProfileSelectionConfig>,
+    access_profile_config: RwLock<AccessProfileConfig>,
     env_passthrough: RwLock<EnvPassthrough>,
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
@@ -522,15 +528,15 @@ impl GatewayService {
             system_role_models: RwLock::new(parse_system_role_model_list(
                 DEFAULT_ALLOW_SYSTEM_ROLE_MODELS,
             )),
-            access_policy: RwLock::new(
-                AccessPolicy::parse(
+            access_profile_config: RwLock::new(AccessProfileConfig {
+                policy: AccessPolicy::parse(
                     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
                     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
                     DEFAULT_ALLOWED_USER_AGENTS,
                 )
                 .expect("默认访问策略必须合法"),
-            ),
-            profile_selection_config: RwLock::new(ClaudeCodeProfileSelectionConfig::default()),
+                selection: ClaudeCodeProfileSelectionConfig::default(),
+            }),
             env_passthrough: RwLock::new(default_env_passthrough()),
             cache_control_ttl_rewrite: RwLock::new(default_cache_control_ttl_rewrite()),
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
@@ -1203,65 +1209,64 @@ impl GatewayService {
             .identity_injection_enabled
     }
 
-    /// 刷新画像选择方式和未匹配 UA 使用的默认画像。
+    /// 原子刷新准入和画像选择，不影响已冻结的进行中请求。
     ///
-    /// @return 更新成功返回 `Ok(())`；存储失败返回业务错误，非法存量值使用明确默认值。
-    pub async fn reload_profile_selection_config(&self) -> Result<(), AppError> {
+    /// @return 读取及解析成功返回 Ok，失败时保留原快照。
+    pub async fn reload_access_profile_config(&self) -> Result<(), AppError> {
+        // 写锁同时串行化读取和替换，避免并发管理保存的较旧读取覆盖较新快照。
+        let mut snapshot = self.access_profile_config.write().await;
         let settings = self.settings_store.get_all().await?;
-        let mode = ClaudeCodeProfileSelectionMode::parse(
-            settings
-                .get("claude_code_profile_selection_mode")
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING),
-        )
+        let value = |key, fallback| settings.get(key).map(String::as_str).unwrap_or(fallback);
+        let policy = AccessPolicy::parse(
+            value(
+                "allowed_claude_code_versions",
+                DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
+            ),
+            value(
+                "blocked_claude_code_versions",
+                DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
+            ),
+            value("allowed_user_agents", DEFAULT_ALLOWED_USER_AGENTS),
+        )?;
+        let mode = ClaudeCodeProfileSelectionMode::parse(value(
+            "claude_code_profile_selection_mode",
+            DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING,
+        ))
         .unwrap_or(ClaudeCodeProfileSelectionMode::ClientVersion);
-        let default_profile = profile_for_key(
-            settings
-                .get("claude_code_version_profile")
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING),
-        )
+        let default_profile = profile_for_key(value(
+            "claude_code_version_profile",
+            DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
+        ))
         .unwrap_or_else(|_| default_profile());
-        // 同一把锁更新两个字段，入口只获取一次快照，热刷新不会改变进行中的请求。
-        *self.profile_selection_config.write().await = ClaudeCodeProfileSelectionConfig {
-            mode,
-            default_profile,
+        *snapshot = AccessProfileConfig {
+            policy,
+            selection: ClaudeCodeProfileSelectionConfig {
+                mode,
+                default_profile,
+            },
         };
         Ok(())
     }
 
-    /// 获取网关当前生效的画像选择配置快照，供管理页面展示。
+    /// 沿用现有画像配置刷新入口，整组刷新准入和选择。
     ///
-    /// @return 当前选择方式及默认画像。
-    pub async fn profile_selection_config(&self) -> ClaudeCodeProfileSelectionConfig {
-        *self.profile_selection_config.read().await
+    /// @return 刷新结果。
+    pub async fn reload_profile_selection_config(&self) -> Result<(), AppError> {
+        self.reload_access_profile_config().await
     }
 
-    /// 从全局设置刷新客户端访问策略。
+    /// 获取管理页显示的当前画像选择快照。
     ///
-    /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析配置失败时返回业务错误。
+    /// @return 当前选择方式与默认画像。
+    pub async fn profile_selection_config(&self) -> ClaudeCodeProfileSelectionConfig {
+        self.access_profile_config.read().await.selection
+    }
+
+    /// 沿用现有准入刷新入口，整组刷新准入和选择。
+    ///
+    /// @return 刷新结果。
     pub async fn reload_access_policy(&self) -> Result<(), AppError> {
-        let raw_versions = self
-            .settings_store
-            .get_value(
-                "allowed_claude_code_versions",
-                DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS,
-            )
-            .await?;
-        let raw_blocked_versions = self
-            .settings_store
-            .get_value(
-                "blocked_claude_code_versions",
-                DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
-            )
-            .await?;
-        let raw_user_agents = self
-            .settings_store
-            .get_value("allowed_user_agents", DEFAULT_ALLOWED_USER_AGENTS)
-            .await?;
-        let policy = AccessPolicy::parse(&raw_versions, &raw_blocked_versions, &raw_user_agents)?;
-        *self.access_policy.write().await = policy;
-        Ok(())
+        self.reload_access_profile_config().await
     }
 
     async fn non_stream_probe_cache_lookup(
@@ -1414,15 +1419,19 @@ impl GatewayService {
             .cloned()
             .unwrap_or_default();
 
-        if let Err(rejection) = self.access_policy.read().await.check_user_agent(&ua) {
-            warn!(
-                "access policy rejected count_tokens request: setting={} reason={}",
-                rejection.setting, rejection.reason
-            );
-            return Ok(access_policy_error_response(&rejection));
-        }
+        let request_profile = {
+            let snapshot = self.access_profile_config.read().await;
+            if let Err(rejection) = snapshot.policy.check_user_agent(&ua) {
+                warn!(
+                    "access policy rejected count_tokens request: setting={} reason={}",
+                    rejection.setting, rejection.reason
+                );
+                return Ok(access_policy_error_response(&rejection));
+            }
+            // 准入通过后，在同一个读锁内冻结；body 与重试不重新决定画像。
+            snapshot.selection.resolve(&ua)
+        };
 
-        let request_profile = self.profile_selection_config.read().await.resolve(&ua);
         let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1609,16 +1618,18 @@ impl GatewayService {
             .cloned()
             .unwrap_or_default();
 
-        if let Err(rejection) = self.access_policy.read().await.check_user_agent(&ua) {
-            warn!(
-                "access policy rejected request: setting={} reason={}",
-                rejection.setting, rejection.reason
-            );
-            return Ok(access_policy_error_response(&rejection));
-        }
-
-        // 在读 body 和账号重试前固定选择，body 中的版本字段不参与画像识别。
-        let request_profile = self.profile_selection_config.read().await.resolve(&ua);
+        let request_profile = {
+            let snapshot = self.access_profile_config.read().await;
+            if let Err(rejection) = snapshot.policy.check_user_agent(&ua) {
+                warn!(
+                    "access policy rejected request: setting={} reason={}",
+                    rejection.setting, rejection.reason
+                );
+                return Ok(access_policy_error_response(&rejection));
+            }
+            // 准入通过后，在同一个读锁内冻结；body 与重试不重新决定画像。
+            snapshot.selection.resolve(&ua)
+        };
 
         // 读取请求体
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
@@ -1827,9 +1838,14 @@ impl GatewayService {
                             &body_map,
                         )?);
                     }
-                } else if let Some(intercept_type) =
-                    detect_warmup_intercept(&body_map, client_type, warmup_config)
-                {
+                } else if let Some(intercept_type) = detect_warmup_intercept(
+                    &body_map,
+                    client_type,
+                    warmup_config,
+                    request_profile.unwrap_or_else(|| {
+                        profile_for_version(&device_profile(&account).env.version)
+                    }),
+                ) {
                     if should_bind_session {
                         let _ = self
                             .account_svc
@@ -4129,6 +4145,7 @@ fn detect_warmup_intercept(
     body: &serde_json::Value,
     client_type: ClientType,
     config: WarmupInterceptConfig,
+    profile: &ClaudeCodeProfile,
 ) -> Option<WarmupInterceptType> {
     if config.haiku_probe_enabled && is_haiku_probe_request(body, client_type) {
         return Some(WarmupInterceptType::HaikuProbe);
@@ -4137,7 +4154,7 @@ fn detect_warmup_intercept(
         return Some(WarmupInterceptType::Suggestion);
     }
     if config.title_enabled {
-        if is_json_title_request(body) {
+        if is_json_title_request(body, profile) {
             return Some(WarmupInterceptType::JsonTitle);
         }
         if is_text_title_or_warmup_request(body) {
@@ -4146,7 +4163,7 @@ fn detect_warmup_intercept(
     }
     if is_haiku_probe_request(body, client_type)
         || is_suggestion_mode_request(body)
-        || is_json_title_request(body)
+        || is_json_title_request(body, profile)
         || is_text_title_or_warmup_request(body)
     {
         return None;
@@ -5084,8 +5101,8 @@ fn is_suggestion_mode_request(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-fn is_json_title_request(body: &serde_json::Value) -> bool {
-    is_structured_haiku_title_request(body)
+fn is_json_title_request(body: &serde_json::Value, profile: &ClaudeCodeProfile) -> bool {
+    is_structured_haiku_title_request_for_profile(body, &profile.request)
         || system_text_items(body).any(|text| {
             text.contains(
                 "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session",
@@ -7237,7 +7254,12 @@ mod tests {
         client_type: ClientType,
         config: WarmupInterceptConfig,
     ) -> Option<WarmupInterceptType> {
-        detect_warmup_intercept(body, client_type, config)
+        detect_warmup_intercept(
+            body,
+            client_type,
+            config,
+            profile_for_key("2.1.280").unwrap(),
+        )
     }
 
     fn cli_bg_status_classifier_body(state: &str, tail: &str) -> serde_json::Value {
@@ -8108,7 +8130,10 @@ mod tests {
                 .expect("业务请求原始字节接收超时")
             });
             let service = test_gateway_service_with_urls(base, String::new()).await;
-            let account = test_account();
+            let account = account_for_request_profile(
+                &test_account(),
+                Some(profile_for_key("2.1.280").unwrap()),
+            );
             let incoming = HashMap::from([
                 (
                     "User-Agent".into(),
@@ -8422,6 +8447,15 @@ mod tests {
         payload
     }
 
+    fn profile_messages_payload_for(version: &str) -> serde_json::Value {
+        let mut payload = profile_messages_payload();
+        if version == "2.1.293" {
+            payload["model"] = json!("claude-sonnet-5-5");
+            payload["tools"][0]["model"] = json!("claude-sonnet-5-5");
+        }
+        payload
+    }
+
     fn assert_profile_message(
         headers: &HeaderMap,
         bytes: &Bytes,
@@ -8431,14 +8465,24 @@ mod tests {
         assert_eq!(headers["user-agent"], claude_cli_user_agent(version));
         assert_eq!(
             headers["x-stainless-package-version"],
-            STAINLESS_PACKAGE_VERSION
+            profile_for_key(version)
+                .unwrap()
+                .identity
+                .stainless_package_version
         );
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
         assert_eq!(
             headers["anthropic-beta"],
-            if version == "2.1.260" {
-                SONNET_5_MESSAGE_BETA_TOKENS_2_1_260
-            } else {
-                SONNET_5_MESSAGE_BETA_TOKENS_2_1_280
+            match version {
+                "2.1.260" => SONNET_5_MESSAGE_BETA_TOKENS_2_1_260,
+                "2.1.280" => SONNET_5_MESSAGE_BETA_TOKENS_2_1_280,
+                "2.1.293" => fixture["request_profiles"]["claude-sonnet-5-5"]["beta"]
+                    .as_str()
+                    .unwrap(),
+                _ => panic!("未定义的测试画像"),
             }
         );
         let payload: serde_json::Value = serde_json::from_slice(bytes).unwrap();
@@ -8451,7 +8495,14 @@ mod tests {
             .unwrap();
         assert!(billing.contains(&format!("cc_version={version}.")));
         assert!(!billing.contains("cch=00000"));
-        assert_eq!(payload["tools"][0]["model"], "claude-sonnet-5");
+        assert_eq!(
+            payload["tools"][0]["model"],
+            if version == "2.1.293" {
+                "claude-sonnet-5-5"
+            } else {
+                "claude-sonnet-5"
+            }
+        );
         assert_eq!(payload["profile_test_unknown"], json!({"keep":true}));
         let selected =
             account_for_request_profile(account, Some(profile_for_key(version).unwrap()));
@@ -8493,7 +8544,7 @@ mod tests {
                     profile_request(
                         "/v1/messages",
                         Some(&format!("claude-code/{version}")),
-                        profile_messages_payload(),
+                        profile_messages_payload_for(version),
                     ),
                     None,
                 )
@@ -8505,10 +8556,11 @@ mod tests {
         };
         send("2.1.260").await;
         send("2.1.280").await;
-        tokio::join!(send("2.1.260"), send("2.1.280"));
+        send("2.1.293").await;
+        tokio::join!(send("2.1.260"), send("2.1.280"), send("2.1.293"));
         let requests = state.requests.lock().await;
-        assert_eq!(requests.len(), 4);
-        for version in ["2.1.260", "2.1.280"] {
+        assert_eq!(requests.len(), 6);
+        for version in ["2.1.260", "2.1.280", "2.1.293"] {
             assert_eq!(
                 requests
                     .iter()
@@ -8520,8 +8572,10 @@ mod tests {
         for (headers, bytes) in requests.iter() {
             let version = if headers["user-agent"].to_str().unwrap().contains("2.1.260") {
                 "2.1.260"
-            } else {
+            } else if headers["user-agent"].to_str().unwrap().contains("2.1.280") {
                 "2.1.280"
+            } else {
+                "2.1.293"
             };
             assert_profile_message(headers, bytes, &before, version);
         }
@@ -8537,71 +8591,73 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_401_retry_keeps_profile_frozen_across_settings_reload() {
-        let (base, state, server) = spawn_auth_mock_server().await;
-        let service = Arc::new(
-            test_gateway_service_with_urls(base.clone(), format!("{base}/oauth/token")).await,
-        );
-        let mut account =
-            create_oauth_gateway_account(&service, "profile-refresh@example.com", "access-old")
-                .await;
-        account.billing_mode = BillingMode::Rewrite;
-        account.allow_1m_models.clear();
-        service.account_svc.update_account(&account).await.unwrap();
-        state.pause_first_request.store(true, Ordering::SeqCst);
-        let request_service = service.clone();
-        let pending = tokio::spawn(async move {
-            let response = request_service
-                .handle_request(
-                    profile_request(
-                        "/v1/messages",
-                        Some("claude-cli/2.1.260"),
-                        profile_messages_payload(),
-                    ),
-                    None,
-                )
-                .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            body::to_bytes(response.into_body(), 1024 * 1024)
+        for version in ["2.1.260", "2.1.293"] {
+            let (base, state, server) = spawn_auth_mock_server().await;
+            let service = Arc::new(
+                test_gateway_service_with_urls(base.clone(), format!("{base}/oauth/token")).await,
+            );
+            let mut account =
+                create_oauth_gateway_account(&service, "profile-refresh@example.com", "access-old")
+                    .await;
+            account.billing_mode = BillingMode::Rewrite;
+            account.allow_1m_models.clear();
+            service.account_svc.update_account(&account).await.unwrap();
+            state.pause_first_request.store(true, Ordering::SeqCst);
+            let request_service = service.clone();
+            let pending = tokio::spawn(async move {
+                let response = request_service
+                    .handle_request(
+                        profile_request(
+                            "/v1/messages",
+                            Some(&format!("claude-cli/{version}")),
+                            profile_messages_payload_for(version),
+                        ),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+            });
+            timeout(Duration::from_secs(3), state.request_started.notified())
                 .await
                 .unwrap();
-        });
-        timeout(Duration::from_secs(3), state.request_started.notified())
-            .await
-            .unwrap();
-        service
-            .settings_store
-            .upsert_many(&HashMap::from([(
-                "claude_code_profile_selection_mode".into(),
-                "account".into(),
-            )]))
-            .await
-            .unwrap();
-        service.reload_profile_selection_config().await.unwrap();
-        assert_eq!(
-            service.profile_selection_config.read().await.mode,
-            ClaudeCodeProfileSelectionMode::Account
-        );
-        state.request_resume.notify_one();
-        timeout(Duration::from_secs(5), pending)
-            .await
-            .unwrap()
-            .unwrap();
-        let requests = state.requests.lock().await;
-        assert_eq!(requests.len(), 2);
-        for (headers, bytes) in requests.iter() {
-            assert_profile_message(headers, bytes, &account, "2.1.260");
-        }
-        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
             service
-                .account_svc
-                .get_account(account.id)
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "claude_code_profile_selection_mode".into(),
+                    "account".into(),
+                )]))
+                .await
+                .unwrap();
+            service.reload_profile_selection_config().await.unwrap();
+            assert_eq!(
+                service.access_profile_config.read().await.selection.mode,
+                ClaudeCodeProfileSelectionMode::Account
+            );
+            state.request_resume.notify_one();
+            timeout(Duration::from_secs(5), pending)
                 .await
                 .unwrap()
-                .canonical_env,
-            account.canonical_env
-        );
-        server.abort();
+                .unwrap();
+            let requests = state.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            for (headers, bytes) in requests.iter() {
+                assert_profile_message(headers, bytes, &account, version);
+            }
+            assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                service
+                    .account_svc
+                    .get_account(account.id)
+                    .await
+                    .unwrap()
+                    .canonical_env,
+                account.canonical_env
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -8659,8 +8715,8 @@ mod tests {
         service.reload_access_policy().await.unwrap();
         create_gateway_account(&service, "profile-aux@example.com", 1, 0).await;
         for (ua, expected) in [
-            (None, "2.1.280"),
-            (Some("Bun/1.4.1"), "2.1.280"),
+            (None, "2.1.293"),
+            (Some("Bun/1.4.1"), "2.1.293"),
             (Some("claude-code/2.1.260"), "2.1.260"),
         ] {
             let response = service
@@ -8685,6 +8741,8 @@ mod tests {
                 headers["user-agent"],
                 if expected == "2.1.260" {
                     "Bun/1.4.1"
+                } else if expected == "2.1.293" {
+                    "claude-code/2.1.293"
                 } else {
                     "Bun/1.4.3"
                 }
@@ -8734,7 +8792,116 @@ mod tests {
             body,
         )
         .unwrap();
+        let current = non_stream_probe_cache_key(
+            "/v1/messages",
+            "2.1.293",
+            "claude-opus-4-8",
+            &headers,
+            body,
+        )
+        .unwrap();
         assert_ne!(old, new);
+        assert_ne!(old, current);
+        assert_ne!(new, current);
+    }
+
+    #[tokio::test]
+    async fn target_access_rules_admit_280_293_before_selecting_default_profile() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account =
+            create_gateway_account(&service, "target-profile@example.invalid", 2, 0).await;
+        account.billing_mode = BillingMode::Rewrite;
+        service.account_svc.update_account(&account).await.unwrap();
+        service
+            .settings_store
+            .upsert_many_with_profile(
+                &HashMap::from([
+                    (
+                        "claude_code_profile_selection_mode".into(),
+                        "client_version".into(),
+                    ),
+                    ("claude_code_version_profile".into(), "2.1.293".into()),
+                    (
+                        "allowed_claude_code_versions".into(),
+                        "2.1.89-2.1.293".into(),
+                    ),
+                    (
+                        "blocked_claude_code_versions".into(),
+                        "2.1.89-2.1.279,2.1.281-2.1.292".into(),
+                    ),
+                    ("allowed_user_agents".into(), "synthetic-client*".into()),
+                ]),
+                Some(profile_for_key("2.1.293").unwrap()),
+            )
+            .await
+            .unwrap();
+        service.reload_access_profile_config().await.unwrap();
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            for version in ["2.1.280", "2.1.293"] {
+                let request = profile_request(
+                    path,
+                    Some(&format!("claude-code/{version}")),
+                    profile_messages_payload_for(version),
+                );
+                let response = if path == COUNT_TOKENS_PATH {
+                    service.handle_count_tokens_request(request, None).await
+                } else {
+                    service.handle_request(request, None).await
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let requests = state.requests.lock().await;
+                let (headers, bytes) = requests.last().unwrap();
+                assert_eq!(headers["user-agent"], claude_cli_user_agent(version));
+                if path == "/v1/messages" {
+                    assert_profile_message(headers, bytes, &account, version);
+                }
+            }
+            let forwarded = state.requests.lock().await.len();
+            for version in ["2.1.260", "2.1.279", "2.1.281", "2.1.292", "2.1.294"] {
+                let mut payload = profile_messages_payload_for("2.1.293");
+                // 请求体宣称默认版本也不能绕过 UA 准入。
+                payload["version"] = json!("2.1.293");
+                let request =
+                    profile_request(path, Some(&format!("claude-code/{version}")), payload);
+                let response = if path == COUNT_TOKENS_PATH {
+                    service.handle_count_tokens_request(request, None).await
+                } else {
+                    service.handle_request(request, None).await
+                };
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            }
+            assert_eq!(state.requests.lock().await.len(), forwarded);
+        }
+        let response = service
+            .handle_request(
+                profile_request(
+                    "/v1/messages",
+                    Some("synthetic-client/1"),
+                    profile_messages_payload_for("2.1.293"),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let requests = state.requests.lock().await;
+        let (headers, bytes) = requests.last().unwrap();
+        assert_eq!(headers["user-agent"], claude_cli_user_agent("2.1.293"));
+        assert_eq!(headers["x-stainless-package-version"], "0.128.0");
+        let payload: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert!(payload["system"].as_array().unwrap().iter().any(|block| {
+            block["text"].as_str().is_some_and(|text| {
+                text.starts_with("x-anthropic-billing-header:")
+                    && text.contains("cc_version=2.1.293.")
+            })
+        }));
+        server.abort();
     }
 
     #[tokio::test]
@@ -8784,7 +8951,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.requests.lock().await.last().unwrap().0["user-agent"],
-            claude_cli_user_agent("2.1.280")
+            claude_cli_user_agent("2.1.293")
         );
         server.abort();
     }
@@ -8804,7 +8971,8 @@ mod tests {
         for (ua, version) in [
             (Some("claude-code/2.1.260"), "2.1.260"),
             (Some("claude-code/2.1.280"), "2.1.280"),
-            (None, "2.1.280"),
+            (Some("claude-code/2.1.293"), "2.1.293"),
+            (None, "2.1.293"),
         ] {
             let mut builder =
                 Request::builder().uri("/api/claude_cli/bootstrap?model=claude-opus-5-5");

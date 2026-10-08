@@ -952,7 +952,7 @@ async function copyText(text: string) {
                   {{ profileSelectionMode === 'client_version' ? '按客户端 UA 适配' : profileSelectionMode === 'account' ? '使用账号画像' : '未提供画像配置' }}
                 </p>
                 <p v-if="profileSelectionMode === 'client_version' && defaultVersionProfile" class="text-xs text-[#8c8475] mt-0.5">
-                  默认回退：v{{ defaultVersionProfile }}
+                  默认回退：v{{ defaultVersionProfile }}（准入通过后）
                 </p>
               </div>
               <div>

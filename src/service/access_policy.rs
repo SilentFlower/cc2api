@@ -365,7 +365,8 @@ mod tests {
                 .is_ok()
         );
         assert!(policy.check_user_agent("claude-code/2.1.88").is_err());
-        assert!(policy.check_user_agent("claude-code/2.1.281").is_err());
+        assert!(policy.check_user_agent("claude-code/2.1.293").is_ok());
+        assert!(policy.check_user_agent("claude-code/2.1.294").is_err());
         assert!(policy.check_user_agent("claude-code/").is_err());
         assert!(policy.check_user_agent("AI-Hub-Monitor/1.0.0").is_ok());
         assert!(policy.check_user_agent("python-httpx/0.28.1").is_ok());

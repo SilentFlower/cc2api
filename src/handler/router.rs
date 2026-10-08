@@ -1125,15 +1125,6 @@ async fn update_settings(
     } else {
         None
     };
-    if let Some(profile) = selected_profile {
-        body.insert(
-            "allowed_claude_code_versions".into(),
-            profile
-                .access_policy
-                .allowed_claude_code_versions
-                .to_string(),
-        );
-    }
     if let Some(val) = body.get("allowed_claude_code_versions") {
         validate_claude_code_versions(val)?;
     }
@@ -1244,31 +1235,23 @@ async fn update_settings(
     if let Some(val) = body.get("bootstrap_additional_model_options") {
         parse_bootstrap_additional_model_options(val)?;
     }
-    let profile_changed = selected_profile.is_some();
-    if let Some(profile) = selected_profile {
-        state
-            .settings_store
-            .apply_claude_code_profile(profile)
-            .await?;
-        body.remove("claude_code_version_profile");
-        body.remove("allowed_claude_code_versions");
-    }
-    state.settings_store.upsert_many(&body).await?;
-    if profile_changed || body.contains_key("claude_code_profile_selection_mode") {
-        state.gateway_svc.reload_profile_selection_config().await?;
+    state
+        .settings_store
+        .upsert_many_with_profile(&body, selected_profile)
+        .await?;
+    if selected_profile.is_some()
+        || body.contains_key("claude_code_profile_selection_mode")
+        || body.contains_key("allowed_claude_code_versions")
+        || body.contains_key("blocked_claude_code_versions")
+        || body.contains_key("allowed_user_agents")
+    {
+        state.gateway_svc.reload_access_profile_config().await?;
     }
     if let Some(val) = body.get("proxy_client_pool_enabled") {
         crate::tlsfp::set_request_client_pool_enabled(val == "true");
     }
     if body.contains_key("allow_system_role_models") {
         state.gateway_svc.reload_system_role_models().await?;
-    }
-    if profile_changed
-        || body.contains_key("allowed_claude_code_versions")
-        || body.contains_key("blocked_claude_code_versions")
-        || body.contains_key("allowed_user_agents")
-    {
-        state.gateway_svc.reload_access_policy().await?;
     }
     if body.contains_key("passthrough_shell")
         || body.contains_key("passthrough_os_version")
@@ -1524,13 +1507,13 @@ mod tests {
                 serde_json::json!({"claude_code_profile_selection_mode":"invalid", "claude_code_version_profile":"2.1.260"}),
                 StatusCode::BAD_REQUEST,
                 ClaudeCodeProfileSelectionMode::ClientVersion,
-                "2.1.280",
+                "2.1.293",
             ),
             (
                 serde_json::json!({"claude_code_profile_selection_mode":"account"}),
                 StatusCode::OK,
                 ClaudeCodeProfileSelectionMode::Account,
-                "2.1.280",
+                "2.1.293",
             ),
             (
                 serde_json::json!({"claude_code_version_profile":"2.1.260"}),
@@ -1623,6 +1606,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_profile_settings_round_trip_and_invalid_rule_is_atomic() {
+        let (app, gateway) = test_router_with_gateway().await;
+        let target = serde_json::json!({
+            "claude_code_profile_selection_mode":"client_version",
+            "claude_code_version_profile":"2.1.293",
+            "allowed_claude_code_versions":"2.1.89-2.1.293",
+            "blocked_claude_code_versions":"2.1.89-2.1.279,2.1.281-2.1.292",
+            "allowed_user_agents":"synthetic-client*"
+        });
+        for (payload, status) in [
+            (target.clone(), StatusCode::OK),
+            (
+                serde_json::json!({"claude_code_version_profile":"2.1.280", "blocked_claude_code_versions":"invalid"}),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let config = gateway.profile_selection_config().await;
+            assert_eq!(config.mode, ClaudeCodeProfileSelectionMode::ClientVersion);
+            assert_eq!(config.default_profile.key, "2.1.293");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let settings: serde_json::Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            for (key, value) in target.as_object().unwrap() {
+                assert_eq!(&settings[key], value);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn account_list_reports_base_version_and_effective_profile_configuration() {
         let app = test_router().await;
         let created = app
@@ -1665,9 +1706,9 @@ mod tests {
             payload["claude_code_profile_selection_mode"],
             "client_version"
         );
-        assert_eq!(payload["claude_code_version_profile"], "2.1.280");
+        assert_eq!(payload["claude_code_version_profile"], "2.1.293");
         assert_eq!(payload["total"], 1);
-        assert_eq!(payload["data"][0]["canonical_env"]["version"], "2.1.280");
+        assert_eq!(payload["data"][0]["canonical_env"]["version"], "2.1.293");
         assert_eq!(payload["data"][0]["auto_telemetry"], false);
     }
 

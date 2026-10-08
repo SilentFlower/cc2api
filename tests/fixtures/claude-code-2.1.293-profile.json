@@ -1,0 +1,971 @@
+{
+  "fixture_version": 1,
+  "source": "纯合成正文；协议常量来源于正式抓包脱敏结构，hash 期望由独立 Python 复算器和系统 libxxhash 生成",
+  "identity": {
+    "version": "2.1.293",
+    "version_base": "2.1.293",
+    "build_time": "2026-10-07T06:36:42Z",
+    "stainless_package_version": "0.128.0",
+    "stainless_runtime_version": "v26.3.0"
+  },
+  "request_profiles": {
+    "claude-opus-5-5": {
+      "max_tokens": 128000,
+      "thinking": {
+        "display": "updates",
+        "type": "adaptive"
+      },
+      "output_config": {
+        "effort": "xhigh"
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+      "safeguard_beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    "claude-sonnet-5-5": {
+      "max_tokens": 128000,
+      "thinking": {
+        "display": "updates",
+        "type": "adaptive"
+      },
+      "output_config": {
+        "effort": "xhigh"
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+      "safeguard_beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    "claude-haiku-5-5": {
+      "max_tokens": 128000,
+      "thinking": {
+        "display": "updates",
+        "type": "adaptive"
+      },
+      "output_config": {
+        "effort": "xhigh"
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+      "safeguard_beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    "claude-fable-5-1": {
+      "max_tokens": 64000,
+      "thinking": {
+        "display": "updates",
+        "type": "adaptive"
+      },
+      "output_config": {
+        "effort": "xhigh"
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+      "safeguard_beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    }
+  },
+  "haiku_title": {
+    "max_tokens": 128000,
+    "thinking": null,
+    "output_config": {
+      "effort": "xhigh",
+      "format": {
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "title"
+          ],
+          "type": "object"
+        },
+        "type": "json_schema"
+      }
+    },
+    "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07"
+  },
+  "hash_cases": [
+    {
+      "version": "2.1.293",
+      "model": "claude-opus-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-opus-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"完全合成的二九三协议回归样本文本\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.542; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-opus-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "542",
+      "expected_cch": "0fbc4",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-sonnet-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-sonnet-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"完全合成的二九三协议回归样本文本\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.542; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-sonnet-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "542",
+      "expected_cch": "0fbc4",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-haiku-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-haiku-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"完全合成的二九三协议回归样本文本\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.542; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-haiku-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "542",
+      "expected_cch": "0fbc4",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-fable-5-1",
+      "kind": "main",
+      "body": "{\"model\":\"claude-fable-5-1\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"完全合成的二九三协议回归样本文本\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.542; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-fable-5-1\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":64000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "542",
+      "expected_cch": "0fbc4",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-opus-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-opus-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"零一二😀四五六七八九十甲乙丙丁戊己庚辛壬癸\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.a1d; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-opus-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "a1d",
+      "expected_cch": "4215a",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-opus-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-opus-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"仅供合成回归的默认后备请求\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.39a; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-opus-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"fallbacks\":\"default\",\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "39a",
+      "expected_cch": "dd7fe",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-haiku-5-5",
+      "kind": "title",
+      "body": "{\"model\":\"claude-haiku-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"合成标题测试\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.964; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"output_config\":{\"effort\":\"xhigh\",\"format\":{\"schema\":{\"additionalProperties\":false,\"properties\":{\"title\":{\"type\":\"string\"}},\"required\":[\"title\"],\"type\":\"object\"},\"type\":\"json_schema\"}},\"stream\":true}",
+      "expected_cc_version_suffix": "964",
+      "expected_cch": "7f719",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-haiku-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-haiku-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"独立会话甲的初始化文字\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.c85; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-haiku-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "c85",
+      "expected_cch": "c3645",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-haiku-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-haiku-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"续轮输入包含新文字但复用自己的会话后缀\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.c85; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-haiku-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\",\"previous_message_id\":\"msg_synthetic_previous\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "c85",
+      "expected_cch": "28b5a",
+      "thread_followup": true
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-haiku-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-haiku-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"独立会话乙的另一个初始化文本\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.94b; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-haiku-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "94b",
+      "expected_cch": "12149",
+      "thread_followup": false
+    },
+    {
+      "version": "2.1.293",
+      "model": "claude-haiku-5-5",
+      "kind": "main",
+      "body": "{\"model\":\"claude-haiku-5-5\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"续轮输入包含新文字但复用自己的会话后缀\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.94b; cc_entrypoint=cli; cch=00000;\"}],\"tools\":[{\"name\":\"合成工具\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"}}},\"model\":\"claude-haiku-5-5\"}],\"metadata\":{\"user_id\":\"synthetic\"},\"max_tokens\":128000,\"thinking\":{\"display\":\"updates\",\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"xhigh\"},\"thread\":{\"type\":\"request\",\"previous_message_id\":\"msg_synthetic_previous\"},\"diagnostics\":{},\"stream\":true}",
+      "expected_cc_version_suffix": "94b",
+      "expected_cch": "1aab5",
+      "thread_followup": true
+    }
+  ],
+  "native_header_cases": [
+    {
+      "kind": "probe",
+      "body": {
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 1,
+        "stream": null
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+    },
+    {
+      "kind": "title",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "output_config": {
+          "effort": "xhigh",
+          "format": {
+            "schema": {
+              "additionalProperties": false,
+              "properties": {
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "title"
+              ],
+              "type": "object"
+            },
+            "type": "json_schema"
+          }
+        }
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-opus-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        }
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-opus-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        }
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-opus-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "fallbacks": "default"
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,server-side-fallback-2026-07-01,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-opus-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-opus-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-sonnet-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        }
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-sonnet-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        }
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-sonnet-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-sonnet-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-fable-5-1",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 64000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        }
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-fable-5-1",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 64000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        }
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-fable-5-1",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 64000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-fable-5-1",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 64000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        }
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        }
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {},
+        "thread": {
+          "type": "request",
+          "previous_message_id": "msg_synthetic_previous"
+        },
+        "safeguards": [
+          {
+            "type": "dangerous_tool_use",
+            "synthetic_unknown": {
+              "keep": true
+            }
+          }
+        ]
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    },
+    {
+      "kind": "main",
+      "body": {
+        "model": "claude-haiku-5-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "合成回归"
+          }
+        ],
+        "tools": [],
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {
+          "display": "updates",
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        },
+        "diagnostics": {}
+      },
+      "beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+    }
+  ],
+  "capture_coverage": {
+    "runs": 25,
+    "billing": 112,
+    "effort": "xhigh",
+    "raw_body_exported": false
+  },
+  "endpoint_header_cases": [
+    {
+      "path": "/api/hello",
+      "method": "HEAD",
+      "status": 200,
+      "headers": {
+        "user-agent": "Bun/1.4.3",
+        "anthropic-beta": null,
+        "x-stainless-package-version": null,
+        "x-stainless-runtime-version": null,
+        "anthropic-mcp-client-capabilities": null,
+        "mcp-protocol-version": null,
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "content-type": null,
+        "anthropic-version": null
+      }
+    },
+    {
+      "path": "/api/eval/*",
+      "method": "POST",
+      "status": 200,
+      "headers": {
+        "user-agent": "claude-code/2.1.293",
+        "anthropic-beta": "oauth-2025-04-20",
+        "x-stainless-package-version": null,
+        "x-stainless-runtime-version": null,
+        "anthropic-mcp-client-capabilities": null,
+        "mcp-protocol-version": null,
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "content-type": "application/json",
+        "anthropic-version": null
+      }
+    },
+    {
+      "path": "/api/claude_code_grove",
+      "method": "GET",
+      "status": 200,
+      "headers": {
+        "user-agent": "claude-cli/2.1.293 (external, cli)",
+        "anthropic-beta": "oauth-2025-04-20",
+        "x-stainless-package-version": null,
+        "x-stainless-runtime-version": null,
+        "anthropic-mcp-client-capabilities": null,
+        "mcp-protocol-version": null,
+        "accept": "application/json, text/plain, */*",
+        "accept-encoding": "gzip, compress, deflate, br",
+        "content-type": null,
+        "anthropic-version": null
+      }
+    },
+    {
+      "path": "/api/claude_code_penguin_mode",
+      "method": "GET",
+      "status": 200,
+      "headers": {
+        "user-agent": "claude-code/2.1.293",
+        "anthropic-beta": "oauth-2025-04-20",
+        "x-stainless-package-version": null,
+        "x-stainless-runtime-version": null,
+        "anthropic-mcp-client-capabilities": null,
+        "mcp-protocol-version": null,
+        "accept": "application/json, text/plain, */*",
+        "accept-encoding": "gzip, compress, deflate, br",
+        "content-type": null,
+        "anthropic-version": null
+      }
+    },
+    {
+      "path": "/api/claude_cli/bootstrap",
+      "method": "GET",
+      "status": 200,
+      "headers": {
+        "user-agent": "claude-code/2.1.293",
+        "anthropic-beta": "oauth-2025-04-20",
+        "x-stainless-package-version": null,
+        "x-stainless-runtime-version": null,
+        "anthropic-mcp-client-capabilities": null,
+        "mcp-protocol-version": null,
+        "accept": "application/json, text/plain, */*",
+        "accept-encoding": "gzip, compress, deflate, br",
+        "content-type": "application/json",
+        "anthropic-version": null
+      }
+    },
+    {
+      "path": "/v1/mcp_servers",
+      "method": "GET",
+      "status": 200,
+      "headers": {
+        "user-agent": "claude-code/2.1.293",
+        "anthropic-beta": "mcp-servers-2025-12-04",
+        "x-stainless-package-version": null,
+        "x-stainless-runtime-version": null,
+        "anthropic-mcp-client-capabilities": "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0=",
+        "mcp-protocol-version": "2025-11-25",
+        "accept": "application/json, text/plain, */*",
+        "accept-encoding": "gzip, compress, deflate, br",
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+      }
+    }
+  ]
+}

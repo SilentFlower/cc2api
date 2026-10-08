@@ -36,10 +36,10 @@ const primeModel = ref('claude-haiku-4-5-20251001');
 const allowSystemRoleModels = ref('claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8');
 
 /** 客户端访问策略表单 */
-const claudeCodeVersionProfile = ref('2.1.280');
-/** 请求画像选择方式：默认按原始 UA 适配 260/280。 */
+const claudeCodeVersionProfile = ref('2.1.293');
+/** 请求画像选择方式：默认按原始 UA 适配 260/280/293。 */
 const claudeCodeProfileSelectionMode = ref<'client_version' | 'account'>('client_version');
-const allowedClaudeCodeVersions = ref('2.1.89-2.1.280');
+const allowedClaudeCodeVersions = ref('2.1.89-2.1.293');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
 
@@ -135,6 +135,15 @@ interface ClaudeCodeVersionProfileOption {
 
 /** Claude Code 版本画像选项 */
 const claudeCodeVersionProfiles = ref<ClaudeCodeVersionProfileOption[]>([
+  {
+    key: '2.1.293',
+    version: '2.1.293',
+    version_base: '2.1.293',
+    build_time: '2026-10-07T06:36:42Z',
+    allowed_claude_code_versions: '2.1.89-2.1.293',
+    growthbook_user_agent: 'Bun/1.4.3',
+    telemetry_shape: 'claude_code_2_1_185',
+  },
   {
     key: '2.1.280',
     version: '2.1.280',
@@ -284,6 +293,27 @@ function parseClaudeCodeVersionProfiles(raw: string | undefined): ClaudeCodeVers
   } catch {
     return claudeCodeVersionProfiles.value;
   }
+}
+
+/**
+ * 账号模式保持目标画像的准入范围，客户端模式保留独立配置。
+ * @return 仅更新表单，不发送保存请求。
+ */
+function syncAccountProfileRange(): void {
+  if (claudeCodeProfileSelectionMode.value !== 'account') return;
+  const profile = claudeCodeVersionProfiles.value.find((item) => item.key === claudeCodeVersionProfile.value);
+  if (profile) allowedClaudeCodeVersions.value = profile.allowed_claude_code_versions;
+}
+
+/**
+ * 填入默认 293、仅允许 280/293 的访问策略。
+ * @return 仅更新四项表单，保存后才生效。
+ */
+function use280293AccessPreset(): void {
+  claudeCodeProfileSelectionMode.value = 'client_version';
+  claudeCodeVersionProfile.value = '2.1.293';
+  allowedClaudeCodeVersions.value = '2.1.89-2.1.293';
+  blockedClaudeCodeVersions.value = '2.1.89-2.1.279,2.1.281-2.1.292';
 }
 
 /** 格式化 telemetry 结构标识，避免误读为当前 Claude Code 版本。 */
@@ -462,9 +492,9 @@ async function loadSettings() {
     primeModel.value = data.peak_prime_model ?? 'claude-haiku-4-5-20251001';
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8';
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
-    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.280';
+    claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.293';
     claudeCodeProfileSelectionMode.value = data.claude_code_profile_selection_mode === 'account' ? 'account' : 'client_version';
-    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.280';
+    allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.293';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
     const contextSanitizerMode = data.claude_code_context_sanitizer_mode ?? 'report_only';
@@ -1259,7 +1289,7 @@ onMounted(async () => {
               type="button"
               @click="allowSystemRoleModels = 'claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8'"
               class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 transition-colors"
-            >2.1.280 默认</button>
+            >默认模型列表</button>
             <button
               type="button"
               @click="allowSystemRoleModels = ''"
@@ -1597,16 +1627,17 @@ onMounted(async () => {
           <div>
             <Label class="text-[#5c5647] text-sm">Claude Code 默认版本画像</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              按客户端适配时，原始 UA 的 260/280 请求使用对应画像；缺少、非法或未匹配版本使用此默认画像，出厂为 280。准入版本范围独立生效。
+              通过准入后，原始 UA 的 260/280/293 请求使用对应画像；缺少、非法或未匹配版本使用默认画像，出厂为 293。禁止版本优先于允许范围。
             </p>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              保存默认画像仍同步账号软件环境和允许版本范围；其他允许 UA 保持独立配置。
+              保存默认画像仍同步账号基础软件环境；客户端模式的准入范围独立保存，账号模式使用目标画像范围。
             </p>
           </div>
           <div class="space-y-1.5">
             <Label class="text-[#5c5647] text-xs">画像选择方式</Label>
             <select
               v-model="claudeCodeProfileSelectionMode"
+              @change="syncAccountProfileRange"
               class="h-9 w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 text-sm text-[#29261e] focus:outline-none focus:ring-2 focus:ring-[#c4704f]"
             >
               <option value="client_version">按客户端 UA 适配（默认）</option>
@@ -1617,6 +1648,7 @@ onMounted(async () => {
             <div class="space-y-1.5">
               <select
                 v-model="claudeCodeVersionProfile"
+                @change="syncAccountProfileRange"
                 class="h-9 w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 text-sm text-[#29261e] focus:outline-none focus:ring-2 focus:ring-[#c4704f]"
               >
                 <option
@@ -1648,12 +1680,12 @@ onMounted(async () => {
             <Textarea
               v-model="allowedClaudeCodeVersions"
               rows="4"
-              placeholder="2.1.89-2.1.280"
+              placeholder="2.1.89-2.1.293"
               class="border-[#e8e2d9] focus:ring-[#c4704f] font-mono text-sm bg-[#f9f6f1]"
               :class="isValidClaudeCodeVersions ? '' : 'border-red-400'"
-              readonly
+              :readonly="claudeCodeProfileSelectionMode === 'account'"
             />
-            <p class="text-[11px] text-[#b5b0a6]">该值由版本特征强制覆盖，保存后按后端返回值回显。</p>
+            <p class="text-[11px] text-[#b5b0a6]">客户端模式可独立配置；账号模式由画像决定。保存后回显实际生效值。</p>
           </div>
 
           <div class="space-y-2">
@@ -1666,6 +1698,12 @@ onMounted(async () => {
               :class="isValidBlockedClaudeCodeVersions ? '' : 'border-red-400'"
             />
             <p class="text-[11px] text-[#b5b0a6]">支持精确版本、* 通配和区间；优先于允许范围，允许范围为空时仍生效。</p>
+            <button
+              type="button"
+              @click="use280293AccessPreset"
+              class="px-2 py-0.5 text-xs rounded border border-[#e8e2d9] bg-[#f9f6f1] text-[#8c8475] hover:border-emerald-300"
+            >仅允许 280、293（默认 293）</button>
+            <p class="text-[11px] text-[#b5b0a6]">预设填入两段禁止区间，保存后生效；已有画像选项仍保留。</p>
           </div>
 
           <div class="space-y-2">

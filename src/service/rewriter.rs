@@ -13,7 +13,7 @@ use crate::model::identity::{
     DeviceProfile, device_profile, process_snapshot, process_snapshot_json, request_profile,
 };
 use crate::service::version_profile::{
-    CchProfile, ClaudeCodeProfile, EndpointHeaderProfile, FableFallbackProfile,
+    CchProfile, ClaudeCodeProfile, EndpointHeaderProfile, FableFallbackProfile, HaikuTitleProfile,
     MCP_PROTOCOL_VERSION, MessageBodyOrderProfile, OAUTH_BETA_TOKEN, RequestProfile,
     TelemetryShape, ThinkingProfile, claude_cli_user_agent, claude_code_user_agent,
     exact_profile_for_version, is_event_logging_path, normalize_version, profile_for_version,
@@ -123,6 +123,23 @@ const MESSAGE_BODY_ORDER_OPUS_MAIN: &[&str] = &[
     "thinking",
     "context_management",
     "output_config",
+    "diagnostics",
+    "stream",
+];
+// 293 的可选字段仍位于已观察的位置，缺失字段跳过，未知字段按原相对顺序保留。
+const MESSAGE_BODY_ORDER_2_1_293: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "metadata",
+    "max_tokens",
+    "thinking",
+    "context_management",
+    "fallbacks",
+    "safeguards",
+    "output_config",
+    "thread",
     "diagnostics",
     "stream",
 ];
@@ -293,7 +310,7 @@ fn beta_header_for_path(
         if let Some(beta) = safeguard_beta {
             beta.to_string()
         } else {
-            match haiku_request_kind(model_id, body) {
+            match haiku_request_kind(request_profile, model_id, body) {
                 Some(HaikuRequestKind::Probe) => {
                     request_profile.haiku_probe_beta_tokens.to_string()
                 }
@@ -401,7 +418,11 @@ enum HaikuRequestKind {
     NonStreamAux,
 }
 
-fn haiku_request_kind(model_id: &str, body: &serde_json::Value) -> Option<HaikuRequestKind> {
+fn haiku_request_kind(
+    request_profile: &RequestProfile,
+    model_id: &str,
+    body: &serde_json::Value,
+) -> Option<HaikuRequestKind> {
     if !model_id.to_ascii_lowercase().contains("haiku") {
         return None;
     }
@@ -409,9 +430,15 @@ fn haiku_request_kind(model_id: &str, body: &serde_json::Value) -> Option<HaikuR
     if tools_are_empty(body) && max_tokens == 1 && !is_streaming_messages_body(body) {
         return Some(HaikuRequestKind::Probe);
     }
-    if tools_are_empty(body)
+    if request_profile.haiku_title_profile == HaikuTitleProfile::Legacy
+        && tools_are_empty(body)
         && max_tokens == 32_000
         && (is_structured_haiku_title_request(body) || has_title_prompt_marker(body))
+    {
+        return Some(HaikuRequestKind::Title);
+    }
+    if request_profile.haiku_title_profile == HaikuTitleProfile::ClaudeCode21293
+        && is_structured_haiku_title_request_for_profile(body, request_profile)
     {
         return Some(HaikuRequestKind::Title);
     }
@@ -430,7 +457,7 @@ fn requires_exact_beta_profile(
     path.starts_with("/v1/messages")
         && (safeguard_beta_header(request_profile, model_id, body).is_some()
             || matches!(
-                haiku_request_kind(model_id, body),
+                haiku_request_kind(request_profile, model_id, body),
                 Some(HaikuRequestKind::Probe | HaikuRequestKind::Title)
             ))
 }
@@ -519,6 +546,29 @@ fn auxiliary_endpoint_headers(
         return None;
     }
     let version = profile.identity.version;
+    if profile.endpoints.header_profile == EndpointHeaderProfile::ClaudeCode21293 {
+        // 仅扩展本轮采到的端点，不将旧版其它后台路径推断为 293 的新合同。
+        return match path {
+            "/api/hello" => Some((profile.telemetry.growthbook_user_agent.to_string(), None)),
+            "/api/claude_code_grove" => Some((
+                claude_cli_user_agent(version),
+                Some(profile.request.oauth_beta_token),
+            )),
+            "/api/claude_code_penguin_mode" | "/api/claude_cli/bootstrap" => Some((
+                claude_code_user_agent(version),
+                Some(profile.request.oauth_beta_token),
+            )),
+            "/v1/mcp_servers" => Some((
+                claude_code_user_agent(version),
+                Some(profile.request.mcp_servers_beta_token),
+            )),
+            _ if path.starts_with("/api/eval/") => Some((
+                claude_code_user_agent(version),
+                Some(profile.request.oauth_beta_token),
+            )),
+            _ => None,
+        };
+    }
     if profile.endpoints.header_profile == EndpointHeaderProfile::ClaudeCode21280 {
         match business_endpoint(path) {
             Some(BusinessEndpoint::Frame) => {
@@ -612,6 +662,30 @@ pub(crate) fn is_structured_haiku_title_request(body: &serde_json::Value) -> boo
             .pointer("/output_config/format")
             .map(schema_requires_only_title)
             .unwrap_or(false)
+}
+
+/// 按请求画像识别标题，保留旧画像的结构和提示词兼容边界。
+///
+/// @param body 消息请求体。
+/// @param request_profile 本次请求冻结的协议画像。
+/// @return 命中该版本已验证的结构化标题时返回 true。
+pub(crate) fn is_structured_haiku_title_request_for_profile(
+    body: &serde_json::Value,
+    request_profile: &RequestProfile,
+) -> bool {
+    match request_profile.haiku_title_profile {
+        HaikuTitleProfile::Legacy => is_structured_haiku_title_request(body),
+        HaikuTitleProfile::ClaudeCode21293 => {
+            body.get("model").and_then(serde_json::Value::as_str) == Some("claude-haiku-5-5")
+                && is_streaming_messages_body(body)
+                && tools_are_empty(body)
+                && body.get("max_tokens").and_then(serde_json::Value::as_u64) == Some(128_000)
+                && body.get("thinking").is_none()
+                && body
+                    .pointer("/output_config/format")
+                    .is_some_and(schema_requires_only_title)
+        }
+    }
 }
 
 fn tools_are_empty(body: &serde_json::Value) -> bool {
@@ -1584,7 +1658,14 @@ impl Rewriter {
                         // 客户端掌握 feature flag 和会话条件；只保留其显式携带的可选 token。
                         required_beta = required_beta
                             .split(',')
-                            .filter(|token| !model.client_optional_beta_tokens.contains(token))
+                            .filter(|token| {
+                                !model.client_optional_beta_tokens.contains(token)
+                                    || (version_profile.request.message_body_order
+                                        == MessageBodyOrderProfile::ClaudeCode21293
+                                        && filtered_existing
+                                            .split(',')
+                                            .any(|incoming| incoming == *token))
+                            })
                             .collect::<Vec<_>>()
                             .join(",");
                     }
@@ -1595,7 +1676,30 @@ impl Rewriter {
                     model_id,
                     body_map,
                 ) {
-                    required_beta
+                    if version_profile.request.message_body_order
+                        == MessageBodyOrderProfile::ClaudeCode21293
+                    {
+                        let optional = version_profile
+                            .request
+                            .main_model(model_id)
+                            .map(|model| {
+                                filtered_existing
+                                    .split(',')
+                                    .filter(|token| {
+                                        model.client_optional_beta_tokens.contains(token)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_default();
+                        // 精确 safeguard 仍只接受已验证的客户端可选项，1M 先经过账号白名单。
+                        order_context_1m_after_oauth(merge_anthropic_beta(
+                            &required_beta,
+                            &optional,
+                        ))
+                    } else {
+                        required_beta
+                    }
                 } else {
                     order_context_1m_after_oauth(merge_anthropic_beta(
                         required_beta.as_str(),
@@ -1627,7 +1731,8 @@ impl Rewriter {
 
         // 两种客户端入口共用末端规范化，避免 API 注入和原生客户端合并出现不同结果。
         if path == "/v1/messages"
-            && haiku_request_kind(model_id, body_map) == Some(HaikuRequestKind::Title)
+            && haiku_request_kind(&version_profile.request, model_id, body_map)
+                == Some(HaikuRequestKind::Title)
         {
             let incoming_beta = find_header_value(headers, "anthropic-beta")
                 .map(String::as_str)
@@ -1644,6 +1749,25 @@ impl Rewriter {
                 out.insert("anthropic-beta".into(), beta.to_string());
             } else {
                 out.remove("anthropic-beta");
+            }
+        }
+        if version_profile.endpoints.header_profile == EndpointHeaderProfile::ClaudeCode21293 {
+            match path {
+                "/api/hello" => {
+                    out.remove("content-type");
+                    out.remove("anthropic-version");
+                    out.insert("Accept".into(), "*/*".into());
+                    out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
+                }
+                "/api/claude_code_grove" | "/api/claude_code_penguin_mode" => {
+                    out.remove("content-type");
+                    out.remove("anthropic-version");
+                }
+                "/api/claude_cli/bootstrap" => {
+                    out.insert("content-type".into(), "application/json".into());
+                    out.remove("anthropic-version");
+                }
+                _ => {}
             }
         }
         if client_type == ClientType::API && business == Some(BusinessEndpoint::Frame) {
@@ -2537,7 +2661,7 @@ fn random_cc_version_suffix(bytes: [u8; 2]) -> String {
 }
 
 fn is_cc_version_thread_followup(body: &serde_json::Value, version: &str) -> bool {
-    version == "2.1.280"
+    matches!(version, "2.1.280" | "2.1.293")
         && body
             .get("thread")
             .and_then(serde_json::Value::as_object)
@@ -2567,7 +2691,7 @@ fn existing_cc_version_suffix(body: &serde_json::Value) -> Option<String> {
 
 fn cc_version_suffix_for_body(body: &serde_json::Value, version: &str) -> String {
     if is_cc_version_thread_followup(body, version) {
-        // 官方 2.1.280 在线程续轮复用会话已有后缀，即使 tool_result 后重新带入 text block。
+        // 官方 280/293 在线程续轮复用当前入站会话后缀，不给交错会话建立全局缓存。
         if let Some(suffix) = existing_cc_version_suffix(body) {
             return suffix;
         }
@@ -2607,7 +2731,9 @@ fn build_claude_code_identity_system_block() -> serde_json::Value {
 fn cch_attestation_seed(version: &str) -> u64 {
     match normalize_version(version) {
         "2.1.156" | "2.1.169" | "2.1.172" | "2.1.173" | "2.1.185" | "2.1.187" | "2.1.195"
-        | "2.1.197" | "2.1.220" | "2.1.257" | "2.1.260" | "2.1.280" => CCH_ATTESTATION_SEED_2156,
+        | "2.1.197" | "2.1.220" | "2.1.257" | "2.1.260" | "2.1.280" | "2.1.293" => {
+            CCH_ATTESTATION_SEED_2156
+        }
         _ => CCH_ATTESTATION_SEED_LEGACY,
     }
 }
@@ -5601,10 +5727,15 @@ fn disabled_thinking_model_matches(model: &str, configured_models: &[String]) ->
 
 /// 按 Claude Code 2.1.156 抓包约束 API 模式的 `max_tokens`。
 fn normalize_api_max_tokens(body: &mut serde_json::Value, request_profile: &RequestProfile) {
+    let limit = if request_profile.message_body_order == MessageBodyOrderProfile::ClaudeCode21293 {
+        api_default_max_tokens(body, request_profile)
+    } else {
+        API_MAX_TOKENS_LIMIT
+    };
     match body.get("max_tokens").and_then(|v| v.as_f64()) {
-        Some(max_tokens) if max_tokens > API_MAX_TOKENS_LIMIT as f64 => {
+        Some(max_tokens) if max_tokens > limit as f64 => {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("max_tokens".into(), serde_json::json!(API_MAX_TOKENS_LIMIT));
+                obj.insert("max_tokens".into(), serde_json::json!(limit));
             }
         }
         Some(_) => {}
@@ -5665,7 +5796,9 @@ fn ensure_api_model_profile(body: &mut serde_json::Value, request_profile: &Requ
         .unwrap_or_default()
         .to_string();
     let main_profile = request_profile.main_model(&model);
-    if model.to_ascii_lowercase().contains("haiku") && !is_haiku_main_for_api_mimicry(body) {
+    if model.to_ascii_lowercase().contains("haiku")
+        && !is_haiku_main_for_api_mimicry(body, request_profile)
+    {
         return;
     }
     let Some(obj) = body.as_object_mut() else {
@@ -5787,14 +5920,17 @@ fn ensure_api_model_profile(body: &mut serde_json::Value, request_profile: &Requ
     }
 }
 
-fn is_haiku_main_for_api_mimicry(body: &serde_json::Value) -> bool {
+fn is_haiku_main_for_api_mimicry(
+    body: &serde_json::Value,
+    request_profile: &RequestProfile,
+) -> bool {
     let max_tokens = body
         .get("max_tokens")
         .and_then(|value| value.as_u64())
         .unwrap_or_default();
     max_tokens != 1
         && max_tokens != 1_024
-        && !is_structured_haiku_title_request(body)
+        && !is_structured_haiku_title_request_for_profile(body, request_profile)
         && !has_title_prompt_marker(body)
 }
 
@@ -6269,6 +6405,9 @@ fn message_body_order_profile(
     map: &serde_json::Map<String, serde_json::Value>,
     request_profile: &RequestProfile,
 ) -> &'static [&'static str] {
+    if request_profile.message_body_order == MessageBodyOrderProfile::ClaudeCode21293 {
+        return MESSAGE_BODY_ORDER_2_1_293;
+    }
     let model = map
         .get("model")
         .and_then(|value| value.as_str())
@@ -6317,14 +6456,12 @@ mod tests {
     };
     use crate::model::identity::device_profile;
     use crate::service::version_profile::{
-        DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, FABLE_5_MESSAGE_BETA_TOKENS_2_1_257,
-        HAIKU_MAIN_BETA_TOKENS_2_1_280, HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280,
-        HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257, HAIKU_PROBE_BETA_TOKENS,
-        HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_PROTOCOL_VERSION, MESSAGE_BETA_TOKENS,
-        OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280, OPUS_4_8_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280,
-        OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280,
-        SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280, STAINLESS_PACKAGE_VERSION,
+        FABLE_5_MESSAGE_BETA_TOKENS_2_1_257, HAIKU_MAIN_BETA_TOKENS_2_1_280,
+        HAIKU_MAIN_NO_DIAGNOSTICS_BETA_TOKENS_2_1_280, HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
+        HAIKU_PROBE_BETA_TOKENS, HAIKU_STREAMING_TITLE_BETA_TOKENS, MCP_PROTOCOL_VERSION,
+        MESSAGE_BETA_TOKENS, OPUS_4_8_MESSAGE_BETA_TOKENS_2_1_280,
+        OPUS_4_8_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
+        OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_280, SONNET_4_5_MESSAGE_BETA_TOKENS_2_1_280,
         STAINLESS_RUNTIME_VERSION, apply_identity_to_env_json, claude_cli_user_agent,
         claude_code_user_agent, profile_for_key,
     };
@@ -6333,6 +6470,12 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::collections::HashMap;
+
+    // 历史回归固定 280，新增 293 用例显式选择新画像，避免默认升级改变旧用例含义。
+    const TEST_VERSION: &str = "2.1.280";
+    const TEST_VERSION_BASE: &str = "2.1.280";
+    const TEST_BUILD_TIME: &str = "2026-09-21T20:40:17Z";
+    const TEST_SDK_VERSION: &str = "0.112.1";
 
     const CTX_1M: &str = "context-1m-2025-08-07";
     const FAST_MODE: &str = "fast-mode-2026-02-01";
@@ -6347,9 +6490,9 @@ mod tests {
             package_managers: "npm".into(),
             runtimes: "node".into(),
             is_claude_ai_auth: true,
-            version: DEFAULT_CLAUDE_CODE_VERSION.into(),
-            version_base: DEFAULT_CLAUDE_CODE_VERSION_BASE.into(),
-            build_time: DEFAULT_CLAUDE_CODE_BUILD_TIME.into(),
+            version: TEST_VERSION.into(),
+            version_base: TEST_VERSION_BASE.into(),
+            build_time: TEST_BUILD_TIME.into(),
             deployment_environment: "unknown-linux".into(),
             vcs: "git".into(),
             ..Default::default()
@@ -6760,6 +6903,264 @@ mod tests {
     }
 
     #[test]
+    fn native_293_headers_match_every_observed_variant() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
+        let account = crate::service::version_profile::account_for_request_profile(
+            &test_account(),
+            Some(profile_for_key("2.1.293").unwrap()),
+        );
+        for case in fixture["native_header_cases"].as_array().unwrap() {
+            let headers = HashMap::from([
+                (
+                    "User-Agent".into(),
+                    "claude-cli/2.1.293 (external, cli)".into(),
+                ),
+                ("x-stainless-package-version".into(), "0.1.0".into()),
+                (
+                    "anthropic-beta".into(),
+                    case["beta"].as_str().unwrap().into(),
+                ),
+            ]);
+            let body = &case["body"];
+            let result = Rewriter::new().rewrite_headers(
+                &headers,
+                "/v1/messages",
+                &account,
+                ClientType::ClaudeCode,
+                body["model"].as_str().unwrap(),
+                body,
+            );
+            assert_eq!(
+                result["anthropic-beta"],
+                case["beta"].as_str().unwrap(),
+                "{}",
+                case
+            );
+            assert_eq!(
+                super::find_header_value(&result, "x-stainless-package-version")
+                    .map(String::as_str),
+                Some("0.128.0")
+            );
+            assert_eq!(result["User-Agent"], "claude-cli/2.1.293 (external, cli)");
+        }
+    }
+
+    #[test]
+    fn cch_293_fixture_matches_independent_bytes_and_interleaved_suffixes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
+        for case in fixture["hash_cases"].as_array().unwrap() {
+            let raw = case["body"].as_str().unwrap();
+            let body: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                super::cc_version_suffix_for_body(&body, "2.1.293"),
+                case["expected_cc_version_suffix"].as_str().unwrap()
+            );
+            let output =
+                String::from_utf8(compute_cch_attestation(raw.as_bytes().to_vec(), "2.1.293"))
+                    .unwrap();
+            assert!(output.contains(&format!("cch={}", case["expected_cch"].as_str().unwrap())));
+        }
+    }
+
+    #[test]
+    fn auxiliary_293_header_sets_match_captured_endpoints_and_keep_280_identity() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
+        let account = crate::service::version_profile::account_for_request_profile(
+            &test_account(),
+            Some(profile_for_key("2.1.293").unwrap()),
+        );
+        let rewriter = Rewriter::new();
+        for case in fixture["endpoint_header_cases"].as_array().unwrap() {
+            let path = case["path"].as_str().unwrap();
+            let incoming: HashMap<String, String> = case["headers"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.into())))
+                .collect();
+            for client in [ClientType::API, ClientType::ClaudeCode] {
+                let headers = rewriter.rewrite_headers(
+                    &incoming,
+                    path,
+                    &account,
+                    client,
+                    "claude-opus-5-5",
+                    &json!({}),
+                );
+                for (key, expected) in case["headers"].as_object().unwrap() {
+                    assert_eq!(
+                        super::find_header_value(&headers, key).map(String::as_str),
+                        expected.as_str(),
+                        "{path} {key}"
+                    );
+                }
+            }
+        }
+        let legacy = test_account();
+        for (path, expected) in [
+            ("/api/eval/synthetic", "Bun/1.4.3"),
+            ("/api/claude_code_penguin_mode", "axios/1.15.2"),
+            ("/v1/mcp_servers", "axios/1.15.2"),
+        ] {
+            let headers = rewriter.rewrite_headers(
+                &HashMap::new(),
+                path,
+                &legacy,
+                ClientType::API,
+                "claude-opus-5-5",
+                &json!({}),
+            );
+            assert_eq!(
+                super::find_header_value(&headers, "user-agent").map(String::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn safeguard_293_context_beta_requires_incoming_token_and_account_permission() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
+        let case = fixture["native_header_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| {
+                case["body"]["model"] == "claude-opus-5-5"
+                    && case["body"].get("safeguards").is_some()
+            })
+            .unwrap();
+        let mut account = crate::service::version_profile::account_for_request_profile(
+            &test_account(),
+            Some(profile_for_key("2.1.293").unwrap()),
+        );
+        let incoming = HashMap::from([(
+            "anthropic-beta".into(),
+            format!("{},synthetic-extra", case["beta"].as_str().unwrap()),
+        )]);
+        let rewriter = Rewriter::new();
+        let beta = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-5-5",
+            &case["body"],
+        )["anthropic-beta"]
+            .clone();
+        assert!(beta.contains("context-1m-2025-08-07"));
+        assert!(!beta.contains("synthetic-extra"));
+        account.allow_1m_models.clear();
+        let blocked = rewriter.rewrite_headers(
+            &incoming,
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-5-5",
+            &case["body"],
+        )["anthropic-beta"]
+            .clone();
+        assert!(!blocked.contains("context-1m-2025-08-07"));
+        let absent = rewriter.rewrite_headers(
+            &HashMap::new(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-5-5",
+            &case["body"],
+        )["anthropic-beta"]
+            .clone();
+        assert!(!absent.contains("context-1m-2025-08-07"));
+    }
+
+    #[test]
+    fn api_293_model_limits_title_and_order_follow_capture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
+        let account = crate::service::version_profile::account_for_request_profile(
+            &test_account(),
+            Some(profile_for_key("2.1.293").unwrap()),
+        );
+        let rewriter = Rewriter::new();
+        for (model, expected) in fixture["request_profiles"].as_object().unwrap() {
+            let body = json!({"stream":true,"diagnostics":{},"thread":{"type":"request"},"output_config":{},"synthetic_unknown":{"keep":true},"messages":[{"role":"user","content":"合成文本"}],"model":model});
+            let result = rewriter.rewrite_body(
+                &serde_json::to_vec(&body).unwrap(),
+                "/v1/messages",
+                &account,
+                ClientType::API,
+                EnvPassthrough::default(),
+                CacheControlTtlRewrite::Off,
+                MessageCacheControlRewrite::Off,
+                true,
+            );
+            let value: serde_json::Value = serde_json::from_slice(&result).unwrap();
+            assert_eq!(value["max_tokens"], expected["max_tokens"]);
+            assert_eq!(value["thinking"], expected["thinking"]);
+            assert_eq!(value["output_config"], expected["output_config"]);
+            assert_eq!(value["synthetic_unknown"], body["synthetic_unknown"]);
+            assert!(value.get("fallbacks").is_none());
+            let keys: Vec<_> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                keys.iter().position(|k| *k == "thread")
+                    < keys.iter().position(|k| *k == "diagnostics")
+            );
+        }
+        let title = fixture["native_header_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "title")
+            .unwrap()["body"]
+            .clone();
+        let result = rewriter.rewrite_body(
+            &serde_json::to_vec(&title).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::API,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(value["max_tokens"], 128000);
+        assert!(value.get("thinking").is_none());
+        assert!(super::is_structured_haiku_title_request_for_profile(
+            &value,
+            &profile_for_key("2.1.293").unwrap().request
+        ));
+        assert!(!super::is_structured_haiku_title_request_for_profile(
+            &value,
+            &profile_for_key("2.1.280").unwrap().request
+        ));
+        let mut main = title;
+        main["thinking"] = json!({"type":"adaptive","display":"updates"});
+        assert!(!super::is_structured_haiku_title_request_for_profile(
+            &main,
+            &profile_for_key("2.1.293").unwrap().request
+        ));
+    }
+
+    #[test]
     fn cli_bg_identity_only_rewrite_preserves_request_shape() {
         let account = test_account();
         let profile = device_profile(&account);
@@ -6880,12 +7281,9 @@ mod tests {
             serde_json::from_str(parsed["metadata"]["user_id"].as_str().unwrap()).unwrap();
 
         assert_eq!(system.len(), 3);
-        assert!(
-            billing.starts_with(
-                format!("x-anthropic-billing-header: cc_version={DEFAULT_CLAUDE_CODE_VERSION}.")
-                    .as_str()
-            )
-        );
+        assert!(billing.starts_with(
+            format!("x-anthropic-billing-header: cc_version={TEST_VERSION}.").as_str()
+        ));
         assert!(billing.contains("; cc_entrypoint=cli; cch="));
         assert!(!billing.contains("cch=00000"));
         assert_eq!(system[1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
@@ -6906,10 +7304,7 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        assert_eq!(
-            output,
-            compute_cch_attestation(placeholder, DEFAULT_CLAUDE_CODE_VERSION)
-        );
+        assert_eq!(output, compute_cch_attestation(placeholder, TEST_VERSION));
     }
 
     #[test]
@@ -6966,10 +7361,7 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        assert_eq!(
-            first,
-            compute_cch_attestation(placeholder, DEFAULT_CLAUDE_CODE_VERSION)
-        );
+        assert_eq!(first, compute_cch_attestation(placeholder, TEST_VERSION));
     }
 
     #[test]
@@ -7123,11 +7515,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert!(expected.contains(&actual));
     }
@@ -8586,7 +8975,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_completion_is_delayed_until_upstream_finishes() {
-        let key = format!("1:{}:session-delayed", DEFAULT_CLAUDE_CODE_VERSION);
+        let key = format!("1:{}:session-delayed", TEST_VERSION);
         let rewriter = Rewriter::new();
         let (first, first_completion) = rewrite_messages_body_with_stateful_completion(
             &rewriter,
@@ -8685,10 +9074,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_does_not_persist_tool_result_anchors() {
-        let key = format!(
-            "1:{}:session-tool-result-durable",
-            DEFAULT_CLAUDE_CODE_VERSION
-        );
+        let key = format!("1:{}:session-tool-result-durable", TEST_VERSION);
         let rewriter = Rewriter::new();
         let (parsed, completion) = rewrite_messages_body_with_stateful_completion(
             &rewriter,
@@ -8723,7 +9109,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_rejects_completion_when_usage_shows_rebuild() {
-        let key = format!("1:{}:session-usage-feedback", DEFAULT_CLAUDE_CODE_VERSION);
+        let key = format!("1:{}:session-usage-feedback", TEST_VERSION);
         let rewriter = Rewriter::new();
         let (_first, first_completion) = rewrite_messages_body_with_stateful_completion(
             &rewriter,
@@ -8934,10 +9320,7 @@ mod tests {
                 .stateful_cache
                 .lock()
                 .unwrap()
-                .get(&format!(
-                    "1:{}:session-bootstrap",
-                    DEFAULT_CLAUDE_CODE_VERSION
-                ))
+                .get(&format!("1:{}:session-bootstrap", TEST_VERSION))
                 .is_none()
         );
 
@@ -8955,10 +9338,7 @@ mod tests {
                     .stateful_cache
                     .lock()
                     .unwrap()
-                    .get(&format!(
-                        "1:{}:session-bootstrap",
-                        DEFAULT_CLAUDE_CODE_VERSION
-                    ))
+                    .get(&format!("1:{}:session-bootstrap", TEST_VERSION))
                     .is_none()
             );
         }
@@ -8976,10 +9356,7 @@ mod tests {
             .stateful_cache
             .lock()
             .unwrap()
-            .get(&format!(
-                "1:{}:session-bootstrap",
-                DEFAULT_CLAUDE_CODE_VERSION
-            ))
+            .get(&format!("1:{}:session-bootstrap", TEST_VERSION))
             .expect("snapshot");
         assert_eq!(snapshot.normal_profile.block_count, 22);
 
@@ -9118,7 +9495,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_stale_generation_without_shared_anchor_is_rejected() {
-        let key = format!("1:{}:session-stale", DEFAULT_CLAUDE_CODE_VERSION);
+        let key = format!("1:{}:session-stale", TEST_VERSION);
         let first_body = stateful_session_body_with_prefix("session-stale", 80, "first");
         let second_body = stateful_session_body_with_prefix("session-stale", 82, "second");
         let stale_body = stateful_session_body_with_prefix("session-stale", 81, "stale");
@@ -9178,7 +9555,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_cold_parallel_completion_without_shared_anchor_is_rejected() {
-        let key = format!("1:{}:session-cold-parallel", DEFAULT_CLAUDE_CODE_VERSION);
+        let key = format!("1:{}:session-cold-parallel", TEST_VERSION);
         let first_body = stateful_session_body_with_prefix("session-cold-parallel", 80, "first");
         let parallel_body =
             stateful_session_body_with_prefix("session-cold-parallel", 82, "parallel");
@@ -9680,12 +10057,9 @@ mod tests {
 
         let system = parsed["system"].as_array().expect("system array");
         assert_eq!(system.len(), 3);
-        assert!(
-            system[0]["text"].as_str().unwrap().starts_with(
-                format!("x-anthropic-billing-header: cc_version={DEFAULT_CLAUDE_CODE_VERSION}.")
-                    .as_str()
-            )
-        );
+        assert!(system[0]["text"].as_str().unwrap().starts_with(
+            format!("x-anthropic-billing-header: cc_version={TEST_VERSION}.").as_str()
+        ));
         assert!(system[0]["text"].as_str().unwrap().contains("cch="));
         assert_eq!(system[1]["text"], json!(super::CLAUDE_CODE_SYSTEM_PROMPT));
         assert_eq!(
@@ -10332,7 +10706,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("User-Agent").unwrap(),
-            claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
+            claude_cli_user_agent(TEST_VERSION).as_str()
         );
         assert_eq!(
             headers.get("anthropic-beta").unwrap(),
@@ -10340,7 +10714,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("X-Stainless-Package-Version").unwrap(),
-            STAINLESS_PACKAGE_VERSION
+            TEST_SDK_VERSION
         );
         assert_eq!(
             headers.get("X-Stainless-Runtime-Version").unwrap(),
@@ -11388,10 +11762,7 @@ mod tests {
         );
         assert_eq!(
             completion.key,
-            format!(
-                "{}:{}:real-session",
-                account.id, DEFAULT_CLAUDE_CODE_VERSION
-            )
+            format!("{}:{}:real-session", account.id, TEST_VERSION)
         );
     }
 
@@ -11670,11 +12041,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert!(expected.contains(&actual));
     }
@@ -11979,11 +12347,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert_eq!(
             top_level_keys(&out),
@@ -12258,10 +12623,7 @@ mod tests {
                 "",
                 &json!({}),
             );
-            assert_eq!(
-                headers["User-Agent"],
-                claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION)
-            );
+            assert_eq!(headers["User-Agent"], claude_cli_user_agent(TEST_VERSION));
             assert_eq!(
                 headers["anthropic-beta"], OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280,
                 "{path}"
@@ -12307,7 +12669,7 @@ mod tests {
         );
         assert_eq!(
             event_headers.get("User-Agent").unwrap(),
-            claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
+            claude_code_user_agent(TEST_VERSION).as_str()
         );
         assert_eq!(event_headers.get("x-service-name").unwrap(), "claude-code");
         assert_eq!(
@@ -12435,7 +12797,7 @@ mod tests {
         );
         assert_eq!(
             oauth_headers.get("User-Agent").unwrap(),
-            claude_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION).as_str()
+            claude_cli_user_agent(TEST_VERSION).as_str()
         );
 
         let penguin_headers = rewriter.rewrite_headers(
@@ -12668,10 +13030,7 @@ mod tests {
             "default_claude_max_20x"
         );
         assert_eq!(attrs.get("entrypoint").unwrap(), "cli");
-        assert_eq!(
-            attrs.get("appVersion").unwrap(),
-            DEFAULT_CLAUDE_CODE_VERSION
-        );
+        assert_eq!(attrs.get("appVersion").unwrap(), TEST_VERSION);
         assert!(parsed.get("forcedVariations").unwrap().is_object());
         assert!(parsed.get("forcedFeatures").unwrap().is_array());
         assert_eq!(parsed.get("url").unwrap(), "");
@@ -12808,7 +13167,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let env = &parsed["events"][0]["event_data"]["env"];
 
-        assert_eq!(env["version"], DEFAULT_CLAUDE_CODE_VERSION);
+        assert_eq!(env["version"], TEST_VERSION);
         assert_eq!(env["shell"], "bash");
         assert_eq!(env["is_running_with_bun"], true);
     }
@@ -12971,10 +13330,7 @@ mod tests {
 
     #[test]
     fn cch_seed_is_versioned() {
-        assert_eq!(
-            cch_attestation_seed(DEFAULT_CLAUDE_CODE_VERSION),
-            0x4D659218E32A3268
-        );
+        assert_eq!(cch_attestation_seed(TEST_VERSION), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.156"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.169"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.172"), 0x4D659218E32A3268);
@@ -13166,7 +13522,7 @@ mod tests {
     #[test]
     fn cch_refresh_recomputes_existing_value_after_retry_body_change() {
         let body = br#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.156.b94; cc_entrypoint=cli; cch=40943;"}],"messages":[{"role":"assistant","content":[{"type":"text","text":"sanitized"}]}]}"#;
-        let out = super::refresh_cch_attestation(body.to_vec(), DEFAULT_CLAUDE_CODE_VERSION);
+        let out = super::refresh_cch_attestation(body.to_vec(), TEST_VERSION);
         let text = String::from_utf8(out).unwrap();
 
         assert!(!text.contains("cch=40943"));
@@ -13196,11 +13552,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert!(expected.contains(&actual));
     }
@@ -13281,11 +13634,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert!(expected.contains(&actual));
     }
@@ -13340,11 +13690,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert!(expected.contains(&actual));
     }
@@ -13389,11 +13736,8 @@ mod tests {
             .position(|window| window.starts_with(b"cch="))
             .expect("cch value position");
         placeholder_body[cch_pos + 4..cch_pos + 9].copy_from_slice(b"00000");
-        let expected = String::from_utf8(compute_cch_attestation(
-            placeholder_body,
-            DEFAULT_CLAUDE_CODE_VERSION,
-        ))
-        .unwrap();
+        let expected =
+            String::from_utf8(compute_cch_attestation(placeholder_body, TEST_VERSION)).unwrap();
 
         assert!(expected.contains(&actual));
     }

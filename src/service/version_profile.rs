@@ -6,20 +6,22 @@ use crate::model::identity::device_profile;
 use crate::service::access_policy::extract_claude_code_version;
 
 /// 默认 Claude Code 版本画像 key。
-pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.280";
+pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.293";
 /// 默认按客户端原始 UA 选择已验证的版本画像。
 pub const DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE: &str = "client_version";
 /// Claude Code 默认兼容版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_280.identity.version;
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_293.identity.version;
 /// Claude Code 默认基础版本。
-pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_280.identity.version_base;
+pub const DEFAULT_CLAUDE_CODE_VERSION_BASE: &str = PROFILE_2_1_293.identity.version_base;
 /// 当前默认 Claude Code 抓包对应的构建时间。
-pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_280.identity.build_time;
+pub const DEFAULT_CLAUDE_CODE_BUILD_TIME: &str = PROFILE_2_1_293.identity.build_time;
 /// 默认画像对应的 Claude Code / Claude CLI 允许版本范围。
 pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS: &str =
-    PROFILE_2_1_280.access_policy.allowed_claude_code_versions;
+    PROFILE_2_1_293.access_policy.allowed_claude_code_versions;
 /// 当前默认 Claude Code 使用的 Stainless SDK 版本。
-pub const STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
+pub const STAINLESS_PACKAGE_VERSION: &str = "0.128.0";
+/// 257、260、280 固定原有 SDK 身份，不随默认画像升级。
+const STAINLESS_PACKAGE_VERSION_2_1_257: &str = "0.112.1";
 /// Claude Code 2.1.220 及旧回滚画像使用的 Stainless SDK 版本。
 const STAINLESS_PACKAGE_VERSION_2_1_220: &str = "0.94.0";
 /// 当前默认 Claude Code 抓包中的 Node runtime 版本。
@@ -34,6 +36,20 @@ const MESSAGE_BETA_TOKENS_2_1_197: &str = "claude-code-20250219,oauth-2025-04-20
 ///
 /// `fallback-credit-2026-06-01` 位于 effort 与 extended-cache-ttl 之间。
 pub const MESSAGE_BETA_TOKENS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+/// 293 的 claude-opus-5-5 已验证普通 beta 顺序。
+pub const OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// 293 的 claude-opus-5-5 已验证集成 safeguard beta 顺序。
+pub const OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// 293 的 claude-sonnet-5-5 已验证普通 beta 顺序。
+pub const SONNET_5_5_MESSAGE_BETA_TOKENS_2_1_293: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// 293 的 claude-sonnet-5-5 已验证集成 safeguard beta 顺序。
+pub const SONNET_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// 293 的 claude-haiku-5-5 已验证普通 beta 顺序。
+pub const HAIKU_5_5_MESSAGE_BETA_TOKENS_2_1_293: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// 293 的 claude-haiku-5-5 已验证集成 safeguard beta 顺序。
+pub const HAIKU_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+/// 293 的 Haiku 5.5 结构化标题 beta 顺序。
+pub const HAIKU_STREAMING_TITLE_BETA_TOKENS_2_1_293: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07";
 /// Claude Code 2.1.260 Opus 5 主请求使用的 message beta token 集合。
 ///
 /// `context-1m-2025-08-07` 仍由账号白名单按请求动态插入。
@@ -177,6 +193,7 @@ impl ClaudeCodeProfileSelectionConfig {
         let matched = match extract_claude_code_version(user_agent).flatten() {
             Some("2.1.260") => Some(&PROFILE_2_1_260),
             Some("2.1.280") => Some(&PROFILE_2_1_280),
+            Some("2.1.293") => Some(&PROFILE_2_1_293),
             _ => None,
         };
         Some(matched.unwrap_or(self.default_profile))
@@ -238,6 +255,7 @@ pub struct RequestProfile {
     pub main_models: &'static [MainRequestProfile],
     pub safeguard_models: &'static [SafeguardRequestProfile],
     pub fable_models: &'static [FableRequestProfile],
+    pub haiku_title_profile: HaikuTitleProfile,
     pub haiku_probe_beta_tokens: &'static str,
     pub haiku_streaming_title_beta_tokens: &'static str,
     pub haiku_title_optional_beta_tokens: &'static [&'static str],
@@ -333,11 +351,19 @@ pub enum FableFallbackProfile {
     Default,
 }
 
-/// `/v1/messages` 顶层字段顺序画像。
+/// 已验证的 Haiku 标题结构，防止新标题误分类为主请求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaikuTitleProfile {
+    Legacy,
+    ClaudeCode21293,
+}
+
+/// 消息顶层字段顺序画像。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageBodyOrderProfile {
     Legacy,
     ClaudeCode21220,
+    ClaudeCode21293,
 }
 
 /// billing header 和 CCH 子画像。
@@ -407,6 +433,7 @@ pub enum EndpointHeaderProfile {
     Legacy,
     ClaudeCode21257,
     ClaudeCode21280,
+    ClaudeCode21293,
 }
 
 impl EndpointProfile {
@@ -415,7 +442,7 @@ impl EndpointProfile {
     /// @return 与已验证端点画像对应的 Base64 JSON。
     pub fn mcp_client_capabilities(&self) -> &'static str {
         match self.header_profile {
-            EndpointHeaderProfile::ClaudeCode21280 => {
+            EndpointHeaderProfile::ClaudeCode21280 | EndpointHeaderProfile::ClaudeCode21293 => {
                 "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0="
             }
             _ => MCP_CLIENT_CAPABILITIES,
@@ -627,6 +654,7 @@ const ROLLBACK_REQUEST_PROFILE: RequestProfile = RequestProfile {
     safeguard_models: &[],
     fable_models: &FABLE_MODELS_ROLLBACK,
     haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+    haiku_title_profile: HaikuTitleProfile::Legacy,
     haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
     haiku_title_optional_beta_tokens: &[],
     haiku_main_beta_tokens: MESSAGE_BETA_TOKENS_2_1_197,
@@ -725,13 +753,151 @@ const BOOTSTRAP_MODELS_ROLLBACK: [BootstrapModelProfile; 1] = [BootstrapModelPro
     cwk_cfg_key: Some("marigold"),
 }];
 
+const MAIN_MODELS_2_1_293: [MainRequestProfile; 4] = [
+    MainRequestProfile {
+        model_id: "claude-opus-5-5",
+        message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        default_max_tokens: 128_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("xhigh"),
+        client_optional_beta_tokens: &["context-1m-2025-08-07"],
+    },
+    MainRequestProfile {
+        model_id: "claude-sonnet-5-5",
+        message_beta_tokens: SONNET_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        default_max_tokens: 128_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("xhigh"),
+        client_optional_beta_tokens: &[],
+    },
+    MainRequestProfile {
+        model_id: "claude-haiku-5-5",
+        message_beta_tokens: HAIKU_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        default_max_tokens: 128_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("xhigh"),
+        client_optional_beta_tokens: &["claude-code-20250219", "extended-cache-ttl-2025-04-11"],
+    },
+    MainRequestProfile {
+        model_id: "claude-fable-5-1",
+        message_beta_tokens: SONNET_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        default_max_tokens: 64_000,
+        thinking: ThinkingProfile::Adaptive {
+            display: Some("updates"),
+        },
+        output_effort: Some("xhigh"),
+        client_optional_beta_tokens: &[],
+    },
+];
+
+const SAFEGUARD_MODELS_2_1_293: [SafeguardRequestProfile; 4] = [
+    SafeguardRequestProfile {
+        model_id: "claude-opus-5-5",
+        message_beta_tokens: OPUS_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293,
+    },
+    SafeguardRequestProfile {
+        model_id: "claude-sonnet-5-5",
+        message_beta_tokens: SONNET_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293,
+    },
+    SafeguardRequestProfile {
+        model_id: "claude-haiku-5-5",
+        message_beta_tokens: HAIKU_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293,
+    },
+    SafeguardRequestProfile {
+        model_id: "claude-fable-5-1",
+        message_beta_tokens: SONNET_5_5_SAFEGUARD_MESSAGE_BETA_TOKENS_2_1_293,
+    },
+];
+const FABLE_MODELS_2_1_293: [FableRequestProfile; 1] = [FableRequestProfile {
+    model_id: "claude-fable-5-1",
+    message_beta_tokens: SONNET_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+    fallback: FableFallbackProfile::None,
+    default_max_tokens: 64_000,
+    thinking_display: Some("updates"),
+}];
+const BOOTSTRAP_MODELS_2_1_293: [BootstrapModelProfile; 4] = [
+    BootstrapModelProfile {
+        model_id: "claude-opus-5-5",
+        cwk_cfg_key: Some("saffron"),
+    },
+    BootstrapModelProfile {
+        model_id: "claude-sonnet-5-5",
+        cwk_cfg_key: Some("cardamom"),
+    },
+    BootstrapModelProfile {
+        model_id: "claude-haiku-5-5",
+        cwk_cfg_key: Some("lovage"),
+    },
+    BootstrapModelProfile {
+        model_id: "claude-fable-5-1",
+        cwk_cfg_key: Some("sorrel"),
+    },
+];
+
+const PROFILE_2_1_293: ClaudeCodeProfile = ClaudeCodeProfile {
+    key: "2.1.293",
+    identity: IdentityProfile {
+        version: "2.1.293",
+        version_base: "2.1.293",
+        build_time: "2026-10-07T06:36:42Z",
+        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
+    },
+    access_policy: AccessPolicyProfile {
+        allowed_claude_code_versions: "2.1.89-2.1.293",
+    },
+    request: RequestProfile {
+        message_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        message_fallback_beta_tokens: MESSAGE_FALLBACK_BETA_TOKENS_2_1_280,
+        main_models: &MAIN_MODELS_2_1_293,
+        safeguard_models: &SAFEGUARD_MODELS_2_1_293,
+        fable_models: &FABLE_MODELS_2_1_293,
+        haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+        haiku_title_profile: HaikuTitleProfile::ClaudeCode21293,
+        haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS_2_1_293,
+        haiku_title_optional_beta_tokens: &[],
+        haiku_main_beta_tokens: HAIKU_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        haiku_main_no_diagnostics_beta_tokens: HAIKU_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+        haiku_non_stream_aux_beta_tokens: HAIKU_NON_STREAM_AUX_BETA_TOKENS_2_1_257,
+        count_tokens_beta_tokens: COUNT_TOKENS_BETA_TOKENS,
+        oauth_beta_token: OAUTH_BETA_TOKEN,
+        code_triggers_beta_token: CODE_TRIGGERS_BETA_TOKEN,
+        mcp_servers_beta_token: MCP_SERVERS_BETA_TOKEN,
+        opus_default_max_tokens_model: "claude-opus-5-5",
+        message_body_order: MessageBodyOrderProfile::ClaudeCode21293,
+    },
+    billing: BillingProfile {
+        cc_version_algorithm: CcVersionAlgorithm::Sha256TextPositions,
+        cch_profile: CchProfile::ClaudeCodeAllModelValues,
+    },
+    telemetry: TelemetryProfile {
+        shape: TelemetryShape::ClaudeCode2185,
+        growthbook_user_agent: "Bun/1.4.3",
+        default_model: "claude-opus-5-5",
+        base_beta_tokens: OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293,
+    },
+    endpoints: EndpointProfile {
+        event_logging_path: EVENT_LOGGING_V2_PATH,
+        event_logging_legacy_path: EVENT_LOGGING_LEGACY_PATH,
+        bootstrap_cedar_basin: Some("2027-08-31"),
+        bootstrap_models: &BOOTSTRAP_MODELS_2_1_293,
+        header_profile: EndpointHeaderProfile::ClaudeCode21293,
+    },
+};
+
 const PROFILE_2_1_280: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.280",
     identity: IdentityProfile {
         version: "2.1.280",
         version_base: "2.1.280",
         build_time: "2026-09-21T20:40:17Z",
-        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_package_version: STAINLESS_PACKAGE_VERSION_2_1_257,
         stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
     },
     access_policy: AccessPolicyProfile {
@@ -744,6 +910,7 @@ const PROFILE_2_1_280: ClaudeCodeProfile = ClaudeCodeProfile {
         safeguard_models: &SAFEGUARD_MODELS_2_1_280,
         fable_models: &FABLE_MODELS_2_1_280,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+        haiku_title_profile: HaikuTitleProfile::Legacy,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
         haiku_title_optional_beta_tokens: HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257,
         haiku_main_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_280,
@@ -781,7 +948,7 @@ const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
         version: "2.1.260",
         version_base: "2.1.260",
         build_time: "2026-09-03T19:41:35Z",
-        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_package_version: STAINLESS_PACKAGE_VERSION_2_1_257,
         stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
     },
     access_policy: AccessPolicyProfile {
@@ -794,6 +961,7 @@ const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
         safeguard_models: &[],
         fable_models: &FABLE_MODELS_2_1_260,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+        haiku_title_profile: HaikuTitleProfile::Legacy,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
         haiku_title_optional_beta_tokens: HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257,
         haiku_main_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_260,
@@ -833,7 +1001,7 @@ const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
         version: "2.1.257",
         version_base: "2.1.257",
         build_time: "2026-09-01T05:28:54Z",
-        stainless_package_version: STAINLESS_PACKAGE_VERSION,
+        stainless_package_version: STAINLESS_PACKAGE_VERSION_2_1_257,
         stainless_runtime_version: STAINLESS_RUNTIME_VERSION,
     },
     access_policy: AccessPolicyProfile {
@@ -846,6 +1014,7 @@ const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
         safeguard_models: &[],
         fable_models: &FABLE_MODELS_2_1_257,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+        haiku_title_profile: HaikuTitleProfile::Legacy,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
         haiku_title_optional_beta_tokens: HAIKU_TITLE_OPTIONAL_BETA_TOKENS_2_1_257,
         haiku_main_beta_tokens: HAIKU_MAIN_BETA_TOKENS_2_1_257,
@@ -898,6 +1067,7 @@ const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
         safeguard_models: &[],
         fable_models: &FABLE_MODELS_2_1_220,
         haiku_probe_beta_tokens: HAIKU_PROBE_BETA_TOKENS,
+        haiku_title_profile: HaikuTitleProfile::Legacy,
         haiku_streaming_title_beta_tokens: HAIKU_STREAMING_TITLE_BETA_TOKENS,
         haiku_title_optional_beta_tokens: &[],
         haiku_main_beta_tokens: MESSAGE_BETA_TOKENS,
@@ -1089,7 +1259,8 @@ const PROFILE_2_1_197: ClaudeCodeProfile = ClaudeCodeProfile {
     },
 };
 
-static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 9] = [
+static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 10] = [
+    &PROFILE_2_1_293,
     &PROFILE_2_1_280,
     &PROFILE_2_1_260,
     &PROFILE_2_1_257,
@@ -1105,7 +1276,7 @@ static CLAUDE_CODE_PROFILES: [&ClaudeCodeProfile; 9] = [
 ///
 /// @return 默认版本画像。
 pub fn default_profile() -> &'static ClaudeCodeProfile {
-    &PROFILE_2_1_280
+    &PROFILE_2_1_293
 }
 
 /// 返回所有内置 Claude Code 版本画像。
@@ -1230,16 +1401,18 @@ mod tests {
             ("claude-code/2.1.260", "2.1.260"),
             ("ClAuDe-ClI/2.1.260 (external, cli)", "2.1.260"),
             ("CLAUDE-CODE/2.1.280 (external, cli)", "2.1.280"),
-            ("", "2.1.280"),
-            ("claude-code/", "2.1.280"),
-            ("claude-code/2.1.2600", "2.1.280"),
-            ("claude-code/2.1.260-beta", "2.1.280"),
-            ("claude-code/2.1.260.1", "2.1.280"),
-            ("claude-code/2.1.257", "2.1.280"),
-            ("claude-code/2.1.293", "2.1.280"),
-            ("Bun/1.4.2", "2.1.280"),
-            ("axios/1.13.6", "2.1.280"),
-            ("python claude-code/2.1.260", "2.1.280"),
+            ("claude-cli/2.1.293 (external, cli)", "2.1.293"),
+            ("claude-code/2.1.294", "2.1.293"),
+            ("", "2.1.293"),
+            ("claude-code/", "2.1.293"),
+            ("claude-code/2.1.2600", "2.1.293"),
+            ("claude-code/2.1.260-beta", "2.1.293"),
+            ("claude-code/2.1.260.1", "2.1.293"),
+            ("claude-code/2.1.257", "2.1.293"),
+            ("claude-code/2.1.293", "2.1.293"),
+            ("Bun/1.4.2", "2.1.293"),
+            ("axios/1.13.6", "2.1.293"),
+            ("python claude-code/2.1.260", "2.1.293"),
         ] {
             assert_eq!(config.resolve(ua).unwrap().key, expected, "{ua}");
         }

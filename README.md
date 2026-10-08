@@ -197,12 +197,14 @@ curl http://127.0.0.1:5674/v1/messages \
 
 | 设置 | 默认值 | 行为 |
 |------|--------|------|
-| `claude_code_profile_selection_mode` | `client_version` | 根据原始 `claude-code/` 或 `claude-cli/` UA 精确适配 `2.1.260` / `2.1.280`；设为 `account` 可恢复账号画像方式 |
-| `claude_code_version_profile` | `2.1.280` | 客户端模式中，UA 缺少版本、非法或未匹配时使用的默认画像 |
+| `claude_code_profile_selection_mode` | `client_version` | 根据原始 `claude-code/` 或 `claude-cli/` UA 精确适配 `2.1.260` / `2.1.280` / `2.1.293`；设为 `account` 可恢复账号画像方式 |
+| `claude_code_version_profile` | `2.1.293` | 客户端模式中，UA 缺少版本、非法或未匹配时使用的默认画像 |
 
-请求体中的版本字段不参与画像选择。请求选定画像后，换号、401 恢复、签名重试和异步遥测继续沿用该画像。设备身份、账号并发、RPM 和上游 session 池容量由两版请求共享；遥测与版本相关缓存分别隔离。
+请求体中的版本字段不参与画像选择。请求选定画像后，换号、401 恢复、签名重试和异步遥测继续沿用该画像。设备身份、账号并发、RPM 和上游 session 池容量由多版本请求共享；遥测与版本相关缓存分别隔离。
 
-访问策略先于画像选择生效，未支持版本回退也受准入限制。保存默认画像仍会按现有规则同步账号软件环境和允许版本范围；已有管理员配置在升级时保留。若要同时放行两版，可将允许版本范围设置为 `2.1.260-2.1.280`。
+访问策略先于画像选择生效，禁止规则优先；默认回退不能绕过门禁。保存默认画像仍同步账号软件环境，客户端模式保留显式准入范围，账号模式使用所选画像范围。启动仅迁移精确的旧出厂 profile/range 配对，自定义禁止版本和其它 UA 规则保留。
+
+设置页提供“仅允许 280、293（默认 293）”预设，填入客户端模式、默认 2.1.293、允许范围 2.1.89-2.1.293 和禁止区间 2.1.89-2.1.279,2.1.281-2.1.292，保存后生效。260 的画像、UA 映射及选项仍存在，可通过调整准入继续使用。账号列表显示持久基础版本与当前默认回退，不将共享账号标为某个临时请求的版本。
 
 账号管理页分别展示账号保存的基础版本、当前画像选择方式和默认回退版本，并随账号列表每 5 秒刷新。基础版本显示 280 的账号仍能按客户端 UA 承载 260 请求，版本适配不依赖自动遥测是否开启。
 
@@ -533,7 +535,7 @@ cc-bridge/
 
 网关通过全局 settings 控制客户端入口访问，校验发生在账号选择和上游请求之前：
 
-- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.280`
+- `allowed_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认 `2.1.89-2.1.293`
 - `blocked_claude_code_versions`：只作用于 `claude-code/` / `claude-cli/` UA，默认空；命中后优先拒绝
 - `allowed_user_agents`：只作用于非 Claude Code / CLI UA，默认允许 `AI-Hub-Monitor*` 和 `python-httpx*`
 - 版本规则支持精确版本、通配和闭区间，例如 `2.1.187`、`2.1.*`、`2.1.89-2.1.187`
@@ -605,10 +607,10 @@ cc-bridge/
 
 ### 请求头改写
 
-- 默认 Claude Code 指纹为 `2.1.280`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移只把仍使用历史默认 profile/range 组合的设置升级到当前画像
+- 默认 Claude Code 指纹为 `2.1.293`，新账号的 `version` / `version_base` / `build_time` 会按该版本生成；启动迁移只把仍使用历史默认 profile/range 组合的设置升级到当前画像
 - `/v1/messages` 使用所选画像的 `claude-cli/<version> (external, cli)`、Stainless package 和 Node runtime；2.1.280 为 `0.112.1` / `v26.3.0`
 - `/api/event_logging/v2/batch` 使用 `claude-code/<version>`、`anthropic-beta=oauth-2025-04-20`、`x-service-name=claude-code`
-- `/api/eval/*` 使用所选画像的 Bun UA；2.1.280 为 `Bun/1.4.3`
+- `/api/eval/*` 在 293 使用 `claude-code/2.1.293`，2.1.280 保留 `Bun/1.4.3`
 - `/v1/code/triggers` / `/v1/mcp_servers` 使用各自 endpoint beta token
 - 注入/合并 `anthropic-beta`、固定必要 `anthropic-version`
 - 强制使用账号真实 `Authorization`
@@ -635,6 +637,10 @@ Claude Code 2.1.280 的 Opus Auto 与 Plan 模式会把 `dangerous_tool_use` 分
 bootstrap `cwk_cfg_key`。2.1.280 的 CCH 会清空请求体内所有字符串类型的精确 `model`
 字段并保留 fallback；2.1.260 与更早画像继续使用原有顶层归一化规则。2.1.257 仍可作为回滚画像，其中 Fable 5 使用抓包确认的
 `fallbacks="default"`、`server-side-fallback-2026-07-01` 和 `marigold`。
+
+293 的独立画像依据正式 capture API 的 25 轮、112 条 billing 全量复算建立：Opus/Sonnet/Haiku 5.5 使用 128000 token、adaptive/display updates，Fable 5.1 使用 64000，缺省 effort 为实测 xhigh。Fable 的 CLI [1m] 选项在样本中对应裸 wire ID，未携带 context-1m 或 fallbacks，不按名称自动添加这些字段。标题使用 Haiku 5.5、128000 token 且省略 thinking，旧 Haiku 单 token 探测继续兼容。
+
+293 使用 SDK 0.128.0，260/280 保留 SDK 0.112.1。293 单独维护 inline-tools、message-threads、safeguard 和模型 beta 顺序；原生 Haiku 的可选 token 遵从客户端选择。CCH 延用 280 的精确字节规则，线程后缀保留每条入站会话的值。Remote eval、penguin、bootstrap 和 MCP 列表使用 Claude Code UA，Hello 保留 Bun/1.4.3。遥测不在本轮升级范围，未采到的其它 effort 和可选组合不计入实测覆盖。
 
 ### Thinking 签名错误重试
 
