@@ -149,7 +149,14 @@ impl SessionHelloProbeService {
             return SessionHelloProbeDecision::Proceed;
         }
 
-        let state_key = probe_state_key(account.id, upstream_session_id, &account.proxy_url);
+        let profile = device_profile(account);
+        let profile_key = profile_for_version(&profile.env.version).key;
+        let state_key = probe_state_key(
+            account.id,
+            upstream_session_id,
+            &account.proxy_url,
+            profile_key,
+        );
         let session_logs = ProbeSessionLogs::new(real_session_id, upstream_session_id);
         let lock_key = format!("{}:lock", state_key);
         let owner = Uuid::new_v4().to_string();
@@ -396,10 +403,16 @@ fn parse_u64_range(key: &str, raw: &str, min: u64, max: u64) -> Result<u64, AppE
     }
 }
 
-fn probe_state_key(account_id: i64, upstream_session_id: &str, proxy_url: &str) -> String {
+fn probe_state_key(
+    account_id: i64,
+    upstream_session_id: &str,
+    proxy_url: &str,
+    profile_key: &str,
+) -> String {
     format!(
-        "session_hello_probe:v1:{}:{}:{}",
+        "session_hello_probe:v2:{}:{}:{}:{}",
         account_id,
+        profile_key,
         hex::encode(Sha256::digest(upstream_session_id.as_bytes())),
         hex::encode(Sha256::digest(proxy_url.as_bytes()))
     )
@@ -463,6 +476,7 @@ mod tests {
         DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
+    use crate::service::version_profile::account_for_request_profile;
     use crate::store::cache::{
         RpmAcquire, UpstreamSessionPoolResolve, UpstreamSessionPoolStatus,
         UpstreamSessionRefreshPolicy,
@@ -750,6 +764,27 @@ mod tests {
         assert!(headers.get("authorization").is_none());
         assert!(headers.get("cookie").is_none());
         assert!(headers.get("x-anthropic-billing-header").is_none());
+        assert!(receiver.try_recv().is_err());
+
+        let profile = profile_for_version("2.1.260");
+        let older = account_for_request_profile(&account, Some(profile));
+        assert_eq!(
+            service
+                .ensure_ready(&older, "session-a", "session-a", config)
+                .await,
+            SessionHelloProbeDecision::Proceed
+        );
+        let headers = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .expect("另一画像独立探测");
+        assert_eq!(headers.get(USER_AGENT).unwrap(), "Bun/1.4.1");
+        assert_eq!(
+            service
+                .ensure_ready(&older, "session-a", "session-a", config)
+                .await,
+            SessionHelloProbeDecision::Proceed
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1200,10 +1235,11 @@ mod tests {
 
     #[test]
     fn state_key_changes_with_account_upstream_session_and_proxy_without_leaking_values() {
-        let first = probe_state_key(1, "secret-upstream", "http://proxy-a:8080");
-        let second_account = probe_state_key(2, "secret-upstream", "http://proxy-a:8080");
-        let second_session = probe_state_key(1, "other-upstream", "http://proxy-a:8080");
-        let second_proxy = probe_state_key(1, "secret-upstream", "http://proxy-b:8080");
+        let first = probe_state_key(1, "secret-upstream", "http://proxy-a:8080", "2.1.280");
+        let second_account =
+            probe_state_key(2, "secret-upstream", "http://proxy-a:8080", "2.1.280");
+        let second_session = probe_state_key(1, "other-upstream", "http://proxy-a:8080", "2.1.280");
+        let second_proxy = probe_state_key(1, "secret-upstream", "http://proxy-b:8080", "2.1.280");
 
         assert_ne!(first, second_account);
         assert_ne!(first, second_session);

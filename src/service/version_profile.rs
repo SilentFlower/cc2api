@@ -1,9 +1,14 @@
 use serde_json::Value;
 
 use crate::error::AppError;
+use crate::model::account::{Account, CanonicalEnvData};
+use crate::model::identity::device_profile;
+use crate::service::access_policy::extract_claude_code_version;
 
 /// 默认 Claude Code 版本画像 key。
 pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.280";
+/// 默认按客户端原始 UA 选择已验证的版本画像。
+pub const DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE: &str = "client_version";
 /// Claude Code 默认兼容版本。
 pub const DEFAULT_CLAUDE_CODE_VERSION: &str = PROFILE_2_1_280.identity.version;
 /// Claude Code 默认基础版本。
@@ -117,6 +122,96 @@ pub struct ClaudeCodeProfile {
     pub billing: BillingProfile,
     pub telemetry: TelemetryProfile,
     pub endpoints: EndpointProfile,
+}
+
+/// 请求级画像的选择方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeCodeProfileSelectionMode {
+    ClientVersion,
+    Account,
+}
+
+impl ClaudeCodeProfileSelectionMode {
+    /// 解析设置中的画像选择方式。
+    ///
+    /// @param value 设置字符串。
+    /// @return 合法模式或参数错误。
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        match value {
+            "client_version" => Ok(Self::ClientVersion),
+            "account" => Ok(Self::Account),
+            _ => Err(AppError::BadRequest(format!(
+                "未知 Claude Code 画像选择方式: {}",
+                value
+            ))),
+        }
+    }
+}
+
+/// 原子热刷新的画像选择配置，供请求入口获取固定快照。
+#[derive(Debug, Clone, Copy)]
+pub struct ClaudeCodeProfileSelectionConfig {
+    pub mode: ClaudeCodeProfileSelectionMode,
+    pub default_profile: &'static ClaudeCodeProfile,
+}
+
+impl Default for ClaudeCodeProfileSelectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: ClaudeCodeProfileSelectionMode::ClientVersion,
+            default_profile: default_profile(),
+        }
+    }
+}
+
+impl ClaudeCodeProfileSelectionConfig {
+    /// 仅依据原始 UA 冻结本请求的画像选择。
+    ///
+    /// @param user_agent 原始请求 User-Agent。
+    /// @return 客户端模式返回匹配或默认画像；账号模式返回 `None`，沿用账号画像。
+    pub fn resolve(self, user_agent: &str) -> Option<&'static ClaudeCodeProfile> {
+        if self.mode == ClaudeCodeProfileSelectionMode::Account {
+            return None;
+        }
+        // 只匹配已纳入本轮适配的精确 token，避免把 2600、预发布或未来版本套成 260。
+        let matched = match extract_claude_code_version(user_agent).flatten() {
+            Some("2.1.260") => Some(&PROFILE_2_1_260),
+            Some("2.1.280") => Some(&PROFILE_2_1_280),
+            _ => None,
+        };
+        Some(matched.unwrap_or(self.default_profile))
+    }
+}
+
+/// 创建改写专用的账号副本，持久设备身份与账号容量均沿用原账号。
+///
+/// @param account 最终选定账号，保持原值供调度和存储使用。
+/// @param profile 请求入口冻结的画像；`None` 表示沿用账号画像。
+/// @return 软件字段使用指定画像的请求级副本；旧环境沿用原补齐规则，禁止写回存储。
+pub fn account_for_request_profile(
+    account: &Account,
+    profile: Option<&'static ClaudeCodeProfile>,
+) -> Account {
+    let mut request_account = account.clone();
+    if let Some(profile) = profile {
+        // 旧账号的空/不完整 env 会整体反序列化失败；先沿用原有设备归一化结果，
+        // 再覆盖软件版本，避免所选版本被 device_profile 的默认画像吞掉。
+        if serde_json::from_value::<CanonicalEnvData>(account.canonical_env.clone()).is_err() {
+            let mut env = account
+                .canonical_env
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            if let Value::Object(normalized) = serde_json::to_value(device_profile(account).env)
+                .expect("归一化环境仅包含可序列化的基础字段")
+            {
+                env.extend(normalized);
+            }
+            request_account.canonical_env = Value::Object(env);
+        }
+        apply_identity_to_env_json(&mut request_account.canonical_env, &profile.identity);
+    }
+    request_account
 }
 
 /// 账号 canonical env 中需要与版本同步的身份字段。
@@ -1127,6 +1222,47 @@ pub fn is_event_logging_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn request_profile_matches_only_exact_supported_claude_ua_versions() {
+        let config = ClaudeCodeProfileSelectionConfig::default();
+        for (ua, expected) in [
+            ("claude-code/2.1.260", "2.1.260"),
+            ("ClAuDe-ClI/2.1.260 (external, cli)", "2.1.260"),
+            ("CLAUDE-CODE/2.1.280 (external, cli)", "2.1.280"),
+            ("", "2.1.280"),
+            ("claude-code/", "2.1.280"),
+            ("claude-code/2.1.2600", "2.1.280"),
+            ("claude-code/2.1.260-beta", "2.1.280"),
+            ("claude-code/2.1.260.1", "2.1.280"),
+            ("claude-code/2.1.257", "2.1.280"),
+            ("claude-code/2.1.293", "2.1.280"),
+            ("Bun/1.4.2", "2.1.280"),
+            ("axios/1.13.6", "2.1.280"),
+            ("python claude-code/2.1.260", "2.1.280"),
+        ] {
+            assert_eq!(config.resolve(ua).unwrap().key, expected, "{ua}");
+        }
+    }
+
+    #[test]
+    fn request_profile_respects_explicit_default_and_account_mode() {
+        let config = ClaudeCodeProfileSelectionConfig {
+            default_profile: &PROFILE_2_1_260,
+            ..Default::default()
+        };
+        assert_eq!(config.resolve("").unwrap().key, "2.1.260");
+        assert_eq!(config.resolve("Bun/1.4.3").unwrap().key, "2.1.260");
+        assert_eq!(config.resolve("claude-cli/2.1.280").unwrap().key, "2.1.280");
+        let legacy = ClaudeCodeProfileSelectionConfig {
+            mode: ClaudeCodeProfileSelectionMode::Account,
+            ..config
+        };
+        assert!(legacy.resolve("claude-code/2.1.280").is_none());
+        assert!(legacy.resolve("").is_none());
+        assert!(ClaudeCodeProfileSelectionMode::parse("unknown").is_err());
+        assert!(ClaudeCodeProfileSelectionMode::parse(" account ").is_err());
+    }
 
     #[test]
     fn default_profile_matches_compat_constants() {

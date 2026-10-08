@@ -121,6 +121,10 @@ async fn main() {
         .await
         .expect("load access policy failed");
     gateway_svc
+        .reload_profile_selection_config()
+        .await
+        .expect("load profile selection config failed");
+    gateway_svc
         .reload_env_passthrough()
         .await
         .expect("load env passthrough failed");

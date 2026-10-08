@@ -37,6 +37,8 @@ const allowSystemRoleModels = ref('claude-opus-5-5,claude-opus-5,claude-fable-5,
 
 /** 客户端访问策略表单 */
 const claudeCodeVersionProfile = ref('2.1.280');
+/** 请求画像选择方式：默认按原始 UA 适配 260/280。 */
+const claudeCodeProfileSelectionMode = ref<'client_version' | 'account'>('client_version');
 const allowedClaudeCodeVersions = ref('2.1.89-2.1.280');
 const blockedClaudeCodeVersions = ref('');
 const allowedUserAgents = ref('AI-Hub-Monitor*\npython-httpx*');
@@ -461,6 +463,7 @@ async function loadSettings() {
     allowSystemRoleModels.value = data.allow_system_role_models ?? 'claude-opus-5-5,claude-opus-5,claude-fable-5,claude-fable-5-1,claude-opus-4-8';
     claudeCodeVersionProfiles.value = parseClaudeCodeVersionProfiles(data.claude_code_version_profiles);
     claudeCodeVersionProfile.value = data.claude_code_version_profile ?? '2.1.280';
+    claudeCodeProfileSelectionMode.value = data.claude_code_profile_selection_mode === 'account' ? 'account' : 'client_version';
     allowedClaudeCodeVersions.value = data.allowed_claude_code_versions ?? '2.1.89-2.1.280';
     blockedClaudeCodeVersions.value = data.blocked_claude_code_versions ?? '';
     allowedUserAgents.value = data.allowed_user_agents ?? 'AI-Hub-Monitor*\npython-httpx*';
@@ -614,6 +617,7 @@ async function saveSettings() {
       peak_prime_model: trimFormString(primeModel.value),
       allow_system_role_models: trimFormString(allowSystemRoleModels.value),
       claude_code_version_profile: claudeCodeVersionProfile.value,
+      claude_code_profile_selection_mode: claudeCodeProfileSelectionMode.value,
       allowed_claude_code_versions: trimFormString(allowedClaudeCodeVersions.value),
       blocked_claude_code_versions: trimFormString(blockedClaudeCodeVersions.value),
       allowed_user_agents: trimFormString(allowedUserAgents.value),
@@ -1591,10 +1595,23 @@ onMounted(async () => {
 
         <div class="space-y-3 border-b border-[#f0ebe4] pb-4">
           <div>
-            <Label class="text-[#5c5647] text-sm">Claude Code 版本特征</Label>
+            <Label class="text-[#5c5647] text-sm">Claude Code 默认版本画像</Label>
             <p class="text-[11px] text-[#b5b0a6] mt-1">
-              保存后同步所有账号 canonical env，并覆盖 Claude Code 版本范围；其他允许 UA 保持独立配置。
+              按客户端适配时，原始 UA 的 260/280 请求使用对应画像；缺少、非法或未匹配版本使用此默认画像，出厂为 280。准入版本范围独立生效。
             </p>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              保存默认画像仍同步账号软件环境和允许版本范围；其他允许 UA 保持独立配置。
+            </p>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-[#5c5647] text-xs">画像选择方式</Label>
+            <select
+              v-model="claudeCodeProfileSelectionMode"
+              class="h-9 w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 text-sm text-[#29261e] focus:outline-none focus:ring-2 focus:ring-[#c4704f]"
+            >
+              <option value="client_version">按客户端 UA 适配（默认）</option>
+              <option value="account">使用账号画像（旧方式）</option>
+            </select>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div class="space-y-1.5">

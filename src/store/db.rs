@@ -232,6 +232,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
         ),
         (
+            "claude_code_profile_selection_mode",
+            crate::store::settings_store::DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING,
+        ),
+        (
             "allowed_user_agents",
             crate::store::settings_store::DEFAULT_ALLOWED_USER_AGENTS_SETTING,
         ),
@@ -1142,6 +1146,37 @@ mod tests {
             profile,
             crate::store::settings_store::DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING
         );
+    }
+
+    #[tokio::test]
+    async fn migrate_backfills_selection_mode_without_overwriting_explicit_value() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.unwrap();
+        sqlx::query("DELETE FROM settings WHERE key=$1")
+            .bind("claude_code_profile_selection_mode")
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate(&pool, "sqlite").await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("claude_code_profile_selection_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "client_version");
+        sqlx::query("UPDATE settings SET value=$1 WHERE key=$2")
+            .bind("account")
+            .bind("claude_code_profile_selection_mode")
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate(&pool, "sqlite").await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+            .bind("claude_code_profile_selection_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "account");
     }
 
     #[tokio::test]

@@ -35,11 +35,14 @@ use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerMode, MessageCacheControlRewrite,
 };
 use crate::service::telemetry::TelemetryService;
-use crate::service::version_profile::{all_profiles, profile_for_key};
+use crate::service::version_profile::{
+    ClaudeCodeProfileSelectionMode, all_profiles, profile_for_key,
+};
 use crate::store::prime_log_store::PrimeLogStore;
 use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
+    DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING,
     DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
     DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
@@ -899,6 +902,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("claude_code_version_profile".into())
         .or_insert_with(|| DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING.to_string());
+    settings
+        .entry("claude_code_profile_selection_mode".into())
+        .or_insert_with(|| DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING.to_string());
     settings.insert(
         "claude_code_version_profiles".into(),
         serde_json::to_string(&claude_code_version_profile_options())
@@ -1099,6 +1105,9 @@ async fn update_settings(
     if let Some(val) = body.get("allow_system_role_models") {
         validate_model_id_list("allow_system_role_models", val)?;
     }
+    if let Some(val) = body.get("claude_code_profile_selection_mode") {
+        ClaudeCodeProfileSelectionMode::parse(val)?;
+    }
     let selected_profile = if let Some(val) = body.get("claude_code_version_profile") {
         Some(profile_for_key(val)?)
     } else {
@@ -1233,6 +1242,9 @@ async fn update_settings(
         body.remove("allowed_claude_code_versions");
     }
     state.settings_store.upsert_many(&body).await?;
+    if profile_changed || body.contains_key("claude_code_profile_selection_mode") {
+        state.gateway_svc.reload_profile_selection_config().await?;
+    }
     if let Some(val) = body.get("proxy_client_pool_enabled") {
         crate::tlsfp::set_request_client_pool_enabled(val == "true");
     }
@@ -1414,6 +1426,7 @@ mod tests {
     use crate::service::oauth_flow::OAuthFlowService;
     use crate::service::rewriter::Rewriter;
     use crate::service::telemetry::TelemetryService;
+    use crate::service::version_profile::ClaudeCodeProfileSelectionMode;
     use crate::store::account_store::AccountStore;
     use crate::store::memory::MemoryStore;
     use crate::store::prime_log_store::PrimeLogStore;
@@ -1489,6 +1502,82 @@ mod tests {
             telemetry_svc,
         );
         (router, gateway_svc)
+    }
+
+    #[tokio::test]
+    async fn settings_selection_mode_validates_and_hot_reloads_with_default_profile() {
+        let (app, gateway) = test_router_with_gateway().await;
+        for (payload, status, mode, profile) in [
+            (
+                serde_json::json!({"claude_code_profile_selection_mode":"invalid", "claude_code_version_profile":"2.1.260"}),
+                StatusCode::BAD_REQUEST,
+                ClaudeCodeProfileSelectionMode::ClientVersion,
+                "2.1.280",
+            ),
+            (
+                serde_json::json!({"claude_code_profile_selection_mode":"account"}),
+                StatusCode::OK,
+                ClaudeCodeProfileSelectionMode::Account,
+                "2.1.280",
+            ),
+            (
+                serde_json::json!({"claude_code_version_profile":"2.1.260"}),
+                StatusCode::OK,
+                ClaudeCodeProfileSelectionMode::Account,
+                "2.1.260",
+            ),
+            (
+                serde_json::json!({"claude_code_profile_selection_mode":"client_version"}),
+                StatusCode::OK,
+                ClaudeCodeProfileSelectionMode::ClientVersion,
+                "2.1.260",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let config = gateway.profile_selection_config_for_test().await;
+            assert_eq!(config.mode, mode);
+            assert_eq!(config.default_profile.key, profile);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let settings: serde_json::Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(settings["claude_code_version_profile"], profile);
+            assert_eq!(
+                settings["claude_code_profile_selection_mode"],
+                if mode == ClaudeCodeProfileSelectionMode::Account {
+                    "account"
+                } else {
+                    "client_version"
+                }
+            );
+        }
     }
 
     async fn test_router() -> Router {

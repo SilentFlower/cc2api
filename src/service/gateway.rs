@@ -43,14 +43,16 @@ use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
 };
 use crate::service::version_profile::{
-    COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile, is_event_logging_path,
-    profile_for_version,
+    COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile,
+    ClaudeCodeProfileSelectionConfig, ClaudeCodeProfileSelectionMode, account_for_request_profile,
+    default_profile, is_event_logging_path, profile_for_key, profile_for_version,
 };
 use crate::store::cache::CacheStore;
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
-    DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
+    DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE, DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING,
+    DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING, DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED,
     DEFAULT_FABLE_WEEKLY_USAGE_LIMIT_PERCENT, DEFAULT_INTERCEPT_ASSISTANT_PREFILL_ENABLED,
     DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS, DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE1_MODE,
     DEFAULT_INTERCEPT_AUTO_MODE_CLASSIFIER_STAGE2_MODE,
@@ -474,6 +476,7 @@ pub struct GatewayService {
     upstream_base: String,
     system_role_models: RwLock<Vec<String>>,
     access_policy: RwLock<AccessPolicy>,
+    profile_selection_config: RwLock<ClaudeCodeProfileSelectionConfig>,
     env_passthrough: RwLock<EnvPassthrough>,
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
@@ -527,6 +530,7 @@ impl GatewayService {
                 )
                 .expect("默认访问策略必须合法"),
             ),
+            profile_selection_config: RwLock::new(ClaudeCodeProfileSelectionConfig::default()),
             env_passthrough: RwLock::new(default_env_passthrough()),
             cache_control_ttl_rewrite: RwLock::new(default_cache_control_ttl_rewrite()),
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
@@ -1199,6 +1203,43 @@ impl GatewayService {
             .identity_injection_enabled
     }
 
+    /// 刷新画像选择方式和未匹配 UA 使用的默认画像。
+    ///
+    /// @return 更新成功返回 `Ok(())`；存储失败返回业务错误，非法存量值使用明确默认值。
+    pub async fn reload_profile_selection_config(&self) -> Result<(), AppError> {
+        let settings = self.settings_store.get_all().await?;
+        let mode = ClaudeCodeProfileSelectionMode::parse(
+            settings
+                .get("claude_code_profile_selection_mode")
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING),
+        )
+        .unwrap_or(ClaudeCodeProfileSelectionMode::ClientVersion);
+        let default_profile = profile_for_key(
+            settings
+                .get("claude_code_version_profile")
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING),
+        )
+        .unwrap_or_else(|_| default_profile());
+        // 同一把锁更新两个字段，入口只获取一次快照，热刷新不会改变进行中的请求。
+        *self.profile_selection_config.write().await = ClaudeCodeProfileSelectionConfig {
+            mode,
+            default_profile,
+        };
+        Ok(())
+    }
+
+    /// 获取测试使用的画像选择配置快照。
+    ///
+    /// @return 当前选择方式及默认画像。
+    #[cfg(test)]
+    pub(crate) async fn profile_selection_config_for_test(
+        &self,
+    ) -> ClaudeCodeProfileSelectionConfig {
+        *self.profile_selection_config.read().await
+    }
+
     /// 从全局设置刷新客户端访问策略。
     ///
     /// @return 刷新成功返回 `Ok(())`,读取 settings 或解析配置失败时返回业务错误。
@@ -1229,6 +1270,7 @@ impl GatewayService {
     async fn non_stream_probe_cache_lookup(
         &self,
         path: &str,
+        profile_key: &str,
         client_type: ClientType,
         body: &serde_json::Value,
         headers: &HashMap<String, String>,
@@ -1245,7 +1287,7 @@ impl GatewayService {
             .and_then(|model| model.as_str())
             .unwrap_or_default()
             .to_string();
-        let key = non_stream_probe_cache_key(path, &model, headers, body_bytes)?;
+        let key = non_stream_probe_cache_key(path, profile_key, &model, headers, body_bytes)?;
         let key_hash = short_hash_for_log(key.as_bytes());
         Ok(Some(NonStreamProbeCacheLookup {
             key,
@@ -1383,6 +1425,7 @@ impl GatewayService {
             return Ok(access_policy_error_response(&rejection));
         }
 
+        let request_profile = self.profile_selection_config.read().await.resolve(&ua);
         let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1472,15 +1515,21 @@ impl GatewayService {
                 }
             };
             let account = selected.account;
+            let request_account = account_for_request_profile(&account, request_profile);
             let mut final_headers = self.rewriter.rewrite_headers(
                 &headers,
                 COUNT_TOKENS_PATH,
-                &account,
+                &request_account,
                 client_type,
                 &model_id,
                 &body_map,
             );
-            apply_count_tokens_beta_header(&mut final_headers, &headers, &account, &model_id);
+            apply_count_tokens_beta_header(
+                &mut final_headers,
+                &headers,
+                &request_account,
+                &model_id,
+            );
 
             let upstream_token = match self.account_svc.resolve_upstream_token(account.id).await {
                 Ok(token) => token,
@@ -1570,6 +1619,9 @@ impl GatewayService {
             );
             return Ok(access_policy_error_response(&rejection));
         }
+
+        // 在读 body 和账号重试前固定选择，body 中的版本字段不参与画像识别。
+        let request_profile = self.profile_selection_config.read().await.resolve(&ua);
 
         // 读取请求体
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
@@ -1879,6 +1931,7 @@ impl GatewayService {
                 info!("[耗时] 槽位获取: {:.0}ms", slot_ms);
             }
             let mut slot_guard = SlotReleaseGuard::new(admission.permit);
+            let request_account = account_for_request_profile(&account, request_profile);
 
             // Hello 必须按最终上游 session 去重，因此先解析账号级 session 池，
             // 但 sticky、RPM 与本地缓存仍继续使用未经改写的真实下游 session。
@@ -1897,7 +1950,7 @@ impl GatewayService {
                 let hello_decision = self
                     .session_hello_probe_svc
                     .ensure_ready(
-                        &account,
+                        &request_account,
                         &real_session_id,
                         upstream_session_id,
                         hello_config,
@@ -1946,7 +1999,7 @@ impl GatewayService {
                         self.rewriter
                             .rewrite_claude_code_status_classifier_attribution(
                                 &body_bytes,
-                                &account,
+                                &request_account,
                                 &upstream_session_rewrite,
                             ),
                         None,
@@ -1957,7 +2010,7 @@ impl GatewayService {
                     (
                         self.rewriter.rewrite_claude_code_identity_only(
                             &body_bytes,
-                            &account,
+                            &request_account,
                             &upstream_session_rewrite,
                         ),
                         None,
@@ -1966,7 +2019,7 @@ impl GatewayService {
                     self.rewriter.rewrite_body_with_stateful_completion(
                         &body_bytes,
                         &path,
-                        &account,
+                        &request_account,
                         client_type,
                         env_pt,
                         cache_ttl,
@@ -2003,7 +2056,7 @@ impl GatewayService {
             let mut rewritten_headers = self.rewriter.rewrite_headers(
                 &headers,
                 &path,
-                &account,
+                &request_account,
                 client_type,
                 model_id,
                 &rewritten_body_map,
@@ -2019,7 +2072,7 @@ impl GatewayService {
                     client_type,
                     attempt,
                     final_beta_header(&rewritten_headers),
-                    profile_for_version(&device_profile(&account).env.version)
+                    profile_for_version(&device_profile(&request_account).env.version)
                         .telemetry
                         .default_model
                         .to_string(),
@@ -2085,6 +2138,7 @@ impl GatewayService {
             } else {
                 self.non_stream_probe_cache_lookup(
                     &path,
+                    profile_for_version(&device_profile(&request_account).env.version).key,
                     client_type,
                     &rewritten_body_map,
                     &final_headers,
@@ -2111,10 +2165,10 @@ impl GatewayService {
                 // 遥测会话会启动后台上游请求，必须等 RPM/槽位/改写/Token 全部成功后再激活，
                 // 避免被 RPM 跳过的账号产生额外上游副作用。
                 let t_tel = std::time::Instant::now();
-                self.telemetry_svc.activate_session(&account).await;
+                self.telemetry_svc.activate_session(&request_account).await;
                 if let Some(context) = telemetry_context.clone() {
                     self.telemetry_svc
-                        .record_message_request(&account, context)
+                        .record_message_request(&request_account, context)
                         .await;
                 }
                 info!("[耗时] 遥测激活: {:.0}ms", t_tel.elapsed().as_millis());
@@ -2138,7 +2192,7 @@ impl GatewayService {
                     &query,
                     &final_headers,
                     &final_body,
-                    &account,
+                    &request_account,
                     &account_selection_context,
                     request_capture_policy,
                 )
@@ -2149,7 +2203,7 @@ impl GatewayService {
                     if let Some(context) = telemetry_context.clone() {
                         self.telemetry_svc
                             .record_message_result(
-                                &account,
+                                &request_account,
                                 context,
                                 MessageTelemetryResult {
                                     status_code: None,
@@ -2187,7 +2241,7 @@ impl GatewayService {
                                 &query,
                                 &final_headers,
                                 &final_body,
-                                &account,
+                                &request_account,
                                 &account_selection_context,
                                 request_capture_policy,
                             )
@@ -2216,7 +2270,7 @@ impl GatewayService {
                     &query,
                     &final_headers,
                     &final_body,
-                    &account,
+                    &request_account,
                     client_type,
                     &account_selection_context,
                     request_capture_policy,
@@ -2242,7 +2296,7 @@ impl GatewayService {
                         if let Some(context) = telemetry_context.clone() {
                             self.telemetry_svc
                                 .record_message_result(
-                                    &account,
+                                    &request_account,
                                     context,
                                     build_message_telemetry_result_from_bytes(
                                         telemetry_status_code,
@@ -2285,7 +2339,7 @@ impl GatewayService {
                     cache_usage_context,
                     telemetry_context.clone(),
                     self.telemetry_svc.clone(),
-                    account.clone(),
+                    request_account.clone(),
                     telemetry_status_code,
                     telemetry_ttft_ms,
                     telemetry_error_kind.clone(),
@@ -2296,7 +2350,7 @@ impl GatewayService {
             if let Some(context) = telemetry_context.clone() {
                 self.telemetry_svc
                     .record_message_result(
-                        &account,
+                        &request_account,
                         context,
                         MessageTelemetryResult {
                             status_code: Some(telemetry_status_code),
@@ -4199,6 +4253,7 @@ fn classify_non_stream_probe_text(text: &str) -> Option<NonStreamProbeType> {
 
 fn non_stream_probe_cache_key(
     path: &str,
+    profile_key: &str,
     model: &str,
     headers: &HashMap<String, String>,
     body: &[u8],
@@ -4212,6 +4267,7 @@ fn non_stream_probe_cache_key(
     let body_hash = full_hex_hash(body);
     let key = serde_json::json!({
         "path": path,
+        "profile": profile_key,
         "model": model,
         "body_sha256": body_hash,
         "headers": selected_headers,
@@ -7123,14 +7179,16 @@ mod tests {
         HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
     };
     use crate::service::rewriter::{
-        CLAUDE_CODE_SYSTEM_PROMPT, ClientType, StatefulCacheUsage, UpstreamSessionRewrite,
+        CLAUDE_CODE_SYSTEM_PROMPT, ClientType, Rewriter, StatefulCacheUsage, UpstreamSessionRewrite,
     };
     use crate::service::session_hello_probe::{SessionHelloProbeConfig, SessionHelloProbeDecision};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
-        DEFAULT_CLAUDE_CODE_VERSION, STAINLESS_PACKAGE_VERSION, claude_code_user_agent,
-        profile_for_key,
+        ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_VERSION,
+        SONNET_5_MESSAGE_BETA_TOKENS_2_1_260, SONNET_5_MESSAGE_BETA_TOKENS_2_1_280,
+        STAINLESS_PACKAGE_VERSION, account_for_request_profile, claude_cli_user_agent,
+        claude_code_user_agent, profile_for_key,
     };
     use crate::store::account_store::AccountStore;
     use crate::store::cache::{
@@ -7158,7 +7216,7 @@ mod tests {
     use std::convert::Infallible;
     use std::io::Write;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -7692,6 +7750,10 @@ mod tests {
         refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
         hello_calls: Arc<AtomicUsize>,
         hello_status: Arc<AtomicU16>,
+        requests: Arc<tokio::sync::Mutex<Vec<(HeaderMap, Bytes)>>>,
+        pause_first_request: Arc<AtomicBool>,
+        request_started: Arc<tokio::sync::Notify>,
+        request_resume: Arc<tokio::sync::Notify>,
     }
 
     struct PoolResolveFailureCache {
@@ -7838,7 +7900,21 @@ mod tests {
                 .unwrap_or_default()
                 .to_string(),
         );
-        state.request_bodies.lock().await.push(body);
+        state
+            .requests
+            .lock()
+            .await
+            .push((headers.clone(), body.clone()));
+        state.request_bodies.lock().await.push(body.clone());
+        if state.pause_first_request.swap(false, Ordering::SeqCst) {
+            state.request_started.notify_one();
+            state.request_resume.notified().await;
+        }
+        if authorization == "Bearer setup-signature"
+            && String::from_utf8_lossy(&body).contains("\"type\":\"thinking\"")
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}))).into_response();
+        }
 
         if matches!(
             authorization.as_str(),
@@ -7943,6 +8019,12 @@ mod tests {
             .route("/v1/messages/count_tokens", post(mock_upstream_response))
             .route("/oauth/token", post(mock_oauth_refresh))
             .route("/api/hello", axum::routing::head(mock_hello_response))
+            .route(
+                "/api/claude_cli/bootstrap",
+                axum::routing::get(|| async { Json(json!({"client_data": {}})) }),
+            )
+            .route("/api/eval/test", post(mock_upstream_response))
+            .route("/api/event_logging/v2/batch", post(mock_upstream_response))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -8308,6 +8390,452 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap()
+    }
+
+    fn profile_request(path: &str, ua: Option<&str>, payload: serde_json::Value) -> Request {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(ua) = ua {
+            builder = builder.header("user-agent", ua);
+            if path.starts_with("/v1/messages") && ua.starts_with("claude-") {
+                builder = builder
+                    .header("x-stainless-package-version", "0.1.0")
+                    .header("x-stainless-runtime-version", "v1.0.0")
+                    .header("anthropic-beta", "claude-code-20250219");
+            }
+        }
+        builder.body(Body::from(payload.to_string())).unwrap()
+    }
+
+    fn profile_messages_payload() -> serde_json::Value {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.260-profile.json"
+        ))
+        .unwrap();
+        let mut payload: serde_json::Value =
+            serde_json::from_str(fixture["hash_cases"][0]["body"].as_str().unwrap()).unwrap();
+        payload["model"] = json!("claude-sonnet-5");
+        payload["tools"] =
+            json!([{"name":"advisor","model":"claude-sonnet-5","input_schema":{"type":"object"}}]);
+        payload["metadata"] = json!({"user_id": json!({"device_id":"client-device","account_uuid":"client-account","session_id":"123e4567-e89b-12d3-a456-426614174800"}).to_string()});
+        payload["profile_test_unknown"] = json!({"keep":true});
+        payload["stream"] = json!(false);
+        payload
+    }
+
+    fn assert_profile_message(
+        headers: &HeaderMap,
+        bytes: &Bytes,
+        account: &Account,
+        version: &str,
+    ) {
+        assert_eq!(headers["user-agent"], claude_cli_user_agent(version));
+        assert_eq!(
+            headers["x-stainless-package-version"],
+            STAINLESS_PACKAGE_VERSION
+        );
+        assert_eq!(
+            headers["anthropic-beta"],
+            if version == "2.1.260" {
+                SONNET_5_MESSAGE_BETA_TOKENS_2_1_260
+            } else {
+                SONNET_5_MESSAGE_BETA_TOKENS_2_1_280
+            }
+        );
+        let payload: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let billing = payload["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .find(|text| text.starts_with("x-anthropic-billing-header:"))
+            .unwrap();
+        assert!(billing.contains(&format!("cc_version={version}.")));
+        assert!(!billing.contains("cch=00000"));
+        assert_eq!(payload["tools"][0]["model"], "claude-sonnet-5");
+        assert_eq!(payload["profile_test_unknown"], json!({"keep":true}));
+        let selected =
+            account_for_request_profile(account, Some(profile_for_key(version).unwrap()));
+        let other = account_for_request_profile(
+            account,
+            Some(
+                profile_for_key(if version == "2.1.260" {
+                    "2.1.280"
+                } else {
+                    "2.1.260"
+                })
+                .unwrap(),
+            ),
+        );
+        let rewriter = Rewriter::new();
+        assert_eq!(
+            rewriter.refresh_cch_attestation(bytes.to_vec(), &selected, ClientType::ClaudeCode),
+            bytes.to_vec()
+        );
+        assert_ne!(
+            rewriter.refresh_cch_attestation(bytes.to_vec(), &other, ClientType::ClaudeCode),
+            bytes.to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_interleaved_and_concurrent_profile_requests_preserve_persistent_identity() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_gateway_account(&service, "profiles@example.com", 2, 0).await;
+        account.billing_mode = BillingMode::Rewrite;
+        account.allow_1m_models.clear();
+        service.account_svc.update_account(&account).await.unwrap();
+        let before = service.account_svc.get_account(account.id).await.unwrap();
+        let service_ref = &service;
+        let send = |version: &'static str| async move {
+            let response = service_ref
+                .handle_request(
+                    profile_request(
+                        "/v1/messages",
+                        Some(&format!("claude-code/{version}")),
+                        profile_messages_payload(),
+                    ),
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+        };
+        send("2.1.260").await;
+        send("2.1.280").await;
+        tokio::join!(send("2.1.260"), send("2.1.280"));
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        for version in ["2.1.260", "2.1.280"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(headers, _)| headers["user-agent"] == claude_cli_user_agent(version))
+                    .count(),
+                2
+            );
+        }
+        for (headers, bytes) in requests.iter() {
+            let version = if headers["user-agent"].to_str().unwrap().contains("2.1.260") {
+                "2.1.260"
+            } else {
+                "2.1.280"
+            };
+            assert_profile_message(headers, bytes, &before, version);
+        }
+        let after = service.account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(before.canonical_env, after.canonical_env);
+        assert_eq!(before.canonical_prompt, after.canonical_prompt);
+        assert_eq!(before.canonical_process, after.canonical_process);
+        assert_eq!(before.device_id, after.device_id);
+        assert_eq!(before.account_uuid, after.account_uuid);
+        assert_eq!(after.concurrency, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_401_retry_keeps_profile_frozen_across_settings_reload() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = Arc::new(
+            test_gateway_service_with_urls(base.clone(), format!("{base}/oauth/token")).await,
+        );
+        let mut account =
+            create_oauth_gateway_account(&service, "profile-refresh@example.com", "access-old")
+                .await;
+        account.billing_mode = BillingMode::Rewrite;
+        account.allow_1m_models.clear();
+        service.account_svc.update_account(&account).await.unwrap();
+        state.pause_first_request.store(true, Ordering::SeqCst);
+        let request_service = service.clone();
+        let pending = tokio::spawn(async move {
+            let response = request_service
+                .handle_request(
+                    profile_request(
+                        "/v1/messages",
+                        Some("claude-cli/2.1.260"),
+                        profile_messages_payload(),
+                    ),
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+        });
+        timeout(Duration::from_secs(3), state.request_started.notified())
+            .await
+            .unwrap();
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "claude_code_profile_selection_mode".into(),
+                "account".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_profile_selection_config().await.unwrap();
+        assert_eq!(
+            service.profile_selection_config.read().await.mode,
+            ClaudeCodeProfileSelectionMode::Account
+        );
+        state.request_resume.notify_one();
+        timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for (headers, bytes) in requests.iter() {
+            assert_profile_message(headers, bytes, &account, "2.1.260");
+        }
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            service
+                .account_svc
+                .get_account(account.id)
+                .await
+                .unwrap()
+                .canonical_env,
+            account.canonical_env
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_signature_retry_keeps_profile_and_recomputes_cch() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "profile-signature@example.com",
+            "setup-signature",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        account.allow_1m_models.clear();
+        service.account_svc.update_account(&account).await.unwrap();
+        let mut payload = profile_messages_payload();
+        payload["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","content":[{"type":"thinking","thinking":"合成样本","signature":"invalid"},{"type":"text","text":"answer"}]}));
+        let response = service
+            .handle_request(
+                profile_request("/v1/messages", Some("claude-code/2.1.260"), payload),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for (headers, bytes) in requests.iter() {
+            assert_profile_message(headers, bytes, &account, "2.1.260");
+        }
+        assert_ne!(requests[0].1, requests[1].1);
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].1).unwrap();
+        assert!(
+            second["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "thinking" && block.get("signature").is_none())
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_auxiliary_body_version_cannot_replace_ua_or_bypass_access_policy() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([("allowed_user_agents".into(), "".into())]))
+            .await
+            .unwrap();
+        service.reload_access_policy().await.unwrap();
+        create_gateway_account(&service, "profile-aux@example.com", 1, 0).await;
+        for (ua, expected) in [
+            (None, "2.1.280"),
+            (Some("Bun/1.4.1"), "2.1.280"),
+            (Some("claude-code/2.1.260"), "2.1.260"),
+        ] {
+            let response = service
+                .handle_request(
+                    profile_request(
+                        "/api/eval/test",
+                        ua,
+                        json!({"attributes":{"appVersion":"2.1.260"}}),
+                    ),
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.requests.lock().await;
+            let (headers, bytes) = requests.last().unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(payload["attributes"]["appVersion"], expected);
+            assert_eq!(
+                headers["user-agent"],
+                if expected == "2.1.260" {
+                    "Bun/1.4.1"
+                } else {
+                    "Bun/1.4.3"
+                }
+            );
+        }
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "allowed_claude_code_versions".into(),
+                "2.1.280".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_access_policy().await.unwrap();
+        let response = service
+            .handle_request(
+                profile_request(
+                    "/api/eval/test",
+                    Some("claude-code/2.1.260"),
+                    json!({"attributes":{"appVersion":"2.1.280"}}),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state.requests.lock().await.len(), 3);
+        server.abort();
+    }
+
+    #[test]
+    fn non_stream_cache_keys_separate_profiles_even_when_payload_and_headers_match() {
+        let headers = HashMap::new();
+        let body = br#"{"model":"claude-opus-4-8","messages":[]}"#;
+        let old = non_stream_probe_cache_key(
+            "/v1/messages",
+            "2.1.260",
+            "claude-opus-4-8",
+            &headers,
+            body,
+        )
+        .unwrap();
+        let new = non_stream_probe_cache_key(
+            "/v1/messages",
+            "2.1.280",
+            "claude-opus-4-8",
+            &headers,
+            body,
+        )
+        .unwrap();
+        assert_ne!(old, new);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_uses_client_default_and_legacy_account_profiles() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([("allowed_user_agents".into(), "".into())]))
+            .await
+            .unwrap();
+        service.reload_access_policy().await.unwrap();
+        create_gateway_account(&service, "profile-count@example.com", 1, 0).await;
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "claude_code_version_profile".into(),
+                "2.1.260".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_profile_selection_config().await.unwrap();
+        for (ua, expected) in [(Some("claude-code/2.1.280"), "2.1.280"), (None, "2.1.260")] {
+            let response = service.handle_count_tokens_request(profile_request(COUNT_TOKENS_PATH, ua, json!({"model":"claude-sonnet-5","version":"2.1.280","messages":[{"role":"user","content":"合成样本"}]})), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.requests.lock().await.last().unwrap().0["user-agent"],
+                claude_cli_user_agent(expected)
+            );
+        }
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "claude_code_profile_selection_mode".into(),
+                "account".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_profile_selection_config().await.unwrap();
+        let response = service.handle_count_tokens_request(profile_request(COUNT_TOKENS_PATH, Some("claude-code/2.1.260"), json!({"model":"claude-sonnet-5","messages":[{"role":"user","content":"合成样本"}]})), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.requests.lock().await.last().unwrap().0["user-agent"],
+            claude_cli_user_agent("2.1.280")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_response_follows_request_profile_and_ua_less_default() {
+        let (base, _, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([("allowed_user_agents".into(), "".into())]))
+            .await
+            .unwrap();
+        service.reload_access_policy().await.unwrap();
+        create_gateway_account(&service, "profile-bootstrap@example.com", 1, 0).await;
+        service.bootstrap_profile_config.write().await.mode = BootstrapModelOptionsMode::Configured;
+        for (ua, version) in [
+            (Some("claude-code/2.1.260"), "2.1.260"),
+            (Some("claude-code/2.1.280"), "2.1.280"),
+            (None, "2.1.280"),
+        ] {
+            let mut builder =
+                Request::builder().uri("/api/claude_cli/bootstrap?model=claude-opus-5-5");
+            if let Some(ua) = ua {
+                builder = builder.header("user-agent", ua);
+            }
+            let response = service
+                .handle_request(builder.body(Body::empty()).unwrap(), None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let profile = profile_for_key(version).unwrap();
+            assert_eq!(
+                payload["client_data"]["cedar_basin"],
+                profile.endpoints.bootstrap_cedar_basin.unwrap()
+            );
+            if let Some(model) = profile.endpoints.bootstrap_model("claude-opus-5-5") {
+                assert_eq!(payload["cwk_cfg_key"], json!(model.cwk_cfg_key));
+            } else {
+                assert!(payload.get("cwk_cfg_key").is_none());
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -8877,7 +9405,16 @@ mod tests {
             create_setup_gateway_account(&service, "gateway-good@example.com", "setup-good", 20)
                 .await;
 
-        let response = service.handle_request(messages_request(), None).await;
+        let response = service
+            .handle_request(
+                profile_request(
+                    "/v1/messages",
+                    Some("claude-code/2.1.260"),
+                    profile_messages_payload(),
+                ),
+                None,
+            )
+            .await;
         assert_eq!(response.status(), StatusCode::OK);
         let _ = body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -8905,6 +9442,15 @@ mod tests {
                 .status,
             AccountStatus::Active
         );
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for (headers, _) in requests.iter() {
+            assert_eq!(headers["user-agent"], claude_cli_user_agent("2.1.260"));
+            assert_eq!(
+                headers["anthropic-beta"],
+                SONNET_5_MESSAGE_BETA_TOKENS_2_1_260
+            );
+        }
         server.abort();
     }
 
@@ -9862,8 +10408,14 @@ mod tests {
             ),
         ]);
 
-        let key = non_stream_probe_cache_key("/v1/messages", "claude-opus-4-8", &headers, body)
-            .expect("cache key");
+        let key = non_stream_probe_cache_key(
+            "/v1/messages",
+            DEFAULT_CLAUDE_CODE_VERSION,
+            "claude-opus-4-8",
+            &headers,
+            body,
+        )
+        .expect("cache key");
         let parsed: serde_json::Value = serde_json::from_str(&key).expect("json key");
 
         assert_eq!(parsed["path"], "/v1/messages");
@@ -9884,9 +10436,14 @@ mod tests {
 
         let mut changed_headers = headers.clone();
         changed_headers.insert("anthropic-beta".into(), "different-beta".into());
-        let changed_key =
-            non_stream_probe_cache_key("/v1/messages", "claude-opus-4-8", &changed_headers, body)
-                .expect("changed key");
+        let changed_key = non_stream_probe_cache_key(
+            "/v1/messages",
+            DEFAULT_CLAUDE_CODE_VERSION,
+            "claude-opus-4-8",
+            &changed_headers,
+            body,
+        )
+        .expect("changed key");
         assert_ne!(key, changed_key);
     }
 
@@ -10020,6 +10577,7 @@ mod tests {
             service
                 .non_stream_probe_cache_lookup(
                     "/v1/messages",
+                    DEFAULT_CLAUDE_CODE_VERSION,
                     ClientType::ClaudeCode,
                     &body,
                     &headers,
@@ -10047,6 +10605,7 @@ mod tests {
         let lookup = service
             .non_stream_probe_cache_lookup(
                 "/v1/messages",
+                DEFAULT_CLAUDE_CODE_VERSION,
                 ClientType::ClaudeCode,
                 &body,
                 &headers,

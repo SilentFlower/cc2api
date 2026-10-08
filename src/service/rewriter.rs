@@ -5036,7 +5036,9 @@ fn stateful_session_key(
     let session_id = real_session_id_override
         .map(str::to_string)
         .or_else(|| extract_claude_code_session_id(body))?;
-    Some(format!("{}:{}", account.id, session_id))
+    let profile = device_profile(account);
+    let profile_key = profile_for_version(&profile.env.version).key;
+    Some(format!("{}:{}:{}", account.id, profile_key, session_id))
 }
 
 /// 从 Claude Code metadata.user_id 中提取 session_id。
@@ -8584,7 +8586,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_completion_is_delayed_until_upstream_finishes() {
-        let key = "1:session-delayed".to_string();
+        let key = format!("1:{}:session-delayed", DEFAULT_CLAUDE_CODE_VERSION);
         let rewriter = Rewriter::new();
         let (first, first_completion) = rewrite_messages_body_with_stateful_completion(
             &rewriter,
@@ -8626,8 +8628,67 @@ mod tests {
     }
 
     #[test]
+    fn stateful_delayed_completions_keep_same_real_session_profiles_isolated() {
+        let rewriter = Rewriter::new();
+        let pending: Vec<_> = [("2.1.260", 60), ("2.1.280", 80)]
+            .into_iter()
+            .map(|(version, count)| {
+                let account = test_account_with_profile(version);
+                let (_, completion) = rewriter.rewrite_body_with_stateful_completion(
+                    &serde_json::to_vec(&stateful_session_body("shared-real-session", count))
+                        .unwrap(),
+                    "/v1/messages",
+                    &account,
+                    ClientType::ClaudeCode,
+                    EnvPassthrough::default(),
+                    CacheControlTtlRewrite::Off,
+                    MessageCacheControlRewrite::Stateful,
+                    true,
+                    &DisabledThinkingRewrite::off(),
+                    &UpstreamSessionRewrite::default(),
+                    ClaudeCodeContextSanitizerConfig::off(),
+                );
+                completion.expect("延迟提交句柄")
+            })
+            .collect();
+        assert!(
+            rewriter
+                .stateful_cache
+                .lock()
+                .unwrap()
+                .get("1:2.1.260:shared-real-session")
+                .is_none()
+        );
+        let mut pending = pending.into_iter();
+        let old = pending.next().unwrap();
+        let new = pending.next().unwrap();
+        rewriter.complete_stateful_cache(Some(new));
+        rewriter.complete_stateful_cache(Some(old));
+        let mut cache = rewriter.stateful_cache.lock().unwrap();
+        assert_eq!(
+            cache
+                .get("1:2.1.260:shared-real-session")
+                .unwrap()
+                .normal_profile
+                .block_count,
+            60
+        );
+        assert_eq!(
+            cache
+                .get("1:2.1.280:shared-real-session")
+                .unwrap()
+                .normal_profile
+                .block_count,
+            80
+        );
+    }
+
+    #[test]
     fn message_cache_control_stateful_does_not_persist_tool_result_anchors() {
-        let key = "1:session-tool-result-durable".to_string();
+        let key = format!(
+            "1:{}:session-tool-result-durable",
+            DEFAULT_CLAUDE_CODE_VERSION
+        );
         let rewriter = Rewriter::new();
         let (parsed, completion) = rewrite_messages_body_with_stateful_completion(
             &rewriter,
@@ -8662,7 +8723,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_rejects_completion_when_usage_shows_rebuild() {
-        let key = "1:session-usage-feedback".to_string();
+        let key = format!("1:{}:session-usage-feedback", DEFAULT_CLAUDE_CODE_VERSION);
         let rewriter = Rewriter::new();
         let (_first, first_completion) = rewrite_messages_body_with_stateful_completion(
             &rewriter,
@@ -8873,7 +8934,10 @@ mod tests {
                 .stateful_cache
                 .lock()
                 .unwrap()
-                .get("1:session-bootstrap")
+                .get(&format!(
+                    "1:{}:session-bootstrap",
+                    DEFAULT_CLAUDE_CODE_VERSION
+                ))
                 .is_none()
         );
 
@@ -8891,7 +8955,10 @@ mod tests {
                     .stateful_cache
                     .lock()
                     .unwrap()
-                    .get("1:session-bootstrap")
+                    .get(&format!(
+                        "1:{}:session-bootstrap",
+                        DEFAULT_CLAUDE_CODE_VERSION
+                    ))
                     .is_none()
             );
         }
@@ -8909,7 +8976,10 @@ mod tests {
             .stateful_cache
             .lock()
             .unwrap()
-            .get("1:session-bootstrap")
+            .get(&format!(
+                "1:{}:session-bootstrap",
+                DEFAULT_CLAUDE_CODE_VERSION
+            ))
             .expect("snapshot");
         assert_eq!(snapshot.normal_profile.block_count, 22);
 
@@ -9048,7 +9118,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_stale_generation_without_shared_anchor_is_rejected() {
-        let key = "1:session-stale".to_string();
+        let key = format!("1:{}:session-stale", DEFAULT_CLAUDE_CODE_VERSION);
         let first_body = stateful_session_body_with_prefix("session-stale", 80, "first");
         let second_body = stateful_session_body_with_prefix("session-stale", 82, "second");
         let stale_body = stateful_session_body_with_prefix("session-stale", 81, "stale");
@@ -9108,7 +9178,7 @@ mod tests {
 
     #[test]
     fn message_cache_control_stateful_cold_parallel_completion_without_shared_anchor_is_rejected() {
-        let key = "1:session-cold-parallel".to_string();
+        let key = format!("1:{}:session-cold-parallel", DEFAULT_CLAUDE_CODE_VERSION);
         let first_body = stateful_session_body_with_prefix("session-cold-parallel", 80, "first");
         let parallel_body =
             stateful_session_body_with_prefix("session-cold-parallel", 82, "parallel");
@@ -11316,7 +11386,13 @@ mod tests {
             super::extract_session_id_from_body(&parsed).as_deref(),
             Some("upstream-session")
         );
-        assert_eq!(completion.key, format!("{}:real-session", account.id));
+        assert_eq!(
+            completion.key,
+            format!(
+                "{}:{}:real-session",
+                account.id, DEFAULT_CLAUDE_CODE_VERSION
+            )
+        );
     }
 
     #[test]

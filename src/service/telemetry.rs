@@ -19,7 +19,7 @@ use crate::service::account::AccountService;
 use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
     ClaudeCodeProfile, EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN, TelemetryShape,
-    claude_code_user_agent, is_event_logging_path, normalize_version, profile_for_version,
+    claude_code_user_agent, is_event_logging_path, profile_for_version,
 };
 use crate::store::account_store::AccountStore;
 
@@ -66,6 +66,14 @@ pub fn fake_telemetry_response() -> serde_json::Value {
 // ---------------------------------------------------------------------------
 // 会话状态
 // ---------------------------------------------------------------------------
+
+/// 自动遥测按账号和有效画像隔离，避免请求续期覆盖另一版本的后台发送。
+type TelemetrySessionKey = (i64, &'static str);
+
+fn telemetry_session_key(account: &Account) -> TelemetrySessionKey {
+    let profile = device_profile(account);
+    (account.id, profile_for_version(&profile.env.version).key)
+}
 
 struct TelemetrySession {
     account: Account,
@@ -331,12 +339,17 @@ fn prefixed_random_id(prefix: &str) -> String {
 
 /// 管理自动遥测会话的后台服务。
 pub struct TelemetryService {
-    sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
+    sessions: Arc<Mutex<HashMap<TelemetrySessionKey, TelemetrySession>>>,
     account_store: Arc<AccountStore>,
     account_svc: Arc<AccountService>,
 }
 
 impl TelemetryService {
+    /// 创建共享账号计数、按画像隔离会话的遥测服务。
+    ///
+    /// @param account_store 账号存储，用于累计发送计数。
+    /// @param account_svc 账号服务，用于获取最新凭证。
+    /// @return 尚未激活会话的服务实例。
     pub fn new(account_store: Arc<AccountStore>, account_svc: Arc<AccountService>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -345,13 +358,23 @@ impl TelemetryService {
         }
     }
 
-    /// 查询账号的遥测会话过期时间。
+    /// 查询账号所有活跃画像中最晚的遥测会话过期时间。
+    ///
+    /// @param account_id 账号 ID。
+    /// @return 最晚的过期时间，没有活跃画像时返回 `None`。
     pub async fn get_session_expires_at(&self, account_id: i64) -> Option<chrono::DateTime<Utc>> {
         let sessions = self.sessions.lock().await;
-        sessions.get(&account_id).map(|s| s.expires_at_utc)
+        sessions
+            .iter()
+            .filter(|(key, _)| key.0 == account_id)
+            .map(|(_, session)| session.expires_at_utc)
+            .max()
     }
 
     /// 当 /v1/messages 请求到来时调用，激活或续期遥测会话。
+    ///
+    /// @param account 主请求固定画像的账号副本。
+    /// @return 激活完成；获取凭证失败时跳过本次激活。
     pub async fn activate_session(&self, account: &Account) {
         if !account.auto_telemetry {
             return;
@@ -368,17 +391,33 @@ impl TelemetryService {
             }
         };
 
+        if !self.activate_session_with_token(account, token).await {
+            return;
+        }
+
+        let key = telemetry_session_key(account);
+        let sessions_ref = self.sessions.clone();
+        let store_ref = self.account_store.clone();
+        let proxy_url = account.proxy_url.clone();
+        tokio::spawn(async move {
+            telemetry_loop(sessions_ref, store_ref, key, proxy_url).await;
+        });
+    }
+
+    // 状态更新与启动发送任务分开，只有新容器需要后台循环；续期不替换固定画像。
+    async fn activate_session_with_token(&self, account: &Account, token: String) -> bool {
         let mut sessions = self.sessions.lock().await;
         let now = Instant::now();
+        let key = telemetry_session_key(account);
 
-        if let Some(session) = sessions.get_mut(&account.id) {
+        if let Some(session) = sessions.get_mut(&key) {
             // 续期
             session.expires_at = now + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
             session.token = token;
-            session.account = account.clone();
+            // 只刷新凭证和 TTL，后台软件画像固定在容器创建时的账号副本上。
             debug!("telemetry: renewed session for account {}", account.id);
-            return;
+            return false;
         }
 
         // 新建会话
@@ -399,22 +438,17 @@ impl TelemetryService {
             send_count: 0,
             running: true,
         };
-        sessions.insert(account.id, session);
-
-        // 启动后台任务
-        let sessions_ref = self.sessions.clone();
-        let store_ref = self.account_store.clone();
-        let account_id = account.id;
-        let proxy_url = account.proxy_url.clone();
-
-        tokio::spawn(async move {
-            telemetry_loop(sessions_ref, store_ref, account_id, proxy_url).await;
-        });
+        sessions.insert(key, session);
+        true
     }
 
     /// 将 `/v1/messages` 请求改写前后的安全摘要写入遥测事件队列。
     ///
     /// `context` 只能包含字段数量、字节长度、session id 等派生信息，不能传入请求体原文或 token。
+    ///
+    /// @param account 主请求固定画像的账号副本。
+    /// @param context 请求的安全摘要。
+    /// @return 摘要已写入对应画像的活跃队列，未激活时跳过。
     pub async fn record_message_request(
         &self,
         account: &Account,
@@ -424,7 +458,7 @@ impl TelemetryService {
             return;
         }
         let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(&account.id) {
+        if let Some(session) = sessions.get_mut(&telemetry_session_key(account)) {
             session.expires_at = Instant::now() + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
             let correlation = session
@@ -440,6 +474,11 @@ impl TelemetryService {
     /// 将 `/v1/messages` 上游响应或错误摘要写入遥测事件队列。
     ///
     /// `result` 只描述状态码、耗时和错误类别，用于生成 success、slow first byte 或 error 事件。
+    ///
+    /// @param account 原请求固定画像的账号副本。
+    /// @param context 原请求的安全摘要。
+    /// @param result 响应的安全摘要。
+    /// @return 结果已写入原画像的活跃队列，未激活时跳过。
     pub async fn record_message_result(
         &self,
         account: &Account,
@@ -450,7 +489,7 @@ impl TelemetryService {
             return;
         }
         let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(&account.id) {
+        if let Some(session) = sessions.get_mut(&telemetry_session_key(account)) {
             session.expires_at = Instant::now() + SESSION_TTL;
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
             let correlation = session
@@ -469,11 +508,12 @@ impl TelemetryService {
 // ---------------------------------------------------------------------------
 
 async fn telemetry_loop(
-    sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
+    sessions: Arc<Mutex<HashMap<TelemetrySessionKey, TelemetrySession>>>,
     store: Arc<AccountStore>,
-    account_id: i64,
+    key: TelemetrySessionKey,
     proxy_url: String,
 ) {
+    let account_id = key.0;
     let client = match crate::tlsfp::get_request_client(&proxy_url) {
         Ok(client) => client,
         Err(_) => {
@@ -482,7 +522,7 @@ async fn telemetry_loop(
                 account_id,
                 !proxy_url.trim().is_empty()
             );
-            sessions.lock().await.remove(&account_id);
+            sessions.lock().await.remove(&key);
             return;
         }
     };
@@ -491,7 +531,7 @@ async fn telemetry_loop(
         tokio::time::sleep(TICK_INTERVAL).await;
 
         let mut map = sessions.lock().await;
-        let session = match map.get_mut(&account_id) {
+        let session = match map.get_mut(&key) {
             Some(s) => s,
             None => break,
         };
@@ -500,7 +540,7 @@ async fn telemetry_loop(
         if Instant::now() >= session.expires_at {
             let count = session.send_count;
             session.running = false;
-            map.remove(&account_id);
+            map.remove(&key);
             drop(map);
             if count > 0 {
                 let _ = store.increment_telemetry_count(account_id, count).await;
@@ -530,6 +570,7 @@ async fn telemetry_loop(
                 build_event_batch(&session.account, &session.run_profile, uptime_secs, &events);
             let scan_summary = sanitize_telemetry_payload(&mut payload);
             let token = session.token.clone();
+            let user_agent = session_ua(&session.account);
             let c = client.clone();
             session.last_event_batch_at = now;
             session.send_count += 1;
@@ -543,7 +584,7 @@ async fn telemetry_loop(
                 &format!("{}{}", UPSTREAM_BASE, EVENT_LOGGING_V2_PATH),
                 &token,
                 &payload,
-                &session_ua(&store, account_id).await,
+                &user_agent,
                 true,
                 Some(&scan_summary),
             )
@@ -594,15 +635,10 @@ async fn telemetry_loop(
     }
 }
 
-/// 从 account store 获取最新的 UA 版本号。
-async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
-    let version = store
-        .get_by_id(account_id)
-        .await
-        .ok()
-        .map(|a| device_profile(&a).env.version)
-        .unwrap_or_default();
-    claude_code_user_agent(normalize_version(&version))
+/// 从当前遥测容器固定的画像构造 UA，不能重新读取账号持久版本。
+fn session_ua(account: &Account) -> String {
+    let profile = device_profile(account);
+    claude_code_user_agent(profile_for_version(&profile.env.version).identity.version)
 }
 
 fn growthbook_user_agent_for_account(account: &Account) -> &'static str {
@@ -2008,9 +2044,11 @@ fn build_metrics(account: &Account) -> serde_json::Value {
 mod tests {
     use super::{
         MessageCorrelation, MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage,
-        TelemetryCorrelationStore, TelemetryEvent, build_event_batch, build_growthbook_eval,
-        build_metrics, enqueue_events, internal_event, is_telemetry_path, message_request_events,
-        message_result_events, sanitize_telemetry_payload, startup_events, telemetry_shape_summary,
+        TelemetryCorrelationStore, TelemetryEvent, TelemetryService, build_event_batch,
+        build_growthbook_eval, build_metrics, enqueue_events, growthbook_user_agent_for_account,
+        internal_event, is_telemetry_path, message_request_events, message_result_events,
+        sanitize_telemetry_payload, session_ua, startup_events, telemetry_loop,
+        telemetry_session_key, telemetry_shape_summary,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -2019,15 +2057,171 @@ mod tests {
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
     use crate::model::identity::run_profile;
+    use crate::service::account::AccountService;
     use crate::service::rewriter::ordered_anthropic_headers;
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
         DEFAULT_CLAUDE_CODE_VERSION_BASE, apply_identity_to_env_json, claude_code_user_agent,
         profile_for_key,
     };
+    use crate::store::account_store::AccountStore;
+    use crate::store::memory::MemoryStore;
+    use crate::store::settings_store::SettingsStore;
     use base64::Engine;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use sqlx::any::AnyPoolOptions;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    async fn test_telemetry_service() -> TelemetryService {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::store::db::migrate(&pool, "sqlite").await.unwrap();
+        let store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let accounts = Arc::new(AccountService::new(
+            store.clone(),
+            Arc::new(MemoryStore::new()),
+            Arc::new(SettingsStore::new(pool)),
+        ));
+        TelemetryService::new(store, accounts)
+    }
+
+    #[tokio::test]
+    async fn interleaved_profile_sessions_preserve_renewal_and_delayed_result_ownership() {
+        let service = test_telemetry_service().await;
+        let old = test_account_with_profile("2.1.260");
+        let new = test_account_with_profile("2.1.280");
+        assert!(
+            service
+                .activate_session_with_token(&old, "old-token".into())
+                .await
+        );
+        let context = test_message_context();
+        service.record_message_request(&old, context.clone()).await;
+        assert!(
+            service
+                .activate_session_with_token(&new, "new-token".into())
+                .await
+        );
+        assert!(
+            !service
+                .activate_session_with_token(&old, "renewed-token".into())
+                .await
+        );
+        service
+            .record_message_result(
+                &old,
+                context.clone(),
+                MessageTelemetryResult {
+                    status_code: Some(200),
+                    duration_ms: 12,
+                    ttft_ms: Some(1),
+                    error_kind: None,
+                    response_body_bytes: Some(32),
+                    usage: MessageTelemetryUsage::default(),
+                    stop_reason: Some("end_turn".into()),
+                },
+            )
+            .await;
+        let mut sessions = service.sessions.lock().await;
+        assert_eq!(sessions.len(), 2);
+        let old_session = sessions.get(&(old.id, "2.1.260")).unwrap();
+        let new_session = sessions.get(&(new.id, "2.1.280")).unwrap();
+        assert_eq!(old_session.token, "renewed-token");
+        assert_eq!(new_session.token, "new-token");
+        assert!(
+            old_session
+                .pending_events
+                .iter()
+                .any(|event| event.name.as_deref() == Some("tengu_api_success"))
+        );
+        assert!(
+            !new_session
+                .pending_events
+                .iter()
+                .any(|event| event.name.as_deref() == Some("tengu_api_success"))
+        );
+        assert!(
+            !old_session
+                .correlations
+                .by_request
+                .contains_key(&context.request_key)
+        );
+        for (version, bun) in [("2.1.260", "Bun/1.4.1"), ("2.1.280", "Bun/1.4.3")] {
+            let session = sessions.get(&(old.id, version)).unwrap();
+            assert_eq!(
+                session_ua(&session.account),
+                claude_code_user_agent(version)
+            );
+            assert_eq!(growthbook_user_agent_for_account(&session.account), bun);
+            assert_eq!(
+                build_growthbook_eval(&session.account, &session.run_profile)["attributes"]["appVersion"],
+                version
+            );
+            let events: Vec<_> = session.pending_events.iter().cloned().collect();
+            let batch = build_event_batch(&session.account, &session.run_profile, 1.0, &events);
+            assert!(
+                batch["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event["event_type"] == "ClaudeCodeInternalEvent")
+                    .all(|event| event["event_data"]["env"]["version"] == version)
+            );
+        }
+        let earlier = Utc::now() + chrono::Duration::minutes(1);
+        let later = Utc::now() + chrono::Duration::minutes(5);
+        sessions
+            .get_mut(&(old.id, "2.1.260"))
+            .unwrap()
+            .expires_at_utc = earlier;
+        sessions
+            .get_mut(&(new.id, "2.1.280"))
+            .unwrap()
+            .expires_at_utc = later;
+        drop(sessions);
+        assert_eq!(service.get_session_expires_at(old.id).await, Some(later));
+        assert_eq!(service.get_session_expires_at(999).await, None);
+    }
+
+    #[tokio::test]
+    async fn profile_ttl_cleanup_preserves_other_profile_container() {
+        let service = test_telemetry_service().await;
+        let old = test_account_with_profile("2.1.260");
+        let new = test_account_with_profile("2.1.280");
+        service
+            .activate_session_with_token(&old, "old-token".into())
+            .await;
+        service
+            .activate_session_with_token(&new, "new-token".into())
+            .await;
+        service
+            .sessions
+            .lock()
+            .await
+            .get_mut(&telemetry_session_key(&old))
+            .unwrap()
+            .expires_at = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            telemetry_loop(
+                service.sessions.clone(),
+                service.account_store.clone(),
+                telemetry_session_key(&old),
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        let sessions = service.sessions.lock().await;
+        assert!(!sessions.contains_key(&telemetry_session_key(&old)));
+        assert!(sessions.contains_key(&telemetry_session_key(&new)));
+    }
 
     fn test_account() -> Account {
         let env = CanonicalEnvData {

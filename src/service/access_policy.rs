@@ -239,7 +239,11 @@ fn parse_version_parts(setting: &'static str, raw: &str) -> Result<Vec<u32>, App
     Ok(parts)
 }
 
-fn extract_claude_code_version(user_agent: &str) -> Option<Option<&str>> {
+/// 提取原始 Claude Code/CLI UA 中的完整版本 token。
+///
+/// @param user_agent 原始请求 User-Agent。
+/// @return 非 Claude UA 返回 `None`；Claude UA 返回其版本 token，缺失时内层为 `None`。
+pub fn extract_claude_code_version(user_agent: &str) -> Option<Option<&str>> {
     let lower = user_agent.to_ascii_lowercase();
     let prefix = if lower.starts_with("claude-code/") {
         "claude-code/"

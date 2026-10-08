@@ -7,7 +7,10 @@ use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS,
 };
-use crate::service::version_profile::{ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_VERSION_PROFILE};
+use crate::service::version_profile::{
+    ClaudeCodeProfile, DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE,
+    DEFAULT_CLAUDE_CODE_VERSION_PROFILE,
+};
 
 /// 允许 `messages[].role=system` 的默认模型列表。
 pub const DEFAULT_ALLOW_SYSTEM_ROLE_MODELS: &str =
@@ -18,6 +21,9 @@ pub const DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_ALLOWED_C
 pub const DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING: &str = DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS;
 /// 默认 Claude Code 版本画像 key。
 pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING: &str = DEFAULT_CLAUDE_CODE_VERSION_PROFILE;
+/// 默认画像选择方式，旧数据库只补缺失设置，不覆盖管理员显式值。
+pub const DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE_SETTING: &str =
+    DEFAULT_CLAUDE_CODE_PROFILE_SELECTION_MODE;
 /// 默认允许的非 Claude Code 客户端 User-Agent。
 pub const DEFAULT_ALLOWED_USER_AGENTS_SETTING: &str = DEFAULT_ALLOWED_USER_AGENTS;
 /// Claude Code 上下文风险控制默认仅观测,不改写请求体。

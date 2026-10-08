@@ -5,7 +5,7 @@ use serde_json::Value;
 use super::account::{Account, CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData};
 use crate::service::version_profile::{
     DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION, DEFAULT_CLAUDE_CODE_VERSION_BASE,
-    STAINLESS_RUNTIME_VERSION,
+    STAINLESS_RUNTIME_VERSION, profile_for_version,
 };
 
 const DEFAULT_ACCOUNT_ID_SEED: &str = "account";
@@ -500,9 +500,15 @@ pub fn device_profile(account: &Account) -> DeviceProfile {
     }
 }
 
-/// 为一次运行创建稳定运行画像。
+/// 为一次运行创建稳定画像，同账号不同有效版本使用独立运行 ID。
+///
+/// @param account 当前请求画像的账号副本。
+/// @param started_at 运行开始时间。
+/// @return 设备身份稳定、按有效画像隔离的运行画像。
 pub fn run_profile(account: &Account, started_at: DateTime<Utc>) -> RunProfile {
-    let seed = account_seed(account);
+    let profile = device_profile(account);
+    let profile_key = profile_for_version(&profile.env.version).key;
+    let seed = format!("{}:{}", account_seed(account), profile_key);
     RunProfile {
         started_at,
         session_id: deterministic_uuid(&format!("{}:run:{}", seed, started_at.timestamp())),
@@ -804,7 +810,8 @@ mod tests {
     };
     use crate::service::version_profile::{
         DEFAULT_CLAUDE_CODE_BUILD_TIME, DEFAULT_CLAUDE_CODE_VERSION,
-        DEFAULT_CLAUDE_CODE_VERSION_BASE, STAINLESS_RUNTIME_VERSION,
+        DEFAULT_CLAUDE_CODE_VERSION_BASE, STAINLESS_RUNTIME_VERSION, account_for_request_profile,
+        profile_for_key,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -961,5 +968,19 @@ mod tests {
         assert!(first.heap_used <= first.heap_total);
         assert!(later.cpu_user > first.cpu_user);
         assert!(later.cpu_system > first.cpu_system);
+    }
+
+    #[test]
+    fn same_second_profile_runs_are_distinct_without_splitting_device_identity() {
+        let account = legacy_account();
+        let old = account_for_request_profile(&account, Some(profile_for_key("2.1.260").unwrap()));
+        let new = account_for_request_profile(&account, Some(profile_for_key("2.1.280").unwrap()));
+        let started_at = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
+        let old_run = run_profile(&old, started_at);
+        let new_run = run_profile(&new, started_at);
+        assert_ne!(old_run.session_id, new_run.session_id);
+        assert_ne!(old_run.growthbook_session_id, new_run.growthbook_session_id);
+        assert_eq!(derive_device_id(&old), derive_device_id(&new));
+        assert_eq!(derive_account_uuid(&old), derive_account_uuid(&new));
     }
 }
