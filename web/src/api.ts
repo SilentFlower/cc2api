@@ -22,6 +22,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return res.json()
 }
 
+/** 账号持久信息，以及账号管理页使用的运行状态摘要。 */
 export interface Account {
   id: number
   name: string
@@ -196,8 +197,17 @@ function normalizeSettingsMap(data: RawSettingsMap): SettingsMap {
 }
 
 export const api = {
+  /**
+   * 加载账号分页和当前生效的画像配置。
+   * @param page 页码。
+   * @param pageSize 每页账号数。
+   * @return 账号分页及画像配置；兼容旧后端缺少新增字段的响应。
+   */
   listAccounts: (page = 1, pageSize = 12) =>
-    request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
+    request<PagedResult<Account> & {
+      claude_code_profile_selection_mode?: 'client_version' | 'account'
+      claude_code_version_profile?: string
+    }>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
   createAccount: (a: Partial<Account>) => request<Account>('POST', '/admin/accounts', a),
   updateAccount: (id: number, a: Partial<Account>) => request<Account>('PUT', `/admin/accounts/${id}`, a),
   deleteAccount: (id: number) => request<void>('DELETE', `/admin/accounts/${id}`),

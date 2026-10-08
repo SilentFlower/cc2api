@@ -1230,13 +1230,10 @@ impl GatewayService {
         Ok(())
     }
 
-    /// 获取测试使用的画像选择配置快照。
+    /// 获取网关当前生效的画像选择配置快照，供管理页面展示。
     ///
     /// @return 当前选择方式及默认画像。
-    #[cfg(test)]
-    pub(crate) async fn profile_selection_config_for_test(
-        &self,
-    ) -> ClaudeCodeProfileSelectionConfig {
+    pub async fn profile_selection_config(&self) -> ClaudeCodeProfileSelectionConfig {
         *self.profile_selection_config.read().await
     }
 

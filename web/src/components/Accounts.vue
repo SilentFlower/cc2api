@@ -22,6 +22,9 @@ const { show: toast } = useToast();
 
 /** 账号列表 */
 const accounts = ref<Account[]>([]);
+/** 网关当前生效的画像配置；旧后端未提供时不推测默认值。 */
+const profileSelectionMode = ref<'client_version' | 'account' | null>(null);
+const defaultVersionProfile = ref<string | null>(null);
 /** 分页状态 */
 const currentPage = ref(1);
 const totalPages = ref(1);
@@ -111,6 +114,8 @@ async function load() {
   try {
     const res = await api.listAccounts(currentPage.value, pageSize);
     accounts.value = res.data ?? [];
+    profileSelectionMode.value = res.claude_code_profile_selection_mode ?? null;
+    defaultVersionProfile.value = res.claude_code_version_profile ?? null;
     totalPages.value = res.total_pages;
     totalCount.value = res.total;
   } catch {
@@ -937,7 +942,17 @@ async function copyText(text: string) {
               <div>
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">环境指纹</p>
                 <p class="text-xs text-[#8c8475] truncate">
-                  {{ a.canonical_env?.platform || '—' }} / {{ a.canonical_env?.arch || '—' }} · v{{ a.canonical_env?.version || '—' }}
+                  {{ a.canonical_env?.platform || '—' }} / {{ a.canonical_env?.arch || '—' }}
+                </p>
+                <p class="text-xs text-[#8c8475] mt-0.5">账号基础版本：v{{ a.canonical_env?.version || '—' }}</p>
+              </div>
+              <div>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">画像选择方式</p>
+                <p class="text-xs text-[#8c8475]">
+                  {{ profileSelectionMode === 'client_version' ? '按客户端 UA 适配' : profileSelectionMode === 'account' ? '使用账号画像' : '未提供画像配置' }}
+                </p>
+                <p v-if="profileSelectionMode === 'client_version' && defaultVersionProfile" class="text-xs text-[#8c8475] mt-0.5">
+                  默认回退：v{{ defaultVersionProfile }}
                 </p>
               </div>
               <div>

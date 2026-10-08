@@ -249,6 +249,11 @@ struct PageQuery {
     page_size: Option<i64>,
 }
 
+/// 分页返回账号和网关当前生效的画像配置。
+///
+/// @param state 管理应用状态。
+/// @param query 分页参数。
+/// @return 账号分页与只读画像配置。
 async fn list_accounts(
     State(state): State<AppState>,
     Query(query): Query<PageQuery>,
@@ -260,6 +265,11 @@ async fn list_accounts(
         .list_accounts_paged(page, page_size)
         .await?;
     let total_pages = (total + page_size - 1) / page_size;
+    let profile_config = state.gateway_svc.profile_selection_config().await;
+    let profile_selection_mode = match profile_config.mode {
+        ClaudeCodeProfileSelectionMode::ClientVersion => "client_version",
+        ClaudeCodeProfileSelectionMode::Account => "account",
+    };
 
     // 为每个账号附加遥测会话过期时间 + 调度评分信息
     let mut data: Vec<serde_json::Value> = Vec::with_capacity(accounts.len());
@@ -333,6 +343,8 @@ async fn list_accounts(
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,
+        "claude_code_profile_selection_mode": profile_selection_mode,
+        "claude_code_version_profile": profile_config.default_profile.key,
     })))
 }
 
@@ -1547,9 +1559,35 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), status);
-            let config = gateway.profile_selection_config_for_test().await;
+            let config = gateway.profile_selection_config().await;
             assert_eq!(config.mode, mode);
             assert_eq!(config.default_profile.key, profile);
+            let account_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/accounts")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(account_response.status(), StatusCode::OK);
+            let account_bytes = body::to_bytes(account_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let account_list: serde_json::Value = serde_json::from_slice(&account_bytes).unwrap();
+            assert_eq!(
+                ClaudeCodeProfileSelectionMode::parse(
+                    account_list["claude_code_profile_selection_mode"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+                mode
+            );
+            assert_eq!(account_list["claude_code_version_profile"], profile);
             let response = app
                 .clone()
                 .oneshot(
@@ -1582,6 +1620,55 @@ mod tests {
 
     async fn test_router() -> Router {
         test_router_with_gateway().await.0
+    }
+
+    #[tokio::test]
+    async fn account_list_reports_base_version_and_effective_profile_configuration() {
+        let app = test_router().await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/accounts")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": "account-display@example.invalid",
+                            "setup_token": "test-token",
+                            "auto_telemetry": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/accounts?page=1&page_size=12")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload["claude_code_profile_selection_mode"],
+            "client_version"
+        );
+        assert_eq!(payload["claude_code_version_profile"], "2.1.280");
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["data"][0]["canonical_env"]["version"], "2.1.280");
+        assert_eq!(payload["data"][0]["auto_telemetry"], false);
     }
 
     #[tokio::test]
