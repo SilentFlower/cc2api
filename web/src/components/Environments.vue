@@ -19,9 +19,9 @@ onMounted(connect);
 </script>
 
 <template>
-  <div class="p-4">
-    <p v-if="error" role="alert">{{ error }}</p>
-    <iframe v-if="ready" src="/runtime/" title="账号环境、任务与抓包管理" class="w-full border-0 rounded-lg" style="height: calc(100vh - 100px)" />
-    <p v-else-if="!error">正在连接环境管理…</p>
+  <div class="flex h-full min-h-0 w-full flex-col">
+    <p v-if="error" class="p-4" role="alert">{{ error }}</p>
+    <iframe v-if="ready" src="/runtime/" title="账号环境、任务与抓包管理" class="block min-h-0 w-full flex-1 border-0" />
+    <p v-else-if="!error" class="p-4">正在连接环境管理…</p>
   </div>
 </template>

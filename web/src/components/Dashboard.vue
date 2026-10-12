@@ -45,17 +45,23 @@ onMounted(loadDashboard);
 </script>
 
 <template>
-  <div class="min-h-screen">
+  <div :class="route.name === 'environments' ? 'h-dvh flex flex-col overflow-hidden' : 'min-h-screen'">
     <!-- 顶部导航栏 -->
-    <header class="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-[#e8e2d9]/60 px-6 py-3">
-      <div class="max-w-7xl mx-auto flex items-center justify-between">
-        <div class="flex items-center gap-6">
-          <div class="flex items-center gap-2">
+    <header class="sticky top-0 z-40 shrink-0 bg-white/80 backdrop-blur-md border-b border-[#e8e2d9]/60 px-6 py-3">
+      <div class="max-w-7xl mx-auto flex items-center justify-between gap-3">
+        <div class="flex min-w-0 flex-wrap items-center gap-x-6 gap-y-2">
+          <div class="flex min-w-0 items-center gap-2">
             <img src="/favicon.svg" alt="Logo" class="w-6 h-6" />
             <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">Claude Code Gateway</h1>
           </div>
-          <nav class="flex items-center gap-1">
-            <router-link :to="{ name: 'environments' }" class="px-3 py-1.5 text-sm rounded-lg text-[#8c8475] hover:text-[#29261e]">环境与任务</router-link>
+          <nav class="flex flex-wrap items-center gap-1">
+            <router-link
+              :to="{ name: 'environments' }"
+              class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'environments'
+                ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium'
+                : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
+            >环境与任务</router-link>
             <router-link
               :to="{ name: 'accounts' }"
               class="px-3 py-1.5 text-sm rounded-lg transition-colors"
@@ -97,9 +103,10 @@ onMounted(loadDashboard);
       </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-6 py-6 space-y-6">
+    <!-- bench 自己管理内容滚动；外层只分配导航下方的空间，避免双重滚动和宽度压缩。 -->
+    <main :class="route.name === 'environments' ? 'flex-1 min-h-0 w-full overflow-hidden' : 'max-w-7xl mx-auto px-6 py-6 space-y-6'">
       <!-- 统计卡片 -->
-      <div v-if="dashboard" class="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div v-if="dashboard && route.name !== 'environments'" class="grid grid-cols-2 md:grid-cols-5 gap-4">
         <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
           <CardContent class="py-3 px-4">
             <p class="text-[#8c8475] text-xs mb-1">总账号</p>
