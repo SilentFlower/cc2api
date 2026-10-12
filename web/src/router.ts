@@ -43,6 +43,7 @@ const router = createRouter({
         { path: '', name: 'accounts', component: () => import('./components/Accounts.vue') },
         { path: 'tokens', name: 'tokens', component: () => import('./components/Tokens.vue') },
         { path: 'settings', name: 'settings', component: () => import('./components/Settings.vue') },
+        { path: 'environments', name: 'environments', component: () => import('./components/Environments.vue') },
       ],
     },
   ],
@@ -77,12 +78,16 @@ export async function login(password: string): Promise<void> {
   await router.push({ name: 'dashboard' });
 }
 
-/** 退出登录并跳转到登录页 */
-export function logout(): void {
+/**
+ * 撤销 v3 会话后退出并跳转登录页。
+ * @return 完整退出完成；撤销失败时保留状态供用户重试。
+ */
+export async function logout(): Promise<void> {
+  await api.closeRuntime();
   authenticated = false;
   localStorage.removeItem('claude-code-gateway_auth');
   setAuth('');
-  router.push({ name: 'login' });
+  await router.push({ name: 'login' });
 }
 
 export default router;

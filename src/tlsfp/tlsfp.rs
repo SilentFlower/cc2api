@@ -8,8 +8,12 @@ use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
 use rustls::internal::msgs::handshake::ClientExtension;
 use rustls::{CipherSuite, Error, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme};
+#[cfg(test)]
+use rustls_pki_types::CertificateDer;
 use static_init::dynamic;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -312,7 +316,10 @@ fn build_tls_config() -> rustls::ClientConfig {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
+    build_tls_config_with_roots(root_store)
+}
 
+fn build_tls_config_with_roots(root_store: RootCertStore) -> rustls::ClientConfig {
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()
@@ -403,11 +410,7 @@ pub fn make_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::
     //
     // 保活: tcp_keepalive OS 层 SO_KEEPALIVE + KEEPIDLE=30s,idle 30s 后发 TCP 探测包。
     // HTTP/2 PING 因 craftls 指纹 ALPN 只声明 http/1.1,永远协商不出 h2,故不配置。
-    let mut builder = reqwest::Client::builder()
-        .use_preconfigured_tls(tls_config)
-        .connect_timeout(Duration::from_secs(30))
-        .tcp_keepalive(Duration::from_secs(30))
-        .no_proxy();
+    let mut builder = request_client_builder(tls_config);
 
     if !proxy_url.is_empty() {
         // 非空代理必须成功解析并真正挂到客户端上，不能因配置错误退回直连。
@@ -415,6 +418,36 @@ pub fn make_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::
     }
 
     builder.build()
+}
+
+fn request_client_builder(tls_config: rustls::ClientConfig) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls_config)
+        .connect_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30))
+        .no_proxy()
+}
+
+/// 本地 TLS 测试复用生产指纹和客户端设置；额外信任根仅编译进测试。
+/// @param certificate 测试 CA；None 时使用生产公有根。
+/// @param host 仅解析到本地的测试域名。
+/// @param address 本地 TLS 服务地址。
+/// @return 保持证书和主机名校验的测试客户端。
+#[cfg(test)]
+pub(crate) fn test_request_client(
+    certificate: Option<CertificateDer<'static>>,
+    host: &str,
+    address: SocketAddr,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    if let Some(certificate) = certificate {
+        roots.add(certificate).unwrap();
+    }
+    request_client_builder(build_tls_config_with_roots(roots))
+        .resolve(host, address)
+        .build()
 }
 
 #[cfg(test)]

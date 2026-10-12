@@ -12,6 +12,7 @@ use crate::service::rewriter::{
     CacheControlTtlRewrite, ClientType, EnvPassthrough, MessageCacheControlRewrite, Rewriter,
     ordered_anthropic_headers,
 };
+use crate::service::runtime_transport::{self, PreparedRequest};
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::{DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, SettingsStore};
 
@@ -426,6 +427,32 @@ impl PrimePollerService {
             }
         };
 
+        // v3 的后台推理也遵守账号占用；permit 保持至整条响应耗尽。
+        let _runtime_permit = if !std::env::var("V3_RUNTIME_URL")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            let queue = self
+                .account_svc
+                .get_or_create_queue(account.id, account.concurrency)
+                .await;
+            match queue.acquire(Duration::from_secs(1), 1).await {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return PrimeOutcome {
+                        success: false,
+                        error_message: "account runtime occupied".into(),
+                        duration_ms: started.elapsed().as_millis() as i64,
+                        passive_usage: None,
+                        usage_observation_kind: UsageObservationKind::Allowed,
+                        status: None,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
         // 构造最小请求体,其余字段交给 rewriter 补全,保证与真实 Claude Code 流量对齐:
         // - metadata.user_id 由 rewriter 注入 {device_id, account_uuid, session_id} JSON 字符串
         // - system prompt、tools、stream=true、去除 temperature 等由 rewriter 统一规范化
@@ -631,21 +658,26 @@ impl PrimePollerService {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> Result<reqwest::Response, String> {
-        let client = crate::tlsfp::get_request_client(&account.proxy_url)
-            .map_err(|_| "request client unavailable".to_string())?;
-        let mut req = client.post(&self.upstream_url).body(body.to_vec());
-        for (k, v) in ordered_anthropic_headers("/v1/messages", headers) {
-            req = req.header(k, v);
-        }
-
-        match tokio::time::timeout(PRIME_TTFB_TIMEOUT, req.send()).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => Err(truncate_chars(
-                &format!("request failed: {}", e),
-                ERROR_SNIPPET_CHARS,
-            )),
-            Err(_) => Err("upstream TTFB timeout".into()),
-        }
+        let prepared = PreparedRequest {
+            account_id: account.id,
+            environment_id: String::new(),
+            generation: 0,
+            request_id: String::new(),
+            deadline_unix_ms: 0,
+            method: "POST".into(),
+            target_url: self.upstream_url.clone(),
+            headers: ordered_anthropic_headers("/v1/messages", headers),
+            preserve_header_casing: false,
+        };
+        runtime_transport::send(account, prepared, body, PRIME_TTFB_TIMEOUT)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("TTFB timeout") {
+                    "upstream TTFB timeout".into()
+                } else {
+                    "upstream submission status unknown".into()
+                }
+            })
     }
 }
 

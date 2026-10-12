@@ -1,5 +1,7 @@
+use crate::service::account::AccountQueue;
+use crate::service::runtime_lease::RuntimeLease;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -8,15 +10,17 @@ use chrono::TimeZone;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{
-    Account, AccountAuthType, AccountStatus, DEFAULT_ALLOW_1M_MODELS,
-    DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
-    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalPromptEnvData,
+    DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
+    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
 };
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
@@ -34,6 +38,7 @@ use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerMode, MessageCacheControlRewrite,
 };
+use crate::service::runtime_bridge;
 use crate::service::telemetry::TelemetryService;
 use crate::service::version_profile::{
     ClaudeCodeProfileSelectionMode, all_profiles, profile_for_key,
@@ -112,7 +117,8 @@ pub fn build_router(
         .route("/", get(spa_handler))
         .route("/login", get(spa_handler))
         .route("/tokens", get(spa_handler))
-        .route("/settings", get(spa_handler));
+        .route("/settings", get(spa_handler))
+        .route("/environments", get(spa_handler));
 
     // 前端静态资源
     let asset_routes = Router::new()
@@ -129,6 +135,14 @@ pub fn build_router(
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
         .route(
+            "/admin/runtime/accounts/:id/lease",
+            get(runtime_lease_status).post(runtime_lease_update),
+        )
+        .route(
+            "/admin/runtime/accounts/:id/config",
+            get(runtime_account_config),
+        )
+        .route(
             "/admin/accounts/:id/oauth-credentials/resolve",
             post(resolve_oauth_credentials),
         )
@@ -138,6 +152,11 @@ pub fn build_router(
             put(update_token).delete(delete_token_handler),
         )
         .route("/admin/dashboard", get(get_dashboard))
+        .route(
+            "/admin/runtime/session",
+            post(runtime_bridge::grant_session),
+        )
+        .route("/runtime/logout", post(runtime_bridge::revoke_session))
         .route(
             "/admin/oauth/generate-auth-url",
             post(oauth_generate_auth_url),
@@ -164,6 +183,16 @@ pub fn build_router(
         .merge(frontend_routes)
         .merge(asset_routes)
         .merge(admin_routes)
+        .merge(
+            if std::env::var("V3_RUNTIME_URL")
+                .unwrap_or_default()
+                .is_empty()
+            {
+                Router::new()
+            } else {
+                runtime_bridge::routes()
+            },
+        )
         .route("/api/hello", get(hello_get).head(hello_head))
         .route("/v1/messages/count_tokens", post(gateway_count_tokens))
         .fallback(gateway_fallback)
@@ -350,6 +379,7 @@ async fn list_accounts(
 
 #[derive(Deserialize)]
 struct CreateAccountRequest {
+    cli_identity: Option<CliIdentityImport>,
     name: Option<String>,
     email: String,
     token: Option<String>,
@@ -376,7 +406,94 @@ struct CreateAccountRequest {
     upstream_session_refresh_policy: Option<String>,
 }
 
+/// 受控 CLI 导入，只接受已经观测到的设备字段和实际基础环境。
+#[derive(Deserialize)]
+struct CliIdentityImport {
+    device_id: String,
+    environment_id: String,
+    source: String,
+    canonical_env: CanonicalEnvData,
+    canonical_prompt: CanonicalPromptEnvData,
+}
+
 const DEFAULT_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 2400;
+
+/// 受信任调度器对单账号占用租约的操作。
+#[derive(Deserialize)]
+struct RuntimeLeaseInput {
+    operation: String,
+    owner: String,
+    generation: Option<String>,
+}
+
+/// 查询账号门禁，便于在服务重启后对账。
+/// @param state 管理服务状态。
+/// @param id 当前账号 ID。
+/// @return 持久租约和活动请求数。
+async fn runtime_lease_status(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let account = state.account_svc.get_account(id).await?;
+    let queue = state
+        .account_svc
+        .get_or_create_queue(id, account.concurrency)
+        .await;
+    let mut snapshot = queue.runtime_gate.snapshot();
+    snapshot["waiting"] = serde_json::json!(queue.waiting_count());
+    Ok(Json(snapshot))
+}
+
+/// 提供账号配置的唯一来源，避免调度器使用已经漂移的代理。
+/// @param id 绑定账号 ID。
+/// @return 不包含 OAuth 凭据的配置。
+async fn runtime_account_config(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let account = state.account_svc.get_account(id).await?;
+    Ok(Json(
+        serde_json::json!({"account_id": account.id, "proxy_url": account.proxy_url,
+        "auth_type": account.auth_type, "status": account.status}),
+    ))
+}
+
+/// 管理共享 CLI 租约与排他维护；只有维护原子关闭 API 入场。
+/// @param state 管理服务状态。
+/// @param id 当前账号 ID。
+/// @param input owner、代次和操作。
+/// @return 当前租约及活动数；不同 owner/旧代次拒绝。
+async fn runtime_lease_update(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<RuntimeLeaseInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if std::env::var("V3_RUNTIME_URL")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(AppError::BadRequest("v3 runtime is not configured".into()));
+    }
+    let account = state.account_svc.get_account(id).await?;
+    let queue = state
+        .account_svc
+        .get_or_create_queue(id, account.concurrency)
+        .await;
+    if input.operation == "prepare" {
+        queue.runtime_gate.prepare(&input.owner)?;
+    } else if input.operation == "prepare-cli" {
+        queue.runtime_gate.prepare_cli(&input.owner)?;
+    } else {
+        queue.runtime_gate.update(
+            &input.owner,
+            input.generation.as_deref().unwrap_or_default(),
+            &input.operation,
+        )?;
+    }
+    let mut snapshot = queue.runtime_gate.snapshot();
+    snapshot["waiting"] = serde_json::json!(queue.waiting_count());
+    Ok(Json(snapshot))
+}
 const MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 60;
 const MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 7200;
 
@@ -411,6 +528,7 @@ fn normalize_oauth_credential_validity_seconds(value: Option<i64>) -> Result<i64
 
 async fn create_account(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<Account>), AppError> {
     if req.email.is_empty() {
@@ -467,8 +585,82 @@ async fn create_account(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
-    state.account_svc.create_account(&mut account).await?;
+    if let Some(identity) = req.cli_identity {
+        let expected = std::env::var("V3_INTERNAL_TOKEN").unwrap_or_default();
+        let supplied = headers
+            .get("x-v3-service-token")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if expected.len() < 32
+            || !bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+            || identity.environment_id.len() != 32
+            || !identity
+                .environment_id
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || identity.source != "cli:/v1/messages:metadata.user_id.device_id"
+        {
+            return Err(AppError::Unauthorized);
+        }
+        account.device_id = identity.device_id;
+        account.canonical_env = serde_json::to_value(identity.canonical_env)
+            .map_err(|_| AppError::BadRequest("invalid CLI environment".into()))?;
+        account.canonical_prompt = serde_json::to_value(identity.canonical_prompt)
+            .map_err(|_| AppError::BadRequest("invalid CLI prompt environment".into()))?;
+        state.account_svc.create_cli_account(&mut account).await?;
+    } else {
+        state.account_svc.create_account(&mut account).await?;
+    }
     Ok((StatusCode::CREATED, Json(account)))
+}
+
+/// 配置修改期间阻止新推理进入，检查和写库之间不能出现新活动请求。
+struct RuntimeConfigPermit {
+    queue: Arc<AccountQueue>,
+    lease: RuntimeLease,
+}
+
+impl Drop for RuntimeConfigPermit {
+    fn drop(&mut self) {
+        if self
+            .queue
+            .runtime_gate
+            .update(&self.lease.owner, &self.lease.generation, "release")
+            .is_err()
+        {
+            warn!("v3 configuration lease requires reconciliation");
+        }
+    }
+}
+
+async fn config_permit(
+    state: &AppState,
+    account: &Account,
+) -> Result<Option<RuntimeConfigPermit>, AppError> {
+    if std::env::var("V3_RUNTIME_URL")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let queue = state
+        .account_svc
+        .get_or_create_queue(account.id, account.concurrency)
+        .await;
+    let lease = queue
+        .runtime_gate
+        .prepare(&format!("gateway-config:{}", Uuid::new_v4()))?;
+    let permit = RuntimeConfigPermit { queue, lease };
+    if permit.queue.runtime_gate.snapshot()["active"]
+        .as_i64()
+        .unwrap_or(0)
+        != 0
+        || permit.queue.waiting_count() != 0
+    {
+        return Err(AppError::BadRequest("account runtime is busy".into()));
+    }
+    runtime_bridge::quiesce(account.id, &permit.lease).await?;
+    Ok(Some(permit))
 }
 
 async fn update_account(
@@ -477,6 +669,25 @@ async fn update_account(
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Account>, AppError> {
     let mut existing = state.account_svc.get_account(id).await?;
+    let _runtime_permit = if [
+        "proxy_url",
+        "auth_type",
+        "access_token",
+        "refresh_token",
+        "status",
+        "token",
+        "setup_token",
+        "account_uuid",
+        "organization_uuid",
+        "expires_at",
+    ]
+    .iter()
+    .any(|key| updates.get(key).is_some())
+    {
+        config_permit(&state, &existing).await?
+    } else {
+        None
+    };
 
     if let Some(name) = updates.get("name").and_then(|v| v.as_str()) {
         if !name.is_empty() {
@@ -649,6 +860,8 @@ async fn delete_account(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let account = state.account_svc.get_account(id).await?;
+    let _runtime_permit = config_permit(&state, &account).await?;
     state.account_svc.delete_account(id).await?;
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }

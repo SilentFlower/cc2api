@@ -197,6 +197,10 @@ function normalizeSettingsMap(data: RawSettingsMap): SettingsMap {
 }
 
 export const api = {
+  /** 换取 v3 的独立浏览器会话。@return 会话签发结果。 */
+  openRuntime: () => request<{ ok: boolean }>('POST', '/admin/runtime/session'),
+  /** 撤销当前 v3 会话。@return 撤销成功结果，未启用 v3 时兼容旧部署。 */
+  closeRuntime: () => request<{ ok: boolean }>('POST', '/runtime/logout'),
   /**
    * 加载账号分页和当前生效的画像配置。
    * @param page 页码。

@@ -5,8 +5,24 @@ import { api, type Dashboard as DashboardData } from '../api';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { logout } from '../router';
+import { useToast } from '../composables/useToast';
 
 const route = useRoute();
+const toast = useToast();
+const loggingOut = ref(false);
+
+/** 完成统一退出；服务异常时展示错误并允许重试。@return 退出操作完成。 */
+async function handleLogout(): Promise<void> {
+  if (loggingOut.value) return;
+  loggingOut.value = true;
+  try {
+    await logout();
+  } catch (error) {
+    toast.show(error instanceof Error ? error.message : '退出失败，请重试');
+  } finally {
+    loggingOut.value = false;
+  }
+}
 
 /** 仪表盘统计数据 */
 const dashboard = ref<DashboardData | null>(null);
@@ -39,6 +55,7 @@ onMounted(loadDashboard);
             <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">Claude Code Gateway</h1>
           </div>
           <nav class="flex items-center gap-1">
+            <router-link :to="{ name: 'environments' }" class="px-3 py-1.5 text-sm rounded-lg text-[#8c8475] hover:text-[#29261e]">环境与任务</router-link>
             <router-link
               :to="{ name: 'accounts' }"
               class="px-3 py-1.5 text-sm rounded-lg transition-colors"
@@ -71,7 +88,8 @@ onMounted(loadDashboard);
         <Button
           variant="ghost"
           size="sm"
-          @click="logout"
+          @click="handleLogout"
+          :disabled="loggingOut"
           class="text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]"
         >
           退出

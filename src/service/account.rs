@@ -12,11 +12,13 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::{
-    Account, AccountAuthType, AccountStatus, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
-    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, MAX_UPSTREAM_SESSION_POOL_SIZE,
-    MAX_UPSTREAM_SESSION_TTL_MINUTES, MIN_UPSTREAM_SESSION_TTL_MINUTES,
+    Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalPromptEnvData,
+    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    MAX_UPSTREAM_SESSION_POOL_SIZE, MAX_UPSTREAM_SESSION_TTL_MINUTES,
+    MIN_UPSTREAM_SESSION_TTL_MINUTES,
 };
 use crate::service::rewriter::ClientType;
+use crate::service::runtime_lease::RuntimeGate;
 use crate::service::version_profile::{
     apply_identity_to_env_json, default_profile, profile_for_key,
 };
@@ -263,9 +265,11 @@ fn waiting_queue_capacity(concurrency: i32) -> i32 {
 /// 正在 `slots.acquire_owned()` 上挂起的 waiter 会从 semaphore 的 FIFO 链表移除；
 /// `waiting` 原子计数通过 scopeguard 反向减回。无泄漏。
 pub struct AccountQueue {
+    /// CLI draining 与 API 活动计数共用门禁。
+    pub runtime_gate: RuntimeGate,
     /// 活跃槽位信号量。
     slots: Arc<Semaphore>,
-    /// 等待位信号量（仅等待中持有，拿到槽位前归还）。
+    /// 等待位信号量，实际通过槽位和 CLI 门禁后归还。
     queue_cap: Arc<Semaphore>,
     /// 槽位容量目标（== 账号当前 `concurrency × 2` 内部单位）。shrinker 循环读这个值作为裁决依据,
     /// 扩容时自动撤销旧的 shrink 意图。
@@ -281,6 +285,8 @@ pub struct AccountQueue {
     waiting: Arc<AtomicI64>,
     /// 正在等待槽位的请求预计占用的内部单位数。
     waiting_units: Arc<AtomicI64>,
+    /// 已持有槽位但仍等待 CLI 门禁的单位，避免同时计入活跃与等待负载。
+    gate_waiting_units: Arc<AtomicI64>,
     /// 当前已经拿到槽位的活跃请求数。
     active_requests: Arc<AtomicI64>,
 }
@@ -323,7 +329,9 @@ impl AccountQueue {
     fn new(concurrency: i32) -> Self {
         let cap = standard_concurrency_to_slot_units(concurrency);
         let qc = waiting_queue_capacity(concurrency);
+        let active_requests = Arc::new(AtomicI64::new(0));
         Self {
+            runtime_gate: RuntimeGate::new(active_requests.clone()),
             slots: Arc::new(Semaphore::new(cap as usize)),
             queue_cap: Arc::new(Semaphore::new(qc as usize)),
             slot_max: Arc::new(AtomicI32::new(cap)),
@@ -332,7 +340,8 @@ impl AccountQueue {
             qc_cap: Arc::new(AtomicI32::new(qc)),
             waiting: Arc::new(AtomicI64::new(0)),
             waiting_units: Arc::new(AtomicI64::new(0)),
-            active_requests: Arc::new(AtomicI64::new(0)),
+            gate_waiting_units: Arc::new(AtomicI64::new(0)),
+            active_requests,
         }
     }
 
@@ -431,7 +440,7 @@ impl AccountQueue {
     /// 2. `waiting += 1`（scopeguard 保证退出路径反向减）；
     /// 3. `tokio::time::timeout(..., slots.acquire_owned())` 按 FIFO 等待；
     ///    即使当前有空闲 permit，若已有 waiter 排在前面，也不会被"插队"。
-    /// 4. 拿到槽位后 drop 等待位 permit，让后续请求有空位进队。
+    /// 4. 拿到槽位后等待 CLI 门禁；实际准入后才归还等待位。
     ///
     /// # 为什么不走 try_acquire_owned 快速路径
     /// tokio 对 `Semaphore::acquire` 保证公平性，但 `try_acquire` 是**非公平**的
@@ -443,6 +452,7 @@ impl AccountQueue {
         timeout: Duration,
         slot_units: u32,
     ) -> Result<AccountSlotPermit, QueueWaitError> {
+        let started = Instant::now();
         let slot_units = slot_units.max(1);
         // 1. 进等待区：拿不到等待位说明队列满，降级。
         //    queue_cap 用 try_acquire 是 OK 的：它仅作上限计数，无用户 waiter 排队。
@@ -473,20 +483,34 @@ impl AccountQueue {
                 Err(_) => return Err(QueueWaitError::Timeout),
             };
 
-        // 4. 已进入活跃区，显式归还等待位，让下一个 waiter 有空间排队
+        // 持有槽位不代表已准入；CLI 占用期间仍须占等待位且只计等待负载。
+        self.gate_waiting_units
+            .fetch_add(slot_units as i64, Ordering::Relaxed);
+        let gate_waiting_units = self.gate_waiting_units.clone();
+        let _gate_guard = scopeguard::guard((), move |_| {
+            gate_waiting_units.fetch_sub(slot_units as i64, Ordering::Relaxed);
+        });
+        if !self
+            .runtime_gate
+            .enter(timeout.saturating_sub(started.elapsed()))
+            .await
+        {
+            return Err(QueueWaitError::Timeout);
+        }
         drop(queue_permit);
-        self.active_requests.fetch_add(1, Ordering::Relaxed);
         Ok(AccountSlotPermit::new(
             slot_permit,
             self.active_requests.clone(),
         ))
     }
 
-    /// 当前活跃内部单位数 = `slots` 当前总 permit - 可用 permit。
+    /// 当前活跃内部单位数 = `slots` 当前总 permit - 可用 permit - 尚在等门禁的单位。
     /// 用 `slots_cap`（信号量实际容量）而非 `slot_max`（目标）——缩容过渡期两者可能暂时不等。
     pub fn active_units(&self) -> i64 {
         let cap = self.slots_cap.load(Ordering::Relaxed) as i64;
-        (cap - self.slots.available_permits() as i64).max(0)
+        (cap - self.slots.available_permits() as i64
+            - self.gate_waiting_units.load(Ordering::Relaxed))
+        .max(0)
     }
 
     /// 当前活跃标准槽位数。
@@ -690,6 +714,37 @@ impl AccountService {
         normalize_upstream_session_pool_config(a)?;
 
         self.store.create(a).await
+    }
+
+    /// 创建有明确 CLI 设备身份和基础环境的新账号，不重新生成身份。
+    /// @param account 已由受信任导入接口校验的新账号。
+    /// @return 创建结果；已有账号由独立绑定流程处理。
+    pub async fn create_cli_account(&self, account: &mut Account) -> Result<(), AppError> {
+        let environment: CanonicalEnvData =
+            serde_json::from_value(account.canonical_env.clone())
+                .map_err(|_| AppError::BadRequest("invalid CLI environment".into()))?;
+        let prompt: CanonicalPromptEnvData =
+            serde_json::from_value(account.canonical_prompt.clone())
+                .map_err(|_| AppError::BadRequest("invalid CLI prompt environment".into()))?;
+        if account.device_id.len() != 64
+            || !account
+                .device_id
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || environment.platform_raw != "linux"
+            || !matches!(environment.arch.as_str(), "x64" | "arm64")
+            || environment.version.is_empty()
+            || environment.version_base != environment.version
+            || environment.linux_kernel.is_empty()
+            || prompt.platform != "linux"
+            || prompt.os_version != environment.linux_kernel
+            || !prompt.working_dir.starts_with('/')
+        {
+            return Err(AppError::BadRequest("unconfirmed CLI identity".into()));
+        }
+        normalize_account_auth(account)?;
+        normalize_upstream_session_pool_config(account)?;
+        self.store.create(account).await
     }
 
     /// 将当前 settings 中选定的 Claude Code 版本画像应用到新账号 env。
@@ -1306,6 +1361,7 @@ impl AccountService {
             return q.clone();
         }
         let q = Arc::new(AccountQueue::new(concurrency));
+        q.runtime_gate.recover(account_id);
         map.insert(account_id, q.clone());
         q
     }
@@ -2359,6 +2415,74 @@ pub fn generate_session_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_runtime_gate_preserves_queue_capacity_and_waiting_load() {
+        let queue = Arc::new(AccountQueue::new(1));
+        let lease = queue.runtime_gate.prepare("login:test").unwrap();
+        let first_queue = queue.clone();
+        let first =
+            tokio::spawn(async move { first_queue.acquire(Duration::from_secs(3), 2).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.waiting_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second_queue = queue.clone();
+        let second =
+            tokio::spawn(async move { second_queue.acquire(Duration::from_secs(3), 2).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.waiting_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            queue.acquire(Duration::from_millis(20), 2).await,
+            Err(QueueWaitError::QueueFull)
+        ));
+        assert_eq!(queue.active_units(), 0);
+        assert_eq!(queue.active_request_count(), 0);
+        assert_eq!(queue.waiting_units(), 4);
+        queue
+            .runtime_gate
+            .update(&lease.owner, &lease.generation, "release")
+            .unwrap();
+        let first = first.await.unwrap().unwrap();
+        drop(first);
+        drop(second.await.unwrap().unwrap());
+        assert_eq!(queue.waiting_count(), 0);
+        assert_eq!(queue.active_units(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_gate_wait_releases_capacity_and_load() {
+        let queue = Arc::new(AccountQueue::new(1));
+        let lease = queue.runtime_gate.prepare("login:test").unwrap();
+        let pending_queue = queue.clone();
+        let pending =
+            tokio::spawn(async move { pending_queue.acquire(Duration::from_secs(30), 2).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.gate_waiting_units.load(Ordering::Relaxed) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pending.abort();
+        assert!(matches!(pending.await, Err(error) if error.is_cancelled()));
+        assert_eq!(queue.waiting_count(), 0);
+        assert_eq!(queue.waiting_units(), 0);
+        assert_eq!(queue.active_units(), 0);
+        queue
+            .runtime_gate
+            .update(&lease.owner, &lease.generation, "release")
+            .unwrap();
+        drop(queue.acquire(Duration::from_secs(1), 2).await.unwrap());
+    }
     use crate::model::account::{
         AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
         DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,

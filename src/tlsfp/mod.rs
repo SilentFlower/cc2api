@@ -1,4 +1,6 @@
 pub mod tlsfp;
+#[cfg(test)]
+pub(crate) use tlsfp::test_request_client;
 
 pub use tlsfp::get_request_client;
 pub use tlsfp::make_request_client;

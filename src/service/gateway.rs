@@ -11,7 +11,6 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::iter::once;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -37,6 +36,7 @@ use crate::service::rewriter::{
     merge_anthropic_beta, order_context_1m_after_oauth, ordered_anthropic_headers,
     strip_empty_text_blocks,
 };
+use crate::service::runtime_transport::{self, PreparedRequest};
 use crate::service::session_hello_probe::{
     SessionHelloProbeConfig, SessionHelloProbeDecision, SessionHelloProbeService,
 };
@@ -2532,42 +2532,18 @@ impl GatewayService {
 
         debug!("upstream URL: {}", target_url);
 
-        let client = upstream_request_client(account)?;
-
-        let mut req_builder = match method {
-            "GET" => client.get(&target_url),
-            "POST" => client.post(&target_url),
-            "PUT" => client.put(&target_url),
-            "DELETE" => client.delete(&target_url),
-            "PATCH" => client.patch(&target_url),
-            _ => client.post(&target_url),
+        let prepared = PreparedRequest {
+            account_id: account.id,
+            environment_id: String::new(),
+            generation: 0,
+            request_id: String::new(),
+            deadline_unix_ms: 0,
+            method: method.to_string(),
+            target_url,
+            headers: ordered_anthropic_headers(path, headers),
+            preserve_header_casing: !is_event_logging_path(path) && !path.starts_with("/api/eval/"),
         };
-
-        let ordered_headers = ordered_anthropic_headers(path, headers);
-        if !is_event_logging_path(path) && !path.starts_with("/api/eval/") {
-            req_builder = req_builder.http1_header_casing(
-                ordered_headers
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .chain(once("Content-Length")),
-            );
-        }
-        for (k, v) in ordered_headers {
-            debug!("upstream header: {}: {}", k, safe_header_log_value(&k, &v));
-            req_builder = req_builder.header(k, v);
-        }
-        req_builder = req_builder.body(body.to_vec());
-
-        let resp = tokio::time::timeout(UPSTREAM_TTFB_TIMEOUT, req_builder.send())
-            .await
-            .map_err(|_| {
-                warn!("upstream TTFB timeout for account {}", account.id);
-                AppError::BadGateway("upstream TTFB timeout".into())
-            })?
-            .map_err(|e| {
-                warn!("upstream error for account {}: {}", account.id, e);
-                AppError::BadGateway("upstream request failed".into())
-            })?;
+        let resp = runtime_transport::send(account, prepared, body, UPSTREAM_TTFB_TIMEOUT).await?;
 
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
@@ -2838,41 +2814,18 @@ impl GatewayService {
         let target_url = count_tokens_upstream_url_with_base(&self.upstream_base);
         debug!("count_tokens upstream URL: {}", target_url);
 
-        let client = upstream_request_client(account)?;
-        let mut req_builder = client.post(&target_url);
-        let ordered_headers = ordered_anthropic_headers(COUNT_TOKENS_PATH, headers);
-        req_builder = req_builder.http1_header_casing(
-            ordered_headers
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .chain(once("Content-Length")),
-        );
-        for (k, v) in ordered_headers {
-            debug!(
-                "count_tokens upstream header: {}: {}",
-                k,
-                safe_header_log_value(&k, &v)
-            );
-            req_builder = req_builder.header(k, v);
-        }
-        req_builder = req_builder.body(body.to_vec());
-
-        let resp = tokio::time::timeout(UPSTREAM_TTFB_TIMEOUT, req_builder.send())
-            .await
-            .map_err(|_| {
-                warn!(
-                    "count_tokens upstream TTFB timeout for account {}",
-                    account.id
-                );
-                AppError::BadGateway("upstream TTFB timeout".into())
-            })?
-            .map_err(|e| {
-                warn!(
-                    "count_tokens upstream request failed for account {}: {}",
-                    account.id, e
-                );
-                AppError::BadGateway("upstream request failed".into())
-            })?;
+        let prepared = PreparedRequest {
+            account_id: account.id,
+            environment_id: String::new(),
+            generation: 0,
+            request_id: String::new(),
+            deadline_unix_ms: 0,
+            method: "POST".into(),
+            target_url,
+            headers: ordered_anthropic_headers(COUNT_TOKENS_PATH, headers),
+            preserve_header_casing: true,
+        };
+        let resp = runtime_transport::send(account, prepared, body, UPSTREAM_TTFB_TIMEOUT).await?;
 
         let status_code = resp.status().as_u16();
         let response_headers = resp.headers().clone();
