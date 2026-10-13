@@ -57,6 +57,8 @@ struct PrimeOutcome {
     /// 上游 HTTP 状态码,None 表示请求没到达上游(如 token 解析失败、序列化失败)。
     /// 用于后续按状态码做 401/429/403 处理。
     status: Option<u16>,
+    /// 仅用于延迟 401 的条件状态写入，不写入日志或数据库。
+    failed_access_token: Option<String>,
 }
 
 /// 峰值 5h 窗口预热服务。
@@ -227,6 +229,7 @@ impl PrimePollerService {
                     passive_usage: None,
                     usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
+                    failed_access_token: None,
                 }
             };
 
@@ -277,8 +280,13 @@ impl PrimePollerService {
                         .rejected_usage(usage)
                         .unwrap_or_else(|| serde_json::json!({}))
                 });
-                self.apply_status_side_effects(&account, code, rate_limit_usage)
-                    .await;
+                self.apply_status_side_effects(
+                    &account,
+                    code,
+                    rate_limit_usage,
+                    outcome.failed_access_token.as_deref(),
+                )
+                .await;
             }
 
             // 成功和 429 都只使用响应头被动采集；普通错误不更新窗口。
@@ -319,22 +327,32 @@ impl PrimePollerService {
         account: &Account,
         status: u16,
         passive_usage: Option<serde_json::Value>,
+        failed_access_token: Option<&str>,
     ) {
         if status == 401 {
             let reason = match account.auth_type {
                 AccountAuthType::Oauth => "401 OAuth 认证失败",
                 AccountAuthType::SetupToken => "401 SetupToken 认证失败",
             };
-            if let Err(e) = self
-                .account_svc
-                .disable_for_auth_failure(account.id, reason)
-                .await
-            {
+            let result = if account.auth_type == AccountAuthType::Oauth {
+                let Some(token) = failed_access_token else {
+                    return;
+                };
+                self.account_svc
+                    .disable_oauth_for_failed_token(account.id, token, reason)
+                    .await
+            } else {
+                self.account_svc
+                    .disable_for_auth_failure(account.id, reason)
+                    .await
+                    .map(|_| true)
+            };
+            if let Err(e) = result {
                 warn!(
                     "prime poller: disable_for_auth_failure failed for account {}: {}",
                     account.id, e
                 );
-            } else {
+            } else if matches!(result, Ok(true)) {
                 warn!(
                     "prime poller: account {} disabled after upstream 401",
                     account.id
@@ -410,7 +428,7 @@ impl PrimePollerService {
         let started = Instant::now();
 
         // 取账号凭证(OAuth 会自动刷新,SetupToken 直接返回)。
-        let token = match self.account_svc.resolve_upstream_token(account.id).await {
+        let mut token = match self.account_svc.resolve_upstream_token(account.id).await {
             Ok(t) => t,
             Err(e) => {
                 return PrimeOutcome {
@@ -423,6 +441,7 @@ impl PrimePollerService {
                     passive_usage: None,
                     usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
+                    failed_access_token: None,
                 };
             }
         };
@@ -446,6 +465,7 @@ impl PrimePollerService {
                         passive_usage: None,
                         usage_observation_kind: UsageObservationKind::Allowed,
                         status: None,
+                        failed_access_token: None,
                     };
                 }
             }
@@ -477,6 +497,7 @@ impl PrimePollerService {
                     passive_usage: None,
                     usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
+                    failed_access_token: None,
                 };
             }
         };
@@ -520,6 +541,7 @@ impl PrimePollerService {
                     passive_usage: None,
                     usage_observation_kind: UsageObservationKind::Allowed,
                     status: None,
+                    failed_access_token: None,
                 };
             }
         };
@@ -544,6 +566,7 @@ impl PrimePollerService {
                         passive_usage: None,
                         usage_observation_kind: UsageObservationKind::Allowed,
                         status: Some(401),
+                        failed_access_token: Some(token),
                     };
                 }
             };
@@ -551,6 +574,7 @@ impl PrimePollerService {
                 "authorization".into(),
                 format!("Bearer {}", refreshed_token),
             );
+            token = refreshed_token;
             resp = match self
                 .send_prime_upstream(account, &headers, &rewritten_bytes)
                 .await
@@ -564,6 +588,7 @@ impl PrimePollerService {
                         passive_usage: None,
                         usage_observation_kind: UsageObservationKind::Allowed,
                         status: None,
+                        failed_access_token: None,
                     };
                 }
             };
@@ -634,6 +659,11 @@ impl PrimePollerService {
                 passive_usage,
                 usage_observation_kind,
                 status: Some(status_code),
+                failed_access_token: if status_code == 401 {
+                    Some(token)
+                } else {
+                    None
+                },
             }
         } else {
             // 按字符(不是字节)截断,避免多字节 UTF-8 切片 panic 把整个后台任务打掉。
@@ -648,6 +678,11 @@ impl PrimePollerService {
                 passive_usage,
                 usage_observation_kind,
                 status: Some(status_code),
+                failed_access_token: if status_code == 401 {
+                    Some(token)
+                } else {
+                    None
+                },
             }
         }
     }
@@ -921,13 +956,43 @@ mod tests {
             .prime_one(&account, "claude-haiku-4-5-20251001", true)
             .await;
         assert_eq!(outcome.status, Some(401));
-        service.apply_status_side_effects(&account, 401, None).await;
+        service
+            .apply_status_side_effects(&account, 401, None, outcome.failed_access_token.as_deref())
+            .await;
 
         assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.authorization_headers.lock().await.len(), 2);
         let stored = account_svc.get_account(account.id).await.unwrap();
         assert_eq!(stored.status, AccountStatus::Disabled);
         assert_eq!(stored.auth_error, "401 OAuth 认证失败");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn late_prime_unauthorized_preserves_reauthorized_credentials() {
+        let (base_url, _, server) = spawn_prime_auth_mock_server(false).await;
+        let (service, account_svc) = setup_prime_poller_with_urls(
+            format!("{}/v1/messages?beta=true", base_url),
+            format!("{}/oauth/token", base_url),
+        )
+        .await;
+        let mut account = oauth_account("late-prime@example.invalid");
+        account_svc.create_account(&mut account).await.unwrap();
+        let outcome = service
+            .prime_one(&account, "claude-haiku-4-5-20251001", true)
+            .await;
+        assert_eq!(outcome.status, Some(401));
+        let mut reauthorized = account_svc.get_account(account.id).await.unwrap();
+        reauthorized.access_token = "reauth-access".into();
+        reauthorized.refresh_token = "reauth-refresh".into();
+        account_svc.update_account(&reauthorized).await.unwrap();
+        service
+            .apply_status_side_effects(&account, 401, None, outcome.failed_access_token.as_deref())
+            .await;
+        let stored = account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Active);
+        assert!(stored.auth_error.is_empty());
+        assert_eq!(stored.access_token, "reauth-access");
         server.abort();
     }
 
@@ -940,7 +1005,7 @@ mod tests {
         account_svc.create_account(&mut forbidden).await.unwrap();
 
         service
-            .apply_status_side_effects(&forbidden, 403, None)
+            .apply_status_side_effects(&forbidden, 403, None, None)
             .await;
         assert_eq!(
             account_svc.get_account(forbidden.id).await.unwrap().status,
@@ -961,7 +1026,7 @@ mod tests {
         account_svc.create_account(&mut rate_limited).await.unwrap();
 
         service
-            .apply_status_side_effects(&rate_limited, 429, Some(usage))
+            .apply_status_side_effects(&rate_limited, 429, Some(usage), None)
             .await;
         let stored = account_svc.get_account(rate_limited.id).await.unwrap();
         assert_eq!(stored.status, AccountStatus::Active);
@@ -978,7 +1043,9 @@ mod tests {
         let mut account = setup_token_account("prime-401@example.com");
         account_svc.create_account(&mut account).await.unwrap();
 
-        service.apply_status_side_effects(&account, 401, None).await;
+        service
+            .apply_status_side_effects(&account, 401, None, None)
+            .await;
 
         let stored = account_svc.get_account(account.id).await.unwrap();
         assert_eq!(stored.status, AccountStatus::Disabled);

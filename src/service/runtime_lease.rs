@@ -30,8 +30,20 @@ pub struct RuntimeLease {
 pub struct RuntimeGate {
     state: Mutex<Option<RuntimeLease>>,
     active: Arc<AtomicI64>,
+    importing: Arc<AtomicI64>,
     changed: Notify,
     path: Mutex<Option<PathBuf>>,
+}
+
+/// 凭据提交持有期间禁止释放维护门禁，即使调用方已经断网。
+pub struct OAuthImportPermit {
+    importing: Arc<AtomicI64>,
+}
+
+impl Drop for OAuthImportPermit {
+    fn drop(&mut self) {
+        self.importing.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn now() -> u64 {
@@ -54,6 +66,7 @@ impl RuntimeGate {
         Self {
             state: Mutex::new(None),
             active,
+            importing: Arc::new(AtomicI64::new(0)),
             changed: Notify::new(),
             path: Mutex::new(None),
         }
@@ -192,7 +205,7 @@ impl RuntimeGate {
     /// 推进、续期或释放同代租约；release 只在执行已收口后由受信任调度器调用。
     /// @param owner 租约来源。
     /// @param generation 租约代次。
-    /// @param operation claim、heartbeat 或 release。
+    /// @param operation claim、heartbeat、fence 或 release。
     /// @return 当前租约；释放成功返回 None。
     pub fn update(
         &self,
@@ -208,10 +221,22 @@ impl RuntimeGate {
             return Err(AppError::BadRequest("stale runtime lease".into()));
         }
         if operation == "release" {
+            if self.importing.load(Ordering::SeqCst) != 0 {
+                return Err(AppError::ServiceUnavailable("凭据提交尚未收口".into()));
+            }
             self.persist(None)?;
             *state = None;
             self.changed.notify_waiters();
             return Ok(None);
+        }
+        if operation == "fence" && lease.exclusive && lease.owner.starts_with("login:") {
+            // 先撤销新导入权限再查询回执，防止迟到的 HTTP 请求在取消后写入。
+            let mut lease = lease.clone();
+            lease.phase = "reconcile".into();
+            lease.expires_at = 0;
+            self.persist(Some(&lease))?;
+            *state = Some(lease.clone());
+            return Ok(Some(lease));
         }
         if lease.expires_at <= now() || lease.phase == "reconcile" {
             return Err(AppError::ServiceUnavailable(
@@ -237,17 +262,75 @@ impl RuntimeGate {
         Ok(Some(lease))
     }
 
+    /// 校验登录租约并固定提交占用，直到事务结束。
+    /// @param owner 原登录来源。
+    /// @param generation 原登录代次。
+    /// @return 保证提交期间维护门禁不能释放的句柄。
+    pub fn begin_oauth_import(
+        &self,
+        owner: &str,
+        generation: &str,
+    ) -> Result<OAuthImportPermit, AppError> {
+        let state = self.state.lock().unwrap();
+        let lease = state
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("登录租约不存在".into()))?;
+        if lease.owner != owner
+            || lease.generation != generation
+            || !lease.exclusive
+            || !owner.starts_with("login:")
+            || lease.phase != "claimed"
+            || lease.expires_at <= now()
+            || self.active.load(Ordering::SeqCst) != 0
+            || self.importing.load(Ordering::SeqCst) != 0
+        {
+            return Err(AppError::ServiceUnavailable(
+                "登录维护租约失效或仍有活动请求".into(),
+            ));
+        }
+        self.importing.fetch_add(1, Ordering::SeqCst);
+        Ok(OAuthImportPermit {
+            importing: self.importing.clone(),
+        })
+    }
+
     /// 查询租约与活动数，供收口和重启对账使用。
     /// @return 不含凭据的运行状态。
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({"lease": self.state.lock().unwrap().clone(),
-            "active": self.active.load(Ordering::SeqCst)})
+            "active": self.active.load(Ordering::SeqCst), "importing": self.importing.load(Ordering::SeqCst)})
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn login_import_fences_late_calls_and_prevents_early_release() {
+        let gate = RuntimeGate::new(Arc::new(AtomicI64::new(0)));
+        let lease = gate.prepare("login:abcdef123456").unwrap();
+        gate.update(&lease.owner, &lease.generation, "claim")
+            .unwrap();
+        let permit = gate
+            .begin_oauth_import(&lease.owner, &lease.generation)
+            .unwrap();
+        gate.update(&lease.owner, &lease.generation, "fence")
+            .unwrap();
+        assert!(
+            gate.begin_oauth_import(&lease.owner, &lease.generation)
+                .is_err()
+        );
+        assert!(
+            gate.update(&lease.owner, &lease.generation, "release")
+                .is_err()
+        );
+        assert!(!gate.enter(Duration::from_millis(5)).await);
+        drop(permit);
+        gate.update(&lease.owner, &lease.generation, "release")
+            .unwrap();
+        assert!(gate.enter(Duration::from_millis(5)).await);
+    }
 
     #[tokio::test]
     async fn shared_cli_admits_api_and_keeps_cli_serial_even_after_expiry_and_restart() {

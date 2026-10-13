@@ -1592,8 +1592,12 @@ impl GatewayService {
                 if resp.status() != StatusCode::UNAUTHORIZED {
                     return Ok(resp);
                 }
-                self.disable_account_after_repeated_unauthorized(&account, "count_tokens")
-                    .await?;
+                self.disable_account_after_repeated_unauthorized(
+                    &account,
+                    &refreshed_token,
+                    "count_tokens",
+                )
+                .await?;
             }
 
             exclude_ids.push(account.id);
@@ -2260,8 +2264,12 @@ impl GatewayService {
                             )
                             .await?;
                         if resp.status() == StatusCode::UNAUTHORIZED {
-                            self.disable_account_after_repeated_unauthorized(&account, "gateway")
-                                .await?;
+                            self.disable_account_after_repeated_unauthorized(
+                                &account,
+                                &refreshed_token,
+                                "gateway",
+                            )
+                            .await?;
                             auth_failure_excluded = true;
                             exclude_ids.push(account.id);
                             drop(slot_guard);
@@ -2873,9 +2881,12 @@ impl GatewayService {
                             "account {} OAuth recovery failed after upstream 401 for {}: {}",
                             account.id, request_kind, e
                         );
-                        self.account_svc
-                            .disable_for_auth_failure(account.id, "401 OAuth 认证恢复失败")
-                            .await?;
+                        self.disable_oauth_for_failed_token(
+                            account.id,
+                            failed_access_token,
+                            "401 OAuth 认证恢复失败",
+                        )
+                        .await?;
                         Ok(None)
                     }
                 }
@@ -2896,15 +2907,36 @@ impl GatewayService {
     async fn disable_account_after_repeated_unauthorized(
         &self,
         account: &Account,
+        failed_access_token: &str,
         request_kind: &str,
     ) -> Result<(), AppError> {
         warn!(
             "account {} still returned upstream 401 after OAuth recovery for {}",
             account.id, request_kind
         );
+        self.disable_oauth_for_failed_token(
+            account.id,
+            failed_access_token,
+            "401 OAuth 刷新后仍认证失败",
+        )
+        .await
+    }
+
+    /// 只按真正收到 401 的令牌停用，保护刷新/重授权之后的新凭据。
+    /// @param id 原请求账号。
+    /// @param failed_access_token 上游拒绝的实际 AT。
+    /// @param reason 已有认证停用原因。
+    /// @return 完成条件写入或忽略过期回包。
+    async fn disable_oauth_for_failed_token(
+        &self,
+        id: i64,
+        failed_access_token: &str,
+        reason: &str,
+    ) -> Result<(), AppError> {
         self.account_svc
-            .disable_for_auth_failure(account.id, "401 OAuth 刷新后仍认证失败")
+            .disable_oauth_for_failed_token(id, failed_access_token, reason)
             .await
+            .map(|_| ())
     }
 
     async fn disable_account_after_permanent_credential_failure(
@@ -2918,7 +2950,7 @@ impl GatewayService {
             account.id, request_kind, reason
         );
         self.account_svc
-            .disable_for_auth_failure(account.id, reason)
+            .disable_for_auth_failure_if_current(account, reason)
             .await
     }
 }
@@ -9964,7 +9996,7 @@ mod tests {
         service.account_svc.update_account(&account).await.unwrap();
 
         service
-            .disable_account_after_repeated_unauthorized(&account, "test")
+            .disable_account_after_repeated_unauthorized(&account, &account.access_token, "test")
             .await
             .unwrap();
 
@@ -9972,6 +10004,36 @@ mod tests {
         assert_eq!(stored.status, AccountStatus::Disabled);
         assert_eq!(stored.auth_error, "401 OAuth 刷新后仍认证失败");
         assert_eq!(stored.disable_reason, "401 OAuth 刷新后仍认证失败");
+    }
+
+    #[tokio::test]
+    async fn late_oauth_unauthorized_preserves_new_credentials_and_manual_disable() {
+        let service = test_gateway_service().await;
+        let mut account =
+            create_gateway_account(&service, "late-oauth-401@example.invalid", 1, 0).await;
+        account.auth_type = AccountAuthType::Oauth;
+        account.access_token = "new-access".into();
+        account.refresh_token = "new-refresh".into();
+        service.account_svc.update_account(&account).await.unwrap();
+        service
+            .disable_account_after_repeated_unauthorized(&account, "old-access", "test")
+            .await
+            .unwrap();
+        let stored = service.account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.status, AccountStatus::Active);
+        assert!(stored.auth_error.is_empty());
+        service
+            .account_svc
+            .disable_account(account.id, AccountStatus::Disabled, "手动停用", None)
+            .await
+            .unwrap();
+        service
+            .disable_account_after_repeated_unauthorized(&account, "new-access", "test")
+            .await
+            .unwrap();
+        let stored = service.account_svc.get_account(account.id).await.unwrap();
+        assert_eq!(stored.disable_reason, "手动停用");
+        assert!(stored.auth_error.is_empty());
     }
 
     async fn wait_until_queue_waiting(service: &GatewayService, account: &Account, expected: i64) {

@@ -21,6 +21,7 @@ use crate::model::account::{
     Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalPromptEnvData,
     DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    OAuthCredentialImport,
 };
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
@@ -145,6 +146,14 @@ pub fn build_router(
         .route(
             "/admin/accounts/:id/oauth-credentials/resolve",
             post(resolve_oauth_credentials),
+        )
+        .route(
+            "/admin/accounts/:id/oauth-credentials/import",
+            post(import_oauth_credentials),
+        )
+        .route(
+            "/admin/accounts/:id/oauth-credentials/import/:operation_id",
+            get(oauth_import_status),
         )
         .route("/admin/tokens", get(list_tokens).post(create_token))
         .route(
@@ -418,6 +427,76 @@ struct CliIdentityImport {
 
 const DEFAULT_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 2400;
 
+/// 凭据导入只允许可信 v3 服务调用，管理密码本身不能替代服务证明。
+/// @param headers 服务请求头。
+/// @return 服务证明有效时返回空值。
+fn require_v3_credential_service(headers: &HeaderMap) -> Result<(), AppError> {
+    let expected = std::env::var("V3_INTERNAL_TOKEN").unwrap_or_default();
+    let supplied = headers
+        .get("x-v3-service-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if std::env::var("V3_RUNTIME_URL")
+        .unwrap_or_default()
+        .is_empty()
+        || expected.len() < 32
+        || !bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+    {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// 将真实 CLI 重授权凭据提交到原关联账号。
+/// @param state 应用服务。
+/// @param id 原账号 ID。
+/// @param headers 可信服务证明。
+/// @param input 身份、新凭据与登录租约。
+/// @return 最终持久化的最小凭据快照。
+async fn import_oauth_credentials(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(input): Json<OAuthCredentialImport>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_v3_credential_service(&headers)?;
+    let snapshot = state
+        .account_svc
+        .import_oauth_credentials(id, &input)
+        .await?;
+    Ok(Json(
+        serde_json::json!({"imported": true, "account_id": snapshot.account_id,
+        "operation_id": input.operation_id, "access_token": snapshot.access_token,
+        "refresh_token": snapshot.refresh_token, "expires_at": snapshot.expires_at}),
+    ))
+}
+
+/// 查询持久提交回执，不将网络错误误当作未提交。
+/// @param state 应用服务。
+/// @param id 账号 ID。
+/// @param operation_id 唯一操作 ID。
+/// @param headers 可信服务证明。
+/// @return 未提交结果或当前权威凭据快照。
+async fn oauth_import_status(
+    State(state): State<AppState>,
+    Path((id, operation_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_v3_credential_service(&headers)?;
+    let snapshot = state
+        .account_svc
+        .oauth_import_status(id, &operation_id)
+        .await?;
+    Ok(Json(match snapshot {
+        Some(value) => serde_json::json!({"imported": true, "account_id": value.account_id,
+            "operation_id": operation_id, "access_token": value.access_token,
+            "refresh_token": value.refresh_token, "expires_at": value.expires_at}),
+        None => {
+            serde_json::json!({"imported": false, "account_id": id, "operation_id": operation_id})
+        }
+    }))
+}
+
 /// 受信任调度器对单账号占用租约的操作。
 #[derive(Deserialize)]
 struct RuntimeLeaseInput {
@@ -454,7 +533,8 @@ async fn runtime_account_config(
     let account = state.account_svc.get_account(id).await?;
     Ok(Json(
         serde_json::json!({"account_id": account.id, "proxy_url": account.proxy_url,
-        "auth_type": account.auth_type, "status": account.status}),
+        "auth_type": account.auth_type, "status": account.status, "email": account.email,
+        "account_uuid": account.account_uuid, "organization_uuid": account.organization_uuid}),
     ))
 }
 

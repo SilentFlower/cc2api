@@ -15,7 +15,7 @@ use crate::model::account::{
     Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalPromptEnvData,
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     MAX_UPSTREAM_SESSION_POOL_SIZE, MAX_UPSTREAM_SESSION_TTL_MINUTES,
-    MIN_UPSTREAM_SESSION_TTL_MINUTES,
+    MIN_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
 };
 use crate::service::rewriter::ClientType;
 use crate::service::runtime_lease::RuntimeGate;
@@ -575,6 +575,27 @@ struct OAuthResolvePolicy {
     min_validity_seconds: i64,
     force_refresh: bool,
     allow_still_valid_fallback: bool,
+}
+
+/// 生成导入/对账快照，不借机刷新或启用人工停用账号。
+/// @param account 当前持久化账号。
+/// @return 最小凭据快照；不完整时拒绝返回。
+fn oauth_import_snapshot(account: Account) -> Result<OAuthCredentialSnapshot, AppError> {
+    if account.auth_type != AccountAuthType::Oauth
+        || account.access_token.is_empty()
+        || account.refresh_token.is_empty()
+    {
+        return Err(AppError::BadRequest("已提交账号凭据不完整".into()));
+    }
+    Ok(OAuthCredentialSnapshot {
+        account_id: account.id,
+        access_token: account.access_token,
+        refresh_token: account.refresh_token,
+        expires_at: account
+            .expires_at
+            .ok_or_else(|| AppError::BadRequest("已提交凭据缺少有效期".into()))?
+            .timestamp_millis(),
+    })
 }
 
 fn validate_managed_oauth_account(account: &Account) -> Result<(), AppError> {
@@ -1562,6 +1583,172 @@ impl AccountService {
         ))
     }
 
+    /// 导入同一账号的真实 CLI 重授权凭据，不创建第二个刷新所有者。
+    /// @param id 原关联账号 ID。
+    /// @param input 新凭据、身份和排他登录租约证明。
+    /// @return 最终持久化的权威凭据快照。
+    pub async fn import_oauth_credentials(
+        &self,
+        id: i64,
+        input: &OAuthCredentialImport,
+    ) -> Result<OAuthCredentialSnapshot, AppError> {
+        if input.operation_id.len() != 32
+            || !input
+                .operation_id
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || input.email.trim().is_empty()
+            || input.email.len() > 320
+            || [&input.access_token, &input.refresh_token]
+                .iter()
+                .any(|token| {
+                    token.is_empty()
+                        || token.len() > 16384
+                        || token.bytes().any(|value| value <= 32 || value >= 127)
+                })
+        {
+            return Err(AppError::BadRequest("重授权凭据格式不合法".into()));
+        }
+        let encoded = serde_json::to_vec(input)
+            .map_err(|_| AppError::BadRequest("凭据提交格式不合法".into()))?;
+        let request_hash = hex::encode(Sha256::digest(encoded));
+        let (key, owner) = self.acquire_oauth_credential_lock(id).await?;
+        let result = self
+            .import_oauth_credentials_locked(id, input, &request_hash)
+            .await;
+        self.cache.release_lock(&key, &owner).await;
+        result
+    }
+
+    async fn acquire_oauth_credential_lock(&self, id: i64) -> Result<(String, String), AppError> {
+        let key = format!("oauth:refresh:account:{}", id);
+        let owner = Uuid::new_v4().to_string();
+        for attempt in 0..=OAUTH_WAIT_ATTEMPTS {
+            if self
+                .cache
+                .acquire_lock(&key, &owner, OAUTH_LOCK_TTL)
+                .await?
+            {
+                return Ok((key, owner));
+            }
+            if attempt < OAUTH_WAIT_ATTEMPTS {
+                sleep(OAUTH_WAIT_RETRY).await;
+            }
+        }
+        Err(AppError::ServiceUnavailable("重授权凭据等待超时".into()))
+    }
+
+    async fn import_oauth_credentials_locked(
+        &self,
+        id: i64,
+        input: &OAuthCredentialImport,
+        request_hash: &str,
+    ) -> Result<OAuthCredentialSnapshot, AppError> {
+        if let Some((account_id, original_hash)) =
+            self.store.oauth_import_receipt(&input.operation_id).await?
+        {
+            if account_id != id || original_hash != request_hash {
+                return Err(AppError::BadRequest("凭据提交操作 ID 冲突".into()));
+            }
+            return oauth_import_snapshot(self.store.get_by_id(id).await?);
+        }
+        if input.expires_at <= Utc::now().timestamp_millis() + 60_000 {
+            return Err(AppError::BadRequest("新登录凭据已过期或即将过期".into()));
+        }
+        let account = self.store.get_by_id(id).await?;
+        if account.auth_type != AccountAuthType::Oauth {
+            return Err(AppError::BadRequest("关联账号不是 OAuth 类型".into()));
+        }
+        let same = |left: &str, right: &str| left.trim().eq_ignore_ascii_case(right.trim());
+        if !same(&account.email, &input.email)
+            || account
+                .account_uuid
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .is_some_and(|expected| {
+                    !input
+                        .account_uuid
+                        .as_deref()
+                        .is_some_and(|actual| same(expected, actual))
+                })
+            || account
+                .organization_uuid
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .is_some_and(|expected| {
+                    !input
+                        .organization_uuid
+                        .as_deref()
+                        .is_some_and(|actual| same(expected, actual))
+                })
+        {
+            return Err(AppError::BadRequest("新登录身份与原关联账号不匹配".into()));
+        }
+        let queue = self.get_or_create_queue(id, account.concurrency).await;
+        let _permit = queue
+            .runtime_gate
+            .begin_oauth_import(&input.owner, &input.generation)?;
+        let reason = account.disable_reason.as_str();
+        let auth_reason = reason
+            .strip_prefix("permanent credential failure: ")
+            .unwrap_or(reason);
+        let permanent_grant = auth_reason.starts_with("OAuth refresh rejected: status ")
+            && auth_reason.ends_with("error=invalid_grant")
+            && auth_reason
+                .split_whitespace()
+                .nth(4)
+                .and_then(|value| value.parse::<u16>().ok())
+                .is_some_and(|status| (400..500).contains(&status) && status != 429);
+        let restore_auth = account.status == AccountStatus::Disabled
+            && account.auth_error == reason
+            && (matches!(
+                auth_reason,
+                "401 OAuth 认证恢复失败"
+                    | "401 OAuth 认证失败"
+                    | "401 OAuth 刷新后仍认证失败"
+                    | OAUTH_MISSING_REFRESH_TOKEN_REASON
+            ) || permanent_grant);
+        self.store
+            .import_oauth_credentials(&account, input, request_hash, restore_auth)
+            .await?;
+        oauth_import_snapshot(self.store.get_by_id(id).await?)
+    }
+
+    /// 串行读取回执和当前凭据，区分未提交与尚不能确认。
+    /// @param id 原关联账号 ID。
+    /// @param operation_id 唯一操作 ID。
+    /// @return 已提交时返回当前快照；明确未提交时返回 None。
+    pub async fn oauth_import_status(
+        &self,
+        id: i64,
+        operation_id: &str,
+    ) -> Result<Option<OAuthCredentialSnapshot>, AppError> {
+        if operation_id.len() != 32 || !operation_id.bytes().all(|value| value.is_ascii_hexdigit())
+        {
+            return Err(AppError::BadRequest("凭据提交操作 ID 不合法".into()));
+        }
+        let account = self.store.get_by_id(id).await?;
+        let queue = self.get_or_create_queue(id, account.concurrency).await;
+        let (key, owner) = self.acquire_oauth_credential_lock(id).await?;
+        let result = async {
+            if queue.runtime_gate.snapshot()["importing"].as_i64() != Some(0) {
+                return Err(AppError::ServiceUnavailable(
+                    "凭据提交结果尚不能确认".into(),
+                ));
+            }
+            match self.store.oauth_import_receipt(operation_id).await? {
+                Some((account_id, _)) if account_id == id => Ok(Some(oauth_import_snapshot(
+                    self.store.get_by_id(id).await?,
+                )?)),
+                Some(_) => Err(AppError::BadRequest("凭据提交账号不匹配".into())),
+                None => Ok(None),
+            }
+        }
+        .await;
+        self.cache.release_lock(&key, &owner).await;
+        result
+    }
+
     async fn resolve_oauth_credentials_locked(
         &self,
         id: i64,
@@ -1570,10 +1757,16 @@ impl AccountService {
         let account = self.store.get_by_id(id).await?;
         validate_managed_oauth_account(&account)?;
         if account.refresh_token.is_empty() {
-            let _ = self
+            if !self
                 .store
-                .update_auth_error(id, OAUTH_MISSING_REFRESH_TOKEN_REASON)
-                .await;
+                .update_auth_error_if_current(&account, OAUTH_MISSING_REFRESH_TOKEN_REASON)
+                .await?
+            {
+                return build_oauth_credential_snapshot(
+                    &self.store.get_by_id(id).await?,
+                    policy.min_validity_seconds,
+                );
+            }
             return Err(AppError::PermanentCredential(
                 OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
             ));
@@ -1595,10 +1788,13 @@ impl AccountService {
         policy: OAuthResolvePolicy,
     ) -> Result<Account, AppError> {
         if account.refresh_token.is_empty() {
-            let _ = self
+            if !self
                 .store
-                .update_auth_error(account.id, OAUTH_MISSING_REFRESH_TOKEN_REASON)
-                .await;
+                .update_auth_error_if_current(account, OAUTH_MISSING_REFRESH_TOKEN_REASON)
+                .await?
+            {
+                return self.store.get_by_id(account.id).await;
+            }
             return Err(AppError::PermanentCredential(
                 OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
             ));
@@ -1648,10 +1844,13 @@ impl AccountService {
         let latest = self.store.get_by_id(id).await?;
         validate_managed_oauth_account(&latest)?;
         if latest.refresh_token.is_empty() {
-            let _ = self
+            if !self
                 .store
-                .update_auth_error(id, OAUTH_MISSING_REFRESH_TOKEN_REASON)
-                .await;
+                .update_auth_error_if_current(&latest, OAUTH_MISSING_REFRESH_TOKEN_REASON)
+                .await?
+            {
+                return self.store.get_by_id(id).await;
+            }
             return Err(AppError::PermanentCredential(
                 OAUTH_MISSING_REFRESH_TOKEN_REASON.into(),
             ));
@@ -1676,8 +1875,8 @@ impl AccountService {
         {
             Ok(tokens) => {
                 self.store
-                    .update_oauth_tokens(
-                        id,
+                    .update_oauth_tokens_if_current(
+                        &latest,
                         &tokens.access_token,
                         &tokens.refresh_token,
                         tokens.expires_at,
@@ -1687,7 +1886,14 @@ impl AccountService {
             }
             Err(err) => {
                 let msg = err.to_string();
-                let _ = self.store.update_auth_error(id, &msg).await;
+                if !self
+                    .store
+                    .update_auth_error_if_current(&latest, &msg)
+                    .await?
+                {
+                    // 锁 TTL 可能已到期；迟到失败不能停用或污染新登录凭据。
+                    return self.store.get_by_id(id).await;
+                }
                 // 永久凭据错误说明 RT 已无法继续使用，即使旧 AT 尚未过期也不能伪装刷新成功。
                 if matches!(&err, AppError::PermanentCredential(_)) {
                     return Err(err);
@@ -1737,6 +1943,42 @@ impl AccountService {
     /// @return 更新成功时返回空值。
     pub async fn disable_for_auth_failure(&self, id: i64, reason: &str) -> Result<(), AppError> {
         self.store.disable_for_auth_failure(id, reason).await
+    }
+
+    /// 仅停用永久凭据失败的原快照，避免迟到回调污染重授权。
+    /// @param expected 原账号快照。
+    /// @param reason 脱敏凭据错误。
+    /// @return 存储成功返回空值；已换凭据时保持新账号状态。
+    pub async fn disable_for_auth_failure_if_current(
+        &self,
+        expected: &Account,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        self.store
+            .disable_for_auth_failure_if_current(expected, reason)
+            .await
+            .map(|_| ())
+    }
+
+    /// 只停用实际收到 401 的当前 OAuth 凭据。
+    /// @param id 原请求账号。
+    /// @param failed_access_token 上游拒绝的实际令牌，仅在内存中使用。
+    /// @param reason 已有脱敏认证停用原因。
+    /// @return 本次是否改变状态；已换凭据或人工停用时返回 false。
+    pub async fn disable_oauth_for_failed_token(
+        &self,
+        id: i64,
+        failed_access_token: &str,
+        reason: &str,
+    ) -> Result<bool, AppError> {
+        let current = self.store.get_by_id(id).await?;
+        if current.access_token != failed_access_token {
+            return Ok(false);
+        }
+        // 恢复可能已经轮换 RT，重读后仍按 AT/RT 条件落库，防止第二次并发变化。
+        self.store
+            .disable_for_auth_failure_if_current(&current, reason)
+            .await
     }
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
@@ -3751,6 +3993,204 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("不是 active 状态"));
+    }
+
+    /// 为合成账号准备同一账号租约与新凭据。
+    /// @param svc 被测服务。
+    /// @param account 合成账号。
+    /// @return 严格导入输入。
+    async fn login_import_input(svc: &AccountService, account: &Account) -> OAuthCredentialImport {
+        let queue = svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let lease = queue.runtime_gate.prepare("login:abcdef123456").unwrap();
+        queue
+            .runtime_gate
+            .update(&lease.owner, &lease.generation, "claim")
+            .unwrap();
+        OAuthCredentialImport {
+            operation_id: Uuid::new_v4().simple().to_string(),
+            owner: lease.owner,
+            generation: lease.generation,
+            email: account.email.clone(),
+            account_uuid: account.account_uuid.clone(),
+            organization_uuid: account.organization_uuid.clone(),
+            access_token: "synthetic-new-access".into(),
+            refresh_token: "synthetic-new-refresh".into(),
+            expires_at: (Utc::now() + ChronoDuration::hours(1)).timestamp_millis(),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_import_restores_only_auth_failures_and_preserves_limits() {
+        for (reason, restored) in [
+            ("", true),
+            ("401 OAuth 认证恢复失败", true),
+            ("401 OAuth 认证失败", true),
+            (
+                "OAuth refresh rejected: status 400 error=invalid_grant",
+                true,
+            ),
+            (
+                "permanent credential failure: OAuth refresh rejected: status 403 error=invalid_grant",
+                true,
+            ),
+            (
+                "OAuth refresh rejected: status 429 error=invalid_grant",
+                false,
+            ),
+            ("手动停用", false),
+            ("账号限制", false),
+        ] {
+            let (_, svc) = setup_account_service().await;
+            let mut account = new_account_request("reauth@example.invalid");
+            account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+            account.account_uuid = Some("original-account".into());
+            account.organization_uuid = Some("original-organization".into());
+            svc.create_account(&mut account).await.unwrap();
+            if !reason.is_empty() {
+                svc.disable_for_auth_failure(account.id, reason)
+                    .await
+                    .unwrap();
+            }
+            let reset = Utc::now() + ChronoDuration::hours(2);
+            svc.set_rate_limit(account.id, reset).await.unwrap();
+            let input = login_import_input(&svc, &account).await;
+            let snapshot = svc
+                .import_oauth_credentials(account.id, &input)
+                .await
+                .unwrap();
+            assert_eq!(snapshot.access_token, input.access_token);
+            let stored = svc.get_account(account.id).await.unwrap();
+            assert_eq!(
+                stored.status,
+                if restored {
+                    AccountStatus::Active
+                } else {
+                    AccountStatus::Disabled
+                }
+            );
+            assert_eq!(
+                stored.rate_limit_reset_at.unwrap().timestamp(),
+                reset.timestamp()
+            );
+            assert_eq!(stored.device_id, account.device_id);
+            assert_eq!(stored.account_uuid, account.account_uuid);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_import_retry_returns_latest_tokens_and_rejects_old_refresh_writes() {
+        let (store, svc) = setup_account_service().await;
+        let mut account = new_account_request("retry@example.invalid");
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        svc.create_account(&mut account).await.unwrap();
+        let input = login_import_input(&svc, &account).await;
+        svc.import_oauth_credentials(account.id, &input)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .update_oauth_tokens_if_current(
+                    &account,
+                    "late-access",
+                    "late-refresh",
+                    Utc::now() + ChronoDuration::hours(1)
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_auth_error_if_current(&account, "late-invalid-grant")
+                .await
+                .unwrap()
+        );
+        store
+            .update_oauth_tokens(
+                account.id,
+                "later-access",
+                "later-refresh",
+                Utc::now() + ChronoDuration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .disable_for_auth_failure_if_current(&account, "late-invalid-grant")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            svc.get_account(account.id).await.unwrap().status,
+            AccountStatus::Active
+        );
+        assert_eq!(
+            svc.import_oauth_credentials(account.id, &input)
+                .await
+                .unwrap()
+                .refresh_token,
+            "later-refresh"
+        );
+        assert_eq!(
+            svc.oauth_import_status(account.id, &input.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .refresh_token,
+            "later-refresh"
+        );
+        let mut conflict = input.clone();
+        conflict.access_token = "different-payload".into();
+        assert!(
+            svc.import_oauth_credentials(account.id, &conflict)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_import_checks_identity_and_rolls_back_stale_transaction() {
+        let (store, svc) = setup_account_service().await;
+        let mut account = new_account_request("identity@example.invalid");
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        account.account_uuid = Some("original-account".into());
+        account.organization_uuid = Some("original-organization".into());
+        svc.create_account(&mut account).await.unwrap();
+        let mut input = login_import_input(&svc, &account).await;
+        input.account_uuid = None;
+        assert!(
+            svc.import_oauth_credentials(account.id, &input)
+                .await
+                .is_err()
+        );
+        input.account_uuid = account.account_uuid.clone();
+        input.organization_uuid = Some("wrong-organization".into());
+        assert!(
+            svc.import_oauth_credentials(account.id, &input)
+                .await
+                .is_err()
+        );
+        input.organization_uuid = account.organization_uuid.clone();
+        svc.disable_account(account.id, AccountStatus::Disabled, "手动停用", None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .import_oauth_credentials(&account, &input, "synthetic-hash", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .oauth_import_receipt(&input.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let current = svc.get_account(account.id).await.unwrap();
+        assert_eq!(current.access_token, account.access_token);
+        assert_eq!(current.disable_reason, "手动停用");
     }
 
     #[test]

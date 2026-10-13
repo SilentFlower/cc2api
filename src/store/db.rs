@@ -59,6 +59,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         }
         sqlx::query(stmt).execute(pool).await?;
     }
+    // 回执和凭据必须同事务提交；仅保存摘要，避免形成第二份令牌存储。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS oauth_credential_imports (
+        operation_id TEXT PRIMARY KEY,
+        account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        request_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )",
+    )
+    .execute(pool)
+    .await?;
     // 增量迁移
     sqlx::query("ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'")
         .execute(pool)

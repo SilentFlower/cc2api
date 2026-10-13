@@ -8,6 +8,7 @@ use crate::error::AppError;
 use crate::model::account::{
     Account, AccountStatus, DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
+    OAuthCredentialImport,
 };
 use crate::service::version_profile::IdentityProfile;
 
@@ -386,6 +387,156 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 只提交仍属于调用时凭据的刷新结果，拒绝覆盖重授权产生的新令牌。
+    /// @param expected 刷新开始时的账号快照。
+    /// @param access_token 新 AT。
+    /// @param refresh_token 新 RT。
+    /// @param expires_at 新有效期。
+    /// @return 是否更新了调用时的同一份凭据。
+    pub async fn update_oauth_tokens_if_current(
+        &self,
+        expected: &Account,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let query = format!(
+            "UPDATE accounts SET access_token=$1,refresh_token=$2,
+            oauth_expires_at={},oauth_refreshed_at={},auth_error='',updated_at={}
+            WHERE id=$5 AND auth_type='oauth' AND access_token=$6 AND refresh_token=$7",
+            self.ts(3),
+            self.ts(4),
+            self.now_expr()
+        );
+        Ok(sqlx::query(&query)
+            .bind(access_token)
+            .bind(refresh_token)
+            .bind(self.fmt_time(expires_at))
+            .bind(self.fmt_time(Utc::now()))
+            .bind(expected.id)
+            .bind(&expected.access_token)
+            .bind(&expected.refresh_token)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1)
+    }
+
+    /// 旧刷新失败不能污染已经重新授权的账号。
+    /// @param expected 刷新开始时的账号快照。
+    /// @param error 脱敏认证错误。
+    /// @return 错误是否仍属于当前凭据。
+    pub async fn update_auth_error_if_current(
+        &self,
+        expected: &Account,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let query = format!(
+            "UPDATE accounts SET auth_error=$1,updated_at={}
+            WHERE id=$2 AND auth_type='oauth' AND access_token=$3 AND refresh_token=$4",
+            self.now_expr()
+        );
+        Ok(sqlx::query(&query)
+            .bind(error)
+            .bind(expected.id)
+            .bind(&expected.access_token)
+            .bind(&expected.refresh_token)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1)
+    }
+
+    /// 读取不含凭据的导入回执，供超时重试与恢复确认。
+    /// @param operation_id 唯一提交操作 ID。
+    /// @return 原账号 ID 和请求摘要；不存在时返回 None。
+    pub async fn oauth_import_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<(i64, String)>, AppError> {
+        let record = sqlx::query(
+            "SELECT account_id,request_hash FROM oauth_credential_imports WHERE operation_id=$1",
+        )
+        .bind(operation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        record
+            .map(|row| Ok((row.try_get("account_id")?, row.try_get("request_hash")?)))
+            .transpose()
+    }
+
+    /// 同事务保存重授权凭据和回执，保留其他账号策略与限流。
+    /// @param expected 已完成身份核对的当前账号快照。
+    /// @param input CLI 产生的新凭据。
+    /// @param request_hash 请求摘要，用于识别重试与操作 ID 冲突。
+    /// @param restore_auth 是否只恢复已确认的认证停用。
+    /// @return 成功返回空值；冲突或失败回滚凭据与回执。
+    pub async fn import_oauth_credentials(
+        &self,
+        expected: &Account,
+        input: &OAuthCredentialImport,
+        request_hash: &str,
+        restore_auth: bool,
+    ) -> Result<(), AppError> {
+        let expires_at = DateTime::from_timestamp_millis(input.expires_at)
+            .ok_or_else(|| AppError::BadRequest("凭据有效期不合法".into()))?;
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO oauth_credential_imports(operation_id,account_id,request_hash,created_at)
+            VALUES($1,$2,$3,$4) ON CONFLICT(operation_id) DO NOTHING",
+        )
+        .bind(&input.operation_id)
+        .bind(expected.id)
+        .bind(request_hash)
+        .bind(self.fmt_time(Utc::now()))
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            let receipt = sqlx::query("SELECT account_id,request_hash FROM oauth_credential_imports WHERE operation_id=$1")
+                .bind(&input.operation_id).fetch_one(&mut *transaction).await?;
+            if receipt.try_get::<i64, _>("account_id")? != expected.id
+                || receipt.try_get::<String, _>("request_hash")? != request_hash
+            {
+                return Err(AppError::BadRequest("凭据提交操作 ID 冲突".into()));
+            }
+            // 重试只读当前权威凭据，绝不再次写入第一次提交的旧 RT。
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let query = format!("UPDATE accounts SET access_token=$1,refresh_token=$2,oauth_expires_at={},
+            auth_error='',status=CASE WHEN $4=1 THEN 'active' ELSE status END,
+            disable_reason=CASE WHEN $4=1 THEN '' ELSE disable_reason END,oauth_refreshed_at={},updated_at={}
+            WHERE id=$6 AND auth_type='oauth' AND access_token=$7 AND refresh_token=$8
+                AND status=$9 AND disable_reason=$10 AND email=$11
+                AND COALESCE(account_uuid,'')=$12 AND COALESCE(organization_uuid,'')=$13",
+            self.ts(3), self.ts(5), self.now_expr());
+        let updated = sqlx::query(&query)
+            .bind(&input.access_token)
+            .bind(&input.refresh_token)
+            .bind(self.fmt_time(expires_at))
+            .bind(i32::from(restore_auth))
+            .bind(self.fmt_time(Utc::now()))
+            .bind(expected.id)
+            .bind(&expected.access_token)
+            .bind(&expected.refresh_token)
+            .bind(expected.status.to_string())
+            .bind(&expected.disable_reason)
+            .bind(&expected.email)
+            .bind(expected.account_uuid.as_deref().unwrap_or_default())
+            .bind(expected.organization_uuid.as_deref().unwrap_or_default())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+        if updated != 1 {
+            return Err(AppError::ServiceUnavailable(
+                "账号状态或凭据已改变，请重试提交".into(),
+            ));
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_status(&self, id: i64, status: AccountStatus) -> Result<(), AppError> {
         let q = format!(
             "UPDATE accounts SET status=$1, updated_at={} WHERE id=$2",
@@ -461,6 +612,29 @@ impl AccountStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// 永久凭据失败的迟到回调不能停用新登录凭据或覆盖人工停用。
+    /// @param expected 失败解析时的账号快照。
+    /// @param reason 脱敏永久凭据错误。
+    /// @return 是否仍属于同一份 active OAuth 凭据。
+    pub async fn disable_for_auth_failure_if_current(
+        &self,
+        expected: &Account,
+        reason: &str,
+    ) -> Result<bool, AppError> {
+        let query = format!("UPDATE accounts SET status='disabled',auth_error=$1,disable_reason=$1,
+            rate_limited_at=NULL,rate_limit_reset_at=NULL,updated_at={}
+            WHERE id=$2 AND status='active' AND auth_type='oauth' AND access_token=$3 AND refresh_token=$4", self.now_expr());
+        Ok(sqlx::query(&query)
+            .bind(reason)
+            .bind(expected.id)
+            .bind(&expected.access_token)
+            .bind(&expected.refresh_token)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1)
     }
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {

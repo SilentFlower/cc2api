@@ -119,6 +119,21 @@ pub enum AccountAuthType {
     Oauth,
 }
 
+/// 真实 CLI 重授权产生的受控凭据导入；不允许顺便修改账号环境。
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthCredentialImport {
+    pub operation_id: String,
+    pub owner: String,
+    pub generation: String,
+    pub email: String,
+    pub account_uuid: Option<String>,
+    pub organization_uuid: Option<String>,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+}
+
 impl Default for AccountAuthType {
     fn default() -> Self {
         Self::SetupToken
