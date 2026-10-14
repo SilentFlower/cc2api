@@ -4,6 +4,7 @@ use claude_code_gateway::service;
 use claude_code_gateway::store;
 use claude_code_gateway::tlsfp;
 
+use std::env;
 use std::sync::Arc;
 use tracing::info;
 
@@ -187,10 +188,14 @@ async fn main() {
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 
-    // 后台定时拉取 OAuth 账户用量数据
+    // v3 只从业务响应被动更新；旧实例仍按账号开关定时查询。
     let usage_poller = Arc::new(service::usage_poller::UsagePollerService::new(
         account_svc.clone(),
         cfg.usage_poll_interval,
+        env::var("V3_RUNTIME_URL")
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
     ));
     tokio::spawn({
         let poller = usage_poller.clone();
