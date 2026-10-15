@@ -363,6 +363,7 @@ fn process_profile(
         heap_used_range: [heap_min / 2, heap_max - 1_000_000],
         external_range: [1_000_000, 3_000_000],
         array_buffers_range: [10_000, 50_000],
+        observation: None,
     }
 }
 
@@ -475,6 +476,8 @@ pub struct ProcessSnapshot {
     pub cpu_user: i64,
     pub cpu_system: i64,
     pub cpu_percent: f64,
+    /// v3 只序列化已实测字段，内部占位数值不能进入上游遥测。
+    pub observed_metrics: Option<Value>,
 }
 
 /// 从账号构建设备画像，缺失字段按旧账号兼容策略补齐。
@@ -567,6 +570,25 @@ pub fn process_snapshot(
     account_seed: &str,
     uptime_secs: f64,
 ) -> ProcessSnapshot {
+    if let Some(observed) = &proc.observation {
+        let mut metrics = serde_json::json!({"constrainedMemory": proc.constrained_memory});
+        if let Some(rss) = observed.rss_bytes {
+            metrics["rss"] = serde_json::json!(rss);
+        }
+        return ProcessSnapshot {
+            uptime: 0.0,
+            rss: observed.rss_bytes.unwrap_or(0),
+            heap_total: 0,
+            heap_used: 0,
+            external: 0,
+            array_buffers: 0,
+            constrained_memory: proc.constrained_memory,
+            cpu_user: 0,
+            cpu_system: 0,
+            cpu_percent: 0.0,
+            observed_metrics: Some(metrics),
+        };
+    }
     let tick = uptime_secs.max(0.0).round() as i64;
     let rss = smooth_value(&proc.rss_range, account_seed, "rss", tick, 7);
     let heap_total = smooth_value(&proc.heap_total_range, account_seed, "heap_total", tick, 11);
@@ -601,11 +623,15 @@ pub fn process_snapshot(
         cpu_user,
         cpu_system,
         cpu_percent,
+        observed_metrics: None,
     }
 }
 
 /// 将进程快照转换为 telemetry 使用的 JSON。
 pub fn process_snapshot_json(snapshot: &ProcessSnapshot) -> Value {
+    if let Some(metrics) = &snapshot.observed_metrics {
+        return metrics.clone();
+    }
     serde_json::json!({
         "uptime": snapshot.uptime,
         "rss": snapshot.rss,
@@ -719,6 +745,9 @@ pub fn normalize_prompt(
 
 /// 旧账号兼容补齐进程范围字段。
 pub fn normalize_process(mut process: CanonicalProcessData) -> CanonicalProcessData {
+    if process.observation.is_some() {
+        return process;
+    }
     if invalid_range(process.rss_range) {
         process.rss_range = [300_000_000, 520_000_000];
     }
@@ -802,7 +831,7 @@ fn stable_hash_bytes(seed: &str) -> Vec<u8> {
 mod tests {
     use super::{
         derive_account_uuid, derive_device_id, generate_canonical_identity, normalize_env,
-        normalize_process, process_snapshot, profile_presets, run_profile,
+        normalize_process, process_snapshot, process_snapshot_json, profile_presets, run_profile,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -968,6 +997,26 @@ mod tests {
         assert!(first.heap_used <= first.heap_total);
         assert!(later.cpu_user > first.cpu_user);
         assert!(later.cpu_system > first.cpu_system);
+    }
+
+    #[test]
+    fn observed_cli_process_keeps_unknown_metrics_out_of_telemetry() {
+        let raw = json!({"constrained_memory": 1610612736_i64, "observation": {
+            "source": "v3:procfs:cli", "environment_id": "a".repeat(32), "cli_version": "2.1.293",
+            "observed_at": 100.0, "sampled_at": null, "sample_count": 0,
+            "rss_bytes": null, "rss_min_bytes": null, "rss_max_bytes": null
+        }});
+        let mut process = normalize_process(serde_json::from_value(raw).unwrap());
+        assert_eq!(process.rss_range, [0, 0]);
+        assert_eq!(
+            process_snapshot_json(&process_snapshot(&process, "device", 12.0)),
+            json!({"constrainedMemory": 1610612736_i64})
+        );
+        process.observation.as_mut().unwrap().rss_bytes = Some(120000000);
+        assert_eq!(
+            process_snapshot_json(&process_snapshot(&process, "device", 12.0)),
+            json!({"constrainedMemory": 1610612736_i64, "rss": 120000000})
+        );
     }
 
     #[test]

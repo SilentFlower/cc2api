@@ -3297,6 +3297,10 @@ fn rewrite_process_fields(obj: &mut serde_json::Value, profile: &DeviceProfile) 
         let uptime = map.get("uptime").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let snapshot = process_snapshot(&profile.process, &profile.device_id, uptime);
         let snapshot_json = process_snapshot_json(&snapshot);
+        if profile.process.observation.is_some() {
+            // v3 缺失的堆/CPU 数据不可用调用方指标或兼容默认值冒充本容器实测。
+            map.clear();
+        }
         if let Some(snapshot_map) = snapshot_json.as_object() {
             for (key, value) in snapshot_map {
                 map.insert(key.clone(), value.clone());
@@ -6510,6 +6514,7 @@ mod tests {
             heap_used_range: [1, 2],
             external_range: [1, 2],
             array_buffers_range: [1, 2],
+            observation: None,
         };
         Account {
             id: 1,
@@ -13136,6 +13141,34 @@ mod tests {
                 <= rewritten_process["heapTotal"].as_i64().unwrap()
         );
         assert_eq!(rewritten_process["constrainedMemory"], 0);
+    }
+
+    #[test]
+    fn observed_cli_process_removes_client_heap_and_internal_metadata() {
+        let mut account = test_account();
+        account.canonical_process = json!({"constrained_memory": 1610612736_i64, "observation": {
+            "source": "v3:procfs:cli", "environment_id": "a".repeat(32), "cli_version": "2.1.293",
+            "observed_at": 100.0, "sampled_at": null, "sample_count": 0,
+            "rss_bytes": null, "rss_min_bytes": null, "rss_max_bytes": null
+        }});
+        let profile = device_profile(&account);
+        let original = json!({"uptime": 12.0, "rss": 999, "heapTotal": 999, "cpuPercent": 12});
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&original).unwrap());
+        for value in [original, json!(encoded)] {
+            let rewritten = super::rewrite_process(&value, &profile);
+            let decoded = if let Some(encoded) = rewritten.as_str() {
+                serde_json::from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .unwrap(),
+                )
+                .unwrap()
+            } else {
+                rewritten
+            };
+            assert_eq!(decoded, json!({"constrainedMemory": 1610612736_i64}));
+        }
     }
 
     #[test]

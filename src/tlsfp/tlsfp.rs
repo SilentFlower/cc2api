@@ -8,10 +8,12 @@ use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
 use rustls::internal::msgs::handshake::ClientExtension;
 use rustls::{CipherSuite, Error, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme};
-#[cfg(test)]
+#[cfg(any(test, feature = "v3-verification"))]
 use rustls_pki_types::CertificateDer;
 use static_init::dynamic;
 use std::collections::HashMap;
+#[cfg(feature = "v3-verification")]
+use std::fs::read;
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -315,6 +317,17 @@ pub static NODEJS_FINGERPRINT: Fingerprint = Fingerprint {
 fn build_tls_config() -> rustls::ClientConfig {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    #[cfg(feature = "v3-verification")]
+    let root_store = {
+        let mut roots = root_store;
+        // 隔离上游使用临时 CA，仍由 rustls 校验签名和主机名；此分支不进入正式二进制。
+        let certificate =
+            read("/run/v3/verification-ca.der").expect("隔离验证构建需要专用 CA 文件");
+        roots
+            .add(CertificateDer::from(certificate))
+            .expect("隔离验证 CA 无效");
+        roots
     };
     build_tls_config_with_roots(root_store)
 }

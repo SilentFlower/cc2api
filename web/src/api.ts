@@ -44,6 +44,17 @@ export interface Account {
     rss_range?: number[]
     heap_total_range?: number[]
     heap_used_range?: number[]
+    observation?: {
+      source: string
+      environment_id: string
+      cli_version: string
+      observed_at: number
+      sampled_at?: number | null
+      sample_count: number
+      rss_bytes?: number | null
+      rss_min_bytes?: number | null
+      rss_max_bytes?: number | null
+    }
   }
   billing_mode: string
   account_uuid?: string | null

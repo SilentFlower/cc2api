@@ -4,6 +4,10 @@ version = "1.6.0"
 edition = "2024"
 default-run = "claude-code-gateway"
 
+[features]
+# 只供隔离容器演练显式编译；正式构建不包含额外信任根读取代码。
+v3-verification = []
+
 [dependencies]
 # HTTP
 axum = { version = "0.7", features = ["macros", "ws"] }

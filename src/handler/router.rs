@@ -18,10 +18,10 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{
-    Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalPromptEnvData,
-    DEFAULT_ALLOW_1M_MODELS, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
-    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
-    OAuthCredentialImport,
+    Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalProcessData,
+    CanonicalPromptEnvData, CliProcessImport, DEFAULT_ALLOW_1M_MODELS,
+    DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
 };
 use crate::model::api_token::{self, ApiToken};
 use crate::service::access_policy::{
@@ -135,6 +135,10 @@ pub fn build_router(
         )
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
+        .route(
+            "/admin/accounts/:id/cli-process/import",
+            post(import_cli_process),
+        )
         .route(
             "/admin/runtime/accounts/:id/lease",
             get(runtime_lease_status).post(runtime_lease_update),
@@ -423,6 +427,7 @@ struct CliIdentityImport {
     source: String,
     canonical_env: CanonicalEnvData,
     canonical_prompt: CanonicalPromptEnvData,
+    canonical_process: Option<CanonicalProcessData>,
 }
 
 impl CliIdentityImport {
@@ -698,11 +703,61 @@ async fn create_account(
             .map_err(|_| AppError::BadRequest("invalid CLI environment".into()))?;
         account.canonical_prompt = serde_json::to_value(identity.canonical_prompt)
             .map_err(|_| AppError::BadRequest("invalid CLI prompt environment".into()))?;
+        if let Some(process) = identity.canonical_process {
+            let version = account.canonical_env["version"]
+                .as_str()
+                .unwrap_or_default();
+            if !process.has_valid_cli_observation(&identity.environment_id, version) {
+                return Err(AppError::BadRequest(
+                    "invalid CLI process observation".into(),
+                ));
+            }
+            account.canonical_process = serde_json::to_value(process)
+                .map_err(|_| AppError::BadRequest("invalid CLI process observation".into()))?;
+        }
         state.account_svc.create_cli_account(&mut account).await?;
     } else {
         state.account_svc.create_account(&mut account).await?;
     }
     Ok((StatusCode::CREATED, Json(account)))
+}
+
+/// 仅导入已绑定账号的进程实测值，不调用凭据解析或停止发送器。
+/// @param state 当前应用服务。
+/// @param id 原关联账号 ID。
+/// @param headers 管理鉴权与内部服务证明。
+/// @param input 独立进程指标载荷。
+/// @return 更新后的进程指标，不含凭据。
+async fn import_cli_process(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(input): Json<CliProcessImport>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_v3_credential_service(&headers)?;
+    let account = state.account_svc.get_account(id).await?;
+    let queue = state
+        .account_svc
+        .get_or_create_queue(id, account.concurrency)
+        .await;
+    let lease = queue
+        .runtime_gate
+        .prepare(&format!("gateway-config:{}", Uuid::new_v4()))?;
+    let permit = RuntimeConfigPermit { queue, lease };
+    if permit.queue.runtime_gate.snapshot()["active"]
+        .as_i64()
+        .unwrap_or(0)
+        != 0
+        || permit.queue.waiting_count() != 0
+    {
+        return Err(AppError::BadRequest(
+            "账号当前有活动请求，请稍后更新进程指标".into(),
+        ));
+    }
+    let process = state.account_svc.import_cli_process(id, &input).await?;
+    Ok(Json(
+        serde_json::json!({"ok": true, "account_id": id, "canonical_process": process}),
+    ))
 }
 
 /// 配置修改期间阻止新推理进入，检查和写库之间不能出现新活动请求。
@@ -1818,6 +1873,7 @@ mod tests {
                 ..Default::default()
             },
             canonical_prompt: CanonicalPromptEnvData::default(),
+            canonical_process: None,
         };
         assert!(identity.has_confirmed_source());
         identity.canonical_env.version = "2.1.294".into();

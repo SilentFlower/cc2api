@@ -1,5 +1,6 @@
 use chrono::Utc;
 use rand::Rng;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,9 +14,9 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::model::account::{
     Account, AccountAuthType, AccountStatus, CanonicalEnvData, CanonicalPromptEnvData,
-    DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
-    MAX_UPSTREAM_SESSION_POOL_SIZE, MAX_UPSTREAM_SESSION_TTL_MINUTES,
-    MIN_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
+    CliProcessImport, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
+    DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, MAX_UPSTREAM_SESSION_POOL_SIZE,
+    MAX_UPSTREAM_SESSION_TTL_MINUTES, MIN_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
 };
 use crate::service::rewriter::ClientType;
 use crate::service::runtime_lease::RuntimeGate;
@@ -786,6 +787,48 @@ impl AccountService {
         };
         apply_identity_to_env_json(&mut env, &profile.identity);
         env
+    }
+
+    /// 导入原账号的真实进程指标，不修改设备、凭据、代理或账号策略。
+    /// @param id 原关联账号 ID。
+    /// @param input 带环境、版本与身份证明的实测载荷。
+    /// @return 已持久化的进程 JSON。
+    pub async fn import_cli_process(
+        &self,
+        id: i64,
+        input: &CliProcessImport,
+    ) -> Result<Value, AppError> {
+        let account = self.store.get_by_id(id).await?;
+        let same = |left: &str, right: &str| left.trim().eq_ignore_ascii_case(right.trim());
+        if account.auth_type != AccountAuthType::Oauth
+            || input.device_id.len() != 64
+            || account.device_id != input.device_id
+            || input.email.trim().is_empty()
+            || !same(&account.email, &input.email)
+            || input.account_uuid.trim().is_empty()
+            || account
+                .account_uuid
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| !same(value, &input.account_uuid))
+            || !input
+                .canonical_process
+                .has_valid_cli_observation(&input.environment_id, &input.cli_version)
+            || account
+                .canonical_process
+                .get("observation")
+                .and_then(|value| value.get("environment_id"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value != input.environment_id)
+        {
+            return Err(AppError::BadRequest(
+                "进程指标与原关联账号身份不匹配".into(),
+            ));
+        }
+        let process = serde_json::to_value(&input.canonical_process)
+            .map_err(|_| AppError::BadRequest("进程指标格式无效".into()))?;
+        self.store.update_cli_process(&account, &process).await?;
+        Ok(process)
     }
 
     pub async fn update_account(&self, a: &Account) -> Result<(), AppError> {
@@ -2773,6 +2816,78 @@ mod tests {
             settings_store.clone(),
         ));
         (store, settings_store, svc)
+    }
+
+    #[tokio::test]
+    async fn cli_process_import_preserves_credentials_and_rejects_wrong_identity() {
+        let (store, service) = setup_account_service().await;
+        let mut account = test_account_with_usage(json!({}));
+        account.device_id = "d".repeat(64);
+        account.account_uuid = Some("synthetic-account".into());
+        store.create(&mut account).await.unwrap();
+        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut input: CliProcessImport = serde_json::from_value(json!({
+            "device_id": account.device_id, "account_uuid": "synthetic-account",
+            "email": account.email, "environment_id": "a".repeat(32), "cli_version": "2.1.293",
+            "canonical_process": {"constrained_memory": 1610612736_i64, "observation": {
+                "source": "v3:procfs:cli", "environment_id": "a".repeat(32), "cli_version": "2.1.293",
+                "observed_at": now, "sampled_at": null, "sample_count": 0,
+                "rss_bytes": null, "rss_min_bytes": null, "rss_max_bytes": null
+            }}
+        })).unwrap();
+        service
+            .import_cli_process(account.id, &input)
+            .await
+            .unwrap();
+        let saved = store.get_by_id(account.id).await.unwrap();
+        assert_eq!(saved.access_token, account.access_token);
+        assert_eq!(saved.refresh_token, account.refresh_token);
+        assert_eq!(saved.billing_mode, account.billing_mode);
+        assert_eq!(saved.proxy_url, account.proxy_url);
+        assert_eq!(saved.concurrency, account.concurrency);
+        let before = saved.canonical_process;
+        for field in ["device", "version", "source", "sample", "environment"] {
+            let original = input.clone();
+            match field {
+                "device" => input.device_id = "e".repeat(64),
+                "version" => input.cli_version = "2.1.280".into(),
+                "source" => {
+                    input.canonical_process.observation.as_mut().unwrap().source = "other".into()
+                }
+                "sample" => {
+                    input
+                        .canonical_process
+                        .observation
+                        .as_mut()
+                        .unwrap()
+                        .rss_bytes = Some(42)
+                }
+                _ => input.environment_id = "b".repeat(32),
+            }
+            assert!(
+                service
+                    .import_cli_process(account.id, &input)
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(
+                store.get_by_id(account.id).await.unwrap().canonical_process,
+                before
+            );
+            input = original;
+        }
+        // 存储层即使拿到旧快照，也不能覆盖已经更新的令牌和管理员策略。
+        let mut changed = store.get_by_id(account.id).await.unwrap();
+        changed.access_token = "new-synthetic-access".into();
+        changed.concurrency = 7;
+        changed.rpm_limit = 23;
+        store.update(&changed).await.unwrap();
+        store.update_cli_process(&account, &before).await.unwrap();
+        let final_account = store.get_by_id(account.id).await.unwrap();
+        assert_eq!(final_account.access_token, changed.access_token);
+        assert_eq!(final_account.concurrency, 7);
+        assert_eq!(final_account.rpm_limit, 23);
     }
 
     /// 生成一个相对当前时间指定偏移的 RFC3339 字符串。

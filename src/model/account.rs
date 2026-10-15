@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -375,6 +376,7 @@ pub struct CanonicalPromptEnvData {
 
 /// 硬件指纹配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CanonicalProcessData {
     pub constrained_memory: i64,
     pub rss_range: [i64; 2],
@@ -384,4 +386,84 @@ pub struct CanonicalProcessData {
     pub external_range: [i64; 2],
     #[serde(default)]
     pub array_buffers_range: [i64; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<CliProcessObservation>,
+}
+
+/// v3 官方 CLI 的只读实测来源；空 RSS 明确表示尚未采到进程。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliProcessObservation {
+    pub source: String,
+    pub environment_id: String,
+    pub cli_version: String,
+    pub observed_at: f64,
+    pub sampled_at: Option<f64>,
+    pub sample_count: u64,
+    pub rss_bytes: Option<i64>,
+    pub rss_min_bytes: Option<i64>,
+    pub rss_max_bytes: Option<i64>,
+}
+
+impl CanonicalProcessData {
+    /// 验证实测数据的环境、版本、时间和值域，不为未知字段生成默认值。
+    /// @param environment_id 当前固定环境。
+    /// @param version 当前官方 CLI 版本。
+    /// @return 实测来源及样本完整性均通过时返回 true。
+    pub fn has_valid_cli_observation(&self, environment_id: &str, version: &str) -> bool {
+        let Some(observed) = &self.observation else {
+            return false;
+        };
+        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+        if observed.source != "v3:procfs:cli"
+            || observed.environment_id != environment_id
+            || environment_id.len() != 32
+            || !environment_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || observed.cli_version != version
+            || !Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?$")
+                .unwrap()
+                .is_match(version)
+            || self.constrained_memory < 0
+            || self.constrained_memory >= 1_i64 << 53
+            || observed.sample_count >= 1_u64 << 53
+            || !observed.observed_at.is_finite()
+            || observed.observed_at <= 0.0
+            || observed.observed_at > now + 60.0
+        {
+            return false;
+        }
+        match (
+            observed.sampled_at,
+            observed.rss_bytes,
+            observed.rss_min_bytes,
+            observed.rss_max_bytes,
+        ) {
+            (None, None, None, None) => observed.sample_count == 0,
+            (Some(at), Some(rss), Some(min), Some(max)) => {
+                observed.sample_count > 0
+                    && at.is_finite()
+                    && at > 0.0
+                    && at <= observed.observed_at
+                    && min > 0
+                    && min <= rss
+                    && rss <= max
+                    && max < 1_i64 << 53
+            }
+            _ => false,
+        }
+    }
+}
+
+/// 内部服务用于更新原账号进程指标的独立载荷，不接受凭据或策略字段。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliProcessImport {
+    pub device_id: String,
+    pub email: String,
+    pub account_uuid: String,
+    pub environment_id: String,
+    pub cli_version: String,
+    pub canonical_process: CanonicalProcessData,
 }

@@ -298,6 +298,39 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 只更新原身份的进程指标，避免用旧账号副本覆盖并发刷新的 OAuth 或策略。
+    /// @param account 校验时读取的账号身份。
+    /// @param process 已校验的进程 JSON。
+    /// @return 条件写入结果；身份已改变时拒绝。
+    pub async fn update_cli_process(
+        &self,
+        account: &Account,
+        process: &Value,
+    ) -> Result<(), AppError> {
+        let query = format!(
+            "UPDATE accounts SET canonical_process=$1, updated_at={} \
+            WHERE id=$2 AND device_id=$3 AND COALESCE(account_uuid,'')=$4 AND email=$5 AND auth_type='oauth'",
+            self.now_expr()
+        );
+        let changed = sqlx::query(&query)
+            .bind(
+                serde_json::to_string(process)
+                    .map_err(|_| AppError::BadRequest("进程指标格式无效".into()))?,
+            )
+            .bind(account.id)
+            .bind(&account.device_id)
+            .bind(account.account_uuid.as_deref().unwrap_or_default())
+            .bind(&account.email)
+            .execute(&self.pool)
+            .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::BadRequest(
+                "账号身份已变化，未更新进程指标".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 批量覆盖所有账号 canonical env 中的 Claude Code 版本身份字段。
     ///
     /// @param identity 目标版本身份画像。

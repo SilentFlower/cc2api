@@ -642,13 +642,16 @@ function formatExpiresAt(expiresAt?: number | null): string {
 }
 
 /**
- * 格式化字节数为可读字符串
+ * 格式化字节数为可读字符串。
+ * @param bytes 字节数。
+ * @param precision 小数位，实测指标保留精度以避免将 1.5G 显示为 2G。
+ * @returns 可读的容量。
  */
-function formatBytes(bytes?: number): string {
+function formatBytes(bytes?: number, precision = 0): string {
   if (!bytes) return '—';
-  if (bytes >= 1_073_741_824) return (bytes / 1_073_741_824).toFixed(0) + 'G';
-  if (bytes >= 1_048_576) return (bytes / 1_048_576).toFixed(0) + 'M';
-  if (bytes >= 1024) return (bytes / 1024).toFixed(0) + 'K';
+  if (bytes >= 1_073_741_824) return (bytes / 1_073_741_824).toFixed(precision) + 'G';
+  if (bytes >= 1_048_576) return (bytes / 1_048_576).toFixed(precision) + 'M';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(precision) + 'K';
   return bytes + 'B';
 }
 
@@ -963,7 +966,18 @@ async function copyText(text: string) {
               </div>
               <div>
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">进程指纹</p>
-                <p class="text-xs text-[#8c8475] truncate">
+                <template v-if="a.canonical_process?.observation?.source === 'v3:procfs:cli'">
+                  <p class="text-xs text-[#8c8475]">
+                    容器内存上限 {{ a.canonical_process.constrained_memory === 0 ? '不限' : formatBytes(a.canonical_process.constrained_memory, 2) }}
+                  </p>
+                  <p class="text-xs text-[#8c8475]">
+                    CLI RSS {{ a.canonical_process.observation.sample_count ? formatBytes(a.canonical_process.observation.rss_bytes ?? undefined, 2) : '未采集' }}
+                  </p>
+                  <p v-if="a.canonical_process.observation.sampled_at" class="text-[10px] text-[#b5b0a6]">
+                    官方 CLI 进程采样 · {{ new Date(a.canonical_process.observation.sampled_at * 1000).toLocaleString('zh-CN') }}
+                  </p>
+                </template>
+                <p v-else class="text-xs text-[#8c8475] truncate">
                   内存 {{ formatBytes(a.canonical_process?.constrained_memory) }} · RSS {{ formatBytes(a.canonical_process?.rss_range?.[0]) }}–{{ formatBytes(a.canonical_process?.rss_range?.[1]) }}
                 </p>
               </div>
