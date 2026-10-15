@@ -425,6 +425,17 @@ struct CliIdentityImport {
     canonical_prompt: CanonicalPromptEnvData,
 }
 
+impl CliIdentityImport {
+    /// 核对请求观察或已通过官方 CLI 实测的本地字段来源。
+    /// @return 来源与版本相符时为 true；未知映射保持拒绝。
+    fn has_confirmed_source(&self) -> bool {
+        self.source == "cli:/v1/messages:metadata.user_id.device_id"
+            || (self.source == "cli:2.1.293:config.userID"
+                && self.canonical_env.version == "2.1.293"
+                && self.canonical_env.version_base == "2.1.293")
+    }
+}
+
 const DEFAULT_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 2400;
 
 /// 凭据导入只允许可信 v3 服务调用，管理密码本身不能替代服务证明。
@@ -678,7 +689,7 @@ async fn create_account(
                 .environment_id
                 .bytes()
                 .all(|value| value.is_ascii_hexdigit())
-            || identity.source != "cli:/v1/messages:metadata.user_id.device_id"
+            || !identity.has_confirmed_source()
         {
             return Err(AppError::Unauthorized);
         }
@@ -1702,12 +1713,13 @@ async fn get_prime_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeCodeContextSanitizerMode, CliBgStatusClassifierMode,
+        ClaudeCodeContextSanitizerMode, CliBgStatusClassifierMode, CliIdentityImport,
         DEFAULT_INTERCEPT_CLI_BG_STATUS_CLASSIFIER_MODELS, MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS,
         MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS, build_router, hello_get, hello_head,
         normalize_oauth_credential_validity_seconds, validate_model_id_list,
     };
     use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
+    use crate::model::account::{CanonicalEnvData, CanonicalPromptEnvData};
     use crate::service::account::AccountService;
     use crate::service::gateway::GatewayService;
     use crate::service::oauth::TokenTester;
@@ -1790,6 +1802,76 @@ mod tests {
             telemetry_svc,
         );
         (router, gateway_svc)
+    }
+
+    /// 已验证字段映射必须与精确版本绑定，旧请求观察继续兼容。
+    /// @return 无；来源或版本判断异常时测试失败。
+    #[test]
+    fn cli_identity_sources_require_verified_version() {
+        let mut identity = CliIdentityImport {
+            device_id: "d".repeat(64),
+            environment_id: "a".repeat(32),
+            source: "cli:2.1.293:config.userID".into(),
+            canonical_env: CanonicalEnvData {
+                version: "2.1.293".into(),
+                version_base: "2.1.293".into(),
+                ..Default::default()
+            },
+            canonical_prompt: CanonicalPromptEnvData::default(),
+        };
+        assert!(identity.has_confirmed_source());
+        identity.canonical_env.version = "2.1.294".into();
+        assert!(!identity.has_confirmed_source());
+        identity.canonical_env.version = "2.1.293".into();
+        identity.canonical_env.version_base = "2.1.294".into();
+        assert!(!identity.has_confirmed_source());
+        for source in [
+            "cli:2.1.294:config.userID",
+            "cli:config.machineID",
+            "unknown",
+        ] {
+            identity.source = source.into();
+            assert!(!identity.has_confirmed_source());
+        }
+        identity.source = "cli:/v1/messages:metadata.user_id.device_id".into();
+        assert!(identity.has_confirmed_source());
+    }
+
+    /// 普通管理鉴权不能代替受信任 v3 服务证明。
+    /// @return 无；未授权导入被接受时测试失败。
+    #[tokio::test]
+    async fn cli_identity_import_requires_internal_service_proof() {
+        let (app, _) = test_router_with_gateway().await;
+        let payload = serde_json::json!({
+            "email": "synthetic@example.invalid",
+            "auth_type": "oauth",
+            "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh",
+            "cli_identity": {
+                "device_id": "d".repeat(64),
+                "environment_id": "a".repeat(32),
+                "source": "cli:2.1.293:config.userID",
+                "canonical_env": CanonicalEnvData {
+                    version: "2.1.293".into(),
+                    version_base: "2.1.293".into(),
+                    ..Default::default()
+                },
+                "canonical_prompt": CanonicalPromptEnvData::default(),
+            },
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/accounts")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

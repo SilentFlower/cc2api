@@ -152,6 +152,9 @@ impl AccountStore {
         }
     }
 
+    /// 创建账号并等待写入完成，使后续独立连接可以立即解析凭据。
+    /// @param a 待创建账号；成功后回填 ID 和数据库时间。
+    /// @return 持久化结果；失败不报告创建成功。
     pub async fn create(&self, a: &mut Account) -> Result<(), AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) as cnt FROM accounts WHERE email=$1")
             .bind(&a.email)
@@ -195,7 +198,8 @@ impl AccountStore {
             self.ts(10),
             "$11"
         );
-        let row: AnyRow = sqlx::query(&q)
+        // SQLite WAL 下只取 RETURNING 首行会在语句完成前返回，必须消费到结束才确认提交。
+        let rows: Vec<AnyRow> = sqlx::query(&q)
             .bind(&a.name)
             .bind(&a.email)
             .bind(a.status.to_string())
@@ -226,12 +230,13 @@ impl AccountStore {
             .bind(a.upstream_session_pool_size)
             .bind(a.upstream_session_ttl_minutes)
             .bind(&a.upstream_session_refresh_policy)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await?;
+        let row = rows.first().ok_or(AppError::NotFound)?;
 
         a.id = row.try_get::<i64, _>("id").unwrap_or_default();
-        a.created_at = Self::parse_time(&row, "created_at");
-        a.updated_at = Self::parse_time(&row, "updated_at");
+        a.created_at = Self::parse_time(row, "created_at");
+        a.updated_at = Self::parse_time(row, "updated_at");
         Ok(())
     }
 

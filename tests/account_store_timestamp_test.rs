@@ -1,5 +1,7 @@
 use chrono::{Duration, Utc};
 use sqlx::AnyPool;
+use std::env::temp_dir;
+use std::fs::remove_file;
 use std::sync::Arc;
 
 use claude_code_gateway::model::account::{
@@ -7,6 +9,7 @@ use claude_code_gateway::model::account::{
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
 };
 use claude_code_gateway::store::account_store::AccountStore;
+use claude_code_gateway::store::db::{init_db, migrate};
 
 async fn setup() -> Arc<AccountStore> {
     sqlx::any::install_default_drivers();
@@ -66,6 +69,32 @@ fn new_account(email: &str) -> Account {
 }
 
 // ─── CREATE: oauth_expires_at and oauth_refreshed_at bound as timestamps ───
+
+/// 创建返回后，独立连接必须立即看到持久记录，不能依赖后续同连接查询完成写入。
+/// @return 无；未提交或只对原连接可见时测试失败。
+#[tokio::test]
+async fn test_create_is_committed_before_independent_read() {
+    sqlx::any::install_default_drivers();
+    let database = temp_dir().join(format!("ccgw_commit_test_{}.db", rand::random::<u64>()));
+    let dsn = format!("sqlite:{}?mode=rwc", database.display());
+    let writer = init_db("sqlite", database.to_str().unwrap()).await.unwrap();
+    migrate(&writer, "sqlite").await.unwrap();
+    let reader = AnyPool::connect(&dsn).await.unwrap();
+    let store = AccountStore::new(writer.clone(), "sqlite".into());
+    let mut account = new_account("committed@example.invalid");
+    store.create(&mut account).await.unwrap();
+
+    // 同池重读可能复用写连接并掩盖问题，必须在另一连接池直接核对提交结果。
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE id=$1")
+        .bind(account.id)
+        .fetch_one(&reader)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "创建成功必须代表独立连接已可读取");
+    reader.close().await;
+    writer.close().await;
+    remove_file(database).unwrap();
+}
 
 #[tokio::test]
 async fn test_create_account_with_oauth_timestamps() {
