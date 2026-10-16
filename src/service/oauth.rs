@@ -8,6 +8,7 @@ use crate::tlsfp::get_request_client;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::env;
 
 pub(crate) const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -22,8 +23,32 @@ const OAUTH_SCOPES: &[&str] = &[
 ];
 
 fn oauth_request_client(proxy_url: &str) -> Result<reqwest::Client, AppError> {
+    validate_oauth_proxy(
+        proxy_url,
+        &env::var("V3_RUNTIME_URL").unwrap_or_default(),
+        &env::var("V3_DEPLOYMENT_ID").unwrap_or_default(),
+    )?;
     get_request_client(proxy_url)
         .map_err(|_| AppError::Internal("OAuth request client unavailable".into()))
+}
+
+/// v3 的 OAuth 在 gateway 执行，必须在创建客户端前拒绝缺失代理。
+///
+/// @param proxy_url 本次 OAuth 使用的账号代理。
+/// @param runtime_url v3 管理桥配置。
+/// @param deployment_id v3 部署标识；管理桥缺失时仍保持保护。
+/// @return 配置允许请求时返回成功，否则返回临时不可用且不修改账号凭据。
+fn validate_oauth_proxy(
+    proxy_url: &str,
+    runtime_url: &str,
+    deployment_id: &str,
+) -> Result<(), AppError> {
+    if (!runtime_url.is_empty() || !deployment_id.is_empty()) && proxy_url.trim().is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "v3 OAuth 必须配置账号代理，已阻止直连".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +219,7 @@ pub async fn refresh_oauth_token(
 /// 使用指定端点刷新 OAuth access token。
 ///
 /// @param refresh_token OAuth refresh token。
-/// @param proxy_url 账号代理地址，空字符串表示直连。
+/// @param proxy_url 账号代理地址；仅独立部署允许空字符串直连。
 /// @param token_url OAuth token 端点。
 /// @return 返回刷新后的 access token、refresh token 和过期时间。
 pub(crate) async fn refresh_oauth_token_at(
@@ -341,6 +366,26 @@ fn scoped_weekly_usage_window(usage: &Value, model_name: &str) -> Option<Value> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn v3_oauth_requires_proxy_even_when_runtime_configuration_is_partial() {
+        for (runtime, deployment) in [
+            ("http://runtime:8000", ""),
+            ("", "fixture"),
+            ("http://runtime:8000", "fixture"),
+        ] {
+            for proxy in ["", " ", "\t\n"] {
+                assert!(matches!(
+                    validate_oauth_proxy(proxy, runtime, deployment),
+                    Err(AppError::ServiceUnavailable(_))
+                ));
+            }
+            for proxy in ["http://proxy.invalid:3128", "socks5h://proxy.invalid:1080"] {
+                assert!(validate_oauth_proxy(proxy, runtime, deployment).is_ok());
+            }
+        }
+        assert!(validate_oauth_proxy("", "", "").is_ok());
+    }
 
     fn request_header<'a>(request: &'a reqwest::Request, name: &str) -> &'a str {
         request
