@@ -194,6 +194,11 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
             | "run-continue"
             | "terminal-ticket"
             | "environments"
+            | "project-catalog"
+            | "project-iteration-batches"
+            | "project-instances"
+            | "project-step-attempts"
+            | "project-iterations-stream"
     )
 }
 
@@ -375,5 +380,30 @@ mod tests {
         ));
         assert!(browser_path_allowed(&Method::GET, "/vendor/xterm.js"));
         assert!(!browser_path_allowed(&Method::POST, "/app.js"));
+    }
+
+    /// 项目模式仅增加管理资源，编码穿越和内部服务入口继续拒绝。
+    #[test]
+    fn project_iteration_resources_use_authenticated_management_bridge() {
+        for path in [
+            "/api/project-catalog",
+            "/api/project-catalog/project-001",
+            "/api/project-instances/1/usage",
+            "/api/project-step-attempts/1/artifacts",
+            "/api/project-iterations-stream",
+        ] {
+            assert!(browser_path_allowed(&Method::GET, path), "{path}");
+        }
+        assert!(browser_path_allowed(
+            &Method::POST,
+            "/api/project-iteration-batches/1/start"
+        ));
+        for path in [
+            "/api/project-instances/../internal/v3/transport/1",
+            "/api/project-instances/%2e%2e/internal/v3/session",
+            "/internal/v3/project-catalog",
+        ] {
+            assert!(!browser_path_allowed(&Method::GET, path), "{path}");
+        }
     }
 }
