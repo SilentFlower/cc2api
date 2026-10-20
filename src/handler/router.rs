@@ -579,6 +579,8 @@ async fn runtime_lease_update(
         queue.runtime_gate.prepare(&input.owner)?;
     } else if input.operation == "prepare-cli" {
         queue.runtime_gate.prepare_cli(&input.owner)?;
+    } else if input.operation == "prepare-cli-shared" {
+        queue.runtime_gate.prepare_shared_cli(&input.owner)?;
     } else {
         queue.runtime_gate.update(
             &input.owner,
