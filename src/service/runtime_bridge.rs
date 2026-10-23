@@ -160,6 +160,7 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
             "" | "/"
                 | "/index.html"
                 | "/app.js"
+                | "/projects.js"
                 | "/style.css"
                 | "/vendor/xterm.js"
                 | "/vendor/xterm.css"
@@ -199,6 +200,7 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
             | "project-instances"
             | "project-step-attempts"
             | "project-iterations-stream"
+            | "projects"
     )
 }
 
@@ -379,6 +381,8 @@ mod tests {
             "/api/accounts/login/start"
         ));
         assert!(browser_path_allowed(&Method::GET, "/vendor/xterm.js"));
+        assert!(browser_path_allowed(&Method::GET, "/projects.js"));
+        assert!(!browser_path_allowed(&Method::POST, "/projects.js"));
         assert!(!browser_path_allowed(&Method::POST, "/app.js"));
     }
 
@@ -391,6 +395,10 @@ mod tests {
             "/api/project-instances/1/usage",
             "/api/project-step-attempts/1/artifacts",
             "/api/project-iterations-stream",
+            "/api/projects",
+            "/api/projects/catalog",
+            "/api/projects/agents/1/events",
+            "/api/projects/stream?account_id=1",
         ] {
             assert!(browser_path_allowed(&Method::GET, path), "{path}");
         }
@@ -402,6 +410,7 @@ mod tests {
             "/api/project-instances/../internal/v3/transport/1",
             "/api/project-instances/%2e%2e/internal/v3/session",
             "/internal/v3/project-catalog",
+            "/api/projects/%2e%2e/internal/v3/session",
         ] {
             assert!(!browser_path_allowed(&Method::GET, path), "{path}");
         }
