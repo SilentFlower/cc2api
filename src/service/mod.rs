@@ -10,5 +10,7 @@ pub mod runtime_lease;
 pub mod runtime_transport;
 pub mod session_hello_probe;
 pub mod telemetry;
+pub mod usage;
 pub mod usage_poller;
+pub mod usage_pricing;
 pub mod version_profile;

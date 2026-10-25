@@ -103,6 +103,7 @@ export interface Account {
   disable_reason?: string
   usage_data?: UsageData
   usage_fetched_at?: string
+  request_usage?: RequestUsage | null
   created_at: string
   updated_at: string
 }
@@ -118,6 +119,27 @@ export interface PagedResult<T> {
 export interface UsageWindow {
   utilization: number
   resets_at?: string | null
+}
+
+/** 账号从网关实际响应记录的两个用量窗口。 */
+export interface RequestUsage {
+  recorded_since: string
+  five_hour: WindowUsageStats
+  seven_day: WindowUsageStats
+}
+
+/** 本地窗口统计；basis 区分官方周期和最近滚动时间段。 */
+export interface WindowUsageStats {
+  requests: number
+  tokens: number
+  cost_usd: number
+  unpriced_requests: number
+  partial_requests: number
+  starts_at: string
+  ends_at: string
+  basis: 'quota' | 'rolling'
+  coverage_complete: boolean
+  estimated_total_cost_usd: number | null
 }
 
 export interface UsageLimit {

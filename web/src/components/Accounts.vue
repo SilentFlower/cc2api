@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { api, type Account, type OAuthExchangeResult } from '../api';
+import { api, type Account, type OAuthExchangeResult, type UsageWindow } from '../api';
+import UsageWindowStats from './UsageWindowStats.vue';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -366,11 +367,8 @@ async function refreshUsage(id: number) {
   try {
     const res = await api.refreshUsage(id);
     if (res.status === 'ok' && res.usage) {
-      const acc = accounts.value.find(a => a.id === id);
-      if (acc) {
-        acc.usage_data = res.usage;
-        acc.usage_fetched_at = new Date().toISOString();
-      }
+      // 官方 reset 可能已推进，立即重读后端汇总以同步切换费用窗口。
+      await load();
     } else if (res.status === 'error') {
       toast(res.message || '刷新用量失败');
     }
@@ -450,13 +448,43 @@ function usageWindow(data: Account['usage_data'], key: UsageWindowKey) {
 }
 
 /**
- * 获取窗口的有效利用率：resets_at 已过期则视为 0（窗口已重置）。
+ * 获取进度条宽度；未知或过期状态由文字单独说明，不能显示成真实 0%。
+ * @param window 官方额度观察。
+ * @return 限制在合法数值范围内的进度条百分比。
  */
 function effectiveUtil(window?: { utilization: number; resets_at?: string | null }): number {
-  if (!window) return 0;
+  if (!window || !Number.isFinite(window.utilization) || window.utilization < 0) return 0;
   const resetMs = window.resets_at ? new Date(window.resets_at).getTime() : NaN;
   if (!Number.isNaN(resetMs) && resetMs <= Date.now()) return 0;
   return window.utilization;
+}
+
+/**
+ * 区分真实零占用、缺少额度观察和等待新周期观察。
+ * @param window 官方额度窗口。
+ * @return 百分比或明确的未知／待更新状态。
+ */
+function usagePercentLabel(window?: UsageWindow): string {
+  if (!window || !Number.isFinite(window.utilization) || window.utilization < 0) return '未知';
+  if (window.resets_at) {
+    const reset = Date.parse(window.resets_at);
+    if (!Number.isFinite(reset)) return '未知';
+    if (reset <= Date.now()) return '待更新';
+  } else if (window.utilization > 0) {
+    return '未知';
+  }
+  return `${Math.round(window.utilization)}%`;
+}
+
+/**
+ * 只为仍有效的官方窗口展示倒计时，避免过期观察同时显示“已重置”。
+ * @param window 官方额度窗口。
+ * @return 重置时间是否合法且尚未到期。
+ */
+function hasFutureReset(window?: UsageWindow): boolean {
+  if (!window?.resets_at) return false;
+  const reset = Date.parse(window.resets_at);
+  return Number.isFinite(reset) && reset > Date.now();
 }
 
 /**
@@ -994,11 +1022,15 @@ async function copyText(text: string) {
               <p v-else class="text-[10px] text-[#b5b0a6]">未刷新</p>
             </div>
             <!-- 5 小时 -->
+            <p v-if="a.request_usage" class="text-[10px] text-[#b5b0a6]" title="仅统计经过网关的请求，启用前及其它入口的消费不在此金额中">
+              网关记录始于 {{ new Date(a.request_usage.recorded_since).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }}
+            </p>
             <div class="space-y-0.5">
+              <UsageWindowStats :stats="a.request_usage?.five_hour" label="5h" />
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">5 小时</span>
-                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(usageWindow(a.usage_data, 'five_hour'))) }}%
-                  <span v-if="usageWindow(a.usage_data, 'five_hour')" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'five_hour')?.resets_at) }}</span>
+                <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'five_hour')) }}
+                  <span v-if="hasFutureReset(usageWindow(a.usage_data, 'five_hour'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'five_hour')?.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
@@ -1009,10 +1041,11 @@ async function copyText(text: string) {
             </div>
             <!-- 7 天 -->
             <div class="space-y-0.5">
+              <UsageWindowStats :stats="a.request_usage?.seven_day" label="7d" />
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天</span>
-                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(usageWindow(a.usage_data, 'seven_day'))) }}%
-                  <span v-if="usageWindow(a.usage_data, 'seven_day')" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day')?.resets_at) }}</span>
+                <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'seven_day')) }}
+                  <span v-if="hasFutureReset(usageWindow(a.usage_data, 'seven_day'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day')?.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
@@ -1025,8 +1058,8 @@ async function copyText(text: string) {
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天 Sonnet</span>
-                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(usageWindow(a.usage_data, 'seven_day_sonnet'))) }}%
-                  <span v-if="usageWindow(a.usage_data, 'seven_day_sonnet')" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day_sonnet')?.resets_at) }}</span>
+                <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'seven_day_sonnet')) }}
+                  <span v-if="hasFutureReset(usageWindow(a.usage_data, 'seven_day_sonnet'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day_sonnet')?.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
@@ -1039,8 +1072,8 @@ async function copyText(text: string) {
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天 Fable</span>
-                <span class="text-[#5c5647] font-medium">{{ Math.round(effectiveUtil(usageWindow(a.usage_data, 'seven_day_fable'))) }}%
-                  <span v-if="usageWindow(a.usage_data, 'seven_day_fable')" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day_fable')?.resets_at) }}</span>
+                <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'seven_day_fable')) }}
+                  <span v-if="hasFutureReset(usageWindow(a.usage_data, 'seven_day_fable'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day_fable')?.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">

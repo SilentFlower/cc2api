@@ -308,6 +308,13 @@ async fn list_accounts(
         .await?;
     let total_pages = (total + page_size - 1) / page_size;
     let profile_config = state.gateway_svc.profile_selection_config().await;
+    let request_usage = match state.gateway_svc.request_usage(&accounts).await {
+        Ok(stats) => Some(stats),
+        Err(error) => {
+            warn!("账号用量统计读取失败: {}", error);
+            None
+        }
+    };
     let profile_selection_mode = match profile_config.mode {
         ClaudeCodeProfileSelectionMode::ClientVersion => "client_version",
         ClaudeCodeProfileSelectionMode::Account => "account",
@@ -317,6 +324,11 @@ async fn list_accounts(
     let mut data: Vec<serde_json::Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
         let mut obj = serde_json::to_value(a).unwrap_or_default();
+        obj["request_usage"] = request_usage
+            .as_ref()
+            .and_then(|stats| stats.get(&a.id))
+            .map(|stats| serde_json::to_value(stats).unwrap_or_default())
+            .unwrap_or_default();
         if let Some(expires) = state.telemetry_svc.get_session_expires_at(a.id).await {
             obj["telemetry_expires_at"] = serde_json::json!(expires.to_rfc3339());
         }
@@ -1789,6 +1801,7 @@ mod tests {
     use crate::store::prime_log_store::PrimeLogStore;
     use crate::store::settings_store::SettingsStore;
     use crate::store::token_store::TokenStore;
+    use crate::store::usage_store::UsageStore;
     use axum::Router;
     use axum::body::{self, Body};
     use axum::http::{Method, Request, StatusCode, header};
@@ -1822,6 +1835,7 @@ mod tests {
             telemetry_svc.clone(),
             settings_store.clone(),
             cache,
+            Arc::new(UsageStore::new(pool.clone())),
         ));
         let cfg = Config {
             server: ServerConfig {
@@ -1859,6 +1873,45 @@ mod tests {
             telemetry_svc,
         );
         (router, gateway_svc)
+    }
+
+    /// 账号列表随刷新返回本地用量，不把读取转换成主动额度查询。
+    /// @return 无；窗口字段缺失、读取失败或主动查询污染时间时测试失败。
+    #[tokio::test]
+    async fn accounts_list_exposes_both_usage_windows_without_triggering_usage_refresh() {
+        let (app, _) = test_router_with_gateway().await;
+        let response=app.clone().oneshot(Request::builder().method(Method::POST).uri("/admin/accounts")
+            .header(header::AUTHORIZATION,"Bearer admin").header(header::CONTENT_TYPE,"application/json")
+            .body(Body::from(serde_json::json!({"email":"usage@example.invalid","setup_token":"synthetic-setup","auto_telemetry":false,"auto_poll_usage":false}).to_string())).unwrap()).await.unwrap();
+        assert!(response.status().is_success());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/accounts")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: serde_json::Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let usage = &value["data"][0]["request_usage"];
+            assert!(usage["recorded_since"].is_string());
+            for key in ["five_hour", "seven_day"] {
+                assert_eq!(usage[key]["requests"], 0);
+                assert_eq!(usage[key]["basis"], "rolling");
+                assert!(usage[key]["estimated_total_cost_usd"].is_null());
+            }
+            assert!(value["data"][0]["usage_fetched_at"].is_null());
+        }
     }
 
     /// 已验证字段映射必须与精确版本绑定，旧请求观察继续兼容。

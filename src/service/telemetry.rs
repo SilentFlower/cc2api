@@ -190,6 +190,37 @@ pub struct MessageTelemetryUsage {
     pub cache_creation_ephemeral_1h_input_tokens: u64,
 }
 
+/// 合并 Anthropic 累计用量，供遥测与本地费用统计共用。
+/// @param usage 已累计的安全数值摘要。
+/// @param value 本次响应的 usage 对象。
+/// @return 无返回值；重复事件保留各字段最大值。
+pub(crate) fn merge_message_usage(usage: &mut MessageTelemetryUsage, value: &serde_json::Value) {
+    for (target, value) in [
+        (&mut usage.input_tokens, value.get("input_tokens")),
+        (&mut usage.output_tokens, value.get("output_tokens")),
+        (
+            &mut usage.cache_read_input_tokens,
+            value.get("cache_read_input_tokens"),
+        ),
+        (
+            &mut usage.cache_creation_input_tokens,
+            value.get("cache_creation_input_tokens"),
+        ),
+        (
+            &mut usage.cache_creation_ephemeral_5m_input_tokens,
+            value.pointer("/cache_creation/ephemeral_5m_input_tokens"),
+        ),
+        (
+            &mut usage.cache_creation_ephemeral_1h_input_tokens,
+            value.pointer("/cache_creation/ephemeral_1h_input_tokens"),
+        ),
+    ] {
+        if let Some(tokens) = value.and_then(serde_json::Value::as_u64) {
+            *target = (*target).max(tokens);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TelemetryEvent {
     event_type: TelemetryEventType,

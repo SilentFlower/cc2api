@@ -19,6 +19,7 @@ use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::model::identity::device_profile;
+use crate::model::request_usage::RequestUsage;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, access_policy_error_response,
@@ -42,7 +43,9 @@ use crate::service::session_hello_probe::{
 };
 use crate::service::telemetry::{
     MessageTelemetryContext, MessageTelemetryResult, MessageTelemetryUsage, TelemetryService,
+    merge_message_usage,
 };
+use crate::service::usage::UsageCapture;
 use crate::service::version_profile::{
     COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile,
     ClaudeCodeProfileSelectionConfig, ClaudeCodeProfileSelectionMode, account_for_request_profile,
@@ -73,6 +76,7 @@ use crate::store::settings_store::{
     DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
     SettingsStore,
 };
+use crate::store::usage_store::UsageStore;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
@@ -479,6 +483,7 @@ pub struct GatewayService {
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
+    usage_store: Arc<UsageStore>,
     settings_store: Arc<SettingsStore>,
     upstream_base: String,
     system_role_models: RwLock<Vec<String>>,
@@ -511,6 +516,7 @@ impl GatewayService {
     /// @param telemetry_svc 遥测服务。
     /// @param settings_store 全局设置存储。
     /// @param cache Memory 或 Redis 缓存实现。
+    /// @param usage_store 本地网关用量统计存储。
     /// @return Gateway 服务实例。
     pub fn new(
         account_svc: Arc<AccountService>,
@@ -518,11 +524,13 @@ impl GatewayService {
         telemetry_svc: Arc<TelemetryService>,
         settings_store: Arc<SettingsStore>,
         cache: Arc<dyn CacheStore>,
+        usage_store: Arc<UsageStore>,
     ) -> Self {
         Self {
             account_svc,
             rewriter,
             telemetry_svc,
+            usage_store,
             settings_store,
             upstream_base: UPSTREAM_BASE.to_string(),
             system_role_models: RwLock::new(parse_system_role_model_list(
@@ -564,6 +572,16 @@ impl GatewayService {
             session_hello_probe_svc: SessionHelloProbeService::new(cache),
             session_hello_probe_config: RwLock::new(SessionHelloProbeConfig::default()),
         }
+    }
+
+    /// 读取当前账号页的两个用量窗口，不触发上游请求。
+    /// @param accounts 当前页账号及额度缓存。
+    /// @return 按账号 ID 索引的本地用量统计。
+    pub async fn request_usage(
+        &self,
+        accounts: &[Account],
+    ) -> Result<HashMap<i64, RequestUsage>, AppError> {
+        self.usage_store.summaries(accounts, Utc::now()).await
     }
 
     /// 构造本次请求的上游 session 改写上下文。
@@ -2201,6 +2219,7 @@ impl GatewayService {
             }
 
             // 转发到上游
+            let usage_started_at = Utc::now();
             let t_upstream = std::time::Instant::now();
             let mut resp = match self
                 .forward_request(
@@ -2311,9 +2330,25 @@ impl GatewayService {
 
             // 非 429：将响应体包装为 SlotGuardBody，流结束时归还槽位
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                let mut usage_capture = (path == "/v1/messages" && resp.status().is_success())
+                    .then(|| {
+                        UsageCapture::new(
+                            self.usage_store.clone(),
+                            account.id,
+                            &rewritten_body_map,
+                            usage_started_at,
+                        )
+                    });
                 if let Some(lookup) = non_stream_probe_cache_lookup {
                     if resp.status().is_success() && signature_retry_stage.is_none() {
                         let (parts, body_bytes) = buffer_response_body(resp).await?;
+                        if let Some(mut capture) = usage_capture.take() {
+                            capture.observe_encoded(
+                                &body_bytes,
+                                &response_content_codings(&parts.headers),
+                            );
+                            capture.finish(true);
+                        }
                         if let Some(context) = telemetry_context.clone() {
                             self.telemetry_svc
                                 .record_message_result(
@@ -2349,22 +2384,25 @@ impl GatewayService {
                 let permit = slot_guard.defuse();
                 let content_codings = response_content_codings(resp.headers());
                 let (parts, body) = resp.into_parts();
-                let guarded_body = Body::new(SlotGuardBody::new(
-                    body,
-                    permit,
-                    req_start,
-                    account.name.clone(),
-                    self.rewriter.clone(),
-                    stateful_cache_completion,
-                    content_codings,
-                    cache_usage_context,
-                    telemetry_context.clone(),
-                    self.telemetry_svc.clone(),
-                    request_account.clone(),
-                    telemetry_status_code,
-                    telemetry_ttft_ms,
-                    telemetry_error_kind.clone(),
-                ));
+                let guarded_body = Body::new(
+                    SlotGuardBody::new(
+                        body,
+                        permit,
+                        req_start,
+                        account.name.clone(),
+                        self.rewriter.clone(),
+                        stateful_cache_completion,
+                        content_codings,
+                        cache_usage_context,
+                        telemetry_context.clone(),
+                        self.telemetry_svc.clone(),
+                        request_account.clone(),
+                        telemetry_status_code,
+                        telemetry_ttft_ms,
+                        telemetry_error_kind.clone(),
+                    )
+                    .with_usage_capture(usage_capture),
+                );
                 return Ok(Response::from_parts(parts, guarded_body));
             }
 
@@ -6516,6 +6554,8 @@ struct SlotGuardBody {
     message_telemetry_stop_reason: Option<String>,
     /// 是否已收到第一个 frame。
     first_frame_logged: bool,
+    /// 独立于自动遥测的一次性本地用量记录。
+    usage_capture: Option<UsageCapture>,
 }
 
 /// prompt cache usage 日志上下文,只保存脱敏后的请求结构信息。
@@ -6630,6 +6670,28 @@ impl SlotGuardBody {
             message_telemetry_buffer: String::new(),
             message_telemetry_stop_reason: None,
             first_frame_logged: false,
+            usage_capture: None,
+        }
+    }
+
+    fn with_usage_capture(mut self, capture: Option<UsageCapture>) -> Self {
+        self.usage_capture = capture;
+        self
+    }
+
+    fn finish_usage_capture(&mut self, complete: bool) {
+        if let Some(mut capture) = self.usage_capture.take() {
+            if !self.response_content_codings.is_empty() {
+                if self.stateful_cache_usage_side_tap_truncated {
+                    capture.mark_partial();
+                } else {
+                    capture.observe_encoded(
+                        &self.stateful_cache_usage_side_tap,
+                        &self.response_content_codings,
+                    );
+                }
+            }
+            capture.finish(complete);
         }
     }
 
@@ -6682,6 +6744,11 @@ impl http_body::Body for SlotGuardBody {
             self.stateful_cache_usage = usage;
             self.stateful_cache_usage_buffer = buffer;
             if let Some(bytes) = frame.data_ref() {
+                if self.response_content_codings.is_empty() {
+                    if let Some(capture) = self.usage_capture.as_mut() {
+                        capture.observe(bytes);
+                    }
+                }
                 let mut message_usage = self.message_telemetry_usage;
                 let mut message_buffer = std::mem::take(&mut self.message_telemetry_buffer);
                 let mut stop_reason = self.message_telemetry_stop_reason.take();
@@ -6737,11 +6804,17 @@ impl http_body::Body for SlotGuardBody {
             self.message_telemetry_stop_reason = stop_reason;
             self.message_telemetry_buffer = message_buffer;
             self.record_message_telemetry_result(None);
+            self.finish_usage_capture(true);
         } else if let std::task::Poll::Ready(Some(Err(_))) = &result {
             // 上游 body 读失败时 Anthropic 的缓存写入状态未知,代理侧不能把该断点当成可复用锚点。
             log_prompt_cache_usage_read_error(self.cache_usage_context.as_ref());
             let _ = self.stateful_cache_completion.take();
             self.record_message_telemetry_result(Some("response_body_error".into()));
+            self.finish_usage_capture(false);
+        }
+        // 有确定长度的 Body 可能在最后一个数据帧后直接被 Hyper 丢弃，不再 poll EOF。
+        if matches!(&result, std::task::Poll::Ready(Some(Ok(_)))) && self.inner.is_end_stream() {
+            self.finish_usage_capture(true);
         }
         result
     }
@@ -7069,57 +7142,14 @@ fn merge_message_telemetry_from_usage_value(
     usage: &mut MessageTelemetryUsage,
     cache_usage: Option<&serde_json::Value>,
 ) {
-    let Some(cache_usage) = cache_usage else {
-        return;
-    };
-    if let Some(input_tokens) = cache_usage
-        .get("input_tokens")
-        .and_then(|tokens| tokens.as_u64())
-    {
-        usage.input_tokens = usage.input_tokens.max(input_tokens);
-    }
-    if let Some(output_tokens) = cache_usage
-        .get("output_tokens")
-        .and_then(|tokens| tokens.as_u64())
-    {
-        usage.output_tokens = usage.output_tokens.max(output_tokens);
-    }
-    if let Some(cache_read_input_tokens) = cache_usage
-        .get("cache_read_input_tokens")
-        .and_then(|tokens| tokens.as_u64())
-    {
-        usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(cache_read_input_tokens);
-    }
-    if let Some(cache_creation_input_tokens) = cache_usage
-        .get("cache_creation_input_tokens")
-        .and_then(|tokens| tokens.as_u64())
-    {
-        usage.cache_creation_input_tokens = usage
-            .cache_creation_input_tokens
-            .max(cache_creation_input_tokens);
-    }
-    if let Some(cache_creation_ephemeral_5m_input_tokens) = cache_usage
-        .get("cache_creation")
-        .and_then(|cache_creation| cache_creation.get("ephemeral_5m_input_tokens"))
-        .and_then(|tokens| tokens.as_u64())
-    {
-        usage.cache_creation_ephemeral_5m_input_tokens = usage
-            .cache_creation_ephemeral_5m_input_tokens
-            .max(cache_creation_ephemeral_5m_input_tokens);
-    }
-    if let Some(cache_creation_ephemeral_1h_input_tokens) = cache_usage
-        .get("cache_creation")
-        .and_then(|cache_creation| cache_creation.get("ephemeral_1h_input_tokens"))
-        .and_then(|tokens| tokens.as_u64())
-    {
-        usage.cache_creation_ephemeral_1h_input_tokens = usage
-            .cache_creation_ephemeral_1h_input_tokens
-            .max(cache_creation_ephemeral_1h_input_tokens);
+    if let Some(value) = cache_usage {
+        merge_message_usage(usage, value);
     }
 }
 
 impl Drop for SlotGuardBody {
     fn drop(&mut self) {
+        self.finish_usage_capture(false);
         info!(
             "[耗时] 传输结束: {:.0}ms → {}",
             self.req_start.elapsed().as_millis(),
@@ -7198,6 +7228,7 @@ mod tests {
     use crate::store::settings_store::{
         DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, SettingsStore,
     };
+    use crate::store::usage_store::UsageStore;
     use axum::body::{self, Body};
     use axum::extract::{Request, State};
     use axum::http::{
@@ -7209,6 +7240,9 @@ mod tests {
     use axum::{Json, Router};
     use bytes::Bytes;
     use chrono::Utc;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use http_body_util::BodyExt;
     use serde_json::json;
     use sqlx::AnyPool;
     use std::collections::HashMap;
@@ -8221,6 +8255,7 @@ mod tests {
             .await
             .expect("migrate");
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
+        let usage_store = Arc::new(UsageStore::new(pool.clone()));
         let settings_store = Arc::new(SettingsStore::new(pool));
         let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
             account_store.clone(),
@@ -8238,6 +8273,7 @@ mod tests {
             telemetry_svc,
             settings_store,
             cache,
+            usage_store,
         );
         service.upstream_base = upstream_base;
         (service, account_store)
@@ -8262,6 +8298,128 @@ mod tests {
             .await
             .expect("create account");
         account
+    }
+
+    /// 验证真实转发在关闭遥测时仍记录 JSON、SSE、压缩及取消后的已观察用量。
+    /// @return 无返回值；响应被修改、漏记或重复记录时测试失败。
+    #[tokio::test]
+    async fn gateway_usage_records_real_responses_once_without_telemetry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let app = Router::new().route("/v1/messages", post(move || {
+            let calls = handler_calls.clone();
+            async move {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                let json = br#"{"id":"msg_synthetic","type":"message","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":500}}"#;
+                if index == 0 || index == 4 {
+                    return ([("content-type", "application/json")], json.to_vec()).into_response();
+                }
+                if index == 2 {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(json).unwrap();
+                    return ([("content-type", "application/json"), ("content-encoding", "gzip")], encoder.finish().unwrap()).into_response();
+                }
+                let start = Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":0,\"cache_read_input_tokens\":500}}}\n\n");
+                if index == 3 {
+                    let stream = tokio_stream::iter(vec![Ok::<_, Infallible>(start)]).chain(tokio_stream::pending());
+                    return ([("content-type", "text/event-stream")], Body::from_stream(stream)).into_response();
+                }
+                let mut sse = start.to_vec();
+                sse.extend_from_slice(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":100}}\n\ndata: {\"type\":\"message_stop\"}\n\n");
+                let chunks: Vec<_> = sse.chunks(13).map(|part| Ok::<_, Infallible>(Bytes::copy_from_slice(part))).collect();
+                ([("content-type", "text/event-stream")], Body::from_stream(tokio_stream::iter(chunks))).into_response()
+            }
+        })).route("/v1/messages/count_tokens", post(|| async { Json(json!({"input_tokens":42})) }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let service = test_gateway_service_with_urls(
+            format!("http://{address}"),
+            format!("http://{address}/oauth/token"),
+        )
+        .await;
+        let account =
+            create_setup_gateway_account(&service, "usage@example.invalid", "synthetic-setup", 1)
+                .await;
+        assert!(!account.auto_telemetry);
+        for index in 0..4 {
+            let response = service.handle_request(messages_request(), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut response_body = response.into_body();
+            if index == 3 {
+                assert!(response_body.frame().await.unwrap().is_ok());
+                drop(response_body);
+            } else {
+                let bytes = body::to_bytes(response_body, 1024 * 1024).await.unwrap();
+                assert!(!bytes.is_empty());
+            }
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let stats = service.request_usage(&[account.clone()]).await.unwrap();
+                    if stats[&account.id].five_hour.requests == index + 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("统计应完成落库");
+        }
+        let stats = service.request_usage(&[account.clone()]).await.unwrap();
+        assert_eq!(stats[&account.id].five_hour.requests, 4);
+        assert_eq!(stats[&account.id].five_hour.partial_requests, 1);
+        assert_eq!(stats[&account.id].five_hour.tokens, 6300);
+        assert!((stats[&account.id].five_hour.cost_usd - 0.0171).abs() < 1e-10);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let settings = HashMap::from([("non_stream_probe_cache_enabled".into(), "true".into())]);
+        service.settings_store.upsert_many(&settings).await.unwrap();
+        service
+            .reload_non_stream_probe_cache_config()
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let request = profile_request(
+                "/v1/messages",
+                Some(&claude_code_user_agent(DEFAULT_CLAUDE_CODE_VERSION)),
+                non_stream_probe_request("count"),
+            );
+            let response = service.handle_request(request, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+        }
+        let response = service.handle_request(count_tokens_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "缓存命中应复用合法 message 响应"
+        );
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let stats = service.request_usage(&[account.clone()]).await.unwrap();
+                if stats[&account.id].five_hour.requests == 5 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "缓存命中与 count_tokens 不应增加模型调用"
+        );
+        let stats = service.request_usage(&[account.clone()]).await.unwrap();
+        assert_eq!(stats[&account.id].seven_day.requests, 5);
+        server.abort();
     }
 
     async fn create_setup_gateway_account(

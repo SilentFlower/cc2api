@@ -75,6 +75,7 @@ async fn main() {
         driver.clone(),
     ));
     let prime_log_store = Arc::new(store::prime_log_store::PrimeLogStore::new(pool.clone()));
+    let usage_store = Arc::new(store::usage_store::UsageStore::new(pool.clone()));
 
     let proxy_client_pool_enabled = settings_store
         .get_value(
@@ -112,6 +113,7 @@ async fn main() {
         telemetry_svc.clone(),
         settings_store.clone(),
         cache.clone(),
+        usage_store,
     ));
     gateway_svc
         .reload_system_role_models()
