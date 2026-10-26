@@ -63,6 +63,8 @@ export interface Account {
   concurrency: number
   priority: number
   rpm_limit: number
+  five_hour_usage_limit_percent: number
+  seven_day_usage_limit_percent: number
   rpm_current?: number
   rpm_remaining?: number | null
   rpm_window_reset_at?: string

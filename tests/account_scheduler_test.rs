@@ -1,4 +1,5 @@
 use chrono::{Duration, Timelike, Utc};
+use serde_json::json;
 use sqlx::AnyPool;
 use std::sync::Arc;
 
@@ -60,6 +61,8 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
         concurrency: 3,
         priority: 50,
         rpm_limit: 0,
+        five_hour_usage_limit_percent: 0,
+        seven_day_usage_limit_percent: 0,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),
@@ -112,6 +115,7 @@ fn fable_selection_context_with_limit(
     limit_percent: u32,
 ) -> AccountSelectionContext {
     AccountSelectionContext {
+        usage_limits_enabled: false,
         fable_quota_fallback_enabled: enabled,
         fable_weekly_usage_limit_percent: limit_percent,
         request_model: Some(model.into()),
@@ -125,6 +129,302 @@ fn fable_usage_window(utilization: i64, reset_offset: Duration) -> serde_json::V
             "resets_at": (Utc::now() + reset_offset).to_rfc3339(),
         }
     })
+}
+
+/// 构造执行普通用量控制线的消息选号上下文。
+/// @return 不依赖模型名称的消息上下文。
+fn usage_limits_context() -> AccountSelectionContext {
+    AccountSelectionContext {
+        usage_limits_enabled: true,
+        ..AccountSelectionContext::disabled()
+    }
+}
+
+/// 两类账号的两个普通窗口都必须在临界点换号，且只在真实承载后重绑。
+/// @return 无；达线、粘性绑定或账号状态错误时测试失败。
+#[tokio::test]
+async fn usage_limits_sticky_boundary_supports_both_windows_and_auth_types() {
+    for oauth in [false, true] {
+        for (window, limit) in [("five_hour", 80), ("seven_day", 60)] {
+            let (store, svc) = setup().await;
+            let mut account = create_test_account(&svc, "limited@example.invalid").await;
+            let spare = create_test_account(&svc, "spare@example.invalid").await;
+            if oauth {
+                mark_oauth_account(&svc, &mut account).await;
+            }
+            account.five_hour_usage_limit_percent = 80;
+            account.seven_day_usage_limit_percent = 60;
+            svc.update_account(&account).await.unwrap();
+            let session = "usage-limit-boundary";
+            svc.bind_selected_session(session, account.id)
+                .await
+                .unwrap();
+            for (utilization, expected) in [
+                (f64::from(limit) - 0.1, account.id),
+                (f64::from(limit), spare.id),
+            ] {
+                let mut usage = json!({});
+                usage[window] = json!({
+                    "utilization": utilization,
+                    "resets_at": (Utc::now() + Duration::hours(2)).to_rfc3339(),
+                });
+                store
+                    .update_usage(account.id, &usage.to_string())
+                    .await
+                    .unwrap();
+                let selected = svc
+                    .select_account_with_selection_context(
+                        session,
+                        &[],
+                        &[],
+                        &usage_limits_context(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(selected.account.id, expected, "{window}, OAuth={oauth}");
+                assert_eq!(selected.sticky, expected == account.id);
+                assert_eq!(selected.should_bind_session, expected != account.id);
+            }
+            let original = svc
+                .select_account_with_context(session, &[], &[])
+                .await
+                .unwrap();
+            assert_eq!(original.account.id, account.id, "换号前不得删除旧绑定");
+            svc.bind_selected_session(session, spare.id).await.unwrap();
+            let rebound = svc
+                .select_account_with_selection_context(session, &[], &[], &usage_limits_context())
+                .await
+                .unwrap();
+            assert_eq!(rebound.account.id, spare.id);
+            assert!(rebound.sticky);
+            let unchanged = svc.get_account(account.id).await.unwrap();
+            assert_eq!(unchanged.status, AccountStatus::Active);
+            assert!(unchanged.rate_limit_reset_at.is_none());
+        }
+    }
+}
+
+/// 各账号使用独立百分比，达线过滤不能越过令牌范围或回退到受限账号。
+/// @return 无；控制线、关闭或令牌范围错误时测试失败。
+#[tokio::test]
+async fn usage_limits_are_per_account_and_respect_token_scope() {
+    let (store, svc) = setup().await;
+    let mut first = create_test_account(&svc, "first-limit@example.invalid").await;
+    let mut second = create_test_account(&svc, "second-limit@example.invalid").await;
+    first.priority = 1;
+    first.five_hour_usage_limit_percent = 80;
+    second.five_hour_usage_limit_percent = 90;
+    for account in [&first, &second] {
+        svc.update_account(account).await.unwrap();
+        store.update_usage(account.id, &json!({
+            "five_hour": {"utilization": 85, "resets_at": (Utc::now() + Duration::hours(2)).to_rfc3339()},
+        }).to_string()).await.unwrap();
+    }
+    let context = usage_limits_context();
+    assert_eq!(
+        svc.select_account_with_selection_context("", &[], &[], &context)
+            .await
+            .unwrap()
+            .account
+            .id,
+        second.id
+    );
+    svc.bind_selected_session("limited-only", first.id)
+        .await
+        .unwrap();
+    for (excluded, allowed) in [(vec![], vec![first.id]), (vec![second.id], vec![])] {
+        let result = svc
+            .select_account_with_selection_context("limited-only", &excluded, &allowed, &context)
+            .await;
+        assert!(
+            matches!(result, Err(AppError::TooManyRequests(ref message)) if message.contains("用量上限"))
+        );
+    }
+    assert_eq!(
+        svc.select_account_with_context("limited-only", &[], &[])
+            .await
+            .unwrap()
+            .account
+            .id,
+        first.id
+    );
+    first.five_hour_usage_limit_percent = 0;
+    svc.update_account(&first).await.unwrap();
+    assert_eq!(
+        svc.select_account_with_selection_context("limited-only", &[], &[], &context)
+            .await
+            .unwrap()
+            .account
+            .id,
+        first.id
+    );
+}
+
+/// 过期、缺失或脏窗口不能误伤账号，两个窗口的有效达线判断彼此独立。
+/// @return 无；窗口恢复、阈值调整或脏数据处理错误时测试失败。
+#[tokio::test]
+async fn usage_limits_invalid_windows_reset_and_configuration_recovery() {
+    let (store, svc) = setup().await;
+    let mut account = create_test_account(&svc, "window-recovery@example.invalid").await;
+    account.five_hour_usage_limit_percent = 50;
+    account.seven_day_usage_limit_percent = 50;
+    svc.update_account(&account).await.unwrap();
+    let future = (Utc::now() + Duration::hours(2)).to_rfc3339();
+    let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+    for window in ["five_hour", "seven_day"] {
+        for invalid in [
+            json!(null),
+            json!({}),
+            json!({"utilization": -1, "resets_at": future}),
+            json!({"utilization": "100", "resets_at": future}),
+            json!({"utilization": true, "resets_at": future}),
+            json!({"utilization": 100}),
+            json!({"utilization": 100, "resets_at": null}),
+            json!({"utilization": 100, "resets_at": "invalid"}),
+            json!({"utilization": 100, "resets_at": past}),
+        ] {
+            let mut usage = json!({});
+            usage[window] = invalid;
+            store
+                .update_usage(account.id, &usage.to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                svc.select_account_with_selection_context("", &[], &[], &usage_limits_context())
+                    .await
+                    .unwrap()
+                    .account
+                    .id,
+                account.id
+            );
+        }
+    }
+    store
+        .update_usage(
+            account.id,
+            &json!({
+                "five_hour": {"utilization": 100, "resets_at": past},
+                "seven_day": {"utilization": 50, "resets_at": future},
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        svc.select_account_with_selection_context("", &[], &[], &usage_limits_context())
+            .await,
+        Err(AppError::TooManyRequests(_))
+    ));
+    // 非消息入口继续兼容；调高后下一次选号即可恢复，不依赖后台清理。
+    assert_eq!(
+        svc.select_account("", &[], &[]).await.unwrap().id,
+        account.id
+    );
+    account.seven_day_usage_limit_percent = 51;
+    svc.update_account(&account).await.unwrap();
+    assert!(
+        svc.select_account_with_selection_context("", &[], &[], &usage_limits_context())
+            .await
+            .is_ok()
+    );
+    account.seven_day_usage_limit_percent = 100;
+    svc.update_account(&account).await.unwrap();
+    for (utilization, blocked) in [(99.9, false), (100.0, true)] {
+        store
+            .update_usage(
+                account.id,
+                &json!({
+                    "seven_day": {"utilization": utilization, "resets_at": future},
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.select_account_with_selection_context("", &[], &[], &usage_limits_context())
+                .await
+                .is_err(),
+            blocked
+        );
+    }
+}
+
+/// 普通窗口与 Fable 窗口可以分别排除不同账号，不能在过滤后重新放回。
+/// @return 无；混合限制被绕过或污染非 Fable 请求时测试失败。
+#[tokio::test]
+async fn usage_limits_combine_with_fable_without_fallback_to_blocked_accounts() {
+    let (store, svc) = setup().await;
+    let mut general = create_test_account(&svc, "general-limit@example.invalid").await;
+    let mut fable = create_test_account(&svc, "fable-limit@example.invalid").await;
+    mark_oauth_account(&svc, &mut general).await;
+    mark_oauth_account(&svc, &mut fable).await;
+    general.five_hour_usage_limit_percent = 80;
+    svc.update_account(&general).await.unwrap();
+    store.update_usage(general.id, &json!({
+        "five_hour": {"utilization": 80, "resets_at": (Utc::now() + Duration::hours(2)).to_rfc3339()},
+    }).to_string()).await.unwrap();
+    store
+        .update_usage(
+            fable.id,
+            &fable_usage_window(50, Duration::days(3)).to_string(),
+        )
+        .await
+        .unwrap();
+    let mut context = fable_selection_context(true, "claude-fable-5");
+    context.usage_limits_enabled = true;
+    for session in ["", "mixed-limit-session"] {
+        if !session.is_empty() {
+            svc.bind_selected_session(session, general.id)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            svc.select_account_with_selection_context(session, &[], &[], &context)
+                .await,
+            Err(AppError::TooManyRequests(_))
+        ));
+    }
+    context.request_model = Some("claude-sonnet-5".into());
+    assert_eq!(
+        svc.select_account_with_selection_context("", &[], &[], &context)
+            .await
+            .unwrap()
+            .account
+            .id,
+        fable.id
+    );
+}
+
+/// 内部服务调用也必须拒绝非法控制线，不能只依赖 HTTP 表单校验。
+/// @return 无；无效创建或更新成功时测试失败。
+#[tokio::test]
+async fn usage_limits_service_rejects_out_of_range_without_writing() {
+    let (_, svc) = setup().await;
+    let original = create_test_account(&svc, "validation@example.invalid").await;
+    for value in [-1, 101] {
+        for five_hour in [false, true] {
+            let mut invalid = original.clone();
+            if five_hour {
+                invalid.five_hour_usage_limit_percent = value;
+            } else {
+                invalid.seven_day_usage_limit_percent = value;
+            }
+            assert!(matches!(
+                svc.update_account(&invalid).await,
+                Err(AppError::BadRequest(_))
+            ));
+            invalid.id = 0;
+            invalid.email = "invalid-create@example.invalid".into();
+            assert!(matches!(
+                svc.create_account(&mut invalid).await,
+                Err(AppError::BadRequest(_))
+            ));
+        }
+    }
+    let unchanged = svc.get_account(original.id).await.unwrap();
+    assert_eq!(unchanged.five_hour_usage_limit_percent, 0);
+    assert_eq!(unchanged.seven_day_usage_limit_percent, 0);
+    assert_eq!(svc.list_accounts().await.unwrap().len(), 1);
 }
 
 // ─── 429 限流测试 ────────────────────────────────────────────

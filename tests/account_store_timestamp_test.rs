@@ -1,5 +1,7 @@
 use chrono::{Duration, Utc};
+use serde_json::json;
 use sqlx::AnyPool;
+use sqlx::any::AnyPoolOptions;
 use std::env::temp_dir;
 use std::fs::remove_file;
 use std::sync::Arc;
@@ -22,6 +24,137 @@ async fn setup() -> Arc<AccountStore> {
         .await
         .expect("failed to run migrations");
     Arc::new(AccountStore::new(pool, "sqlite".into()))
+}
+
+/// 对两种数据库运行旧库升级、重复迁移与账号字段读写合同。
+/// @param pool 当前测试专用数据库。
+/// @param driver 数据库类型。
+/// @return 无；默认值丢失、迁移覆盖或 SQL 映射错误时测试失败。
+async fn usage_limits_storage_contract(pool: &AnyPool, driver: &str) {
+    migrate(pool, driver).await.unwrap();
+    let store = AccountStore::new(pool.clone(), driver.into());
+    let mut account = new_account("usage-limits-storage@example.invalid");
+    store.create(&mut account).await.unwrap();
+    // 在独立测试库中模拟升级前已有账号且尚未添加新列的状态。
+    for column in [
+        "five_hour_usage_limit_percent",
+        "seven_day_usage_limit_percent",
+    ] {
+        sqlx::query(&format!("ALTER TABLE accounts DROP COLUMN {column}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    migrate(pool, driver).await.unwrap();
+    let upgraded = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(upgraded.five_hour_usage_limit_percent, 0);
+    assert_eq!(upgraded.seven_day_usage_limit_percent, 0);
+    account.five_hour_usage_limit_percent = 80;
+    account.seven_day_usage_limit_percent = 60;
+    store.update(&account).await.unwrap();
+    migrate(pool, driver).await.unwrap();
+    store
+        .update_usage(
+            account.id,
+            &json!({"five_hour": {"utilization": 12}}).to_string(),
+        )
+        .await
+        .unwrap();
+    store
+        .update_status(account.id, AccountStatus::Active)
+        .await
+        .unwrap();
+    let refreshed_until = Utc::now() + Duration::hours(3);
+    store
+        .update_oauth_tokens(
+            account.id,
+            "synthetic-next-access",
+            "synthetic-next-refresh",
+            refreshed_until,
+        )
+        .await
+        .unwrap();
+    let process = json!({"constrained_memory": 1024});
+    store.update_cli_process(&account, &process).await.unwrap();
+    let refreshed = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(
+        refreshed.expires_at.unwrap().timestamp(),
+        refreshed_until.timestamp()
+    );
+    assert!(refreshed.oauth_refreshed_at.is_some());
+    assert_eq!(refreshed.canonical_process, process);
+    // 模拟控制线更新时持有旧快照，必须保留稍后刷新的 OAuth 和账号状态。
+    store
+        .update_status(account.id, AccountStatus::Disabled)
+        .await
+        .unwrap();
+    account.five_hour_usage_limit_percent = 81;
+    store.update_usage_limits(&account).await.unwrap();
+    let updated = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(updated.status, AccountStatus::Disabled);
+    assert_eq!(updated.access_token, "synthetic-next-access");
+    assert_eq!(updated.canonical_process, process);
+    assert_eq!(updated.five_hour_usage_limit_percent, 81);
+    account.five_hour_usage_limit_percent = 80;
+    store.update_usage_limits(&account).await.unwrap();
+    store
+        .update_status(account.id, AccountStatus::Active)
+        .await
+        .unwrap();
+    let mut created = new_account("usage-limits-created@example.invalid");
+    created.five_hour_usage_limit_percent = 100;
+    created.seven_day_usage_limit_percent = 1;
+    store.create(&mut created).await.unwrap();
+    let read = store.get_by_id(created.id).await.unwrap();
+    assert_eq!(
+        (
+            read.five_hour_usage_limit_percent,
+            read.seven_day_usage_limit_percent
+        ),
+        (100, 1)
+    );
+    for rows in [
+        store.list().await.unwrap(),
+        store.list_paged(1, 100).await.unwrap(),
+        store.list_schedulable().await.unwrap(),
+    ] {
+        let read = rows.iter().find(|row| row.id == account.id).unwrap();
+        assert_eq!(
+            (
+                read.five_hour_usage_limit_percent,
+                read.seven_day_usage_limit_percent
+            ),
+            (80, 60)
+        );
+    }
+    assert_eq!(
+        store.get_by_id(account.id).await.unwrap().usage_data["five_hour"]["utilization"],
+        12
+    );
+}
+
+/// SQLite 旧库升级后默认关闭，重复升级不能覆盖管理员配置。
+/// @return 无；迁移或持久化合同异常时测试失败。
+#[tokio::test]
+async fn usage_limits_sqlite_storage_and_legacy_migration() {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    usage_limits_storage_contract(&pool, "sqlite").await;
+}
+
+/// 在显式提供的独立 PostgreSQL 测试库验证同一账号字段合同。
+/// @return 无；PostgreSQL 迁移或 SQL 读写异常时测试失败。
+#[tokio::test]
+#[ignore = "需要 CC2API_USAGE_LIMITS_TEST_POSTGRES_DSN 指向独立临时数据库"]
+async fn usage_limits_postgres_storage_and_legacy_migration() {
+    sqlx::any::install_default_drivers();
+    let dsn = std::env::var("CC2API_USAGE_LIMITS_TEST_POSTGRES_DSN").expect("须提供独立临时数据库");
+    let pool = AnyPool::connect(&dsn).await.unwrap();
+    usage_limits_storage_contract(&pool, "postgres").await;
 }
 
 fn new_account(email: &str) -> Account {
@@ -49,6 +182,8 @@ fn new_account(email: &str) -> Account {
         concurrency: 3,
         priority: 50,
         rpm_limit: 0,
+        five_hour_usage_limit_percent: 0,
+        seven_day_usage_limit_percent: 0,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),

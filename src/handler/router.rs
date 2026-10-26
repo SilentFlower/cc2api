@@ -408,6 +408,7 @@ async fn list_accounts(
     })))
 }
 
+/// 管理端创建账号载荷，省略账号用量控制线时默认关闭。
 #[derive(Deserialize)]
 struct CreateAccountRequest {
     cli_identity: Option<CliIdentityImport>,
@@ -427,6 +428,10 @@ struct CreateAccountRequest {
     concurrency: Option<i32>,
     priority: Option<i32>,
     rpm_limit: Option<i32>,
+    #[serde(default)]
+    five_hour_usage_limit_percent: i32,
+    #[serde(default)]
+    seven_day_usage_limit_percent: i32,
     auto_telemetry: Option<bool>,
     auto_poll_usage: Option<bool>,
     allow_1m_models: Option<String>,
@@ -676,6 +681,8 @@ async fn create_account(
         concurrency: req.concurrency.unwrap_or(3),
         priority: req.priority.unwrap_or(50),
         rpm_limit: req.rpm_limit.unwrap_or(0).max(0),
+        five_hour_usage_limit_percent: req.five_hour_usage_limit_percent,
+        seven_day_usage_limit_percent: req.seven_day_usage_limit_percent,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),
@@ -835,6 +842,25 @@ async fn update_account(
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Account>, AppError> {
     let mut existing = state.account_svc.get_account(id).await?;
+    // 先校验新字段，避免状态快捷操作或其它配置先写入后才发现限额无效。
+    for (key, limit) in [
+        (
+            "five_hour_usage_limit_percent",
+            &mut existing.five_hour_usage_limit_percent,
+        ),
+        (
+            "seven_day_usage_limit_percent",
+            &mut existing.seven_day_usage_limit_percent,
+        ),
+    ] {
+        if let Some(value) = updates.get(key) {
+            let number = value
+                .as_i64()
+                .filter(|number| (0..=100).contains(number))
+                .ok_or_else(|| AppError::BadRequest(format!("{key} 必须是 0～100 的整数")))?;
+            *limit = number as i32;
+        }
+    }
     let _runtime_permit = if [
         "proxy_url",
         "auth_type",
@@ -918,17 +944,26 @@ async fn update_account(
         if !status.is_empty() {
             if status == "active" {
                 state.account_svc.enable_account(id).await?;
-                existing = state.account_svc.get_account(id).await?;
-                return Ok(Json(existing));
             } else if status == "disabled" {
                 state
                     .account_svc
                     .disable_account(id, AccountStatus::Disabled, "手动停用", None)
                     .await?;
-                existing = state.account_svc.get_account(id).await?;
-                return Ok(Json(existing));
             } else {
                 existing.status = status.to_string().into();
+            }
+            if status == "active" || status == "disabled" {
+                if updates.get("five_hour_usage_limit_percent").is_some()
+                    || updates.get("seven_day_usage_limit_percent").is_some()
+                {
+                    // 只写控制线，不能把状态操作前的旧凭据或状态整行写回。
+                    state
+                        .account_svc
+                        .update_account_usage_limits(&existing)
+                        .await?;
+                }
+                existing = state.account_svc.get_account(id).await?;
+                return Ok(Json(existing));
             }
         }
     }
@@ -1842,6 +1877,8 @@ mod tests {
     use axum::Router;
     use axum::body::{self, Body};
     use axum::http::{Method, Request, StatusCode, header};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::{Value, json};
     use sqlx::any::AnyPoolOptions;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1999,6 +2036,171 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    /// 调用管理 JSON 接口并读取受限大小的返回值。
+    /// @param app 测试路由。
+    /// @param method HTTP 方法。
+    /// @param path 管理接口路径。
+    /// @param payload 合成请求载荷。
+    /// @return 状态码和 JSON；反序列化拒绝可能返回非 JSON，此时以 null 表示。
+    async fn account_admin_json(
+        app: &Router,
+        method: Method,
+        path: &str,
+        payload: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// bench 现有创建载荷省略新字段时继续成功，后续局部更新不覆盖已保存限制。
+    /// @return 无；旧 API 载荷、默认值或局部更新兼容性异常时测试失败。
+    #[tokio::test]
+    async fn usage_limits_bench_creation_and_partial_update_are_compatible() {
+        let (app, _) = test_router_with_gateway().await;
+        let payload = json!({
+            "name": "synthetic-bench", "email": "bench-created@example.invalid",
+            "auth_type": "oauth", "access_token": "synthetic-access", "refresh_token": "synthetic-refresh",
+            "expires_at": (Utc::now() + ChronoDuration::hours(2)).timestamp_millis(),
+            "proxy_url": "", "account_uuid": "synthetic-account", "organization_uuid": "synthetic-org",
+            "subscription_type": "max", "allow_fast_mode": false, "billing_mode": "rewrite",
+            "upstream_session_pool_enabled": true, "upstream_session_pool_size": 4,
+            "upstream_session_refresh_policy": "owner_only", "concurrency": 4, "rpm_limit": 50,
+        });
+        let (status, account) =
+            account_admin_json(&app, Method::POST, "/admin/accounts", payload).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(account["five_hour_usage_limit_percent"], 0);
+        assert_eq!(account["seven_day_usage_limit_percent"], 0);
+        for (key, value) in [
+            ("concurrency", 4),
+            ("rpm_limit", 50),
+            ("upstream_session_pool_size", 4),
+        ] {
+            assert_eq!(account[key], value);
+        }
+        assert_eq!(account["billing_mode"], "rewrite");
+        assert_eq!(account["upstream_session_refresh_policy"], "owner_only");
+        let path = format!("/admin/accounts/{}", account["id"].as_i64().unwrap());
+        for payload in [
+            json!({"five_hour_usage_limit_percent": 80, "seven_day_usage_limit_percent": 60}),
+            json!({"proxy_url": "", "name": "bench-updated"}),
+        ] {
+            let (status, updated) = account_admin_json(&app, Method::PUT, &path, payload).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(updated["five_hour_usage_limit_percent"], 80);
+            assert_eq!(updated["seven_day_usage_limit_percent"], 60);
+            assert_eq!(updated["rpm_limit"], 50);
+            assert_eq!(updated["concurrency"], 4);
+        }
+        let (status, updated) = account_admin_json(
+            &app,
+            Method::PUT,
+            &path,
+            json!({"five_hour_usage_limit_percent": 0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["five_hour_usage_limit_percent"], 0);
+        assert_eq!(updated["seven_day_usage_limit_percent"], 60);
+        let (status, listed) = account_admin_json(
+            &app,
+            Method::GET,
+            "/admin/accounts?page=1&page_size=100",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"][0]["seven_day_usage_limit_percent"], 60);
+        for (status, payload, expected) in [
+            (
+                "disabled",
+                json!({"five_hour_usage_limit_percent": 70}),
+                (70, 60),
+            ),
+            (
+                "active",
+                json!({"seven_day_usage_limit_percent": 50}),
+                (70, 50),
+            ),
+        ] {
+            let mut update = payload;
+            update["status"] = json!(status);
+            let (code, updated) = account_admin_json(&app, Method::PUT, &path, update).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(updated["status"], status);
+            assert_eq!(updated["five_hour_usage_limit_percent"], expected.0);
+            assert_eq!(updated["seven_day_usage_limit_percent"], expected.1);
+            assert_eq!(updated["rpm_limit"], 50);
+        }
+    }
+
+    /// 管理接口严格拒绝错误类型和范围，不能静默忽略或部分写入。
+    /// @return 无；非法控制线被接受、账号被额外创建或原配置变化时测试失败。
+    #[tokio::test]
+    async fn usage_limits_admin_rejects_invalid_values_before_any_write() {
+        let (app, _) = test_router_with_gateway().await;
+        let (status, account) = account_admin_json(&app, Method::POST, "/admin/accounts", json!({
+            "name": "original", "email": "limits-validation@example.invalid", "setup_token": "synthetic-setup",
+            "five_hour_usage_limit_percent": 80, "seven_day_usage_limit_percent": 60,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let path = format!("/admin/accounts/{}", account["id"].as_i64().unwrap());
+        for key in [
+            "five_hour_usage_limit_percent",
+            "seven_day_usage_limit_percent",
+        ] {
+            for value in [
+                json!(-1),
+                json!(101),
+                json!(50.5),
+                json!("80"),
+                json!(true),
+                Value::Null,
+                json!(i64::MAX),
+            ] {
+                let mut update = json!({"name": "must-not-save", "status": "disabled"});
+                update[key] = value.clone();
+                let (status, _) = account_admin_json(&app, Method::PUT, &path, update).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                let mut create = json!({"email": "invalid-create@example.invalid", "setup_token": "synthetic-setup"});
+                create[key] = value;
+                assert!(
+                    !account_admin_json(&app, Method::POST, "/admin/accounts", create)
+                        .await
+                        .0
+                        .is_success()
+                );
+            }
+        }
+        let (_, listed) =
+            account_admin_json(&app, Method::GET, "/admin/accounts", Value::Null).await;
+        assert_eq!(listed["total"], 1);
+        let unchanged = &listed["data"][0];
+        assert_eq!(unchanged["name"], "original");
+        assert_eq!(unchanged["status"], "active");
+        assert_eq!(unchanged["five_hour_usage_limit_percent"], 80);
+        assert_eq!(unchanged["seven_day_usage_limit_percent"], 60);
     }
 
     /// 账号列表随刷新返回本地用量，不把读取转换成主动额度查询。

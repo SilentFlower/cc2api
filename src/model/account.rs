@@ -159,6 +159,7 @@ impl From<String> for AccountAuthType {
     }
 }
 
+/// 网关账号的身份、运行配置、凭据和最近观测用量。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: i64,
@@ -203,6 +204,12 @@ pub struct Account {
     /// 账号级每分钟请求数上限，0 表示不限制。
     #[serde(default)]
     pub rpm_limit: i32,
+    /// 账号 5 小时用量百分比上限，0 表示不限制，启用时为 1～100。
+    #[serde(default)]
+    pub five_hour_usage_limit_percent: i32,
+    /// 账号 7 天用量百分比上限，0 表示不限制，启用时为 1～100。
+    #[serde(default)]
+    pub seven_day_usage_limit_percent: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limited_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]

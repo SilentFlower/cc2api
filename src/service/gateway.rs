@@ -1803,6 +1803,7 @@ impl GatewayService {
             path == "/v1/messages" && *self.fable_sticky_quota_fallback_enabled.read().await;
         let fable_weekly_usage_limit_percent = *self.fable_weekly_usage_limit_percent.read().await;
         let account_selection_context = AccountSelectionContext {
+            usage_limits_enabled: path == "/v1/messages",
             fable_quota_fallback_enabled,
             fable_weekly_usage_limit_percent,
             request_model,
@@ -7313,7 +7314,7 @@ mod tests {
     use crate::model::request_diagnostics::DiagnosticQuery;
     use crate::service::account::{
         AccountSelectionContext, AccountService, DEFAULT_REQUEST_SLOT_UNITS,
-        HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
+        HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, UsageObservationKind,
     };
     use crate::service::rewriter::{
         CLAUDE_CODE_SYSTEM_PROMPT, ClientType, Rewriter, StatefulCacheUsage, UpstreamSessionRewrite,
@@ -7348,11 +7349,11 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use bytes::Bytes;
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use http_body_util::BodyExt;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sqlx::AnyPool;
     use std::collections::HashMap;
     use std::convert::Infallible;
@@ -7556,6 +7557,8 @@ mod tests {
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,
+            five_hour_usage_limit_percent: 0,
+            seven_day_usage_limit_percent: 0,
             rate_limited_at: None,
             rate_limit_reset_at: None,
             disable_reason: String::new(),
@@ -8409,6 +8412,91 @@ mod tests {
             .await
             .expect("create account");
         account
+    }
+
+    /// 消息请求实际跳过达线账号，全部达线时本地拒绝，count_tokens 继续可用。
+    /// @return 无；入口范围、热生效或真实上游选择异常时测试失败。
+    #[tokio::test]
+    async fn usage_limits_gateway_filters_messages_and_preserves_count_tokens() {
+        let (upstream, state, server) = spawn_auth_mock_server().await;
+        let service =
+            test_gateway_service_with_urls(upstream.clone(), format!("{upstream}/oauth/token"))
+                .await;
+        let mut first =
+            create_setup_gateway_account(&service, "quota-first@example.invalid", "setup-quota", 1)
+                .await;
+        let mut second = create_setup_gateway_account(
+            &service,
+            "quota-second@example.invalid",
+            "setup-spare",
+            50,
+        )
+        .await;
+        first.five_hour_usage_limit_percent = 80;
+        second.five_hour_usage_limit_percent = 90;
+        let reset = (Utc::now() + ChronoDuration::hours(2)).to_rfc3339();
+        for (account, utilization) in [(&first, 80), (&second, 85)] {
+            service.account_svc.update_account(account).await.unwrap();
+            service
+                .account_svc
+                .update_passive_usage(
+                    account.id,
+                    json!({
+                        "five_hour": {"utilization": utilization, "resets_at": reset},
+                    }),
+                    UsageObservationKind::Allowed,
+                )
+                .await
+                .unwrap();
+        }
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            *state.authorization_headers.lock().await,
+            vec!["Bearer setup-spare"]
+        );
+        service
+            .account_svc
+            .update_passive_usage(
+                second.id,
+                json!({
+                    "five_hour": {"utilization": 90, "resets_at": reset},
+                }),
+                UsageObservationKind::Allowed,
+            )
+            .await
+            .unwrap();
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(error["error"].as_str().unwrap().contains("用量上限"));
+        assert_eq!(state.requests.lock().await.len(), 1, "达线请求不得发送上游");
+        let response = service
+            .handle_count_tokens_request(count_tokens_request(), None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        first.five_hour_usage_limit_percent = 81;
+        service.account_svc.update_account(&first).await.unwrap();
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.authorization_headers.lock().await.last().unwrap(),
+            "Bearer setup-quota"
+        );
+        assert_eq!(state.requests.lock().await.len(), 3);
+        server.abort();
     }
 
     /// 验证真实转发在关闭遥测时仍记录 JSON、SSE、压缩及取消后的已观察用量。

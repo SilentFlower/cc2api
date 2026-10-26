@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::AnyPool;
 use sqlx::Row;
@@ -12,12 +12,17 @@ use crate::model::account::{
 };
 use crate::service::version_profile::IdentityProfile;
 
+/// 统一保存和读取 SQLite/PostgreSQL 账号配置与凭据。
 pub struct AccountStore {
     pool: AnyPool,
     driver: String,
 }
 
 impl AccountStore {
+    /// 创建与目标数据库驱动匹配的账号存储。
+    /// @param pool 数据库连接池。
+    /// @param driver sqlite 或 postgres。
+    /// @return 账号存储实例。
     pub fn new(pool: AnyPool, driver: String) -> Self {
         Self { pool, driver }
     }
@@ -38,7 +43,7 @@ impl AccountStore {
         t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
-    /// Returns `$N` for SQLite or `$N::TIMESTAMPTZ` for Postgres
+    /// 为 PostgreSQL 显式转换文本时间参数，SQLite 保留原占位符。
     fn ts(&self, n: u32) -> String {
         if self.is_pg() {
             format!("${}::TIMESTAMPTZ", n)
@@ -47,27 +52,35 @@ impl AccountStore {
         }
     }
 
-    fn parse_time(row: &AnyRow, col: &str) -> DateTime<Utc> {
-        // SQLite returns string, Postgres returns native
-        if let Ok(s) = row.try_get::<String, _>(col) {
-            NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%SZ")
-                .map(|n| n.and_utc())
-                .unwrap_or_default()
+    /// SQLx Any 不直接支持 JSONB，写入 PostgreSQL 原生 JSON 列时需要显式转换。
+    fn json(&self, n: u32) -> String {
+        if self.is_pg() {
+            format!("${n}::JSONB")
         } else {
-            Utc::now()
+            format!("${n}")
         }
     }
 
+    /// 兼容 SQLite 的 RFC3339 和 PostgreSQL 文本化后的带时区时间。
+    fn parse_stored_time(value: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(value)
+            .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z"))
+            .ok()
+            .map(|time| time.with_timezone(&Utc))
+    }
+
+    fn parse_time(row: &AnyRow, col: &str) -> DateTime<Utc> {
+        row.try_get::<String, _>(col)
+            .ok()
+            .and_then(|value| Self::parse_stored_time(&value))
+            .unwrap_or_default()
+    }
+
     fn parse_optional_time(row: &AnyRow, col: &str) -> Option<DateTime<Utc>> {
-        if let Ok(s) = row.try_get::<Option<String>, _>(col) {
-            s.and_then(|s| {
-                NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%SZ")
-                    .map(|n| n.and_utc())
-                    .ok()
-            })
-        } else {
-            None
-        }
+        row.try_get::<Option<String>, _>(col)
+            .ok()
+            .flatten()
+            .and_then(|value| Self::parse_stored_time(&value))
     }
 
     fn parse_json(row: &AnyRow, col: &str) -> Value {
@@ -120,6 +133,12 @@ impl AccountStore {
             concurrency: row.try_get::<i32, _>("concurrency").unwrap_or(3),
             priority: row.try_get::<i32, _>("priority").unwrap_or(50),
             rpm_limit: row.try_get::<i32, _>("rpm_limit").unwrap_or(0),
+            five_hour_usage_limit_percent: row
+                .try_get::<i32, _>("five_hour_usage_limit_percent")
+                .unwrap_or(0),
+            seven_day_usage_limit_percent: row
+                .try_get::<i32, _>("seven_day_usage_limit_percent")
+                .unwrap_or(0),
             rate_limited_at: Self::parse_optional_time(row, "rate_limited_at"),
             rate_limit_reset_at: Self::parse_optional_time(row, "rate_limit_reset_at"),
             disable_reason: row
@@ -191,12 +210,15 @@ impl AccountStore {
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models,
                 allow_fast_mode, upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
-                upstream_session_refresh_policy)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
-            RETURNING id, created_at, updated_at"#,
+                upstream_session_refresh_policy, five_hour_usage_limit_percent, seven_day_usage_limit_percent)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+            RETURNING id, CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at"#,
             self.ts(9),
             self.ts(10),
-            "$11"
+            "$11",
+            self.json(13),
+            self.json(14),
+            self.json(15)
         );
         // SQLite WAL 下只取 RETURNING 首行会在语句完成前返回，必须消费到结束才确认提交。
         let rows: Vec<AnyRow> = sqlx::query(&q)
@@ -230,6 +252,8 @@ impl AccountStore {
             .bind(a.upstream_session_pool_size)
             .bind(a.upstream_session_ttl_minutes)
             .bind(&a.upstream_session_refresh_policy)
+            .bind(a.five_hour_usage_limit_percent)
+            .bind(a.seven_day_usage_limit_percent)
             .fetch_all(&self.pool)
             .await?;
         let row = rows.first().ok_or(AppError::NotFound)?;
@@ -240,6 +264,9 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 保存账号的可编辑配置并保留独立更新的用量与进程指标。
+    /// @param a 已校验的完整账号配置。
+    /// @return 数据库写入结果。
     pub async fn update(&self, a: &Account) -> Result<(), AppError> {
         let expires_at = a.expires_at.map(|t| self.fmt_time(t));
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
@@ -259,8 +286,9 @@ impl AccountStore {
                 concurrency=$16, priority=$17, rpm_limit=$18, auto_telemetry=$19, auto_poll_usage=$20,
                 allow_1m_models=$21, allow_fast_mode=$22, upstream_session_pool_enabled=$23,
                 upstream_session_pool_size=$24, upstream_session_ttl_minutes=$25,
-                upstream_session_refresh_policy=$26, updated_at={}
-            WHERE id=$27"#,
+                upstream_session_refresh_policy=$26, five_hour_usage_limit_percent=$27,
+                seven_day_usage_limit_percent=$28, updated_at={}
+            WHERE id=$29"#,
             self.ts(8),
             self.ts(9),
             self.now_expr()
@@ -292,7 +320,26 @@ impl AccountStore {
             .bind(a.upstream_session_pool_size)
             .bind(a.upstream_session_ttl_minutes)
             .bind(&a.upstream_session_refresh_policy)
+            .bind(a.five_hour_usage_limit_percent)
+            .bind(a.seven_day_usage_limit_percent)
             .bind(a.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 只更新账号的两个用量控制线，避免状态快捷操作覆盖其它配置或凭据。
+    /// @param account 已通过值域校验的账号控制线快照。
+    /// @return 数据库写入结果。
+    pub async fn update_usage_limits(&self, account: &Account) -> Result<(), AppError> {
+        let query = format!(
+            "UPDATE accounts SET five_hour_usage_limit_percent=$1, seven_day_usage_limit_percent=$2, updated_at={} WHERE id=$3",
+            self.now_expr()
+        );
+        sqlx::query(&query)
+            .bind(account.five_hour_usage_limit_percent)
+            .bind(account.seven_day_usage_limit_percent)
+            .bind(account.id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -308,8 +355,9 @@ impl AccountStore {
         process: &Value,
     ) -> Result<(), AppError> {
         let query = format!(
-            "UPDATE accounts SET canonical_process=$1, updated_at={} \
+            "UPDATE accounts SET canonical_process={}, updated_at={} \
             WHERE id=$2 AND device_id=$3 AND COALESCE(account_uuid,'')=$4 AND email=$5 AND auth_type='oauth'",
+            self.json(1),
             self.now_expr()
         );
         let changed = sqlx::query(&query)
@@ -788,15 +836,23 @@ impl AccountStore {
     }
 }
 
+// 将原生 JSON/时间列统一投影为文本，避免 SQLx Any 无法解码 PostgreSQL 类型。
 const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
-    oauth_expires_at, oauth_refreshed_at, auth_error, proxy_url, device_id,
-    canonical_env, canonical_prompt_env, canonical_process,
+    CAST(oauth_expires_at AS TEXT) AS oauth_expires_at,
+    CAST(oauth_refreshed_at AS TEXT) AS oauth_refreshed_at, auth_error, proxy_url, device_id,
+    CAST(canonical_env AS TEXT) AS canonical_env,
+    CAST(canonical_prompt_env AS TEXT) AS canonical_prompt_env,
+    CAST(canonical_process AS TEXT) AS canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
-    concurrency, priority, rpm_limit, rate_limited_at, rate_limit_reset_at,
+    concurrency, priority, rpm_limit, five_hour_usage_limit_percent, seven_day_usage_limit_percent,
+    CAST(rate_limited_at AS TEXT) AS rate_limited_at,
+    CAST(rate_limit_reset_at AS TEXT) AS rate_limit_reset_at,
     disable_reason, auto_telemetry, auto_poll_usage, allow_1m_models, allow_fast_mode,
     upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
     upstream_session_refresh_policy, telemetry_count,
-    usage_data, usage_fetched_at, created_at, updated_at"#;
+    CAST(usage_data AS TEXT) AS usage_data,
+    CAST(usage_fetched_at AS TEXT) AS usage_fetched_at,
+    CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at"#;
 
 #[cfg(test)]
 mod tests {

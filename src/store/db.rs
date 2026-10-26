@@ -154,6 +154,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    for column in [
+        "five_hour_usage_limit_percent",
+        "seven_day_usage_limit_percent",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE accounts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await
+        .ok();
+    }
     sqlx::query(
         "ALTER TABLE accounts ADD COLUMN upstream_session_pool_enabled INTEGER NOT NULL DEFAULT 0",
     )
@@ -689,6 +700,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     concurrency     INTEGER NOT NULL DEFAULT 3,
     priority        INTEGER NOT NULL DEFAULT 50,
     rpm_limit       INTEGER NOT NULL DEFAULT 0,
+    five_hour_usage_limit_percent INTEGER NOT NULL DEFAULT 0,
+    seven_day_usage_limit_percent INTEGER NOT NULL DEFAULT 0,
     allow_fast_mode INTEGER NOT NULL DEFAULT 0,
     upstream_session_pool_enabled INTEGER NOT NULL DEFAULT 0,
     upstream_session_pool_size INTEGER NOT NULL DEFAULT 3,
@@ -724,6 +737,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     concurrency     INT NOT NULL DEFAULT 3,
     priority        INT NOT NULL DEFAULT 50,
     rpm_limit       INT NOT NULL DEFAULT 0,
+    five_hour_usage_limit_percent INT NOT NULL DEFAULT 0,
+    seven_day_usage_limit_percent INT NOT NULL DEFAULT 0,
     allow_fast_mode INT NOT NULL DEFAULT 0,
     upstream_session_pool_enabled INT NOT NULL DEFAULT 0,
     upstream_session_pool_size INT NOT NULL DEFAULT 3,

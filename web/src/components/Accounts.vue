@@ -93,6 +93,8 @@ const form = ref({
   concurrency: 3,
   priority: 50,
   rpm_limit: 0,
+  five_hour_usage_limit_percent: 0,
+  seven_day_usage_limit_percent: 0,
   auto_telemetry: false,
   auto_poll_usage: false,
   allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
@@ -180,6 +182,8 @@ function openCreate() {
     concurrency: 3,
     priority: 50,
     rpm_limit: 0,
+    five_hour_usage_limit_percent: 0,
+    seven_day_usage_limit_percent: 0,
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
@@ -214,6 +218,8 @@ function openEdit(a: Account) {
     concurrency: a.concurrency,
     priority: a.priority,
     rpm_limit: a.rpm_limit ?? 0,
+    five_hour_usage_limit_percent: a.five_hour_usage_limit_percent ?? 0,
+    seven_day_usage_limit_percent: a.seven_day_usage_limit_percent ?? 0,
     auto_telemetry: a.auto_telemetry ?? false,
     auto_poll_usage: a.auto_poll_usage ?? false,
     allow_1m_models: a.allow_1m_models ?? DEFAULT_ALLOW_1M_MODELS,
@@ -226,10 +232,27 @@ function openEdit(a: Account) {
   showForm.value = true;
 }
 
-/** 保存账号（新建或更新） */
+/**
+ * 规整并校验额度输入，拒绝空值和越界数值，避免误将限制关闭。
+ * @param value 输入框当前值。
+ * @param label 用于错误提示的窗口名称。
+ * @return 0～100 的整数百分比。
+ */
+function usageLimitInput(value: unknown, label: string): number {
+  const number = typeof value === 'number' ? value
+    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  if (!Number.isInteger(number) || number < 0 || number > 100) {
+    throw new Error(`${label}用量上限必须为 0～100 的整数，0 表示不限制`);
+  }
+  return number;
+}
+
+/** 保存账号（新建或更新）。@return 保存完成后的空结果。 */
 async function save() {
   try {
     const expiresAt = form.value.expires_at.trim();
+    form.value.five_hour_usage_limit_percent = usageLimitInput(form.value.five_hour_usage_limit_percent, '5 小时');
+    form.value.seven_day_usage_limit_percent = usageLimitInput(form.value.seven_day_usage_limit_percent, '7 天');
     if (form.value.upstream_session_pool_size < 0 || form.value.upstream_session_pool_size > 20) {
       throw new Error('上游 session 池容量必须为 0 或 1-20');
     }
@@ -266,6 +289,8 @@ async function save() {
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       updates.rpm_limit = form.value.rpm_limit;
+      updates.five_hour_usage_limit_percent = form.value.five_hour_usage_limit_percent;
+      updates.seven_day_usage_limit_percent = form.value.seven_day_usage_limit_percent;
       updates.auto_telemetry = form.value.auto_telemetry;
       updates.auto_poll_usage = form.value.auto_poll_usage;
       updates.allow_1m_models = form.value.allow_1m_models;
@@ -297,6 +322,8 @@ async function save() {
         concurrency: form.value.concurrency,
         priority: form.value.priority,
         rpm_limit: form.value.rpm_limit,
+        five_hour_usage_limit_percent: form.value.five_hour_usage_limit_percent,
+        seven_day_usage_limit_percent: form.value.seven_day_usage_limit_percent,
         auto_telemetry: form.value.auto_telemetry,
         auto_poll_usage: form.value.auto_poll_usage,
         allow_1m_models: form.value.allow_1m_models,
@@ -772,6 +799,8 @@ function applyOAuthResult() {
     concurrency: 3,
     priority: 50,
     rpm_limit: 0,
+    five_hour_usage_limit_percent: 0,
+    seven_day_usage_limit_percent: 0,
     auto_telemetry: false,
     auto_poll_usage: false,
     allow_1m_models: DEFAULT_ALLOW_1M_MODELS,
@@ -1028,7 +1057,7 @@ async function copyText(text: string) {
             <div class="space-y-0.5">
               <UsageWindowStats :stats="a.request_usage?.five_hour" label="5h" />
               <div class="flex justify-between text-[11px]">
-                <span class="text-[#8c8475]">5 小时</span>
+                <span class="text-[#8c8475]">5 小时 · {{ a.five_hour_usage_limit_percent > 0 ? `上限 ${a.five_hour_usage_limit_percent}%` : '未限制' }}</span>
                 <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'five_hour')) }}
                   <span v-if="hasFutureReset(usageWindow(a.usage_data, 'five_hour'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'five_hour')?.resets_at) }}</span>
                 </span>
@@ -1043,7 +1072,7 @@ async function copyText(text: string) {
             <div class="space-y-0.5">
               <UsageWindowStats :stats="a.request_usage?.seven_day" label="7d" />
               <div class="flex justify-between text-[11px]">
-                <span class="text-[#8c8475]">7 天</span>
+                <span class="text-[#8c8475]">7 天 · {{ a.seven_day_usage_limit_percent > 0 ? `上限 ${a.seven_day_usage_limit_percent}%` : '未限制' }}</span>
                 <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'seven_day')) }}
                   <span v-if="hasFutureReset(usageWindow(a.usage_data, 'seven_day'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'seven_day')?.resets_at) }}</span>
                 </span>
@@ -1600,6 +1629,37 @@ async function copyText(text: string) {
                 class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
               />
             </div>
+          </div>
+
+          <div class="space-y-2">
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">5 小时用量上限 (%)</Label>
+                <Input
+                  v-model.number="form.five_hour_usage_limit_percent"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+                />
+              </div>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">7 天用量上限 (%)</Label>
+                <Input
+                  v-model.number="form.seven_day_usage_limit_percent"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+                />
+              </div>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">
+              0 表示不限制。达到任一上限后不再分配新消息，窗口重置后恢复。
+              按最近观测用量判断，未知用量允许使用；单次或并发请求可能越线。
+            </p>
           </div>
 
           <DialogFooter class="gap-2 pt-2">

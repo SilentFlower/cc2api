@@ -57,6 +57,8 @@ async fn create_test_account(svc: &AccountService, email: &str, priority: i32) -
         concurrency: 3,
         priority,
         rpm_limit: 0,
+        five_hour_usage_limit_percent: 0,
+        seven_day_usage_limit_percent: 0,
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),

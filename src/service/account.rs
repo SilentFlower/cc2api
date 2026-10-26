@@ -118,6 +118,8 @@ pub struct SelectedAccount {
 /// 账号选择和 429 分类需要的请求模型上下文。
 #[derive(Debug, Clone)]
 pub struct AccountSelectionContext {
+    /// 是否为执行账号 5h/7d 用量控制线的消息请求。
+    pub usage_limits_enabled: bool,
     /// 是否启用 Fable 周用量达到上限后的 sticky fallback 策略。
     pub fable_quota_fallback_enabled: bool,
     /// Fable 周用量百分比上限,范围为 1 到 100。
@@ -127,11 +129,12 @@ pub struct AccountSelectionContext {
 }
 
 impl AccountSelectionContext {
-    /// 构造不启用任何模型级 fallback 的兼容上下文。
+    /// 构造关闭本地用量限制与模型级 fallback 的兼容上下文。
     ///
     /// @return 返回保持旧账号选择与 429 分类行为的上下文。
     pub fn disabled() -> Self {
         Self {
+            usage_limits_enabled: false,
             fable_quota_fallback_enabled: false,
             fable_weekly_usage_limit_percent: 100,
             request_model: None,
@@ -707,6 +710,8 @@ impl AccountService {
     }
 
     /// 创建新账号并自动生成身份信息。
+    /// @param a 待创建账号，成功后回填身份与持久化字段。
+    /// @return 创建或配置校验结果。
     pub async fn create_account(&self, a: &mut Account) -> Result<(), AppError> {
         let (device_id, env, prompt, process) =
             crate::model::identity::generate_canonical_identity();
@@ -734,6 +739,7 @@ impl AccountService {
 
         normalize_account_auth(a)?;
         normalize_upstream_session_pool_config(a)?;
+        validate_account_usage_limits(a)?;
 
         self.store.create(a).await
     }
@@ -766,6 +772,7 @@ impl AccountService {
         }
         normalize_account_auth(account)?;
         normalize_upstream_session_pool_config(account)?;
+        validate_account_usage_limits(account)?;
         self.store.create(account).await
     }
 
@@ -831,11 +838,23 @@ impl AccountService {
         Ok(process)
     }
 
+    /// 校验并保存账号配置，未改变的控制线随账号一起保留。
+    /// @param a 需要持久化的完整账号配置。
+    /// @return 保存结果；无效控制线不会写入。
     pub async fn update_account(&self, a: &Account) -> Result<(), AppError> {
         let mut normalized = a.clone();
         normalize_account_auth(&mut normalized)?;
         normalize_upstream_session_pool_config(&mut normalized)?;
+        validate_account_usage_limits(&normalized)?;
         self.store.update(&normalized).await
+    }
+
+    /// 校验并独立更新账号用量控制线，不写入快照中的凭据或账号状态。
+    /// @param account 包含账号 ID 和两个控制线的快照。
+    /// @return 校验或数据库写入结果。
+    pub async fn update_account_usage_limits(&self, account: &Account) -> Result<(), AppError> {
+        validate_account_usage_limits(account)?;
+        self.store.update_usage_limits(account).await
     }
 
     pub async fn delete_account(&self, id: i64) -> Result<(), AppError> {
@@ -1094,6 +1113,7 @@ impl AccountService {
         let fable_quota_fallback_active = context.is_fable_quota_fallback_active();
         let fable_weekly_usage_limit_percent = context.fable_weekly_usage_limit_percent;
         let mut skipped_sticky_for_fable_quota = false;
+        let mut excluded_for_usage_limit = false;
 
         // 检查粘性会话
         if !session_hash.is_empty() {
@@ -1106,13 +1126,16 @@ impl AccountService {
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
                         {
-                            if fable_quota_fallback_active
-                                && account_fable_weekly_usage_limit_reached(
-                                    &account,
-                                    fable_weekly_usage_limit_percent,
-                                )
+                            let usage_limit_reached = context.usage_limits_enabled
+                                && account_usage_limit_reached(&account);
+                            if usage_limit_reached
+                                || (fable_quota_fallback_active
+                                    && account_fable_weekly_usage_limit_reached(
+                                        &account,
+                                        fable_weekly_usage_limit_percent,
+                                    ))
                             {
-                                // Fable 周用量达到控制线只影响本轮选号；没有替代账号时保留旧 sticky。
+                                // 控制线只影响本轮选号，保留旧绑定直到替代账号真正承载请求。
                                 if !runtime_exclude_ids.contains(&account_id) {
                                     runtime_exclude_ids.push(account_id);
                                 }
@@ -1124,7 +1147,8 @@ impl AccountService {
                                         STICKY_SESSION_TTL,
                                     )
                                     .await;
-                                skipped_sticky_for_fable_quota = true;
+                                excluded_for_usage_limit = usage_limit_reached;
+                                skipped_sticky_for_fable_quota = !usage_limit_reached;
                             } else {
                                 // 粘性命中：刷新 TTL，保持活跃会话不过期
                                 let _ = self
@@ -1143,7 +1167,7 @@ impl AccountService {
                             }
                         }
                     }
-                    if !skipped_sticky_for_fable_quota {
+                    if !skipped_sticky_for_fable_quota && !excluded_for_usage_limit {
                         // 过期绑定，删除
                         let _ = self.cache.delete_session(session_hash).await;
                     }
@@ -1163,6 +1187,19 @@ impl AccountService {
             })
             .collect();
 
+        if context.usage_limits_enabled {
+            let before = candidates.len();
+            candidates.retain(|account| !account_usage_limit_reached(account));
+            if candidates.len() < before {
+                excluded_for_usage_limit = true;
+            }
+            if candidates.is_empty() && excluded_for_usage_limit {
+                return Err(AppError::TooManyRequests(
+                    "账号已达到配置的 5 小时或 7 天用量上限，暂无可切换账号".into(),
+                ));
+            }
+        }
+
         if fable_quota_fallback_active {
             let fable_available: Vec<Account> = candidates
                 .iter()
@@ -1177,6 +1214,11 @@ impl AccountService {
             if !fable_available.is_empty() {
                 candidates = fable_available;
             } else if !candidates.is_empty() || skipped_sticky_for_fable_quota {
+                if excluded_for_usage_limit {
+                    return Err(AppError::TooManyRequests(
+                        "所有可用账号均已达到配置的用量上限，暂无可切换账号".into(),
+                    ));
+                }
                 return Err(AppError::TooManyRequests(format!(
                     "所有可用账号的 Fable 周用量均已达到 {}% 上限",
                     fable_weekly_usage_limit_percent
@@ -2521,7 +2563,7 @@ fn check_usage_window(
 ) -> Option<chrono::DateTime<Utc>> {
     let window = usage.get(key)?;
     let util = window.get("utilization")?.as_f64()?;
-    if util < threshold {
+    if !util.is_finite() || util < 0.0 || util < threshold {
         return None;
     }
     let resets_at_str = window.get("resets_at")?.as_str()?;
@@ -2532,6 +2574,38 @@ fn check_usage_window(
         return None;
     }
     Some(dt)
+}
+
+/// 校验账号控制线，避免内部创建或更新绕过管理接口的值域校验。
+fn validate_account_usage_limits(account: &Account) -> Result<(), AppError> {
+    for (key, value) in [
+        (
+            "five_hour_usage_limit_percent",
+            account.five_hour_usage_limit_percent,
+        ),
+        (
+            "seven_day_usage_limit_percent",
+            account.seven_day_usage_limit_percent,
+        ),
+    ] {
+        if !(0..=100).contains(&value) {
+            return Err(AppError::BadRequest(format!("{key} 必须是 0～100 的整数")));
+        }
+    }
+    Ok(())
+}
+
+/// 仅用有效且尚未重置的普通窗口判断账号是否达到本地控制线。
+fn account_usage_limit_reached(account: &Account) -> bool {
+    [
+        ("five_hour", account.five_hour_usage_limit_percent),
+        ("seven_day", account.seven_day_usage_limit_percent),
+    ]
+    .into_iter()
+    .any(|(window, limit)| {
+        (1..=100).contains(&limit)
+            && check_usage_window(&account.usage_data, window, f64::from(limit)).is_some()
+    })
 }
 
 fn is_fable_quota_model_id(model: &str) -> bool {
@@ -3033,6 +3107,8 @@ mod tests {
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,
+            five_hour_usage_limit_percent: 0,
+            seven_day_usage_limit_percent: 0,
             rate_limited_at: None,
             rate_limit_reset_at: None,
             disable_reason: String::new(),
@@ -3077,6 +3153,8 @@ mod tests {
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,
+            five_hour_usage_limit_percent: 0,
+            seven_day_usage_limit_percent: 0,
             rate_limited_at: None,
             rate_limit_reset_at: None,
             disable_reason: String::new(),
@@ -3759,6 +3837,7 @@ mod tests {
             "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
+            usage_limits_enabled: false,
             fable_quota_fallback_enabled: true,
             fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5-1".into()),
@@ -3782,6 +3861,7 @@ mod tests {
             "seven_day_fable": make_window(json!(49), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
+            usage_limits_enabled: false,
             fable_quota_fallback_enabled: true,
             fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5[1m]".into()),
@@ -3805,6 +3885,7 @@ mod tests {
             "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
+            usage_limits_enabled: false,
             fable_quota_fallback_enabled: true,
             fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
@@ -3829,6 +3910,7 @@ mod tests {
             "seven_day_fable": make_window(json!(50), &rfc3339_at(ChronoDuration::days(3))),
         }));
         let context = AccountSelectionContext {
+            usage_limits_enabled: false,
             fable_quota_fallback_enabled: true,
             fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
@@ -3853,6 +3935,7 @@ mod tests {
         }));
         account.auth_type = AccountAuthType::SetupToken;
         let context = AccountSelectionContext {
+            usage_limits_enabled: false,
             fable_quota_fallback_enabled: true,
             fable_weekly_usage_limit_percent: 50,
             request_model: Some("claude-fable-5".into()),
