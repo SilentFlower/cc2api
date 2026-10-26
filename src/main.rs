@@ -2,6 +2,7 @@ use claude_code_gateway::config;
 use claude_code_gateway::handler;
 use claude_code_gateway::service;
 use claude_code_gateway::store;
+use claude_code_gateway::store::diagnostics_store::DiagnosticsStore;
 use claude_code_gateway::tlsfp;
 
 use std::env;
@@ -76,6 +77,7 @@ async fn main() {
     ));
     let prime_log_store = Arc::new(store::prime_log_store::PrimeLogStore::new(pool.clone()));
     let usage_store = Arc::new(store::usage_store::UsageStore::new(pool.clone()));
+    let diagnostics_store = Arc::new(DiagnosticsStore::new(pool.clone()));
 
     let proxy_client_pool_enabled = settings_store
         .get_value(
@@ -107,14 +109,17 @@ async fn main() {
         account_store.clone(),
         account_svc.clone(),
     ));
-    let gateway_svc = Arc::new(service::gateway::GatewayService::new(
-        account_svc.clone(),
-        rewriter.clone(),
-        telemetry_svc.clone(),
-        settings_store.clone(),
-        cache.clone(),
-        usage_store,
-    ));
+    let gateway_svc = Arc::new(
+        service::gateway::GatewayService::new(
+            account_svc.clone(),
+            rewriter.clone(),
+            telemetry_svc.clone(),
+            settings_store.clone(),
+            cache.clone(),
+            usage_store,
+        )
+        .with_diagnostics(diagnostics_store),
+    );
     gateway_svc
         .reload_system_role_models()
         .await

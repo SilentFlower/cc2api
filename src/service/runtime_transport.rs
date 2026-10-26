@@ -233,7 +233,11 @@ pub async fn send(
     let deployment = std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default();
     let release = std::env::var("V3_RELEASE").unwrap_or_default();
     validate_binding(&binding, account.id, &deployment, &release)?;
-    prepared.request_id = Uuid::new_v4().to_string();
+    if prepared.request_id.is_empty() {
+        prepared.request_id = Uuid::new_v4().to_string();
+    } else if Uuid::parse_str(&prepared.request_id).is_err() {
+        return Err(AppError::BadRequest("内部请求标识无效".into()));
+    }
     prepared.deadline_unix_ms = now_ms() + ttfb_timeout.as_millis() as u64;
     prepared.account_id = account.id;
     prepared.environment_id = binding.environment_id;

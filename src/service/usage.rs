@@ -15,11 +15,11 @@ use crate::service::usage_pricing::calculate_cost;
 use crate::store::usage_store::{UsageRecord, UsageStore};
 
 /// 单行 SSE 或完整 JSON 的采样上限，防止正文使旁路统计无限占用内存。
-const USAGE_BUFFER_LIMIT: usize = 1024 * 1024;
+pub(crate) const USAGE_BUFFER_LIMIT: usize = 1024 * 1024;
 
 /// 一次真实调用的用量观察器；只保存临时解析缓冲与安全摘要。
 pub struct UsageCapture {
-    store: Arc<UsageStore>,
+    store: Option<Arc<UsageStore>>,
     record: UsageRecord,
     speed: String,
     buffer: Vec<u8>,
@@ -28,6 +28,23 @@ pub struct UsageCapture {
     saw_input: bool,
     saw_output: bool,
     saw_end: bool,
+    response_model: Option<String>,
+    message_id: Option<String>,
+    stop_reason: Option<String>,
+    error_type: Option<String>,
+    observation_error: Option<&'static str>,
+    tokens: [Option<u64>; 6],
+}
+
+/// 与计费无关的响应观察结果，只保留白名单元信息。
+pub(crate) struct MessageObservation {
+    pub response_model: Option<String>,
+    pub message_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub error_type: Option<String>,
+    pub observation_error: Option<&'static str>,
+    pub tokens: [Option<u64>; 6],
+    pub partial: bool,
 }
 
 impl UsageCapture {
@@ -39,6 +56,22 @@ impl UsageCapture {
     /// @return 尚未观察响应的采集器。
     pub fn new(
         store: Arc<UsageStore>,
+        account_id: i64,
+        request: &Value,
+        started_at: DateTime<Utc>,
+    ) -> Self {
+        Self::build(Some(store), account_id, request, started_at)
+    }
+
+    /// 创建只解析响应、不写计费表的诊断观察器。
+    /// @param request 实际上游请求的临时参数。
+    /// @return 独立的有界响应观察器。
+    pub(crate) fn observer(request: &Value) -> Self {
+        Self::build(None, 0, request, Utc::now())
+    }
+
+    fn build(
+        store: Option<Arc<UsageStore>>,
         account_id: i64,
         request: &Value,
         started_at: DateTime<Utc>,
@@ -61,6 +94,12 @@ impl UsageCapture {
             saw_input: false,
             saw_output: false,
             saw_end: false,
+            response_model: None,
+            message_id: None,
+            stop_reason: None,
+            error_type: None,
+            observation_error: None,
+            tokens: [None; 6],
         }
     }
 
@@ -76,7 +115,7 @@ impl UsageCapture {
         }
         if self.is_sse != Some(true) {
             if self.buffer.len().saturating_add(bytes.len()) > USAGE_BUFFER_LIMIT {
-                self.record.partial = true;
+                self.mark_partial();
                 self.discard_line = true;
                 self.buffer.clear();
             } else if !self.discard_line {
@@ -86,7 +125,7 @@ impl UsageCapture {
         }
         for part in bytes.split_inclusive(|byte| *byte == b'\n') {
             if self.buffer.len().saturating_add(part.len()) > USAGE_BUFFER_LIMIT {
-                self.record.partial = true;
+                self.mark_partial();
                 self.discard_line = true;
                 self.buffer.clear();
             }
@@ -106,7 +145,12 @@ impl UsageCapture {
     /// 标记解码失败或采样超限，不把缺失数据记成精确零费用。
     /// @return 无返回值。
     pub fn mark_partial(&mut self) {
+        self.mark_observation_error("sampling_limit");
+    }
+
+    fn mark_observation_error(&mut self, reason: &'static str) {
         self.record.partial = true;
+        self.observation_error.get_or_insert(reason);
     }
 
     /// 限长解码压缩旁路副本，原始响应继续由网关直接转发。
@@ -116,7 +160,7 @@ impl UsageCapture {
     pub fn observe_encoded(&mut self, bytes: &[u8], codings: &[String]) {
         match decode_usage_body(bytes, codings) {
             Ok(decoded) => self.observe(&decoded),
-            Err(_) => self.mark_partial(),
+            Err(_) => self.mark_observation_error("decode_error"),
         }
     }
 
@@ -131,7 +175,7 @@ impl UsageCapture {
             } else if let Ok(value) = serde_json::from_slice::<Value>(line) {
                 self.observe_value(&value);
             } else {
-                self.record.partial = true;
+                self.mark_observation_error("invalid_payload");
             }
         }
     }
@@ -144,6 +188,55 @@ impl UsageCapture {
             .filter(|value| !value.is_empty())
         {
             self.record.model = model.to_owned();
+            self.response_model = Some(model.to_owned());
+        }
+        if let Some(id) = value
+            .get("id")
+            .or_else(|| value.pointer("/message/id"))
+            .and_then(Value::as_str)
+        {
+            // ID 只在临时观察器中存在，持久化前由诊断层散列。
+            if id.len() <= 256 {
+                self.message_id = Some(id.to_owned());
+            }
+        }
+        if let Some(reason) = value
+            .get("stop_reason")
+            .or_else(|| value.pointer("/delta/stop_reason"))
+            .and_then(Value::as_str)
+        {
+            if [
+                "end_turn",
+                "max_tokens",
+                "stop_sequence",
+                "tool_use",
+                "pause_turn",
+                "refusal",
+                "model_context_window_exceeded",
+            ]
+            .contains(&reason)
+            {
+                self.stop_reason = Some(reason.to_owned());
+            }
+        }
+        if value["type"].as_str() == Some("error") {
+            self.error_type = Some(
+                match value.pointer("/error/type").and_then(Value::as_str) {
+                    Some(
+                        kind @ ("invalid_request_error"
+                        | "authentication_error"
+                        | "permission_error"
+                        | "not_found_error"
+                        | "rate_limit_error"
+                        | "api_error"
+                        | "overloaded_error"
+                        | "billing_error"
+                        | "timeout_error"),
+                    ) => kind,
+                    _ => "unknown_upstream_error",
+                }
+                .to_owned(),
+            );
         }
         if value["type"].as_str() == Some("message_stop") {
             self.saw_end = true;
@@ -157,7 +250,7 @@ impl UsageCapture {
         .flatten()
         {
             if !usage.is_object() {
-                self.record.partial = true;
+                self.mark_observation_error("invalid_payload");
                 continue;
             }
             self.saw_input |= usage["input_tokens"].as_u64().is_some();
@@ -172,7 +265,7 @@ impl UsageCapture {
                     .get(field)
                     .is_some_and(|value| value.as_u64().is_none())
                 {
-                    self.record.partial = true;
+                    self.mark_observation_error("invalid_payload");
                 }
             }
             for field in ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] {
@@ -181,10 +274,35 @@ impl UsageCapture {
                     .and_then(|value| value.get(field))
                     .is_some_and(|value| value.as_u64().is_none())
                 {
-                    self.record.partial = true;
+                    self.mark_observation_error("invalid_payload");
                 }
             }
             merge_message_usage(&mut self.record.usage, usage);
+            for (index, field) in [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if let Some(value) = usage.get(*field).and_then(Value::as_u64) {
+                    self.tokens[index] = Some(self.tokens[index].unwrap_or(0).max(value));
+                }
+            }
+            for (index, field) in ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]
+                .iter()
+                .enumerate()
+            {
+                if let Some(value) = usage
+                    .get("cache_creation")
+                    .and_then(|v| v.get(*field))
+                    .and_then(Value::as_u64)
+                {
+                    self.tokens[index + 4] = Some(self.tokens[index + 4].unwrap_or(0).max(value));
+                }
+            }
             if let Some(speed) = usage
                 .get("speed")
                 .or_else(|| usage.get("service_tier"))
@@ -195,7 +313,7 @@ impl UsageCapture {
         }
     }
 
-    fn into_record(mut self, complete: bool) -> UsageRecord {
+    fn complete_observation(&mut self, complete: bool) {
         if self.is_sse == Some(true) {
             if !self.buffer.is_empty() && !self.discard_line {
                 self.parse_line();
@@ -203,18 +321,38 @@ impl UsageCapture {
         } else if !self.discard_line {
             match serde_json::from_slice::<Value>(&self.buffer) {
                 Ok(value) => self.observe_value(&value),
-                Err(_) => self.record.partial = true,
+                Err(_) => self.mark_observation_error("invalid_payload"),
             }
         }
         self.record.partial |= !complete
             || !self.saw_input
             || !self.saw_output
             || (self.is_sse == Some(true) && !self.saw_end);
-        if self.saw_input || self.saw_output {
+        if self.store.is_some() && (self.saw_input || self.saw_output) {
             self.record.cost_usd =
                 calculate_cost(&self.record.model, &self.speed, self.record.usage);
         }
+    }
+
+    fn into_record(mut self, complete: bool) -> UsageRecord {
+        self.complete_observation(complete);
         self.record
+    }
+
+    /// 结束诊断旁路解析，不触发费用写入。
+    /// @param complete 是否读到正常的传输结束。
+    /// @return 已观察到的元信息与部分数据标记。
+    pub(crate) fn observation(mut self, complete: bool) -> MessageObservation {
+        self.complete_observation(complete);
+        MessageObservation {
+            response_model: self.response_model,
+            message_id: self.message_id,
+            stop_reason: self.stop_reason,
+            error_type: self.error_type,
+            observation_error: self.observation_error,
+            tokens: self.tokens,
+            partial: self.record.partial,
+        }
     }
 
     /// 完成本次观察并异步落库；由调用方 take 保证只执行一次。
@@ -223,7 +361,7 @@ impl UsageCapture {
     pub fn finish(self, complete: bool) {
         let store = self.store.clone();
         let record = self.into_record(complete);
-        if let Ok(runtime) = Handle::try_current() {
+        if let (Some(store), Ok(runtime)) = (store, Handle::try_current()) {
             runtime.spawn(async move {
                 if let Err(error) = store.record(&record).await {
                     warn!(

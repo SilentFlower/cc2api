@@ -284,6 +284,8 @@ cd docker && docker compose up -d
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/admin/dashboard` | 仪表盘统计 |
+| `GET` | `/admin/request-diagnostics` | 请求诊断分页与采集健康计数（[字段说明](docs/request-diagnostics.md)） |
+| `GET` | `/admin/request-diagnostics/:request_id` | 请求详情与各次真实发送尝试 |
 | `GET` | `/admin/accounts` | 账号列表（`page`/`page_size`） |
 | `POST` | `/admin/accounts` | 创建账号 |
 | `PUT` | `/admin/accounts/:id` | 更新账号 |

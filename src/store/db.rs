@@ -1,4 +1,5 @@
 use crate::service::version_profile::ClaudeCodeProfile;
+use crate::store::diagnostics_store::DiagnosticsStore;
 use crate::store::usage_store::UsageStore;
 use sqlx::{AnyConnection, AnyPool};
 use std::path::Path;
@@ -72,6 +73,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
     UsageStore::migrate(pool).await?;
+    DiagnosticsStore::migrate(pool).await?;
     // 增量迁移
     sqlx::query("ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'")
         .execute(pool)

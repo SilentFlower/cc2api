@@ -114,19 +114,17 @@ async fn raw_body_header_order_and_upstream_error_survive_bridge() {
         socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 7\r\nX-Test: preserved\r\nConnection: close\r\n\r\nblocked").await.unwrap();
         raw
     });
-    let (endpoint, config, path, handle) = sender(&origin).await;
+    let (endpoint, mut config, path, handle) = sender(&origin).await;
+    let evidence = format!("/tmp/v3-sender-evidence-{}.jsonl", Uuid::new_v4());
+    config.evidence_file = Some(evidence.clone());
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let client = Client::builder().no_proxy().build().unwrap();
     let body = b"{ \"messages\" : [\"\xe4\xb8\xad\xe6\x96\x87\"] }\n".to_vec();
-    let response = post(
-        &client,
-        &endpoint,
-        &config,
-        &prepared(&config, format!("{origin}/v1/messages?beta=true")),
-        body.clone(),
-    )
-    .send()
-    .await
-    .unwrap();
+    let request = prepared(&config, format!("{origin}/v1/messages?beta=true"));
+    let response = post(&client, &endpoint, &config, &request, body.clone())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status().as_u16(), 429);
     assert_eq!(response.headers()["x-test"], "preserved");
     assert!(!response.headers().contains_key("x-v3-transport-error"));
@@ -143,8 +141,20 @@ async fn raw_body_header_order_and_upstream_error_survive_bridge() {
     assert!(headers.find("Authorization:").unwrap() < headers.find("Content-Type:").unwrap());
     assert!(headers.find("X-Order-A:").unwrap() < headers.find("X-Order-B:").unwrap());
     assert!(!headers.contains("x-v3-request") && !headers.contains(&config.binding.secret));
+    assert!(!headers.contains(&request.request_id));
+    let observation: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&evidence)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(observation["request_id"], request.request_id);
+    assert_eq!(observation["status"], 429);
     handle.abort();
     std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(evidence).unwrap();
 }
 
 #[tokio::test]

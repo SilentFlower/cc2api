@@ -1,5 +1,6 @@
 pub mod access_policy;
 pub mod account;
+pub mod diagnostics;
 pub mod gateway;
 pub mod oauth;
 pub mod oauth_flow;

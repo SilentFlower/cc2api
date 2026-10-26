@@ -28,11 +28,12 @@ use crate::service::account::{
     AccountSelectionContext, AccountService, AccountSlotPermit, DEFAULT_REQUEST_SLOT_UNITS,
     HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, UsageObservationKind,
 };
+use crate::service::diagnostics::{self, CURRENT_TRACE, RequestTraceGuard, TraceContext};
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
     StatefulCacheUsage, UpstreamSessionRewrite, collect_telemetry_session_ids, detect_client_type,
-    filter_account_beta_tokens, is_claude_code_billing_system_block,
+    extract_session_id_from_body, filter_account_beta_tokens, is_claude_code_billing_system_block,
     is_claude_code_identity_system_block, is_structured_haiku_title_request_for_profile,
     merge_anthropic_beta, order_context_1m_after_oauth, ordered_anthropic_headers,
     strip_empty_text_blocks,
@@ -52,6 +53,7 @@ use crate::service::version_profile::{
     default_profile, is_event_logging_path, profile_for_key, profile_for_version,
 };
 use crate::store::cache::CacheStore;
+use crate::store::diagnostics_store::DiagnosticsStore;
 use crate::store::settings_store::{
     DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS,
     DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE, DEFAULT_CACHE_CONTROL_TTL_REWRITE,
@@ -484,6 +486,7 @@ pub struct GatewayService {
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
     usage_store: Arc<UsageStore>,
+    diagnostics_store: Option<Arc<DiagnosticsStore>>,
     settings_store: Arc<SettingsStore>,
     upstream_base: String,
     system_role_models: RwLock<Vec<String>>,
@@ -531,6 +534,7 @@ impl GatewayService {
             rewriter,
             telemetry_svc,
             usage_store,
+            diagnostics_store: None,
             settings_store,
             upstream_base: UPSTREAM_BASE.to_string(),
             system_role_models: RwLock::new(parse_system_role_model_list(
@@ -572,6 +576,20 @@ impl GatewayService {
             session_hello_probe_svc: SessionHelloProbeService::new(cache),
             session_hello_probe_config: RwLock::new(SessionHelloProbeConfig::default()),
         }
+    }
+
+    /// 接入独立请求诊断，保留原构造函数的兼容性。
+    /// @param store 已启动的有界诊断存储。
+    /// @return 启用诊断的网关。
+    pub fn with_diagnostics(mut self, store: Arc<DiagnosticsStore>) -> Self {
+        self.diagnostics_store = Some(store);
+        self
+    }
+
+    /// 取得管理员查询使用的诊断存储。
+    /// @return 未装配时返回 None。
+    pub fn diagnostics_store(&self) -> Option<&Arc<DiagnosticsStore>> {
+        self.diagnostics_store.as_ref()
     }
 
     /// 读取当前账号页的两个用量窗口，不触发上游请求。
@@ -1390,11 +1408,33 @@ impl GatewayService {
     }
 
     /// 核心网关逻辑 -- axum handler。
+    /// @param req 已通过入口鉴权的请求。
+    /// @param api_token 已校验的账号访问范围。
+    /// @return 原有业务响应及可用的诊断关联头。
     pub async fn handle_request(&self, req: Request, api_token: Option<&ApiToken>) -> Response {
-        match self.handle_request_inner(req, api_token).await {
+        let Some(store) = self
+            .diagnostics_store
+            .as_ref()
+            .filter(|_| req.uri().path() == "/v1/messages")
+        else {
+            return match self.handle_request_inner(req, api_token).await {
+                Ok(resp) => resp,
+                Err(e) => e.into_response(),
+            };
+        };
+        let trace = TraceContext::new(store.clone());
+        let guard = RequestTraceGuard::new(trace.clone());
+        let response = match CURRENT_TRACE
+            .scope(trace, self.handle_request_inner(req, api_token))
+            .await
+        {
             Ok(resp) => resp,
-            Err(e) => e.into_response(),
-        }
+            Err(e) => {
+                guard.error(&e);
+                e.into_response()
+            }
+        };
+        guard.wrap(response)
     }
 
     /// Claude 原生 count_tokens 专用链路。
@@ -1643,6 +1683,7 @@ impl GatewayService {
         let request_profile = {
             let snapshot = self.access_profile_config.read().await;
             if let Err(rejection) = snapshot.policy.check_user_agent(&ua) {
+                diagnostics::error_stage("access_policy");
                 warn!(
                     "access policy rejected request: setting={} reason={}",
                     rejection.setting, rejection.reason
@@ -1652,6 +1693,8 @@ impl GatewayService {
             // 准入通过后，在同一个读锁内冻结；body 与重试不重新决定画像。
             snapshot.selection.resolve(&ua)
         };
+
+        diagnostics::profile_selection(request_profile.is_some());
 
         // 读取请求体
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
@@ -1672,6 +1715,7 @@ impl GatewayService {
                 .and_then(|m| m.as_str())
                 .unwrap_or_default();
             if !is_system_role_model_allowed(model, &allowed_models) {
+                diagnostics::error_stage("request_policy");
                 return Ok(system_role_model_error_response(model, &allowed_models));
             }
         }
@@ -1721,12 +1765,14 @@ impl GatewayService {
                 generic_cli_status_classifier,
                 false,
             );
+            diagnostics::local_outcome("mock");
             return Ok(mock_cli_bg_status_classifier_response(&body_map)?);
         }
 
         if path.starts_with("/v1/messages") {
             let assistant_prefill_config = self.assistant_prefill_intercept_config.read().await;
             if should_intercept_assistant_prefill(&body_map, &assistant_prefill_config) {
+                diagnostics::error_stage("request_policy");
                 let model = body_map
                     .get("model")
                     .and_then(|model| model.as_str())
@@ -1822,6 +1868,7 @@ impl GatewayService {
                 }
             };
             let account = selected.account;
+            diagnostics::selected_account(account.id);
             let sticky_account = selected.sticky;
             let should_bind_session = selected.should_bind_session;
 
@@ -1854,6 +1901,7 @@ impl GatewayService {
                                 .bind_selected_session(&session_hash, account.id)
                                 .await;
                         }
+                        diagnostics::local_outcome("mock");
                         return Ok(warmup_intercept_response(
                             intercept_type,
                             warmup_config,
@@ -1882,6 +1930,7 @@ impl GatewayService {
                         &body_map,
                         body_bytes.len(),
                     );
+                    diagnostics::local_outcome("mock");
                     return Ok(warmup_intercept_response(
                         intercept_type,
                         warmup_config,
@@ -1973,6 +2022,11 @@ impl GatewayService {
             let upstream_session_rewrite = self
                 .build_upstream_session_rewrite(&account, &path, &body_map, client_type)
                 .await;
+            diagnostics::session_context(
+                account.id,
+                extract_session_id_from_body(&body_map).as_deref(),
+                upstream_session_rewrite.message.as_ref(),
+            );
             if let Some(real_session_id) =
                 session_hello_probe_session_id(&path, client_type, &body_map)
             {
@@ -1992,6 +2046,7 @@ impl GatewayService {
                     )
                     .await;
                 if let Some(response) = session_hello_probe_block_response(hello_decision) {
+                    diagnostics::error_stage("session_hello_probe");
                     return Ok(response);
                 }
             }
@@ -2122,6 +2177,7 @@ impl GatewayService {
                 match self.account_svc.resolve_upstream_token(account.id).await {
                     Ok(t) => Some(t),
                     Err(AppError::PermanentCredential(reason)) => {
+                        diagnostics::error_stage("credentials");
                         self.disable_account_after_permanent_credential_failure(
                             &account, &reason, "gateway",
                         )
@@ -2192,6 +2248,7 @@ impl GatewayService {
                             .bind_selected_session(&session_hash, account.id)
                             .await;
                     }
+                    diagnostics::local_outcome("cache_hit");
                     return Ok(resp);
                 }
             }
@@ -2266,6 +2323,7 @@ impl GatewayService {
                     .await?
                 {
                     Some(refreshed_token) => {
+                        diagnostics::retry_reason("oauth_recovery");
                         final_headers.insert(
                             "authorization".into(),
                             format!("Bearer {}", refreshed_token),
@@ -2283,6 +2341,8 @@ impl GatewayService {
                             )
                             .await?;
                         if resp.status() == StatusCode::UNAUTHORIZED {
+                            diagnostics::error_stage("auth_recovery");
+                            diagnostics::retry_reason("credentials_rejected");
                             self.disable_account_after_repeated_unauthorized(
                                 &account,
                                 &refreshed_token,
@@ -2296,6 +2356,8 @@ impl GatewayService {
                         }
                     }
                     None => {
+                        diagnostics::error_stage("auth_recovery");
+                        diagnostics::retry_reason("credentials_rejected");
                         auth_failure_excluded = true;
                         exclude_ids.push(account.id);
                         drop(slot_guard);
@@ -2435,6 +2497,7 @@ impl GatewayService {
                         decision.delay.as_secs()
                     );
                     backoff_retry_ids.push(account.id);
+                    diagnostics::retry_reason("transient_rate_limit");
                     drop(slot_guard); // 等待期间不占用账号并发槽位
                     self.account_svc
                         .wait_transient_rate_limit_backoff(&account)
@@ -2451,6 +2514,7 @@ impl GatewayService {
             );
             exclude_ids.push(account.id);
             drop(slot_guard); // 显式 drop → permit drop → 归还槽位
+            diagnostics::retry_reason("account_rate_limit");
             last_resp = Some(resp);
         }
     }
@@ -2507,6 +2571,7 @@ impl GatewayService {
                     .refresh_cch_attestation(retry_body, account, client_type);
 
             last_stage = Some(stage);
+            diagnostics::retry_reason("signature_repair");
             warn!(
                 "account {} signature retry stage={} request_body={}",
                 account.id,
@@ -2578,18 +2643,41 @@ impl GatewayService {
 
         debug!("upstream URL: {}", target_url);
 
+        let mut diagnostic = (path == "/v1/messages")
+            .then(|| diagnostics::begin_attempt(account, body))
+            .flatten();
         let prepared = PreparedRequest {
             account_id: account.id,
             environment_id: String::new(),
             generation: 0,
-            request_id: String::new(),
+            request_id: diagnostic
+                .as_ref()
+                .map(|trace| trace.id().to_owned())
+                .unwrap_or_default(),
             deadline_unix_ms: 0,
             method: method.to_string(),
             target_url,
             headers: ordered_anthropic_headers(path, headers),
             preserve_header_casing: !is_event_logging_path(path) && !path.starts_with("/api/eval/"),
         };
-        let resp = runtime_transport::send(account, prepared, body, UPSTREAM_TTFB_TIMEOUT).await?;
+        let resp =
+            match runtime_transport::send(account, prepared, body, UPSTREAM_TTFB_TIMEOUT).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(trace) = diagnostic.as_mut() {
+                        trace.transport_error();
+                    }
+                    return Err(error);
+                }
+            };
+
+        if let Some(trace) = diagnostic.as_mut() {
+            trace.headers(
+                resp.status().as_u16(),
+                resp.headers(),
+                response_content_codings(resp.headers()),
+            );
+        }
 
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
@@ -2629,7 +2717,12 @@ impl GatewayService {
                     }
                 });
             }
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_result = resp.bytes().await;
+            let complete = body_result.is_ok();
+            let body_bytes = body_result.unwrap_or_default();
+            if let Some(trace) = diagnostic.as_mut() {
+                trace.buffered(&body_bytes, complete);
+            }
             let request_log_config = *self.rate_limit_request_log_config.read().await;
             if request_log_config.enabled && request_capture_policy.allows_full_capture() {
                 warn!(
@@ -2739,7 +2832,12 @@ impl GatewayService {
 
         if status_code >= 400 {
             let response_headers = resp.headers().clone();
-            let upstream_body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_result = resp.bytes().await;
+            let complete = body_result.is_ok();
+            let upstream_body_bytes = body_result.unwrap_or_default();
+            if let Some(trace) = diagnostic.as_mut() {
+                trace.buffered(&upstream_body_bytes, complete);
+            }
             warn!(
                 "上游错误响应: account={} path={} status={} body={}",
                 account.id,
@@ -2800,7 +2898,12 @@ impl GatewayService {
 
         if should_log_non_stream_response {
             let response_headers = resp.headers().clone();
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_result = resp.bytes().await;
+            let complete = body_result.is_ok();
+            let body_bytes = body_result.unwrap_or_default();
+            if let Some(trace) = diagnostic.as_mut() {
+                trace.buffered(&body_bytes, complete);
+            }
             let (downstream_body, remove_transport_headers) =
                 buffered_response_body_for_downstream(body_bytes.clone(), &response_headers);
             warn!(
@@ -2846,9 +2949,13 @@ impl GatewayService {
         );
         let body = Body::from_stream(body_stream);
 
-        response_builder
+        let response = response_builder
             .body(body)
-            .map_err(|e| AppError::Internal(format!("build response: {}", e)))
+            .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
+        Ok(match diagnostic {
+            Some(trace) => trace.wrap(response),
+            None => response,
+        })
     }
 
     async fn forward_count_tokens_request(
@@ -7203,6 +7310,7 @@ mod tests {
         DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
+    use crate::model::request_diagnostics::DiagnosticQuery;
     use crate::service::account::{
         AccountSelectionContext, AccountService, DEFAULT_REQUEST_SLOT_UNITS,
         HAIKU_REQUEST_SLOT_UNITS, QueueWaitError,
@@ -7224,6 +7332,7 @@ mod tests {
         CacheStore, RpmAcquire, SessionHelloProbeState, UpstreamSessionPoolAction,
         UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
     };
+    use crate::store::diagnostics_store::DiagnosticsStore;
     use crate::store::memory::MemoryStore;
     use crate::store::settings_store::{
         DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, SettingsStore,
@@ -8256,6 +8365,7 @@ mod tests {
             .expect("migrate");
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let usage_store = Arc::new(UsageStore::new(pool.clone()));
+        let diagnostics_store = Arc::new(DiagnosticsStore::new(pool.clone()));
         let settings_store = Arc::new(SettingsStore::new(pool));
         let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
             account_store.clone(),
@@ -8274,7 +8384,8 @@ mod tests {
             settings_store,
             cache,
             usage_store,
-        );
+        )
+        .with_diagnostics(diagnostics_store);
         service.upstream_base = upstream_base;
         (service, account_store)
     }
@@ -8347,6 +8458,11 @@ mod tests {
         for index in 0..4 {
             let response = service.handle_request(messages_request(), None).await;
             assert_eq!(response.status(), StatusCode::OK);
+            let request_id = response.headers()["x-cc2api-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(response.headers()["x-request-id"], request_id);
             let mut response_body = response.into_body();
             if index == 3 {
                 assert!(response_body.frame().await.unwrap().is_ok());
@@ -8366,6 +8482,22 @@ mod tests {
             })
             .await
             .expect("统计应完成落库");
+            let diagnostics = service.diagnostics_store().unwrap();
+            diagnostics.flush().await.unwrap();
+            let detail = diagnostics.detail(&request_id).await.unwrap();
+            assert_eq!(detail.request.attempt_count, 1);
+            assert_eq!(detail.attempts.len(), 1);
+            assert_eq!(detail.attempts[0].tokens.input_tokens, Some(1000));
+            assert_eq!(
+                detail.attempts[0].tokens.output_tokens,
+                Some(if index == 3 { 0 } else { 100 })
+            );
+            assert_eq!(detail.attempts[0].tokens.cache_write_tokens, None);
+            assert_eq!(detail.attempts[0].partial, index == 3);
+            assert_eq!(
+                detail.request.outcome,
+                if index == 3 { "cancelled" } else { "success" }
+            );
         }
         let stats = service.request_usage(&[account.clone()]).await.unwrap();
         assert_eq!(stats[&account.id].five_hour.requests, 4);
@@ -8419,6 +8551,27 @@ mod tests {
         );
         let stats = service.request_usage(&[account.clone()]).await.unwrap();
         assert_eq!(stats[&account.id].seven_day.requests, 5);
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let page = diagnostics.list(DiagnosticQuery::default()).await.unwrap();
+        assert_eq!(
+            page.total, 6,
+            "count_tokens 不产生诊断，缓存命中仍记录本地结果"
+        );
+        let cached = page
+            .items
+            .iter()
+            .find(|row| row.outcome == "cache_hit")
+            .unwrap();
+        assert_eq!(cached.attempt_count, 0);
+        assert!(
+            diagnostics
+                .detail(&cached.request_id)
+                .await
+                .unwrap()
+                .attempts
+                .is_empty()
+        );
         server.abort();
     }
 
@@ -8826,6 +8979,10 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
+        let diagnostic_id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
         body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -8842,6 +8999,26 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|block| block["type"] != "thinking" && block.get("signature").is_none())
+        );
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let detail = diagnostics.detail(&diagnostic_id).await.unwrap();
+        assert_eq!(detail.request.attempt_count, 2);
+        assert_eq!(detail.attempts.len(), 2);
+        assert_ne!(detail.attempts[0].attempt_id, detail.attempts[1].attempt_id);
+        for (index, attempt) in detail.attempts.iter().enumerate() {
+            assert_eq!(attempt.request_id, diagnostic_id);
+            assert_eq!(attempt.ordinal, index as u32 + 1);
+            assert_eq!(attempt.account_id, account.id);
+            assert_eq!(attempt.profile_version, "2.1.260");
+            assert_eq!(attempt.parameters.max_tokens, second["max_tokens"].as_u64());
+        }
+        assert_eq!(detail.attempts[0].status_code, Some(400));
+        assert_eq!(detail.attempts[0].outcome, "upstream_rejected");
+        assert_eq!(detail.attempts[1].status_code, Some(200));
+        assert_eq!(
+            detail.attempts[1].retry_reason.as_deref(),
+            Some("signature_repair")
         );
         server.abort();
     }
@@ -9157,6 +9334,10 @@ mod tests {
 
         let response = service.handle_request(messages_request(), None).await;
         assert_eq!(response.status(), StatusCode::OK);
+        let diagnostic_id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
         let _ = body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -9169,6 +9350,28 @@ mod tests {
         let stored = service.account_svc.get_account(account.id).await.unwrap();
         assert_eq!(stored.status, AccountStatus::Active);
         assert_eq!(stored.access_token, "access-refreshed");
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let detail = diagnostics.detail(&diagnostic_id).await.unwrap();
+        assert_eq!(detail.attempts.len(), 2);
+        assert_eq!(detail.request.attempt_count, 2);
+        assert_ne!(detail.attempts[0].attempt_id, detail.attempts[1].attempt_id);
+        for attempt in &detail.attempts {
+            assert_eq!(attempt.request_id, diagnostic_id);
+            assert_eq!(attempt.account_id, account.id);
+        }
+        assert_eq!(detail.attempts[0].status_code, Some(401));
+        assert_eq!(
+            detail.attempts[0].error_type.as_deref(),
+            Some("authentication_error")
+        );
+        assert_eq!(detail.attempts[1].status_code, Some(200));
+        assert_eq!(
+            detail.attempts[1].retry_reason.as_deref(),
+            Some("oauth_recovery")
+        );
+        let persisted = serde_json::to_string(&detail).unwrap();
+        assert!(!persisted.contains("access-old") && !persisted.contains("access-refreshed"));
         server.abort();
     }
 
@@ -9724,6 +9927,10 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
+        let diagnostic_id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
         let _ = body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -9758,6 +9965,23 @@ mod tests {
                 headers["anthropic-beta"],
                 SONNET_5_MESSAGE_BETA_TOKENS_2_1_260
             );
+        }
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let detail = diagnostics.detail(&diagnostic_id).await.unwrap();
+        assert_eq!(detail.attempts.len(), 2);
+        assert_eq!(detail.request.account_id, Some(accepted.id));
+        assert_eq!(detail.attempts[0].account_id, rejected.id);
+        assert_eq!(detail.attempts[0].status_code, Some(401));
+        assert_eq!(detail.attempts[1].account_id, accepted.id);
+        assert_eq!(detail.attempts[1].status_code, Some(200));
+        assert_eq!(
+            detail.attempts[1].retry_reason.as_deref(),
+            Some("credentials_rejected")
+        );
+        for attempt in detail.attempts {
+            assert_eq!(attempt.request_id, diagnostic_id);
+            assert_eq!(attempt.profile_version, "2.1.260");
         }
         server.abort();
     }
@@ -9868,16 +10092,42 @@ mod tests {
 
         let first_session = "123e4567-e89b-12d3-a456-426614174101";
         let second_session = "123e4567-e89b-12d3-a456-426614174102";
+        let mut observed_sessions = Vec::new();
         for session_id in [first_session, second_session] {
             let response = service
                 .handle_request(claude_code_messages_request(session_id), None)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
+            let diagnostic_id = response.headers()["x-cc2api-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
             let _ = body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
                 .expect("读取模拟响应");
+            let diagnostics = service.diagnostics_store().unwrap();
+            diagnostics.flush().await.unwrap();
+            let detail = diagnostics.detail(&diagnostic_id).await.unwrap();
+            assert_eq!(detail.attempts.len(), 1);
+            observed_sessions.push(detail.attempts[0].sessions.clone());
         }
 
+        assert_ne!(
+            observed_sessions[0].real_session_hash,
+            observed_sessions[1].real_session_hash
+        );
+        assert_eq!(
+            observed_sessions[0].upstream_session_hash,
+            observed_sessions[1].upstream_session_hash
+        );
+        assert_eq!(
+            observed_sessions[1].mapping_action.as_deref(),
+            Some("mapped")
+        );
+        assert_ne!(
+            observed_sessions[1].real_session_hash,
+            observed_sessions[1].upstream_session_hash
+        );
         assert_eq!(state.hello_calls.load(Ordering::SeqCst), 1);
         let resolved = service
             .account_svc
@@ -12227,12 +12477,23 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        let diagnostic_id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
         let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
         let status: serde_json::Value =
             serde_json::from_str(envelope["content"][0]["text"].as_str().unwrap()).unwrap();
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let detail = diagnostics.detail(&diagnostic_id).await.unwrap();
+        assert_eq!(detail.request.outcome, "mock");
+        assert_eq!(detail.request.attempt_count, 0);
+        assert!(detail.attempts.is_empty());
+        assert!(detail.request.account_id.is_none());
         assert_eq!(envelope["id"], "msg_mock_cli_bg_status_classifier");
         assert_eq!(envelope["model"], "claude-fable-5-1");
         assert_eq!(status["state"], "blocked");

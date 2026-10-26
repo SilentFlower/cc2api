@@ -24,6 +24,7 @@ use crate::model::account::{
     DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
 };
 use crate::model::api_token::{self, ApiToken};
+use crate::model::request_diagnostics::{DiagnosticDetail, DiagnosticPage, DiagnosticQuery};
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, validate_blocked_claude_code_versions,
@@ -185,6 +186,11 @@ pub fn build_router(
         )
         .route("/admin/settings", get(get_settings).put(update_settings))
         .route("/admin/prime-logs", get(get_prime_logs))
+        .route("/admin/request-diagnostics", get(list_request_diagnostics))
+        .route(
+            "/admin/request-diagnostics/:request_id",
+            get(request_diagnostic_detail),
+        )
         .layer(middleware::from_fn(move |req, next: Next| {
             let pwd = admin_password.clone();
             admin_auth(pwd, req, next)
@@ -1771,6 +1777,36 @@ fn validate_usize_range(key: &str, raw: &str, min: usize, max: usize) -> Result<
     }
 }
 
+/// 分页查询已鉴权业务请求的白名单诊断。
+/// @param state 管理端共享状态。
+/// @param query 时间、账号、关联 ID 和结果筛选。
+/// @return 诊断列表及采集健康状态。
+async fn list_request_diagnostics(
+    State(state): State<AppState>,
+    Query(query): Query<DiagnosticQuery>,
+) -> Result<Json<DiagnosticPage>, AppError> {
+    let store = state
+        .gateway_svc
+        .diagnostics_store()
+        .ok_or_else(|| AppError::ServiceUnavailable("请求诊断尚未装配".into()))?;
+    Ok(Json(store.list(query).await?))
+}
+
+/// 读取单次请求的实际发送与重试链。
+/// @param state 管理端共享状态。
+/// @param request_id 诊断列表中的内部请求 UUID。
+/// @return 请求摘要及各次尝试。
+async fn request_diagnostic_detail(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<DiagnosticDetail>, AppError> {
+    let store = state
+        .gateway_svc
+        .diagnostics_store()
+        .ok_or_else(|| AppError::ServiceUnavailable("请求诊断尚未装配".into()))?;
+    Ok(Json(store.detail(&request_id).await?))
+}
+
 /// 获取最近 50 条峰值预热调用记录,按时间倒序。
 async fn get_prime_logs(
     State(state): State<AppState>,
@@ -1797,6 +1833,7 @@ mod tests {
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::ClaudeCodeProfileSelectionMode;
     use crate::store::account_store::AccountStore;
+    use crate::store::diagnostics_store::DiagnosticsStore;
     use crate::store::memory::MemoryStore;
     use crate::store::prime_log_store::PrimeLogStore;
     use crate::store::settings_store::SettingsStore;
@@ -1829,14 +1866,17 @@ mod tests {
             settings_store.clone(),
         ));
         let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
-        let gateway_svc = Arc::new(GatewayService::new(
-            account_svc.clone(),
-            Arc::new(Rewriter::new()),
-            telemetry_svc.clone(),
-            settings_store.clone(),
-            cache,
-            Arc::new(UsageStore::new(pool.clone())),
-        ));
+        let gateway_svc = Arc::new(
+            GatewayService::new(
+                account_svc.clone(),
+                Arc::new(Rewriter::new()),
+                telemetry_svc.clone(),
+                settings_store.clone(),
+                cache,
+                Arc::new(UsageStore::new(pool.clone())),
+            )
+            .with_diagnostics(Arc::new(DiagnosticsStore::new(pool.clone()))),
+        );
         let cfg = Config {
             server: ServerConfig {
                 port: 0,
@@ -1873,6 +1913,92 @@ mod tests {
             telemetry_svc,
         );
         (router, gateway_svc)
+    }
+
+    /// 诊断查询只对管理员开放，并支持关联 ID 反查和受控参数错误。
+    #[tokio::test]
+    async fn diagnostics_routes_require_admin_and_expose_committed_requests() {
+        let (app, gateway) = test_router_with_gateway().await;
+        let response = gateway
+            .handle_request(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .header("user-agent", "synthetic-denied-client")
+                    .body(Body::empty())
+                    .unwrap(),
+                None,
+            )
+            .await;
+        let id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = body::to_bytes(response.into_body(), 4096).await.unwrap();
+        gateway.diagnostics_store().unwrap().flush().await.unwrap();
+        for path in [
+            "/admin/request-diagnostics".to_owned(),
+            format!("/admin/request-diagnostics/{id}"),
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+            let accepted = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(accepted.status(), StatusCode::OK);
+            let value: serde_json::Value =
+                serde_json::from_slice(&body::to_bytes(accepted.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            if path.ends_with(&id) {
+                assert_eq!(value["request"]["outcome"], "local_rejected");
+                assert_eq!(value["attempts"], serde_json::json!([]));
+            } else {
+                assert_eq!(value["total"], 1);
+            }
+        }
+        for (path, expected) in [
+            (
+                format!("/admin/request-diagnostics?correlation_id={id}"),
+                StatusCode::OK,
+            ),
+            (
+                "/admin/request-diagnostics?page=0".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/admin/request-diagnostics?since=bad".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/admin/request-diagnostics/missing".into(),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     /// 账号列表随刷新返回本地用量，不把读取转换成主动额度查询。
