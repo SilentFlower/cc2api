@@ -241,7 +241,8 @@ impl UsageStore {
                 && partial_requests == 0;
             let estimated_total_cost_usd = bound
                 .utilization
-                .filter(|pct| coverage_complete && *pct > 0.0 && cost_usd > 0.0)
+                // 与 sub2api 一致，按已有费用和官方比例预估，不以完整周期采集作为门槛。
+                .filter(|pct| *pct > 0.0 && cost_usd > 0.0)
                 .map(|pct| cost_usd * 100.0 / pct)
                 .filter(|cost| cost.is_finite());
             let window = WindowUsage {
@@ -452,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_or_incomplete_data_never_produces_total_estimate() {
+    async fn unpriced_data_without_positive_cost_never_produces_total_estimate() {
         let (_, store, mut account) = fixture().await;
         let now = Utc::now();
         store
@@ -479,6 +480,42 @@ mod tests {
             assert!(!stats.five_hour.coverage_complete);
             assert!(stats.five_hour.estimated_total_cost_usd.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn partial_window_estimates_use_known_cost_like_sub2api() {
+        let (pool, store, mut account) = fixture().await;
+        let now = Utc::now();
+        account.usage_data = json!({
+            "five_hour":{"utilization":10,"resets_at":timestamp(now+Duration::hours(1))},
+            "seven_day":{"utilization":25,"resets_at":timestamp(now+Duration::days(1))}
+        });
+        store
+            .record(&record(
+                account.id,
+                now - Duration::minutes(1),
+                Some(12.5),
+                true,
+            ))
+            .await
+            .unwrap();
+        store
+            .record(&record(account.id, now - Duration::minutes(1), None, true))
+            .await
+            .unwrap();
+        let restarted = UsageStore::new(pool);
+        let stats = restarted
+            .summaries(&[account.clone()], now)
+            .await
+            .unwrap()
+            .remove(&account.id)
+            .unwrap();
+        assert!(!stats.five_hour.coverage_complete);
+        assert!(!stats.seven_day.coverage_complete);
+        assert_eq!(stats.five_hour.unpriced_requests, 1);
+        assert_eq!(stats.five_hour.partial_requests, 2);
+        assert_eq!(stats.five_hour.estimated_total_cost_usd, Some(125.0));
+        assert_eq!(stats.seven_day.estimated_total_cost_usd, Some(50.0));
     }
 
     #[tokio::test]
@@ -522,10 +559,8 @@ mod tests {
             .unwrap();
         assert_eq!(stats.five_hour.cost_usd, 12.5);
         assert_eq!(stats.five_hour.requests, 1);
-        assert!(
-            stats.five_hour.estimated_total_cost_usd.is_none(),
-            "重启后覆盖不足不能外推整周期"
-        );
+        assert!(!stats.five_hour.coverage_complete);
+        assert_eq!(stats.five_hour.estimated_total_cost_usd, Some(125.0));
         drop(store);
         reopened.close().await;
         let _ = std::fs::remove_file(file);

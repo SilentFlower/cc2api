@@ -20,7 +20,6 @@ const description = computed(() => {
   if (!stats) return '尚未提供本地用量统计';
   const range = stats.basis === 'quota' ? '当前额度周期' : `最近 ${props.label}`;
   const notes = [`${range}内经过网关的请求，费用按模型 API 单价折算`];
-  if (!stats.coverage_complete) notes.push('记录可能未覆盖整个周期');
   if (stats.unpriced_requests) notes.push(`${stats.unpriced_requests} 次请求费用未知`);
   if (stats.partial_requests) notes.push(`${stats.partial_requests} 次请求用量不完整`);
   return notes.join('；');
@@ -49,9 +48,8 @@ function compact(value: number): string {
     </span>
     <span v-if="current.estimated_total_cost_usd != null" class="rounded bg-[#f6f3ee] px-1.5 py-0.5"
       title="按本窗口网关费用除以官方已用比例估算；同账号其它入口的消费可能使估算偏低，并非官方美元配额">
-      估算总额 ${{ current.estimated_total_cost_usd.toFixed(2) }}
+      预计总费用 ${{ current.estimated_total_cost_usd.toFixed(2) }}
     </span>
-    <span v-if="!current.coverage_complete" class="text-[#b5b0a6]">部分记录</span>
   </div>
   <p v-else class="pb-1 text-[10px] text-[#b5b0a6]">统计待更新</p>
 </template>
