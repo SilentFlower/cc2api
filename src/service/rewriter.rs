@@ -4,6 +4,7 @@ use rand::Rng;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -2123,7 +2124,7 @@ impl Rewriter {
     /// @param body 已改写但后续又被签名整流修改的请求体。
     /// @param account 当前账号,用于判断 billing 模式和版本 seed。
     /// @param client_type 当前请求客户端类型,API mimicry 即使账号非 Rewrite 也会生成 CCH。
-    /// @return 不需要 CCH 或没有 `cch=` 时原样返回;否则返回重新计算后的 body。
+    /// @return 门禁关闭或根级 billing 目标缺失、非法、歧义时原样返回；否则刷新其 CCH。
     pub fn refresh_cch_attestation(
         &self,
         body: Vec<u8>,
@@ -2332,14 +2333,17 @@ impl Rewriter {
             String::new()
         };
 
+        // 先在整个根级 system 中确认唯一目标，避免逐块重置时掩盖重复 billing 的歧义。
+        if rewrite_billing {
+            reset_system_billing_cch(body);
+        }
+
         let rewrite = |text: &str| -> String {
             let mut text = text.to_string();
             if rewrite_billing {
                 text = BILLING_VERSION_REGEX
                     .replace_all(&text, &format!("cc_version={}.{}", version, cch_hash))
                     .to_string();
-                // 将已有的 cch 值重置为占位符，后续在序列化后通过 xxhash64 重新计算
-                text = CCH_VALUE_REGEX.replace_all(&text, "cch=00000").to_string();
             } else if *billing_mode == BillingMode::Strip {
                 text = BILLING_LINE_REGEX.replace_all(&text, "").to_string();
                 text = BILLING_REGEX.replace_all(&text, "").to_string();
@@ -2563,26 +2567,25 @@ static CLAUDE_CODE_CURRENT_DATE_REGEX: Lazy<Regex> = Lazy::new(|| {
 const CCH_ATTESTATION_SEED_LEGACY: u64 = 0x6E52736AC806831E;
 const CCH_ATTESTATION_SEED_2156: u64 = 0x4D659218E32A3268;
 const CCH_PLACEHOLDER: &[u8] = b"cch=00000";
+const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// 对序列化后的 body 字节计算 cch attestation 并原地替换占位符。
 /// 算法：xxhash64(body_with_placeholder, seed) 取低 20 bits → 5 位十六进制。
 fn compute_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
-    if let Some(pos) = body
-        .windows(CCH_PLACEHOLDER.len())
-        .position(|w| w == CCH_PLACEHOLDER)
+    if let Some(pos) = find_cch_value(&body)
+        && &body[pos..pos + 5] == &CCH_PLACEHOLDER[4..]
     {
         let hash_input = cch_attestation_input(&body, version);
         let hash = xxhash_rust::xxh64::xxh64(&hash_input, cch_attestation_seed(version));
         let cch = format!("{:05x}", hash & 0xFFFFF);
-        // "cch=" 占 4 字节，后续 5 字节是 "00000"。
-        body[pos + 4..pos + 9].copy_from_slice(cch.as_bytes());
+        body[pos..pos + 5].copy_from_slice(cch.as_bytes());
     }
     body
 }
 
 fn refresh_cch_attestation(mut body: Vec<u8>, version: &str) -> Vec<u8> {
     if let Some(pos) = find_cch_value(&body) {
-        body[pos + 4..pos + 9].copy_from_slice(b"00000");
+        body[pos..pos + 5].copy_from_slice(&CCH_PLACEHOLDER[4..]);
         compute_cch_attestation(body, version)
     } else {
         body
@@ -2625,10 +2628,230 @@ fn top_level_string_field(body: &[u8], field: &str) -> Option<String> {
     serde_json::from_slice(&body[range]).ok()
 }
 
+/// 定位以 billing 开头的文本中唯一合法 CCH，后续普通文本不参与归因识别。
+fn billing_cch_value_range(text: &str) -> Option<Range<usize>> {
+    let billing = text.trim_start_matches([' ', '\t', '\r', '\n']);
+    let line_end = billing.find('\n').unwrap_or(billing.len());
+    if billing[line_end..]
+        .lines()
+        .any(|line| line.trim_start().starts_with(BILLING_HEADER_PREFIX))
+    {
+        return None;
+    }
+    let fields = billing[..line_end].strip_prefix(BILLING_HEADER_PREFIX)?;
+    let mut offset = text.len() - billing.len() + BILLING_HEADER_PREFIX.len();
+    let mut has_version = false;
+    let mut has_entrypoint = false;
+    let mut cch = None;
+    // 未知归因字段属于既有透传内容；只按独立字段边界识别 CCH，不限定键集合或顺序。
+    for raw_field in fields.split_inclusive(';') {
+        let field = raw_field.trim_start_matches([' ', '\t']);
+        let field_start = offset + raw_field.len() - field.len();
+        offset += raw_field.len();
+        let terminated = field.ends_with(';');
+        let field = field.strip_suffix(';').unwrap_or(field);
+        let Some((key, value)) = field.split_once('=') else {
+            if field.trim_end_matches([' ', '\t']) == "cch" {
+                return None;
+            }
+            continue;
+        };
+        match key.trim_end_matches([' ', '\t']) {
+            "cc_version" => {
+                has_version |= BILLING_VERSION_REGEX
+                    .find(field)
+                    .is_some_and(|matched| matched.start() == 0 && matched.end() == field.len());
+            }
+            "cc_entrypoint" => {
+                has_entrypoint |= key == "cc_entrypoint"
+                    && !value.is_empty()
+                    && !value.chars().any(char::is_whitespace);
+            }
+            "cch" => {
+                if key != "cch"
+                    || !terminated
+                    || value.len() != 5
+                    || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || cch.is_some()
+                {
+                    return None;
+                }
+                cch = Some(field_start + 4..field_start + 9);
+            }
+            _ => {}
+        }
+    }
+    if has_version && has_entrypoint {
+        cch
+    } else {
+        None
+    }
+}
+
+/// 将唯一根级 billing CCH 归零，保留缓存块和存在歧义的文本。
+fn reset_system_billing_cch(body: &mut serde_json::Value) {
+    let Some(system) = body.get_mut("system") else {
+        return;
+    };
+    let mut target = None;
+    let texts: Vec<_> = match system {
+        serde_json::Value::String(text) => vec![(None, text.as_str())],
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.get("type").and_then(|value| value.as_str()) == Some("text"))
+            .filter_map(|(index, block)| {
+                block.get("text")?.as_str().map(|text| (Some(index), text))
+            })
+            .collect(),
+        _ => return,
+    };
+    for (index, text) in texts {
+        if !text.trim_start().starts_with(BILLING_HEADER_PREFIX) {
+            continue;
+        }
+        let Some(range) = billing_cch_value_range(text) else {
+            return;
+        };
+        if target.replace((index, range)).is_some() {
+            return;
+        }
+    }
+    let Some((index, range)) = target else {
+        return;
+    };
+    let text = if let Some(index) = index {
+        let block = &mut system[index];
+        // 沿用前置改写的键存在即跳过规则，null 的合法性留给缓存策略处理。
+        if block.get("cache_control").is_some() {
+            return;
+        }
+        &mut block["text"]
+    } else {
+        system
+    };
+    if let serde_json::Value::String(text) = text {
+        text.replace_range(range, "00000");
+    }
+}
+
+/// 只扫描根级 system 及直接 text 块，返回五位值在原始 JSON 中的字节下标。
 fn find_cch_value(body: &[u8]) -> Option<usize> {
-    body.windows(CCH_PLACEHOLDER.len()).position(|window| {
-        window.starts_with(b"cch=") && window[4..].iter().all(|b| b.is_ascii_hexdigit())
-    })
+    let system_range = find_unique_json_field_value_range(body, "system").ok()??;
+    let system = &body[system_range.clone()];
+    let mut text_ranges = Vec::new();
+    match system.first()? {
+        b'"' => text_ranges.push(system_range),
+        b'[' => {
+            let mut index = skip_json_ws(system, 1);
+            while system.get(index) != Some(&b']') {
+                let end = scan_json_value_end(system, index)?;
+                if end <= index {
+                    return None;
+                }
+                let block = &system[index..end];
+                if block.first() == Some(&b'{') {
+                    let kind = find_unique_json_field_value_range(block, "type").ok()?;
+                    let text = find_unique_json_field_value_range(block, "text").ok()?;
+                    if kind
+                        .and_then(|range| parse_json_string_bytes(&block[range]))
+                        .as_deref()
+                        == Some("text")
+                        && let Some(range) = text
+                    {
+                        let start = system_range.start + index;
+                        text_ranges.push(start + range.start..start + range.end);
+                    }
+                }
+                index = skip_json_ws(system, end);
+                match system.get(index) {
+                    Some(b',') => {
+                        index = skip_json_ws(system, index + 1);
+                        if system.get(index) == Some(&b']') {
+                            return None;
+                        }
+                    }
+                    Some(b']') => break,
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    let mut target = None;
+    for range in text_ranges {
+        let raw = &body[range.clone()];
+        let text = parse_json_string_bytes(raw)?;
+        if !text.trim_start().starts_with(BILLING_HEADER_PREFIX) {
+            continue;
+        }
+        let value = billing_cch_value_range(&text)?;
+        let field_start = value.start.checked_sub(4)?;
+        let field = &text.as_bytes()[field_start..value.end];
+        // 解码偏移不能直接加到原始 JSON 下标上；局部解码前缀确认映射，值被转义时保守跳过。
+        let raw_position = raw
+            .windows(field.len())
+            .enumerate()
+            .find_map(|(index, bytes)| {
+                if bytes != field {
+                    return None;
+                }
+                let mut prefix = raw[..index + 4].to_vec();
+                prefix.push(b'"');
+                (parse_json_string_bytes(&prefix).as_deref() == Some(&text[..value.start]))
+                    .then_some(range.start + index + 4)
+            })?;
+        if target.replace(raw_position).is_some() {
+            return None;
+        }
+    }
+    target
+}
+
+/// 与 CCH 投影的首字段查找分开，归因定位遇到重复键或无效结构必须停止写入。
+fn find_unique_json_field_value_range(
+    body: &[u8],
+    field: &str,
+) -> Result<Option<Range<usize>>, ()> {
+    let mut index = skip_json_ws(body, 0);
+    if body.get(index) != Some(&b'{') {
+        return Err(());
+    }
+    index = skip_json_ws(body, index + 1);
+    let mut found = None;
+    loop {
+        if body.get(index) == Some(&b'}') {
+            return (skip_json_ws(body, index + 1) == body.len())
+                .then_some(found)
+                .ok_or(());
+        }
+        let key_end = scan_json_string_end(body, index).ok_or(())?;
+        let key = parse_json_string_bytes(&body[index..key_end]).ok_or(())?;
+        index = skip_json_ws(body, key_end);
+        if body.get(index) != Some(&b':') {
+            return Err(());
+        }
+        let start = skip_json_ws(body, index + 1);
+        let end = scan_json_value_end(body, start).ok_or(())?;
+        if start == end {
+            return Err(());
+        }
+        if key == field && found.replace(start..end).is_some() {
+            return Err(());
+        }
+        index = skip_json_ws(body, end);
+        match body.get(index) {
+            Some(b',') => {
+                index = skip_json_ws(body, index + 1);
+                if body.get(index) == Some(&b'}') {
+                    return Err(());
+                }
+            }
+            Some(b'}') => {}
+            _ => return Err(()),
+        }
+    }
 }
 
 // --- CCH fingerprint (SHA256) ---
@@ -13402,6 +13625,451 @@ mod tests {
         assert_eq!(cch_attestation_seed("2.1.280"), 0x4D659218E32A3268);
         assert_eq!(cch_attestation_seed("2.1.81"), 0x6E52736AC806831E);
         assert_eq!(cch_attestation_seed("2.1.999"), 0x6E52736AC806831E);
+    }
+
+    #[test]
+    fn cch_initial_seal_preserves_user_placeholder_before_billing() {
+        let body = r#"{"messages":[{"role":"user","content":"示例 cch=00000"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000;"}]}"#.as_bytes();
+        let output = compute_cch_attestation(body.to_vec(), "2.1.293");
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["messages"][0]["content"], "示例 cch=00000");
+        assert!(
+            !parsed["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cch=00000")
+        );
+    }
+
+    #[test]
+    fn cch_retry_refresh_preserves_user_hex_before_billing() {
+        let body = br#"{"messages":[{"role":"user","content":"example cch=12345"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=abcde;"}]}"#;
+        let output = Rewriter::new().refresh_cch_attestation(
+            body.to_vec(),
+            &test_account_with_profile("2.1.293"),
+            ClientType::ClaudeCode,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["messages"][0]["content"], "example cch=12345");
+        assert!(
+            !parsed["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cch=abcde")
+        );
+    }
+
+    #[test]
+    fn cch_placeholder_reset_preserves_system_document_and_reminder() {
+        let account = test_account();
+        let profile = device_profile(&account);
+        let mut body = json!({
+            "system": [
+                {"type": "text", "text": "Documentation example: cch=12345"},
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli; cch=abcde;"}
+            ],
+            "messages": [{"role": "user", "content": "<system-reminder>Example: cch=fedcb</system-reminder>"}]
+        });
+        let original = body.clone();
+        Rewriter::new().rewrite_system_prompt(
+            &mut body,
+            &profile.prompt,
+            TEST_VERSION,
+            &BillingMode::Rewrite,
+            EnvPassthrough::default(),
+        );
+
+        assert_eq!(body["system"][0], original["system"][0]);
+        assert_eq!(body["messages"], original["messages"]);
+        assert!(
+            body["system"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cch=00000")
+        );
+    }
+
+    #[test]
+    fn cch_billing_location_matches_independent_reference_and_exact_bytes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/cch-billing-location.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let body = case["body"].as_str().unwrap().as_bytes();
+            let version = case["version"].as_str().unwrap();
+            let start = case["target_value_start"].as_u64().unwrap() as usize;
+            let expected_cch = case["expected_cch"].as_str().unwrap();
+            assert_eq!(&body[start..start + 5], b"00000", "{name}");
+            let mut expected = body.to_vec();
+            expected[start..start + 5].copy_from_slice(expected_cch.as_bytes());
+
+            if let Some(original) = case["original_body"].as_str() {
+                let output = Rewriter::new().rewrite_body(
+                    original.as_bytes(),
+                    "/v1/messages",
+                    &test_account_with_profile(version),
+                    ClientType::ClaudeCode,
+                    EnvPassthrough::default(),
+                    CacheControlTtlRewrite::Off,
+                    MessageCacheControlRewrite::Off,
+                    true,
+                );
+                assert_eq!(output, expected, "完整改写：{name}");
+            }
+
+            assert_eq!(
+                compute_cch_attestation(body.to_vec(), version),
+                expected,
+                "{name}"
+            );
+            let mut retry = body.to_vec();
+            retry[start..start + 5].copy_from_slice(b"A1b2C");
+            assert_eq!(
+                super::refresh_cch_attestation(retry, version),
+                expected,
+                "{name}"
+            );
+            assert_eq!(
+                super::refresh_cch_attestation(expected.clone(), version),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn cch_billing_extra_fields_and_field_order_preserve_existing_compatibility() {
+        for billing in [
+            "x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000; cc_prompt_id=synthetic; cc_is_subagent=true; synthetic_fingerprint=synthetic-canary;",
+            "x-anthropic-billing-header: cc_version=2.1.293.abc; cc_prompt_id=synthetic; cc_is_subagent=true; cch=00000; cc_entrypoint=sdk-cli; synthetic_fingerprint=synthetic-canary;",
+            "x-anthropic-billing-header: cch=00000; synthetic_fingerprint=synthetic-canary; cc_entrypoint=subagent; cc_version=2.1.293.abc;",
+            "x-anthropic-billing-header:\tcc_entrypoint=custom;\t cch=00000; cc_version=2.1.293.abc;",
+            "x-anthropic-billing-header: note=cch=12345; cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000; xcch=fedcb;",
+        ] {
+            for system in [json!(billing), json!([{"type": "text", "text": billing}])] {
+                let body = json!({
+                    "messages": [{"role": "user", "content": "用户示例 cch=00000 cch=12345"}],
+                    "system": system,
+                    "thread": {"previous_message_id": "synthetic"},
+                });
+                let raw = serde_json::to_vec(&body).unwrap();
+                let sealed = compute_cch_attestation(raw.clone(), "2.1.293");
+                assert_ne!(sealed, raw, "{billing}");
+                let parsed: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+                let after = if parsed["system"].is_string() {
+                    parsed["system"].as_str().unwrap()
+                } else {
+                    parsed["system"][0]["text"].as_str().unwrap()
+                };
+                let value_start = billing.find("cch=00000").unwrap() + 4;
+                let mut expected_billing = billing.to_string();
+                expected_billing.replace_range(
+                    value_start..value_start + 5,
+                    &after[value_start..value_start + 5],
+                );
+                assert_eq!(after, expected_billing);
+                assert_eq!(parsed["messages"], body["messages"]);
+
+                let mut stale = body.clone();
+                let stale_text = billing.replacen("cch=00000", "cch=abcde", 1);
+                if stale["system"].is_string() {
+                    stale["system"] = json!(stale_text);
+                } else {
+                    stale["system"][0]["text"] = json!(stale_text);
+                }
+                assert_eq!(
+                    super::refresh_cch_attestation(serde_json::to_vec(&stale).unwrap(), "2.1.293"),
+                    sealed
+                );
+                super::reset_system_billing_cch(&mut stale);
+                assert_eq!(stale, body);
+
+                let rewriter = Rewriter::new();
+                assert_eq!(
+                    rewriter.rewrite_body(
+                        &raw,
+                        "/v1/messages",
+                        &test_account_with_profile("2.1.293"),
+                        ClientType::ClaudeCode,
+                        EnvPassthrough::default(),
+                        CacheControlTtlRewrite::Off,
+                        MessageCacheControlRewrite::Off,
+                        true,
+                    ),
+                    sealed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cch_missing_invalid_and_ambiguous_system_targets_preserve_input() {
+        let billing =
+            "x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli; cch=00000;";
+        let block = json!({"type": "text", "text": billing});
+        let mut systems = vec![
+            json!(null),
+            json!([]),
+            json!("cch=00000"),
+            json!(format!("文档中的示例\n{billing}")),
+            json!(format!("near-{billing}")),
+            json!({"system": [block.clone()]}),
+            json!([[block.clone()]]),
+            json!([{"type": "thinking", "text": billing}]),
+            json!([{"type": "text", "text": 123, "system": [block.clone()]}]),
+            json!([block.clone(), block.clone()]),
+            json!(format!("{billing}\n{billing}")),
+        ];
+        for invalid in [
+            "cch=0000;",
+            "cch=000000;",
+            "cch=00000f;",
+            "cch=00000z;",
+            "cch=00g00;",
+            "cch=00000",
+            "cch=00000 ;",
+            "xcch=00000;",
+            "cch=00000; cch=12345;",
+            "cch=12345; cch=00000;",
+            "cch=00000; cc_prompt_id=synthetic; cch=12345;",
+            "cch; cc_prompt_id=synthetic; cch=00000;",
+            "cch=00000; cc_prompt_id=synthetic; cch =12345;",
+            "cch=;",
+            "",
+        ] {
+            let text = billing.replace("cch=00000;", invalid);
+            systems.push(json!(text));
+            systems.push(json!([{"type": "text", "text": text}]));
+            systems.push(json!([block.clone(), {"type": "text", "text": text}]));
+        }
+        for system in systems {
+            let mut parsed = json!({
+                "messages": [{"role": "user", "content": "cch=00000 cch=12345"}],
+                "tools": [{"description": "cch=00000"}],
+                "metadata": {"system": [block.clone()]},
+                "system": system,
+            });
+            let raw = serde_json::to_vec(&parsed).unwrap();
+            assert_eq!(compute_cch_attestation(raw.clone(), TEST_VERSION), raw);
+            assert_eq!(
+                super::refresh_cch_attestation(raw.clone(), TEST_VERSION),
+                raw
+            );
+            super::reset_system_billing_cch(&mut parsed);
+            assert_eq!(serde_json::to_vec(&parsed).unwrap(), raw);
+        }
+        let raw = br#"{"messages":[{"role":"user","content":"cch=00000"}],"metadata":{"system":"cch=12345"}}"#;
+        assert_eq!(compute_cch_attestation(raw.to_vec(), TEST_VERSION), raw);
+        assert_eq!(
+            super::refresh_cch_attestation(raw.to_vec(), TEST_VERSION),
+            raw
+        );
+    }
+
+    #[test]
+    fn cch_duplicate_json_fields_and_escaped_values_do_not_fall_back() {
+        let billing = r#""x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000;""#;
+        let systems = [
+            format!(r#""system":{billing},"system":{billing}"#),
+            format!(r#""system":{billing},"\u0073ystem":{billing}"#),
+            format!(r#""system":[{{"type":"text","text":{billing},"text":{billing}}}]"#),
+            format!(r#""system":[{{"type":"text","\u0074ype":"text","text":{billing}}}]"#),
+            format!(
+                r#""system":{}"#,
+                billing.replace("cch=00000", r"cch=\u00300000")
+            ),
+            format!(
+                r#""system":{}"#,
+                billing.replace("cch=00000", r"\u0063ch=00000")
+            ),
+        ];
+        for system in systems {
+            let raw = format!(
+                r#"{{"messages":[{{"role":"user","content":"cch=00000 cch=12345"}}],{system}}}"#
+            )
+            .into_bytes();
+            assert_eq!(compute_cch_attestation(raw.clone(), "2.1.293"), raw);
+            assert_eq!(super::refresh_cch_attestation(raw.clone(), "2.1.293"), raw);
+        }
+    }
+
+    #[test]
+    fn cch_full_rewrite_preserves_examples_across_clients_modes_and_caches() {
+        for mode in [BillingMode::Rewrite, BillingMode::Strip] {
+            for client in [ClientType::API, ClientType::ClaudeCode] {
+                for cache in [
+                    MessageCacheControlRewrite::Off,
+                    MessageCacheControlRewrite::Auto,
+                ] {
+                    let mut account = test_account_with_profile("2.1.293");
+                    account.billing_mode = mode.clone();
+                    let original = json!({
+                        "model": "claude-sonnet-5-5",
+                        "messages": [{"role": "user", "content": [
+                            {"type": "text", "text": "用户 cch=00000 cch=12345"},
+                            {"type": "text", "text": "<system-reminder>示例 cch=abcde</system-reminder>"},
+                            {"type": "tool_result", "tool_use_id": "synthetic", "content": "结果 cch=00000"}
+                        ]}],
+                        "tools": [{"name": "synthetic", "description": "工具 cch=00000", "input_schema": {"type": "object"}, "system": [{"type": "text", "text": "嵌套 cch=fedcb"}]}],
+                        "metadata": {"sample": "元数据 cch=00000"},
+                        "system": [
+                            {"type": "text", "text": "普通 system 文档 cch=54321"},
+                            {"type": "text", "extra": true, "text": "x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=sdk; cch=45678;"}
+                        ],
+                    });
+                    let rewriter = Rewriter::new();
+                    let output = rewriter.rewrite_body(
+                        &serde_json::to_vec(&original).unwrap(),
+                        "/v1/messages",
+                        &account,
+                        client,
+                        EnvPassthrough::default(),
+                        CacheControlTtlRewrite::Off,
+                        cache,
+                        true,
+                    );
+                    let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    let content = parsed["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_array()
+                        .unwrap();
+                    for expected in original["messages"][0]["content"].as_array().unwrap() {
+                        assert!(
+                            content.iter().any(|block| block["text"] == expected["text"]
+                                && block["content"] == expected["content"]),
+                            "mode={mode:?}, client={client:?}, cache={cache:?}, expected={expected}, content={content:?}"
+                        );
+                    }
+                    assert_eq!(parsed["metadata"]["sample"], original["metadata"]["sample"]);
+                    assert_eq!(
+                        parsed["tools"][0]["description"],
+                        original["tools"][0]["description"]
+                    );
+                    assert_eq!(parsed["tools"][0]["system"], original["tools"][0]["system"]);
+                    if client == ClientType::API || mode == BillingMode::Rewrite {
+                        let index = if client == ClientType::API { 0 } else { 1 };
+                        let billing = parsed["system"][index]["text"].as_str().unwrap();
+                        assert!(!billing.contains("cch=00000"));
+                        assert!(!billing.contains("cch=45678"));
+                    }
+                    if client == ClientType::ClaudeCode {
+                        assert_eq!(parsed["system"][0], original["system"][0]);
+                    }
+                    assert_eq!(
+                        rewriter.refresh_cch_attestation(output.clone(), &account, client),
+                        output
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cch_string_system_rewrite_keeps_later_examples_and_public_refresh_gate() {
+        let account = test_account_with_profile("2.1.293");
+        let body = json!({
+            "system": " \nx-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=subagent; cch=54321;\n普通文档：cch=12345，中文与转义 \\",
+            "messages": [{"role": "user", "content": "<system-reminder>cch=00000</system-reminder>"}],
+        });
+        let rewriter = Rewriter::new();
+        let output = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+            EnvPassthrough::default(),
+            CacheControlTtlRewrite::Off,
+            MessageCacheControlRewrite::Off,
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let system = parsed["system"].as_str().unwrap();
+        assert!(system.starts_with(" \nx-anthropic-billing-header: cc_version=2.1.293."));
+        assert!(!system.contains("cch=54321"));
+        assert!(system.ends_with("普通文档：cch=12345，中文与转义 \\"));
+        assert_eq!(parsed["messages"], body["messages"]);
+        let mut strip_account = account;
+        strip_account.billing_mode = BillingMode::Strip;
+        let stale = serde_json::to_vec(&body).unwrap();
+        assert_eq!(
+            rewriter.refresh_cch_attestation(stale.clone(), &strip_account, ClientType::ClaudeCode),
+            stale
+        );
+        assert_ne!(
+            rewriter.refresh_cch_attestation(stale.clone(), &strip_account, ClientType::API),
+            stale
+        );
+    }
+
+    #[test]
+    fn cch_initial_reset_keeps_cached_billing_and_rejects_duplicate_billing() {
+        let billing =
+            "x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli; cch=12345;";
+        for cache_control in [json!(null), json!({"type": "ephemeral", "ttl": "1h"})] {
+            let system = json!([
+                {"type": "text", "text": "文档 cch=00000"},
+                {"type": "text", "text": billing, "cache_control": cache_control}
+            ]);
+            let mut body =
+                json!({"system": system, "messages": [{"role": "user", "content": "cch=00000"}]});
+            let original = body.clone();
+            super::reset_system_billing_cch(&mut body);
+            assert_eq!(body, original);
+            let raw = serde_json::to_vec(&body).unwrap();
+            assert_eq!(compute_cch_attestation(raw.clone(), TEST_VERSION), raw);
+
+            body["system"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": "text", "text": billing}));
+            let duplicate = body.clone();
+            super::reset_system_billing_cch(&mut body);
+            assert_eq!(body, duplicate);
+            let raw = serde_json::to_vec(&body).unwrap();
+            assert_eq!(
+                super::refresh_cch_attestation(raw.clone(), TEST_VERSION),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn cch_classifier_attribution_preserves_examples_when_adding_and_refreshing_billing() {
+        for existing_billing in [false, true] {
+            let mut body = json!({
+                "messages": [{"role": "user", "content": "classifier cch=00000 cch=12345"}],
+                "tools": [{"description": "cch=00000"}],
+                "metadata": {"example": "cch=abcde"},
+                "system": [{"type": "text", "text": "classifier cch=00000", "cache_control": {"type": "ephemeral"}}],
+            });
+            if existing_billing {
+                body["system"].as_array_mut().unwrap().push(json!({
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=54321;"
+                }));
+            }
+            let rewriter = Rewriter::new();
+            let output = rewriter.rewrite_claude_code_status_classifier_attribution(
+                &serde_json::to_vec(&body).unwrap(),
+                &test_account_with_profile("2.1.293"),
+                &UpstreamSessionRewrite::default(),
+            );
+            let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(parsed["messages"], body["messages"]);
+            assert_eq!(parsed["tools"], body["tools"]);
+            assert_eq!(parsed["metadata"], body["metadata"]);
+            assert_eq!(parsed["system"][2], body["system"][0]);
+            let billing = parsed["system"][0]["text"].as_str().unwrap();
+            assert!(!billing.contains("cch=00000"));
+            assert!(!billing.contains("cch=54321"));
+            assert_eq!(
+                super::refresh_cch_attestation(output.clone(), "2.1.293"),
+                output
+            );
+        }
     }
 
     #[test]

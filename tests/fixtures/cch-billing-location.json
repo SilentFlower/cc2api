@@ -1,0 +1,84 @@
+{
+  "reference": "系统 libxxhash.so.0 的 XXH64；投影按各合成正文的显式字节片段替换，目标由唯一入口标记确定，未调用产品定位或投影函数。",
+  "cases": [
+    {
+      "name": "293-array-user-tools-metadata-before-system",
+      "version": "2.1.293",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"中文 cch=00000 / cch=12345 / \\\\\"},{\"type\":\"tool_result\",\"tool_use_id\":\"synthetic\",\"content\":\"cch=abcde\"}]}],\"tools\":[{\"description\":\"cch=00000\",\"model\":\"advisor-model\"}],\"metadata\":{\"sample\":\"cch=54321\",\"system\":\"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000;\"},\"system\":[{\"type\":\"text\",\"text\":\"文档 cch=00000\\n引用 x-anthropic-billing-header: cch=00000;\"},{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=sdk; cch=00000;\"}],\"model\":\"root-model\",\"max_tokens\":64000,\"fallbacks\":[{\"model\":\"fallback-model\"}]}",
+      "target_value_start": 558,
+      "expected_cch": "58913",
+      "body_sha256": "fba3f787849bfbcf83ed729530cb230bd509f48ed2936d8008000ec8b16cf8e1",
+      "projection_sha256": "ec8972999348e215519ffb897fa0c89c19bed46e46938c2527e1294cdd0468c6",
+      "body_bytes": 649,
+      "projection_bytes": 593,
+      "xxhash64": "c79c53984e058913",
+      "seed": "4d659218e32a3268"
+    },
+    {
+      "name": "280-string-system-first-with-escaped-prefix-and-unicode",
+      "version": "2.1.280",
+      "body": "{ \"system\" : \"\\u0020\\n\\u0078-anthropic-billing-header:\\tcc_version=2.1.280.abc; cc_entrypoint=subagent; cch=00000;\\r\\n中文 \\u4e2d \\\\ \\\" cch=12345\", \"messages\" : [{\"role\":\"user\",\"content\":\"cch=00000\"}], \"model\" : \"root-model\", \"max_tokens\":64000, \"fallbacks\":[{\"model\":\"fallback-model\"}] }",
+      "target_value_start": 108,
+      "expected_cch": "9ada6",
+      "body_sha256": "8a847a5846a90055e8a28e95797f24bffc7f8e6d108cc5e2480dea6e7b8403c5",
+      "projection_sha256": "b35ee165db48c5757596c0835cca8eeb7863e727ccad90be33f61b92fd119c0d",
+      "body_bytes": 290,
+      "projection_bytes": 247,
+      "xxhash64": "8abca525fb49ada6",
+      "seed": "4d659218e32a3268"
+    },
+    {
+      "name": "169-array-with-block-extras-and-system-last",
+      "version": "2.1.169",
+      "body": "{\"model\":\"root-model\",\"max_tokens\":64000,\"messages\":[{\"role\":\"user\",\"content\":\"cch=00000\"}],\"system\":[{\"extra\":\"cch=fedcb\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.169.abc; cc_entrypoint=cli; cch=00000;\\n示例 cch=abcde\",\"type\":\"text\"}]}",
+      "target_value_start": 206,
+      "expected_cch": "d33b5",
+      "body_sha256": "66d39577ce1c11989d4388ffafeeb090dd7ca0e25eb7cba3c6ae8468da4a1ee3",
+      "projection_sha256": "66d39577ce1c11989d4388ffafeeb090dd7ca0e25eb7cba3c6ae8468da4a1ee3",
+      "body_bytes": 248,
+      "projection_bytes": 248,
+      "xxhash64": "72e1b531d74d33b5",
+      "seed": "4d659218e32a3268"
+    },
+    {
+      "name": "unknown-version-keeps-full-body-and-legacy-seed",
+      "version": "2.1.999",
+      "body": "{\"metadata\":{\"cch\":\"cch=00000\"},\"model\":\"root-model\",\"max_tokens\":64000,\"system\":\"x-anthropic-billing-header: cc_version=2.1.999.abc; cc_entrypoint=custom; cch=00000;\",\"messages\":[{\"role\":\"user\",\"content\":\"cch=12345\"}]}",
+      "target_value_start": 160,
+      "expected_cch": "37291",
+      "body_sha256": "2c05ffd29e5ec6df7977d9fe88b260d2f761669e244aadc32db7efe11316f553",
+      "projection_sha256": "2c05ffd29e5ec6df7977d9fe88b260d2f761669e244aadc32db7efe11316f553",
+      "body_bytes": 219,
+      "projection_bytes": 219,
+      "xxhash64": "2f546a7e02b37291",
+      "seed": "6e52736ac806831e"
+    },
+    {
+      "name": "293-complete-claude-code-rewrite-with-user-and-tool-examples",
+      "version": "2.1.293",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"synthetic cch=00000\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.5ae; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5-5\",\"max_tokens\":4096,\"tools\":[{\"description\":\"cch=12345\"}]}",
+      "target_value_start": 170,
+      "expected_cch": "0eab6",
+      "body_sha256": "b37781f5b0ed10c309094f6e01b9e877d64e824267b76c733df656fa48f4be70",
+      "projection_sha256": "e69470299c6adf8dfe61c587ea1a25c525c6a022d23e6c50db1713b45ca1445f",
+      "body_bytes": 264,
+      "projection_bytes": 229,
+      "xxhash64": "8b5a3ef310f0eab6",
+      "seed": "4d659218e32a3268",
+      "original_body": "{\"messages\":[{\"role\":\"user\",\"content\":\"synthetic cch=00000\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=12345;\"}],\"model\":\"claude-sonnet-5-5\",\"max_tokens\":4096,\"tools\":[{\"description\":\"cch=12345\"}]}"
+    },
+    {
+      "name": "293-extra-billing-field-minimal-independent-reference",
+      "version": "2.1.293",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000; cc_prompt_id=synthetic;\"}],\"messages\":[]}",
+      "target_value_start": 109,
+      "expected_cch": "32214",
+      "body_sha256": "ff815a084208b83820772e50dc923778b9f002d032f9ff7f46b6c2b8710d9812",
+      "projection_sha256": "ff815a084208b83820772e50dc923778b9f002d032f9ff7f46b6c2b8710d9812",
+      "body_bytes": 157,
+      "projection_bytes": 157,
+      "xxhash64": "b057ccc826d32214",
+      "seed": "4d659218e32a3268"
+    }
+  ]
+}
