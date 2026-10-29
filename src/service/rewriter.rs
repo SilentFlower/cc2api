@@ -2172,7 +2172,7 @@ impl Rewriter {
             // 注入模式
             self.inject_metadata_user_id(body, &profile, account);
 
-            // 剥离 Claude Code 不会发送的字段
+            // 剥离 Claude Code 不会发送的字段；stream 保留调用方选择，避免非流请求变为 SSE。
             if let Some(obj) = body.as_object_mut() {
                 obj.remove("temperature");
                 obj.remove("top_k");
@@ -2182,9 +2182,6 @@ impl Rewriter {
                 // 确保 tools 字段存在
                 obj.entry("tools")
                     .or_insert(serde_json::Value::Array(vec![]));
-
-                // 确保 stream 为 true
-                obj.insert("stream".into(), serde_json::Value::Bool(true));
             }
 
             // API mimicry 自己接管 system 断点；客户端 message 断点稍后按设置重打。
@@ -12080,6 +12077,54 @@ mod tests {
         );
     }
 
+    /// 验证普通 API 与原生 CC 在最终序列化后仍保留调用方的流式选择。
+    /// @return 无；任一版本把非流请求改为流式时测试失败。
+    #[test]
+    fn messages_rewrite_preserves_explicit_stream_preference() {
+        for version in ["2.1.260", "2.1.280", "2.1.293"] {
+            for client_type in [ClientType::API, ClientType::ClaudeCode] {
+                for stream in [false, true] {
+                    let body = json!({
+                        "model": "claude-sonnet-5",
+                        "max_tokens": 1024,
+                        "messages": [{"role": "user", "content": "合成流模式回归"}],
+                        "stream": stream
+                    });
+
+                    let output = rewrite_messages_body_for_profile(body, client_type, version);
+
+                    assert_eq!(
+                        output.get("stream"),
+                        Some(&json!(stream)),
+                        "版本={version} 客户端={client_type:?} stream={stream}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 验证缺省流模式交由上游默认值决定，不因 API 画像改写而补入 true。
+    /// @return 无；任一版本额外生成 stream 字段时测试失败。
+    #[test]
+    fn messages_rewrite_preserves_missing_stream_preference() {
+        for version in ["2.1.260", "2.1.280", "2.1.293"] {
+            for client_type in [ClientType::API, ClientType::ClaudeCode] {
+                let body = json!({
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "合成缺省流模式回归"}]
+                });
+
+                let output = rewrite_messages_body_for_profile(body, client_type, version);
+
+                assert!(
+                    output.get("stream").is_none(),
+                    "版本={version} 客户端={client_type:?} 不应补入 stream"
+                );
+            }
+        }
+    }
+
     #[test]
     fn api_mode_overwrites_client_metadata_user_id_and_aligns_session_header() {
         let account = test_account();
@@ -12416,8 +12461,7 @@ mod tests {
                 "system",
                 "tools",
                 "metadata",
-                "max_tokens",
-                "stream"
+                "max_tokens"
             ]
         );
     }

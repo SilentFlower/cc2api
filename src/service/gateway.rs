@@ -8499,6 +8499,115 @@ mod tests {
         server.abort();
     }
 
+    /// 验证真实网关按调用方选择发送请求，并返回上游对应的 JSON 或 SSE。
+    /// @return 无；出站 stream、响应协议或非流完整消息不符时测试失败。
+    #[tokio::test]
+    async fn gateway_preserves_stream_preference_through_upstream_and_response() {
+        let (sent_requests, mut received_requests) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(payload): Json<Value>| {
+                let sent_requests = sent_requests.clone();
+                async move {
+                    sent_requests.send(payload.clone()).unwrap();
+                    let message = json!({
+                        "id": "msg_stream_preference",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-5-5",
+                        "content": [{"type": "text", "text": "合成非流响应"}],
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    });
+                    if payload.get("stream").and_then(Value::as_bool) != Some(true) {
+                        return Json(message).into_response();
+                    }
+
+                    // 模拟上游按实际 stream 参数选协议，避免只核对改写后的内部对象。
+                    let mut start = message;
+                    start["content"] = json!([]);
+                    start["stop_reason"] = Value::Null;
+                    start["usage"]["output_tokens"] = json!(0);
+                    let events = [
+                        ("message_start", json!({"type": "message_start", "message": start})),
+                        ("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+                        ("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "合成非流响应"}})),
+                        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
+                        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 1}})),
+                        ("message_stop", json!({"type": "message_stop"})),
+                    ];
+                    let bytes = events
+                        .into_iter()
+                        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+                        .collect::<String>();
+                    ([(CONTENT_TYPE, "text/event-stream")], bytes).into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "stream-preference@example.invalid",
+            "synthetic-stream-preference",
+            50,
+        )
+        .await;
+
+        for user_agent in ["python-httpx/0.28.1", "claude-cli/2.1.293 (external, cli)"] {
+            for stream in [Some(false), Some(true), None] {
+                let mut payload = json!({
+                    "model": "claude-sonnet-5-5",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "合成流协议请求"}]
+                });
+                if let Some(stream) = stream {
+                    payload["stream"] = json!(stream);
+                }
+                let response = service
+                    .handle_request(
+                        profile_request("/v1/messages", Some(user_agent), payload),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let expected_content_type = if stream == Some(true) {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                assert_eq!(
+                    response.headers()[CONTENT_TYPE],
+                    expected_content_type,
+                    "客户端={user_agent} stream={stream:?}"
+                );
+                let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let upstream = timeout(Duration::from_secs(3), received_requests.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(upstream.get("stream"), stream.map(Value::Bool).as_ref());
+                if stream == Some(true) {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(text.contains("event: message_stop\n"));
+                } else {
+                    let message: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(message["id"], json!("msg_stream_preference"));
+                    assert_eq!(message["content"][0]["text"], json!("合成非流响应"));
+                    assert_eq!(message["stop_reason"], json!("end_turn"));
+                }
+            }
+        }
+        server.abort();
+    }
+
     /// 验证真实转发在关闭遥测时仍记录 JSON、SSE、压缩及取消后的已观察用量。
     /// @return 无返回值；响应被修改、漏记或重复记录时测试失败。
     #[tokio::test]
