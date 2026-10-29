@@ -1,3 +1,4 @@
+use axum::Error as AxumError;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{
@@ -8,8 +9,10 @@ use axum::http::{
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
+use http_body_util::LengthLimitError;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -29,6 +32,9 @@ use crate::service::account::{
     HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, UsageObservationKind,
 };
 use crate::service::diagnostics::{self, CURRENT_TRACE, RequestTraceGuard, TraceContext};
+use crate::service::request_body_codec::{
+    REQUEST_BODY_LIMIT, RequestBodyCodecError, RequestBodyEncoding,
+};
 use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerConfig, ClientType, DisabledThinkingRewrite,
     EnvPassthrough, MessageCacheControlRewrite, Rewriter, StatefulCacheCompletion,
@@ -1576,8 +1582,17 @@ impl GatewayService {
             snapshot.selection.resolve(&ua)
         };
 
-        let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+        let request_encoding = match RequestBodyEncoding::from_headers(req.headers()) {
+            Ok(encoding) => encoding,
+            Err(error) => return Ok(request_body_codec_error_response(error)),
+        };
+        let body_bytes = match axum::body::to_bytes(req.into_body(), REQUEST_BODY_LIMIT).await {
             Ok(bytes) => bytes,
+            Err(error) if request_encoding.is_encoded() => {
+                return Ok(request_body_codec_error_response(
+                    compressed_body_read_error(&error),
+                ));
+            }
             Err(e) => {
                 warn!("count_tokens body read failed: {}", e);
                 return Ok(anthropic_error_response(
@@ -1586,6 +1601,10 @@ impl GatewayService {
                     "Failed to read request body",
                 ));
             }
+        };
+        let body_bytes = match request_encoding.decode(body_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(request_body_codec_error_response(error)),
         };
         if body_bytes.is_empty() {
             return Ok(anthropic_error_response(
@@ -1716,7 +1735,12 @@ impl GatewayService {
             );
 
             let mut resp = self
-                .forward_count_tokens_request(&final_headers, &final_body, &account)
+                .forward_count_tokens_request(
+                    &final_headers,
+                    &final_body,
+                    &request_encoding,
+                    &account,
+                )
                 .await?;
             if resp.status() != StatusCode::UNAUTHORIZED {
                 return Ok(resp);
@@ -1731,7 +1755,12 @@ impl GatewayService {
                     format!("Bearer {}", refreshed_token),
                 );
                 resp = self
-                    .forward_count_tokens_request(&final_headers, &final_body, &account)
+                    .forward_count_tokens_request(
+                        &final_headers,
+                        &final_body,
+                        &request_encoding,
+                        &account,
+                    )
                     .await?;
                 if resp.status() != StatusCode::UNAUTHORIZED {
                     return Ok(resp);
@@ -1782,10 +1811,29 @@ impl GatewayService {
 
         diagnostics::profile_selection(request_profile.is_some());
 
-        // 读取请求体
-        let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {}", e)))?;
+        // 从原始多值头冻结编码链，解码必须先于正文策略和账号相关副作用。
+        let request_encoding = match RequestBodyEncoding::from_headers(req.headers()) {
+            Ok(encoding) => encoding,
+            Err(error) => return Ok(request_body_codec_error_response(error)),
+        };
+        let body_bytes = match axum::body::to_bytes(req.into_body(), REQUEST_BODY_LIMIT).await {
+            Ok(bytes) => bytes,
+            Err(error) if request_encoding.is_encoded() => {
+                return Ok(request_body_codec_error_response(
+                    compressed_body_read_error(&error),
+                ));
+            }
+            Err(error) => {
+                return Err(AppError::BadRequest(format!(
+                    "failed to read body: {}",
+                    error
+                )));
+            }
+        };
+        let body_bytes = match request_encoding.decode(body_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(request_body_codec_error_response(error)),
+        };
 
         // 解析请求体
         let body_map: serde_json::Value = if body_bytes.is_empty() {
@@ -2391,6 +2439,7 @@ impl GatewayService {
                     &query,
                     &final_headers,
                     &final_body,
+                    &request_encoding,
                     &request_account,
                     &account_selection_context,
                     request_capture_policy,
@@ -2441,6 +2490,7 @@ impl GatewayService {
                                 &query,
                                 &final_headers,
                                 &final_body,
+                                &request_encoding,
                                 &request_account,
                                 &account_selection_context,
                                 request_capture_policy,
@@ -2478,6 +2528,7 @@ impl GatewayService {
                     &query,
                     &final_headers,
                     &final_body,
+                    &request_encoding,
                     &request_account,
                     client_type,
                     &account_selection_context,
@@ -2632,6 +2683,7 @@ impl GatewayService {
     /// @param query 原始查询字符串。
     /// @param headers 已改写并携带 upstream token 的请求头。
     /// @param body 已改写后的原始上游请求体。
+    /// @param request_encoding 入站冻结的编码链，所有修复阶段都按该链重新编码。
     /// @param account 当前已选账号，重试必须复用该账号。
     /// @param client_type 原始客户端类型，用于判断 API mimicry 生成的 CCH 是否需要刷新。
     /// @param account_selection_context 当前请求模型与 Fable 配额 fallback 开关上下文。
@@ -2643,8 +2695,9 @@ impl GatewayService {
         method: &str,
         path: &str,
         query: &str,
-        headers: &std::collections::HashMap<String, String>,
+        headers: &HashMap<String, String>,
         body: &[u8],
+        request_encoding: &RequestBodyEncoding,
         account: &Account,
         client_type: ClientType,
         account_selection_context: &AccountSelectionContext,
@@ -2692,6 +2745,7 @@ impl GatewayService {
                     query,
                     &retry_headers,
                     &retry_body,
+                    request_encoding,
                     account,
                     account_selection_context,
                     request_capture_policy,
@@ -2734,13 +2788,25 @@ impl GatewayService {
         Ok((response_from_buffered(last_parts, last_body), last_stage))
     }
 
+    /// 保留逻辑正文用于诊断，在每次真正发送前重新编码本次最终正文。
+    /// @param method 原请求方法。
+    /// @param path 不含查询参数的请求路径。
+    /// @param query 原始查询字符串。
+    /// @param headers 已完成业务改写的请求头。
+    /// @param body 已完成本次改写与 CCH 封口的逻辑正文。
+    /// @param request_encoding 入站冻结的编码链。
+    /// @param account 当前请求画像副本。
+    /// @param account_selection_context 账号限额选择上下文。
+    /// @param request_capture_policy 请求捕获策略。
+    /// @return 既有上游响应或本地编解码错误；编码失败不提交本次业务请求。
     async fn forward_request(
         &self,
         method: &str,
         path: &str,
         query: &str,
-        headers: &std::collections::HashMap<String, String>,
+        headers: &HashMap<String, String>,
         body: &[u8],
+        request_encoding: &RequestBodyEncoding,
         account: &Account,
         account_selection_context: &AccountSelectionContext,
         request_capture_policy: RequestCapturePolicy,
@@ -2752,6 +2818,12 @@ impl GatewayService {
         let mut diagnostic = (path == "/v1/messages")
             .then(|| diagnostics::begin_attempt(account, body))
             .flatten();
+        // 正文和 CCH 在上层已完成；此后只改变传输表示，诊断仍观察逻辑正文。
+        let wire_body = match request_encoding.encode(body).await {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(request_body_codec_error_response(error)),
+        };
+        let wire_headers = request_headers_for_encoding(headers, request_encoding);
         let prepared = PreparedRequest {
             account_id: account.id,
             environment_id: String::new(),
@@ -2763,19 +2835,25 @@ impl GatewayService {
             deadline_unix_ms: 0,
             method: method.to_string(),
             target_url,
-            headers: ordered_anthropic_headers(path, headers),
+            headers: ordered_anthropic_headers(path, &wire_headers),
             preserve_header_casing: !is_event_logging_path(path) && !path.starts_with("/api/eval/"),
         };
-        let resp =
-            match runtime_transport::send(account, prepared, body, UPSTREAM_TTFB_TIMEOUT).await {
-                Ok(response) => response,
-                Err(error) => {
-                    if let Some(trace) = diagnostic.as_mut() {
-                        trace.transport_error();
-                    }
-                    return Err(error);
+        let resp = match runtime_transport::send(
+            account,
+            prepared,
+            wire_body.as_ref(),
+            UPSTREAM_TTFB_TIMEOUT,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(trace) = diagnostic.as_mut() {
+                    trace.transport_error();
                 }
-            };
+                return Err(error);
+            }
+        };
 
         if let Some(trace) = diagnostic.as_mut() {
             trace.headers(
@@ -3064,15 +3142,27 @@ impl GatewayService {
         })
     }
 
+    /// 发送独立 count_tokens 请求，在传输边界恢复入站编码。
+    /// @param headers 已完成计数请求业务改写的请求头。
+    /// @param body 计数请求的最终逻辑正文。
+    /// @param request_encoding 入站冻结的编码链。
+    /// @param account 当前选定账号。
+    /// @return 上游计数结果或本地编解码错误。
     async fn forward_count_tokens_request(
         &self,
-        headers: &std::collections::HashMap<String, String>,
+        headers: &HashMap<String, String>,
         body: &[u8],
+        request_encoding: &RequestBodyEncoding,
         account: &Account,
     ) -> Result<Response, AppError> {
         let target_url = count_tokens_upstream_url_with_base(&self.upstream_base);
         debug!("count_tokens upstream URL: {}", target_url);
 
+        let wire_body = match request_encoding.encode(body).await {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(request_body_codec_error_response(error)),
+        };
+        let wire_headers = request_headers_for_encoding(headers, request_encoding);
         let prepared = PreparedRequest {
             account_id: account.id,
             environment_id: String::new(),
@@ -3081,10 +3171,12 @@ impl GatewayService {
             deadline_unix_ms: 0,
             method: "POST".into(),
             target_url,
-            headers: ordered_anthropic_headers(COUNT_TOKENS_PATH, headers),
+            headers: ordered_anthropic_headers(COUNT_TOKENS_PATH, &wire_headers),
             preserve_header_casing: true,
         };
-        let resp = runtime_transport::send(account, prepared, body, UPSTREAM_TTFB_TIMEOUT).await?;
+        let resp =
+            runtime_transport::send(account, prepared, wire_body.as_ref(), UPSTREAM_TTFB_TIMEOUT)
+                .await?;
 
         let status_code = resp.status().as_u16();
         let response_headers = resp.headers().clone();
@@ -3395,6 +3487,75 @@ fn anthropic_error_response(status: StatusCode, error_type: &str, message: &str)
         axum::Json(anthropic_error_body(error_type, message)),
     )
         .into_response()
+}
+
+/// 将压缩请求的原始读体错误区分为大小超限或无效正文。
+/// @param error Axum 有界读体返回的错误，不检查不稳定的库错误字符串。
+/// @return 大小限制返回 TooLarge，其它读取失败返回 InvalidBody。
+fn compressed_body_read_error(error: &AxumError) -> RequestBodyCodecError {
+    if error
+        .source()
+        .is_some_and(|source| source.is::<LengthLimitError>())
+    {
+        RequestBodyCodecError::TooLarge
+    } else {
+        RequestBodyCodecError::InvalidBody
+    }
+}
+
+/// 生成不会泄露原始编码声明、正文或库内部细节的 Anthropic 错误。
+/// @param error 请求编解码模块的稳定错误分类。
+/// @return 对应 400、413、415 或 500 的可解析错误响应。
+fn request_body_codec_error_response(error: RequestBodyCodecError) -> Response {
+    diagnostics::error_stage("request_body_codec");
+    let (status, error_type, message) = match error {
+        RequestBodyCodecError::InvalidEncoding => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Content-Encoding 声明无效，最多支持 32 个列表片段",
+        ),
+        RequestBodyCodecError::UnsupportedEncoding => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "不支持请求的 Content-Encoding，最多支持 4 层 gzip、x-gzip、deflate、br 或 zstd",
+        ),
+        RequestBodyCodecError::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "压缩请求原始正文或任一解码层超过 10 MiB",
+        ),
+        RequestBodyCodecError::InvalidBody => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "请求正文无法在支持范围内完整解码（标准 br，zstd 窗口最大 16 MiB）",
+        ),
+        RequestBodyCodecError::Internal => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "请求正文编解码失败",
+        ),
+    };
+    anthropic_error_response(status, error_type, message)
+}
+
+/// 用本次实际传输表示重建编码头，长度交给 transport 根据最终字节生成。
+/// @param headers 业务改写后的头，可能包含其它大小写形式的旧传输声明。
+/// @param request_encoding 入站冻结的有效编码链。
+/// @return 无旧长度或传输编码、且最多有一个 Content-Encoding 的头副本。
+fn request_headers_for_encoding(
+    headers: &HashMap<String, String>,
+    request_encoding: &RequestBodyEncoding,
+) -> HashMap<String, String> {
+    let mut headers = headers.clone();
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
+            && !name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str())
+            && !name.eq_ignore_ascii_case(CONTENT_ENCODING.as_str())
+    });
+    if let Some(encoding) = request_encoding.content_encoding() {
+        headers.insert("Content-Encoding".into(), encoding);
+    }
+    headers
 }
 
 fn count_tokens_app_error_response(err: AppError) -> Response {
@@ -7441,12 +7602,13 @@ mod tests {
         buffered_response_body_for_downstream, build_message_telemetry_context,
         build_warmup_intercept_sse, cached_non_stream_probe_body, cached_non_stream_probe_response,
         classify_cli_bg_status, classify_non_stream_probe_text, cli_bg_status_json,
-        default_cli_bg_status_classifier_config, default_fable_weekly_usage_limit_percent,
-        detect_auto_mode_classifier_request, detect_claude_code_status_classifier_request,
-        detect_non_stream_probe_type, detect_warmup_intercept, extract_headers,
-        extract_message_session_id, extract_passive_usage, extract_rejected_passive_usage_windows,
-        extract_upstream_request_id, flush_stateful_cache_usage_buffer, format_request_capture,
-        format_response_capture, has_system_role_message, is_cacheable_non_stream_probe_response,
+        decode_upstream_error_body, default_cli_bg_status_classifier_config,
+        default_fable_weekly_usage_limit_percent, detect_auto_mode_classifier_request,
+        detect_claude_code_status_classifier_request, detect_non_stream_probe_type,
+        detect_warmup_intercept, extract_headers, extract_message_session_id,
+        extract_passive_usage, extract_rejected_passive_usage_windows, extract_upstream_request_id,
+        flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
+        has_system_role_message, is_cacheable_non_stream_probe_response,
         is_cli_bg_status_classifier_request, is_signature_related_error_body,
         is_signature_related_error_response_body, is_system_role_model_allowed,
         mock_warmup_intercept_json_response, non_stream_probe_cache_create_log_payload,
@@ -7462,17 +7624,24 @@ mod tests {
         strip_thinking_from_messages_request, system_role_model_error_body, truncate_log_text,
         update_message_telemetry_from_bytes, update_stateful_cache_usage_from_bytes,
     };
+    use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
     use crate::error::AppError;
+    use crate::handler::router::build_router;
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_ALLOW_1M_MODELS,
         DEFAULT_UPSTREAM_SESSION_POOL_SIZE, DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
         DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     };
+    use crate::model::api_token::{ApiToken, ApiTokenStatus};
+    use crate::model::identity::device_profile;
     use crate::model::request_diagnostics::DiagnosticQuery;
     use crate::service::account::{
         AccountSelectionContext, AccountService, DEFAULT_REQUEST_SLOT_UNITS,
         HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, UsageObservationKind,
     };
+    use crate::service::oauth::TokenTester;
+    use crate::service::oauth_flow::OAuthFlowService;
+    use crate::service::request_body_codec::{REQUEST_BODY_LIMIT, RequestBodyEncoding};
     use crate::service::rewriter::{
         CLAUDE_CODE_SYSTEM_PROMPT, ClientType, Rewriter, StatefulCacheUsage,
         UpstreamSessionRewrite, extract_session_id_from_body,
@@ -7492,41 +7661,51 @@ mod tests {
         CacheStore, RpmAcquire, SessionHelloProbeState, UpstreamSessionPoolAction,
         UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
     };
+    use crate::store::db::migrate;
     use crate::store::diagnostics_store::DiagnosticsStore;
     use crate::store::memory::MemoryStore;
+    use crate::store::prime_log_store::PrimeLogStore;
     use crate::store::settings_store::{
         DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, SettingsStore,
     };
+    use crate::store::token_store::TokenStore;
     use crate::store::usage_store::UsageStore;
     use axum::body::{self, Body};
     use axum::extract::{Request, State};
     use axum::http::{
-        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
     };
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::{Json, Router};
+    use brotli::CompressorReader;
     use bytes::Bytes;
     use chrono::{Duration as ChronoDuration, Utc};
     use flate2::Compression;
-    use flate2::write::GzEncoder;
+    use flate2::bufread::MultiGzDecoder;
+    use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use sqlx::AnyPool;
     use sqlx::any::AnyPoolOptions;
     use std::collections::HashMap;
     use std::convert::Infallible;
-    use std::io::Write;
+    use std::io::{Error as IoError, Read, Write};
+    use std::str::from_utf8;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex, mpsc};
+    use tokio::task::JoinHandle;
     use tokio::time::timeout;
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
+    use tower::ServiceExt;
+    use zstd::stream::encode_all as zstd_encode_all;
 
     fn all_warmup_intercepts_enabled() -> WarmupInterceptConfig {
         WarmupInterceptConfig {
@@ -8073,6 +8252,10 @@ mod tests {
         inner: MemoryStore,
         fail_resolution: bool,
         resolve_calls: AtomicUsize,
+        account_reads: AtomicUsize,
+        admission_calls: AtomicUsize,
+        binding_writes: AtomicUsize,
+        hello_state_calls: AtomicUsize,
     }
 
     impl SessionPoolTestCache {
@@ -8084,6 +8267,10 @@ mod tests {
                 inner: MemoryStore::new(),
                 fail_resolution,
                 resolve_calls: AtomicUsize::new(0),
+                account_reads: AtomicUsize::new(0),
+                admission_calls: AtomicUsize::new(0),
+                binding_writes: AtomicUsize::new(0),
+                hello_state_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -8094,6 +8281,7 @@ mod tests {
             &self,
             session_hash: &str,
         ) -> Result<Option<i64>, AppError> {
+            self.account_reads.fetch_add(1, Ordering::SeqCst);
             self.inner.get_session_account_id(session_hash).await
         }
 
@@ -8103,6 +8291,7 @@ mod tests {
             account_id: i64,
             ttl: Duration,
         ) -> Result<(), AppError> {
+            self.binding_writes.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .set_session_account_id(session_hash, account_id, ttl)
                 .await
@@ -8113,6 +8302,7 @@ mod tests {
         }
 
         async fn acquire_slot(&self, key: &str, max: i32, ttl: Duration) -> Result<bool, AppError> {
+            self.admission_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.acquire_slot(key, max, ttl).await
         }
 
@@ -8135,6 +8325,7 @@ mod tests {
             limit: i32,
             ttl: Duration,
         ) -> Result<RpmAcquire, AppError> {
+            self.admission_calls.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .try_acquire_account_rpm(account_id, minute_ts, limit, ttl)
                 .await
@@ -8181,6 +8372,7 @@ mod tests {
             key: &str,
             success_ttl: Duration,
         ) -> Result<Option<SessionHelloProbeState>, AppError> {
+            self.hello_state_calls.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .get_session_hello_probe_state(key, success_ttl)
                 .await
@@ -8192,6 +8384,7 @@ mod tests {
             state: SessionHelloProbeState,
             ttl: Duration,
         ) -> Result<(), AppError> {
+            self.hello_state_calls.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .set_session_hello_probe_state(key, state, ttl)
                 .await
@@ -8244,6 +8437,38 @@ mod tests {
         if state.pause_first_request.swap(false, Ordering::SeqCst) {
             state.request_started.notify_one();
             state.request_resume.notified().await;
+        }
+        if authorization == "Bearer synthetic-compressed-matrix" {
+            // 上游用独立的响应 decoder 观察实际 wire bytes，不复用被测请求 codec。
+            let logical = decode_upstream_error_body(&body, &headers);
+            let sent: Value = serde_json::from_slice(&logical).unwrap();
+            if sent.get("stream").and_then(Value::as_bool) == Some(true) {
+                return (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                )
+                    .into_response();
+            }
+        }
+        if authorization == "Bearer synthetic-compressed-two-stage" {
+            let logical = decode_upstream_error_body(&body, &headers);
+            let sent: Value = serde_json::from_slice(&logical).unwrap();
+            let sensitive_history = sent["messages"].as_array().unwrap().iter().any(|message| {
+                message["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        matches!(
+                            block["type"].as_str(),
+                            Some("thinking" | "redacted_thinking" | "tool_use" | "tool_result")
+                        )
+                    })
+                })
+            });
+            if sensitive_history {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}))).into_response();
+            }
+        }
+        if authorization == "Bearer synthetic-unsupported-codec" {
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"type":"error","error":{"type":"invalid_request_error","message":"unsupported content coding"}}))).into_response();
         }
         if authorization == "Bearer setup-signature"
             && String::from_utf8_lossy(&body).contains("\"type\":\"thinking\"")
@@ -8359,6 +8584,7 @@ mod tests {
                 axum::routing::get(|| async { Json(json!({"client_data": {}})) }),
             )
             .route("/api/eval/test", post(mock_upstream_response))
+            .route("/artifact/publish", post(mock_upstream_response))
             .route("/api/event_logging/v2/batch", post(mock_upstream_response))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -8469,7 +8695,12 @@ mod tests {
             );
             let response = if path == COUNT_TOKENS_PATH {
                 service
-                    .forward_count_tokens_request(&headers, b"{}", &account)
+                    .forward_count_tokens_request(
+                        &headers,
+                        b"{}",
+                        &RequestBodyEncoding::default(),
+                        &account,
+                    )
                     .await
                     .unwrap()
             } else {
@@ -8480,6 +8711,7 @@ mod tests {
                         "",
                         &headers,
                         b"{}",
+                        &RequestBodyEncoding::default(),
                         &account,
                         &AccountSelectionContext::disabled(),
                         RequestCapturePolicy::SummaryOnly,
@@ -9976,6 +10208,1361 @@ mod tests {
             );
             assert_eq!(cache.resolve_calls.load(Ordering::SeqCst), 7);
             server.abort();
+        }
+    }
+
+    /// 用独立依赖 API 构造客户端编码字节，避免用被测请求 codec 同时生成和验证样本。
+    /// @param body 合成逻辑正文。
+    /// @param codings 按施加顺序列出的编码，raw-deflate 仅表示客户端兼容包装。
+    /// @return 可直接交给实际 Gateway 的传输正文。
+    fn encode_gateway_test_body(body: &[u8], codings: &[&str]) -> Vec<u8> {
+        let mut encoded = body.to_vec();
+        for coding in codings {
+            encoded = match *coding {
+                "gzip" | "x-gzip" => {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&encoded).unwrap();
+                    encoder.finish().unwrap()
+                }
+                "deflate" => {
+                    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&encoded).unwrap();
+                    encoder.finish().unwrap()
+                }
+                "raw-deflate" => {
+                    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&encoded).unwrap();
+                    encoder.finish().unwrap()
+                }
+                "br" => {
+                    let mut encoder = CompressorReader::new(encoded.as_slice(), 4096, 4, 22);
+                    let mut output = Vec::new();
+                    encoder.read_to_end(&mut output).unwrap();
+                    output
+                }
+                "zstd" => zstd_encode_all(encoded.as_slice(), 1).unwrap(),
+                _ => panic!("未定义的合成请求编码"),
+            };
+        }
+        encoded
+    }
+
+    /// 保留既有请求助手的业务头，替换为客户端压缩表示和真实多值编码头。
+    /// @param request 含逻辑正文的合成请求。
+    /// @param codings 用于构造字节的编码顺序。
+    /// @param encoding_rows 原始 Content-Encoding 各行，独立于字节生成以验证解析。
+    /// @return 带原始压缩长度的请求，编码头交替使用大小写。
+    async fn encode_gateway_test_request(
+        request: Request,
+        codings: &[&str],
+        encoding_rows: &[&str],
+    ) -> Request {
+        let (mut parts, body) = request.into_parts();
+        let logical = body::to_bytes(body, usize::MAX).await.unwrap();
+        let encoded = encode_gateway_test_body(&logical, codings);
+        parts.headers.remove(CONTENT_ENCODING);
+        for (index, row) in encoding_rows.iter().enumerate() {
+            let name = HeaderName::from_bytes(if index % 2 == 0 {
+                b"CoNtEnT-EnCoDiNg"
+            } else {
+                b"content-encoding"
+            })
+            .unwrap();
+            parts.headers.append(name, row.parse().unwrap());
+        }
+        parts
+            .headers
+            .insert(CONTENT_LENGTH, encoded.len().to_string().parse().unwrap());
+        Request::from_parts(parts, Body::from(encoded))
+    }
+
+    /// 构造标准编码、兼容 raw、重复头与最大四层链的集成样本。
+    /// @return 客户端编码顺序、原始多值头和规范出站声明。
+    fn gateway_test_encoding_cases() -> Vec<(Vec<&'static str>, Vec<&'static str>, &'static str)> {
+        vec![
+            (vec!["gzip"], vec![" \tGZIP\t "], "gzip"),
+            (vec!["x-gzip"], vec![", x-GZIP, identity,"], "x-gzip"),
+            (vec!["deflate"], vec!["deflate"], "deflate"),
+            (vec!["raw-deflate"], vec!["DEFLATE"], "deflate"),
+            (vec!["br"], vec!["br"], "br"),
+            (vec!["zstd"], vec!["zstd"], "zstd"),
+            (
+                vec!["gzip", "br"],
+                vec!["\tGZip ,", " identity , Br , "],
+                "gzip, br",
+            ),
+            (vec!["gzip", "gzip"], vec!["gzip,,gzip"], "gzip, gzip"),
+            (
+                vec!["gzip", "deflate", "br", "zstd"],
+                vec!["GZip, DEFLATE", "br,zstd"],
+                "gzip, deflate, br, zstd",
+            ),
+        ]
+    }
+
+    /// 在真实 TCP 上接收完整 HTTP/1 请求，用实际长度切分压缩字节。
+    /// @param expected_requests 预期业务发送次数，每次响应后关闭连接。
+    /// @return 上游地址、原始头/解析头/原始正文接收通道和服务器任务。
+    async fn spawn_compressed_wire_upstream(
+        expected_requests: usize,
+    ) -> (
+        String,
+        mpsc::UnboundedReceiver<(String, HeaderMap, Bytes)>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            for _ in 0..expected_requests {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (head, headers, bytes) = timeout(Duration::from_secs(20), async {
+                    let mut raw = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let mut header_end = None;
+                    let mut body_len = 0;
+                    loop {
+                        let size = socket.read(&mut chunk).await.unwrap();
+                        assert_ne!(size, 0, "上游请求在声明长度前结束");
+                        raw.extend_from_slice(&chunk[..size]);
+                        if header_end.is_none() {
+                            if let Some(end) = raw.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let head = from_utf8(&raw[..end]).unwrap();
+                                body_len = head
+                                    .lines()
+                                    .filter_map(|line| line.split_once(':'))
+                                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                    .unwrap()
+                                    .1
+                                    .trim()
+                                    .parse::<usize>()
+                                    .unwrap();
+                                header_end = Some(end + 4);
+                            }
+                        }
+                        if let Some(end) = header_end {
+                            if raw.len() >= end + body_len {
+                                assert_eq!(
+                                    raw.len(),
+                                    end + body_len,
+                                    "线上正文不能超过实际 Content-Length"
+                                );
+                                let head = from_utf8(&raw[..end]).unwrap().to_string();
+                                let mut headers = HeaderMap::new();
+                                for line in head.lines().skip(1).filter(|line| !line.is_empty()) {
+                                    let (name, value) = line.split_once(':').unwrap();
+                                    headers.append(
+                                        HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                                        value.trim().parse::<HeaderValue>().unwrap(),
+                                    );
+                                }
+                                break (head, headers, Bytes::copy_from_slice(&raw[end..]));
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("等待实际压缩请求 TCP 字节超时");
+                sender.send((head, headers, bytes)).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"input_tokens\":42}").await.unwrap();
+            }
+        });
+        (base, receiver, task)
+    }
+
+    /// 实际 Gateway 必须先解码 gzip，再完成改写并按 gzip 发出一致的头和正文。
+    /// @return 无；压缩输入绕过正文改写、丢失编码头或未按最终字节计长时失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_gzip_rewrites_before_sending() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "compressed-gzip@example.invalid",
+            "synthetic-compressed-gzip",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        service.account_svc.update_account(&account).await.unwrap();
+        let mut payload = profile_messages_payload_for("2.1.293");
+        payload["settings"] = json!({"drop":"root"});
+        let logical = serde_json::to_vec(&payload).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&logical).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let mut request = profile_request("/v1/messages", Some("claude-code/2.1.293"), payload);
+        request
+            .headers_mut()
+            .insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        request.headers_mut().insert(
+            "x-claude-code-session-id",
+            "different-header-session".parse().unwrap(),
+        );
+        *request.body_mut() = Body::from(encoded);
+
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        let (headers, wire) = &requests[0];
+        assert_eq!(
+            headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+        assert!(!headers.contains_key(TRANSFER_ENCODING));
+        let mut decoded = Vec::new();
+        MultiGzDecoder::new(wire.as_ref())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&decoded).unwrap();
+        assert!(sent.get("settings").is_none());
+        assert_eq!(
+            headers["x-claude-code-session-id"],
+            extract_session_id_from_body(&sent).unwrap()
+        );
+        assert_profile_message(headers, &Bytes::from(decoded), &account, "2.1.293");
+        server.abort();
+    }
+
+    /// 编码表示不改变实际 Messages 的身份、Session、CCH、根键过滤或流选择。
+    /// @return 无；CC/API、三种 stream、过滤开关或编码链与明文基线不同即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_messages_match_plaintext() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "compressed-matrix@example.invalid",
+            "synthetic-compressed-matrix",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        service.account_svc.update_account(&account).await.unwrap();
+        let selected =
+            account_for_request_profile(&account, Some(profile_for_key("2.1.293").unwrap()));
+        let mut sent_count = 0;
+        for ua in ["claude-code/2.1.293", "python-httpx/0.28.1"] {
+            let client_type = if ua.starts_with("claude-") {
+                ClientType::ClaudeCode
+            } else {
+                ClientType::API
+            };
+            for enabled in [false, true] {
+                *service.message_top_field_filter_enabled.write().await = enabled;
+                for stream in [Some(false), Some(true), None] {
+                    let mut payload = profile_messages_payload_for("2.1.293");
+                    payload["settings"] = json!({"root":"drop"});
+                    payload["metadata"]["settings"] = json!({"nested":"keep"});
+                    payload.as_object_mut().unwrap().shift_remove("stream");
+                    if let Some(stream) = stream {
+                        payload["stream"] = json!(stream);
+                    }
+                    let mut reference = None;
+                    let mut cases = vec![(Vec::new(), Vec::new(), "")];
+                    cases.extend(gateway_test_encoding_cases());
+                    for (codings, rows, outgoing) in cases {
+                        let mut request = profile_request(
+                            "/v1/messages?beta=false&x=%2f",
+                            Some(ua),
+                            payload.clone(),
+                        );
+                        request.headers_mut().insert(
+                            "x-claude-code-session-id",
+                            "different-header-session".parse().unwrap(),
+                        );
+                        let request = encode_gateway_test_request(request, &codings, &rows).await;
+                        let response = service.handle_request(request, None).await;
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::OK,
+                            "UA={ua} 清理={enabled} stream={stream:?} 编码={outgoing}"
+                        );
+                        assert_eq!(
+                            response.headers()[CONTENT_TYPE],
+                            if stream == Some(true) {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            }
+                        );
+                        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        if stream == Some(true) {
+                            assert!(
+                                from_utf8(&response_body)
+                                    .unwrap()
+                                    .contains("event: message_stop\n")
+                            );
+                        } else {
+                            let message: Value = serde_json::from_slice(&response_body).unwrap();
+                            assert_eq!(message["stop_reason"], "end_turn");
+                        }
+                        sent_count += 1;
+                        let (headers, wire) = state.requests.lock().await.last().unwrap().clone();
+                        assert_eq!(
+                            headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+                            if outgoing.is_empty() {
+                                None
+                            } else {
+                                Some(outgoing)
+                            }
+                        );
+                        assert_eq!(
+                            headers.get_all(CONTENT_ENCODING).iter().count(),
+                            usize::from(!outgoing.is_empty())
+                        );
+                        assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+                        assert!(!headers.contains_key(TRANSFER_ENCODING));
+                        let logical = decode_upstream_error_body(&wire, &headers);
+                        let sent: Value = serde_json::from_slice(&logical).unwrap();
+                        assert_eq!(sent.get("stream"), stream.map(Value::Bool).as_ref());
+                        assert_eq!(sent.get("settings").is_none(), enabled);
+                        assert_eq!(
+                            sent["metadata"]["settings"],
+                            payload["metadata"]["settings"]
+                        );
+                        assert_eq!(
+                            headers["x-claude-code-session-id"],
+                            extract_session_id_from_body(&sent).unwrap()
+                        );
+                        let user_id: Value =
+                            serde_json::from_str(sent["metadata"]["user_id"].as_str().unwrap())
+                                .unwrap();
+                        let device = device_profile(&selected);
+                        assert_eq!(user_id["device_id"], device.device_id);
+                        assert_eq!(user_id["account_uuid"], device.account_uuid);
+                        assert_eq!(
+                            service.rewriter.refresh_cch_attestation(
+                                logical.clone(),
+                                &selected,
+                                client_type
+                            ),
+                            logical
+                        );
+                        if let Some(reference) = &reference {
+                            assert_eq!(&logical, reference, "压缩表示不能改变最终逻辑字节");
+                        } else {
+                            reference = Some(logical);
+                        }
+                        let uri = state.request_uris.lock().await.last().unwrap().clone();
+                        assert_eq!(uri.query(), Some("beta=true&x=%2f"));
+                    }
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), sent_count);
+        assert_eq!(sent_count, 120);
+        server.abort();
+    }
+
+    /// 独立 count_tokens、event_logging 与通用非 JSON 转发共用编解码边界。
+    /// @return 无；路径语义、身份改写、计数清理、重复编码头或实际长度异常即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_other_endpoints_match_plaintext() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let account = create_setup_gateway_account(
+            &service,
+            "compressed-paths@example.invalid",
+            "synthetic-paths",
+            50,
+        )
+        .await;
+        for ua in ["claude-code/2.1.293", "python-httpx/0.28.1"] {
+            for path in [
+                COUNT_TOKENS_PATH,
+                "/api/event_logging/v2/batch",
+                "/api/eval/test",
+                "/artifact/publish",
+            ] {
+                let payload = match path {
+                    COUNT_TOKENS_PATH => {
+                        json!({"model":"claude-sonnet-5-5", "messages":[{"role":"user","content":[{"type":"text","text":""},{"type":"text","text":"合成计数"}]}], "max_tokens":32, "stream":false, "settings":{"keep":"count"}})
+                    }
+                    "/api/event_logging/v2/batch" => {
+                        json!({"events":[{"event_data":{"device_id":"client-device","account_uuid":"client-account","session_id":"event-session","event_name":"synthetic"}}]})
+                    }
+                    _ => json!({"device_id":"client-device"}),
+                };
+                let mut reference = None;
+                let mut cases = vec![(Vec::new(), Vec::new(), "")];
+                cases.extend(gateway_test_encoding_cases());
+                for (codings, rows, outgoing) in cases {
+                    let mut request = profile_request(path, Some(ua), payload.clone());
+                    if path == "/api/eval/test" || path == "/artifact/publish" {
+                        *request.body_mut() =
+                            Body::from(Bytes::from_static(b"\x00synthetic artifact\xff\r\n"));
+                    }
+                    let request = encode_gateway_test_request(request, &codings, &rows).await;
+                    let response = if path == COUNT_TOKENS_PATH {
+                        service.handle_count_tokens_request(request, None).await
+                    } else {
+                        service.handle_request(request, None).await
+                    };
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "UA={ua} 路径={path} 编码={outgoing}"
+                    );
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let (headers, wire) = state.requests.lock().await.last().unwrap().clone();
+                    assert_eq!(
+                        headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+                        if outgoing.is_empty() {
+                            None
+                        } else {
+                            Some(outgoing)
+                        }
+                    );
+                    assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+                    assert!(!headers.contains_key(TRANSFER_ENCODING));
+                    let logical = decode_upstream_error_body(&wire, &headers);
+                    if path == COUNT_TOKENS_PATH {
+                        let sent: Value = serde_json::from_slice(&logical).unwrap();
+                        assert!(sent.get("max_tokens").is_none());
+                        assert!(sent.get("stream").is_none());
+                        assert_eq!(sent["settings"], payload["settings"]);
+                        assert_eq!(sent["messages"][0]["content"].as_array().unwrap().len(), 1);
+                        assert_eq!(
+                            state.request_uris.lock().await.last().unwrap().query(),
+                            Some("beta=true")
+                        );
+                    } else if path.contains("event_logging") {
+                        let sent: Value = serde_json::from_slice(&logical).unwrap();
+                        assert_eq!(
+                            sent["events"][0]["event_data"]["device_id"],
+                            account.device_id
+                        );
+                        assert_ne!(
+                            sent["events"][0]["event_data"]["account_uuid"],
+                            "client-account"
+                        );
+                    } else {
+                        assert_eq!(logical, b"\x00synthetic artifact\xff\r\n");
+                    }
+                    if let Some(reference) = &reference {
+                        assert_eq!(&logical, reference);
+                    } else {
+                        reference = Some(logical);
+                    }
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 80);
+        server.abort();
+    }
+
+    /// 入站编码拒绝必须发生在账号选择、RPM、槽位、池、Hello 和自动遥测前。
+    /// @return 无；任一入口错误状态、错误对象或零副作用边界不符即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_rejections_have_no_account_side_effects() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let cache = Arc::new(SessionPoolTestCache::new(false));
+        let mut service = test_gateway_service_with_cache_and_urls(
+            cache.clone(),
+            base.clone(),
+            format!("{base}/oauth/token"),
+        )
+        .await;
+        service
+            .session_hello_probe_svc
+            .set_endpoint_for_test(format!("{base}/api/hello"));
+        service.session_hello_probe_config.write().await.enabled = true;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "compressed-reject@example.invalid",
+            "synthetic-reject",
+            50,
+        )
+        .await;
+        account.rpm_limit = 100;
+        account.upstream_session_pool_enabled = true;
+        account.auto_telemetry = true;
+        service.account_svc.update_account(&account).await.unwrap();
+        let logical = serde_json::to_vec(&profile_messages_payload_for("2.1.293")).unwrap();
+        let gzip = encode_gateway_test_body(&logical, &["gzip"]);
+        let mut corrupt = gzip.clone();
+        let crc_offset = corrupt.len() - 8;
+        corrupt[crc_offset] ^= 1;
+        let mut trailing = gzip.clone();
+        trailing.extend_from_slice(b"trailing");
+        let oversized = Bytes::from(vec![b'a'; REQUEST_BODY_LIMIT + 1]);
+        let bomb = Bytes::from(encode_gateway_test_body(&oversized, &["gzip"]));
+        let empty_member = encode_gateway_test_body(b"", &["gzip"]);
+        let inner = empty_member.repeat(REQUEST_BODY_LIMIT / empty_member.len() + 1);
+        let intermediate_bomb = Bytes::from(encode_gateway_test_body(&inner, &["gzip"]));
+        let cases = vec![
+            (
+                "未知编码",
+                vec![HeaderValue::from_static("compress")],
+                Bytes::from(logical.clone()),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "非法参数",
+                vec![HeaderValue::from_static("gzip;q=1")],
+                Bytes::from(gzip.clone()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "非法非ASCII",
+                vec![HeaderValue::from_bytes(b"gzip,\xff").unwrap()],
+                Bytes::from(gzip.clone()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "片段超限",
+                vec![HeaderValue::from_str(&",".repeat(32)).unwrap()],
+                Bytes::from(gzip.clone()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "编码层超限",
+                vec![HeaderValue::from_static("gzip,gzip,gzip,gzip,gzip")],
+                Bytes::from(gzip.clone()),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "后续头非法",
+                vec![
+                    HeaderValue::from_static("gzip"),
+                    HeaderValue::from_static("\"br\""),
+                ],
+                Bytes::from(gzip.clone()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "空压缩正文",
+                vec![HeaderValue::from_static("gzip")],
+                Bytes::new(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "截断",
+                vec![HeaderValue::from_static("gzip")],
+                Bytes::copy_from_slice(&gzip[..gzip.len() - 1]),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "校验失败",
+                vec![HeaderValue::from_static("gzip")],
+                Bytes::from(corrupt),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "尾随垃圾",
+                vec![HeaderValue::from_static("gzip")],
+                Bytes::from(trailing),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "原始字节超限",
+                vec![HeaderValue::from_static("gzip")],
+                oversized,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "解码结果超限",
+                vec![HeaderValue::from_static("gzip")],
+                bomb,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "中间层超限",
+                vec![HeaderValue::from_static("gzip,gzip")],
+                intermediate_bomb,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+        for path in [
+            "/v1/messages",
+            COUNT_TOKENS_PATH,
+            "/api/event_logging/v2/batch",
+            "/artifact/publish",
+        ] {
+            for (name, encodings, bytes, status) in &cases {
+                let mut request = profile_request(path, Some("claude-code/2.1.293"), json!({}));
+                for encoding in encodings {
+                    request
+                        .headers_mut()
+                        .append(CONTENT_ENCODING, encoding.clone());
+                }
+                *request.body_mut() = Body::from(bytes.clone());
+                let response = if path == COUNT_TOKENS_PATH {
+                    service.handle_count_tokens_request(request, None).await
+                } else {
+                    service.handle_request(request, None).await
+                };
+                assert_eq!(response.status(), *status, "路径={path} 场景={name}");
+                let body = body::to_bytes(response.into_body(), 4096).await.unwrap();
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["type"], "error");
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                assert!(
+                    error["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| !message.is_empty())
+                );
+                assert!(!String::from_utf8_lossy(&body).contains("synthetic-reject"));
+            }
+        }
+        assert!(state.requests.lock().await.is_empty());
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.account_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.admission_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.binding_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.hello_state_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            service
+                .telemetry_svc
+                .get_session_expires_at(account.id)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_account_rpm_status(&account)
+                .await
+                .unwrap()
+                .current,
+            0
+        );
+        server.abort();
+    }
+
+    /// 压缩处理保留 count_tokens 方法、UA 准入和未编码非法正文的原有优先级。
+    /// @return 无；新增编码路径覆盖原拒绝或改变端点 JSON 语义即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_preserves_admission_and_plaintext_semantics() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "compressed-semantics@example.invalid",
+            "synthetic-semantics",
+            50,
+        )
+        .await;
+        let plain = b"synthetic non-json body";
+        for path in ["/v1/messages", COUNT_TOKENS_PATH, "/artifact/publish"] {
+            for rows in [vec![], vec!["identity"], vec![" , identity, ,", "\t"]] {
+                let mut request = profile_request(path, Some("claude-code/2.1.293"), json!({}));
+                *request.body_mut() = Body::from(plain.as_slice());
+                request
+                    .headers_mut()
+                    .insert("accept-encoding", "gzip, br, zstd".parse().unwrap());
+                let request = encode_gateway_test_request(request, &[], &rows).await;
+                let response = if path == COUNT_TOKENS_PATH {
+                    service.handle_count_tokens_request(request, None).await
+                } else {
+                    service.handle_request(request, None).await
+                };
+                assert_eq!(
+                    response.status(),
+                    if path == COUNT_TOKENS_PATH {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                if path != COUNT_TOKENS_PATH {
+                    let requests = state.requests.lock().await;
+                    let (headers, wire) = requests.last().unwrap();
+                    assert!(!headers.contains_key(CONTENT_ENCODING));
+                    assert_eq!(wire.as_ref(), plain);
+                }
+            }
+        }
+        // 没有声明时不嗅探 gzip magic，也不按 Accept-Encoding 推断当前正文编码。
+        let compressed = encode_gateway_test_body(plain, &["gzip"]);
+        let mut request =
+            profile_request("/artifact/publish", Some("claude-code/2.1.293"), json!({}));
+        *request.body_mut() = Body::from(compressed.clone());
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.requests.lock().await.last().unwrap().1.as_ref(),
+            compressed
+        );
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "allowed_user_agents".into(),
+                "allowed-synthetic*".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_access_policy().await.unwrap();
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            let mut request = profile_request(path, Some("blocked-synthetic/1"), json!({}));
+            request
+                .headers_mut()
+                .insert(CONTENT_ENCODING, "gzip;q=1".parse().unwrap());
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(request, None).await
+            } else {
+                service.handle_request(request, None).await
+            };
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let mut request =
+            profile_request(COUNT_TOKENS_PATH, Some("blocked-synthetic/1"), json!({}));
+        *request.method_mut() = Method::GET;
+        request
+            .headers_mut()
+            .insert(CONTENT_ENCODING, "gzip;q=1".parse().unwrap());
+        assert_eq!(
+            service
+                .handle_count_tokens_request(request, None)
+                .await
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(state.requests.lock().await.len(), 7);
+        server.abort();
+    }
+
+    /// 真实 TCP 验证唯一编码头、自动长度和近上限正文的合法重编码膨胀。
+    /// @return 无；旧传输声明残留、画像头名变化或编码容器被误套入站上限即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_tcp_headers_and_near_limit() {
+        let (base, mut captured, server) = spawn_compressed_wire_upstream(6).await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "compressed-wire@example.invalid",
+            "synthetic-wire",
+            50,
+        )
+        .await;
+        for path in [
+            "/v1/messages",
+            COUNT_TOKENS_PATH,
+            "/api/event_logging/v2/batch",
+            "/artifact/publish",
+        ] {
+            let mut request = encode_gateway_test_request(
+                profile_request(
+                    path,
+                    Some("claude-code/2.1.293"),
+                    profile_messages_payload_for("2.1.293"),
+                ),
+                &["gzip", "br"],
+                &["GZip", "identity, BR"],
+            )
+            .await;
+            request.headers_mut().remove(CONTENT_LENGTH);
+            request
+                .headers_mut()
+                .insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(request, None).await
+            } else {
+                service.handle_request(request, None).await
+            };
+            assert_eq!(response.status(), StatusCode::OK, "路径={path}");
+            body::to_bytes(response.into_body(), 1024).await.unwrap();
+            let (head, headers, wire) = captured.recv().await.unwrap();
+            assert_eq!(headers[CONTENT_ENCODING], "gzip, br");
+            assert_eq!(headers.get_all(CONTENT_ENCODING).iter().count(), 1);
+            assert_eq!(headers.get_all(CONTENT_LENGTH).iter().count(), 1);
+            assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+            assert!(!headers.contains_key(TRANSFER_ENCODING));
+            if path.starts_with("/api/event_logging/") {
+                assert!(head.contains("\r\nuser-agent: "));
+                assert!(!head.contains("\r\nUser-Agent: "));
+            } else {
+                assert!(head.contains("\r\nUser-Agent: "));
+                assert!(head.contains(&format!("\r\nContent-Length: {}\r\n", wire.len())));
+            }
+            let logical = decode_upstream_error_body(&wire, &headers);
+            assert!(serde_json::from_slice::<Value>(&logical).is_ok());
+        }
+
+        let exact = vec![b'x'; REQUEST_BODY_LIMIT];
+        let mut request =
+            profile_request("/artifact/publish", Some("claude-code/2.1.293"), json!({}));
+        *request.body_mut() = Body::from(exact.clone());
+        let request = encode_gateway_test_request(request, &["gzip"], &["gzip"]).await;
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let (_, headers, wire) = captured.recv().await.unwrap();
+        let decoded = decode_upstream_error_body(&wire, &headers);
+        assert_eq!(decoded.len(), REQUEST_BODY_LIMIT);
+        assert_eq!(Sha256::digest(&decoded), Sha256::digest(&exact));
+
+        // raw-deflate 与标准 zlib 只差容器开销；调整合成噪声长度使入站合法而出站略超 10 MiB。
+        let mut noise = vec![0u8; REQUEST_BODY_LIMIT];
+        let mut noise_state = 0x4a3b_2c1d_98ab_7654u64;
+        for byte in &mut noise {
+            noise_state ^= noise_state << 13;
+            noise_state ^= noise_state >> 7;
+            noise_state ^= noise_state << 17;
+            *byte = noise_state as u8;
+        }
+        let mut logical_len = REQUEST_BODY_LIMIT;
+        let mut near_limit = None;
+        for _ in 0..8 {
+            let raw = encode_gateway_test_body(&noise[..logical_len], &["raw-deflate"]);
+            if raw.len() > REQUEST_BODY_LIMIT {
+                logical_len -= raw.len() - REQUEST_BODY_LIMIT;
+                continue;
+            }
+            let zlib = encode_gateway_test_body(&noise[..logical_len], &["deflate"]);
+            if zlib.len() > REQUEST_BODY_LIMIT {
+                near_limit = Some((raw, zlib.len()));
+                break;
+            }
+            logical_len += REQUEST_BODY_LIMIT - raw.len();
+        }
+        let (raw, expected_wire_len) = near_limit.expect("应能构造近上限 raw-deflate 合法输入");
+        assert!(raw.len() <= REQUEST_BODY_LIMIT);
+        assert!(logical_len <= REQUEST_BODY_LIMIT);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/artifact/publish")
+            .header("user-agent", "claude-code/2.1.293")
+            .header(CONTENT_ENCODING, "deflate")
+            .header(CONTENT_LENGTH, raw.len())
+            .body(Body::from(raw))
+            .unwrap();
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let (_, headers, wire) = captured.recv().await.unwrap();
+        assert_eq!(headers[CONTENT_ENCODING], "deflate");
+        assert_eq!(wire.len(), expected_wire_len);
+        assert!(wire.len() > REQUEST_BODY_LIMIT);
+        assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+        let decoded = decode_upstream_error_body(&wire, &headers);
+        assert_eq!(decoded.len(), logical_len);
+        assert_eq!(
+            Sha256::digest(&decoded),
+            Sha256::digest(&noise[..logical_len])
+        );
+        server.await.unwrap();
+    }
+
+    /// 实际 401 恢复和 429 换号的每次发送都保留冻结编码并发送当前账号的逻辑正文。
+    /// @return 无；编码漂移、额外发送、错误账号身份或失效 CCH 即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_auth_and_account_retries() {
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            let (base, state, server) = spawn_auth_mock_server().await;
+            let service =
+                test_gateway_service_with_urls(base.clone(), format!("{base}/oauth/token")).await;
+            let mut account = create_oauth_gateway_account(
+                &service,
+                "compressed-auth@example.invalid",
+                "access-old",
+            )
+            .await;
+            account.billing_mode = BillingMode::Rewrite;
+            service.account_svc.update_account(&account).await.unwrap();
+            let request = encode_gateway_test_request(
+                profile_request(
+                    path,
+                    Some("claude-code/2.1.293"),
+                    profile_messages_payload_for("2.1.293"),
+                ),
+                &["gzip", "br"],
+                &["gzip", "BR"],
+            )
+            .await;
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(request, None).await
+            } else {
+                service.handle_request(request, None).await
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                state.authorization_headers.lock().await.as_slice(),
+                ["Bearer access-old", "Bearer access-refreshed"]
+            );
+            let requests = state.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            let mut logical_bodies = Vec::new();
+            for (headers, wire) in requests.iter() {
+                assert_eq!(headers[CONTENT_ENCODING], "gzip, br");
+                assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+                let logical = decode_upstream_error_body(wire, headers);
+                if path == "/v1/messages" {
+                    assert_profile_message(
+                        headers,
+                        &Bytes::from(logical.clone()),
+                        &account,
+                        "2.1.293",
+                    );
+                } else {
+                    let sent: Value = serde_json::from_slice(&logical).unwrap();
+                    assert_eq!(sent["model"], "claude-sonnet-5-5");
+                    assert!(sent.get("max_tokens").is_none());
+                }
+                logical_bodies.push(logical);
+            }
+            assert_eq!(logical_bodies[0], logical_bodies[1]);
+            server.abort();
+        }
+
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut first = create_setup_gateway_account(
+            &service,
+            "compressed-rate-first@example.invalid",
+            "setup-rate-limited",
+            10,
+        )
+        .await;
+        let mut second = create_setup_gateway_account(
+            &service,
+            "compressed-rate-second@example.invalid",
+            "synthetic-good",
+            20,
+        )
+        .await;
+        for account in [&mut first, &mut second] {
+            account.billing_mode = BillingMode::Rewrite;
+            service.account_svc.update_account(account).await.unwrap();
+        }
+        let request = encode_gateway_test_request(
+            profile_request(
+                "/v1/messages",
+                Some("claude-code/2.1.293"),
+                profile_messages_payload_for("2.1.293"),
+            ),
+            &["gzip", "br"],
+            &["gzip, br"],
+        )
+        .await;
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.authorization_headers.lock().await.as_slice(),
+            ["Bearer setup-rate-limited", "Bearer synthetic-good"]
+        );
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for ((headers, wire), account) in requests.iter().zip([&first, &second]) {
+            assert_eq!(headers[CONTENT_ENCODING], "gzip, br");
+            assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+            let logical = decode_upstream_error_body(wire, headers);
+            assert_profile_message(headers, &Bytes::from(logical.clone()), account, "2.1.293");
+            let sent: Value = serde_json::from_slice(&logical).unwrap();
+            let identity: Value =
+                serde_json::from_str(sent["metadata"]["user_id"].as_str().unwrap()).unwrap();
+            assert_eq!(identity["device_id"], account.device_id);
+        }
+        server.abort();
+    }
+
+    /// 两阶段 signature 修复在逻辑正文上执行，每一阶段刷新 CCH 后重新编码。
+    /// @return 无；修复遗漏、压缩首包被复用或额外明文回退即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_signature_stages_reencode_current_body() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "compressed-signature@example.invalid",
+            "synthetic-compressed-two-stage",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        service.account_svc.update_account(&account).await.unwrap();
+        let selected =
+            account_for_request_profile(&account, Some(profile_for_key("2.1.293").unwrap()));
+        let mut payload = profile_messages_payload_for("2.1.293");
+        payload["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"合成历史"}]},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"合成思考","signature":"synthetic-invalid"},{"type":"tool_use","id":"synthetic-tool","name":"synthetic","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"synthetic-tool","content":"合成结果"},{"type":"text","text":"继续"}]}
+        ]);
+        let request = encode_gateway_test_request(
+            profile_request("/v1/messages", Some("claude-code/2.1.293"), payload),
+            &["gzip", "zstd"],
+            &["GZip", "zstd"],
+        )
+        .await;
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 3, "只能执行原有两阶段修复");
+        let mut previous_logical = None;
+        for (stage, (headers, wire)) in requests.iter().enumerate() {
+            assert_eq!(headers[CONTENT_ENCODING], "gzip, zstd");
+            assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+            let logical = decode_upstream_error_body(wire, headers);
+            let sent: Value = serde_json::from_slice(&logical).unwrap();
+            let types: Vec<_> = sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .filter_map(|block| block["type"].as_str())
+                .collect();
+            assert_eq!(types.contains(&"thinking"), stage == 0);
+            assert_eq!(types.contains(&"tool_use"), stage < 2);
+            assert_eq!(types.contains(&"tool_result"), stage < 2);
+            assert_eq!(
+                service.rewriter.refresh_cch_attestation(
+                    logical.clone(),
+                    &selected,
+                    ClientType::ClaudeCode
+                ),
+                logical
+            );
+            if let Some(previous) = previous_logical {
+                assert_ne!(logical, previous);
+            }
+            previous_logical = Some(logical);
+        }
+        server.abort();
+    }
+
+    /// 上游不接受压缩编码时只返回原错误，不新增明文或其它编码回退。
+    /// @return 无；额外网络重试或编码选择漂移即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_does_not_retry_unsupported_upstream_encoding() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "compressed-unsupported@example.invalid",
+            "synthetic-unsupported-codec",
+            50,
+        )
+        .await;
+        let request = encode_gateway_test_request(
+            profile_request(
+                "/v1/messages",
+                Some("claude-code/2.1.293"),
+                profile_messages_payload_for("2.1.293"),
+            ),
+            &["zstd"],
+            &["zstd"],
+        )
+        .await;
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["message"], "unsupported content coding");
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0[CONTENT_ENCODING], "zstd");
+        server.abort();
+    }
+
+    /// 不同压缩容器共用逻辑缓存键，并保留 prefill、warmup 与 classifier 的本地结果。
+    /// @return 无；缓存额外发包、拦截失效或压缩改变本地响应即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_cache_and_local_intercepts_are_equivalent() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let cache = Arc::new(SessionPoolTestCache::new(false));
+        let service =
+            test_gateway_service_with_cache_and_urls(cache.clone(), base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "compressed-cache@example.invalid",
+            "synthetic-cache",
+            50,
+        )
+        .await;
+        account.rpm_limit = 100;
+        service.account_svc.update_account(&account).await.unwrap();
+        service.non_stream_probe_cache_config.write().await.enabled = true;
+        let mut cache_cases = vec![(Vec::new(), Vec::new(), "")];
+        cache_cases.extend(gateway_test_encoding_cases());
+        let mut response_ids = Vec::new();
+        for (codings, rows, _) in cache_cases {
+            let request = encode_gateway_test_request(
+                profile_request(
+                    "/v1/messages",
+                    Some("claude-code/2.1.293"),
+                    non_stream_probe_request("count"),
+                ),
+                &codings,
+                &rows,
+            )
+            .await;
+            let response = service.handle_request(request, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers().contains_key(CONTENT_ENCODING));
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let message: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(message["type"], "message");
+            assert_eq!(message["content"][0]["text"], "ok");
+            response_ids.push(message["id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(state.requests.lock().await.len(), 1);
+        assert_eq!(service.non_stream_probe_cache.read().await.len(), 1);
+        assert!(response_ids.windows(2).all(|pair| pair[0] != pair[1]));
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let page = diagnostics.list(DiagnosticQuery::default()).await.unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|row| row.outcome == "cache_hit" && row.attempt_count == 0)
+                .count(),
+            9
+        );
+
+        *service.assistant_prefill_intercept_config.write().await = assistant_prefill_config(true);
+        *service.warmup_intercept_config.write().await = WarmupInterceptConfig {
+            auto_mode_classifier_stage1_mode: AutoModeClassifierMode::MockAllow,
+            ..all_warmup_intercepts_enabled()
+        };
+        *service.cli_bg_status_classifier_config.write().await = CliBgStatusClassifierConfig {
+            mode: CliBgStatusClassifierMode::Mock,
+            models: parse_system_role_model_list("claude-fable-5-1"),
+            ..default_cli_bg_status_classifier_config()
+        };
+        let admission_before = cache.admission_calls.load(Ordering::SeqCst);
+        for scenario in 0..4 {
+            let mut reference = None;
+            for (codings, rows) in [
+                (&[][..], &[][..]),
+                (&["gzip", "br"][..], &["GZip", "BR"][..]),
+                (&["zstd"][..], &["zstd"][..]),
+            ] {
+                let request = match scenario {
+                    0 => claude_code_assistant_prefill_request("synthetic-prefill"),
+                    1 => profile_request(
+                        "/v1/messages",
+                        Some("claude-code/2.1.293"),
+                        json!({"model":"claude-haiku-4-5", "max_tokens":1, "messages":[{"role":"user","content":"Warmup"}]}),
+                    ),
+                    2 => profile_request(
+                        "/v1/messages",
+                        Some("claude-code/2.1.293"),
+                        classifier_body(64, "\nErr on the side of blocking. <block> immediately."),
+                    ),
+                    _ => cli_bg_status_classifier_request("working", "继续检查合成文件"),
+                };
+                let request = encode_gateway_test_request(request, codings, rows).await;
+                let response = service.handle_request(request, None).await;
+                assert_eq!(
+                    response.status(),
+                    if scenario == 0 {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    },
+                    "本地场景={scenario}"
+                );
+                assert!(!response.headers().contains_key(CONTENT_ENCODING));
+                let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                if let Some(reference) = &reference {
+                    assert_eq!(&bytes, reference);
+                } else {
+                    reference = Some(bytes);
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 1);
+        assert_eq!(state.hello_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cache.admission_calls.load(Ordering::SeqCst),
+            admission_before
+        );
+        server.abort();
+    }
+
+    /// 无编码与 identity 保留读体错误和 count_tokens 严格 JSON 校验，压缩 I/O 错误为对象错误。
+    /// @return 无；未压缩状态或错误形状扩大改变、读体失败产生上游请求即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_read_errors_and_count_json_boundaries() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            for encoding in [None, Some("identity"), Some("gzip")] {
+                for oversized in [false, true] {
+                    let mut request = profile_request(path, Some("claude-code/2.1.293"), json!({}));
+                    if let Some(encoding) = encoding {
+                        request
+                            .headers_mut()
+                            .insert(CONTENT_ENCODING, encoding.parse().unwrap());
+                    }
+                    *request.body_mut() = if oversized {
+                        Body::from(vec![0u8; REQUEST_BODY_LIMIT + 1])
+                    } else {
+                        Body::from_stream(tokio_stream::iter(vec![Err::<Bytes, _>(
+                            IoError::other("合成读取失败"),
+                        )]))
+                    };
+                    let response = if path == COUNT_TOKENS_PATH {
+                        service.handle_count_tokens_request(request, None).await
+                    } else {
+                        service.handle_request(request, None).await
+                    };
+                    assert_eq!(
+                        response.status(),
+                        if oversized && encoding == Some("gzip") {
+                            StatusCode::PAYLOAD_TOO_LARGE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        }
+                    );
+                    let bytes = body::to_bytes(response.into_body(), 4096).await.unwrap();
+                    let error: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        error["error"].is_object(),
+                        path == COUNT_TOKENS_PATH || encoding == Some("gzip")
+                    );
+                }
+            }
+        }
+        for invalid in ["", "[]", "null", "{}", "{\"model\":\" \"}", "not-json"] {
+            let mut reference = None;
+            for (codings, rows) in [
+                (&[][..], &[][..]),
+                (&["gzip"][..], &["gzip"][..]),
+                (&["br"][..], &["br"][..]),
+            ] {
+                let mut request =
+                    profile_request(COUNT_TOKENS_PATH, Some("claude-code/2.1.293"), json!({}));
+                *request.body_mut() = Body::from(invalid.to_string());
+                let request = encode_gateway_test_request(request, codings, rows).await;
+                let response = service.handle_count_tokens_request(request, None).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = body::to_bytes(response.into_body(), 4096).await.unwrap();
+                if let Some(reference) = &reference {
+                    assert_eq!(&bytes, reference);
+                } else {
+                    reference = Some(bytes);
+                }
+            }
+        }
+        assert!(state.requests.lock().await.is_empty());
+        server.abort();
+    }
+
+    /// 真实 Router 先校验 API token，已认证请求才会进入编码声明校验。
+    /// @return 无；畸形编码抢先覆盖缺失/无效 token 的 401 或合法 token 未进入 Gateway 即失败。
+    #[tokio::test]
+    async fn gateway_compressed_request_router_authentication_precedes_decoding() {
+        let service = Arc::new(test_gateway_service().await);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool, "sqlite").await.unwrap();
+        let token_store = Arc::new(TokenStore::new(pool.clone(), "sqlite".into()));
+        let mut token = ApiToken {
+            id: 0,
+            name: "合成编解码鉴权".into(),
+            token: "synthetic-codec-api-key".into(),
+            allowed_accounts: String::new(),
+            blocked_accounts: String::new(),
+            status: ApiTokenStatus::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        token_store.create(&mut token).await.unwrap();
+        let config = Config {
+            server: ServerConfig {
+                port: 0,
+                host: "127.0.0.1".into(),
+                tls_cert: None,
+                tls_key: None,
+            },
+            database: DatabaseConfig {
+                driver: Some("sqlite".into()),
+                dsn: Some("sqlite::memory:".into()),
+                host: String::new(),
+                port: 0,
+                user: String::new(),
+                password: String::new(),
+                dbname: String::new(),
+            },
+            redis: None,
+            admin: AdminConfig {
+                password: "synthetic-admin".into(),
+            },
+            log_level: "info".into(),
+            usage_poll_interval: Duration::from_secs(300),
+        };
+        let router = build_router(
+            &config,
+            service.clone(),
+            service.account_svc.clone(),
+            Arc::new(TokenTester::new()),
+            token_store,
+            service.settings_store.clone(),
+            Arc::new(PrimeLogStore::new(pool)),
+            Arc::new(OAuthFlowService::new()),
+            service.telemetry_svc.clone(),
+        );
+        for path in [
+            "/v1/messages",
+            COUNT_TOKENS_PATH,
+            "/api/event_logging/v2/batch",
+            "/artifact/publish",
+        ] {
+            for api_key in [
+                None,
+                Some("invalid-synthetic-key"),
+                Some(token.token.as_str()),
+            ] {
+                let mut request = profile_request(path, Some("claude-code/2.1.293"), json!({}));
+                request
+                    .headers_mut()
+                    .insert(CONTENT_ENCODING, "gzip;q=1".parse().unwrap());
+                if let Some(api_key) = api_key {
+                    request
+                        .headers_mut()
+                        .insert("x-api-key", api_key.parse().unwrap());
+                }
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    if api_key == Some(token.token.as_str()) {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                );
+                body::to_bytes(response.into_body(), 4096).await.unwrap();
+            }
         }
     }
 

@@ -5,6 +5,7 @@ pub mod gateway;
 pub mod oauth;
 pub mod oauth_flow;
 pub mod prime_poller;
+pub(crate) mod request_body_codec;
 pub mod rewriter;
 pub mod runtime_bridge;
 pub mod runtime_lease;
