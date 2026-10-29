@@ -2638,19 +2638,9 @@ const CCH_POSITIONS: [usize; 3] = [4, 7, 20];
 
 fn compute_cc_version_suffix(first_user_message_text: &str, version: &str) -> String {
     let code_units: Vec<u16> = first_user_message_text.encode_utf16().collect();
-    let mut picked = String::new();
-    for &pos in &CCH_POSITIONS {
-        if let Some(code_unit) = code_units.get(pos) {
-            if let Some(ch) = char::from_u32(*code_unit as u32) {
-                picked.push(ch);
-            } else {
-                // JS 字符串索引可能取到 emoji 的单个 surrogate；Node 作为 UTF-8 输入时会按替换字符处理。
-                picked.push('\u{FFFD}');
-            }
-        } else {
-            picked.push('0');
-        }
-    }
+    // 抽样后的高低代理项可能重新组成有效字符，必须先拼接码元再统一处理孤立代理项。
+    let picked = CCH_POSITIONS.map(|pos| code_units.get(pos).copied().unwrap_or(u16::from(b'0')));
+    let picked = String::from_utf16_lossy(&picked);
     let input = format!("{}{}{}", CCH_SALT, picked, version);
     let hash = Sha256::digest(input.as_bytes());
     format!("{:x}", hash)[..3].to_string()
@@ -13217,6 +13207,38 @@ mod tests {
             compute_cc_version_suffix("abcd你fghijklmnopqrstuv", "2.1.156"),
             "45e"
         );
+    }
+
+    #[test]
+    fn cc_version_suffix_matches_node_utf16_boundaries() {
+        // 独立 Node.js 参考值覆盖抽样后才组成代理对的情况，避免逐码元替换丢失字符。
+        for (case, text, expected) in [
+            ("空文本", "", "49b"),
+            ("短文本补零", "abcde", "f4b"),
+            ("ASCII", "abcdefghijklmnopqrstuvwxyz", "2e9"),
+            (
+                "普通中文",
+                "这是一个用于验证中文指纹计算的测试消息，请保持一致。",
+                "c7e",
+            ),
+            ("emoji 下标偏移", "😀abcdefghijklmnopqrstuvwxyz", "c16"),
+            ("孤立高代理项", "abcd😀fghijklmnopqrstuvwxyz", "d96"),
+            ("孤立低代理项", "abc😀efghijklmnopqrstuvwxyz", "d96"),
+            ("拼接成有效代理对", "abcd😀😀efghijklmnopqrstuvwxyz", "0e9"),
+            ("高低代理项倒置", "abc😀ab😀efghijklmnopqrstuvwxyz", "52c"),
+            (
+                "最大 Unicode 码点",
+                "abcd\u{10ffff}\u{10ffff}efghijklmnopqrstuvwxyz",
+                "ca3",
+            ),
+            ("真正的 NUL", "abcd\0fghijklmnopqrstuvwxyz", "2f6"),
+        ] {
+            assert_eq!(
+                compute_cc_version_suffix(text, "2.1.283"),
+                expected,
+                "用例：{case}"
+            );
+        }
     }
 
     #[test]
