@@ -2,6 +2,7 @@ use base64::Engine;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use regex::Regex;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -1941,12 +1942,27 @@ impl Rewriter {
         serde_json::to_vec(&filtered).ok()
     }
 
-    /// 根字段确实被清理后，按请求账号画像刷新最终正文中已有的唯一 billing CCH。
+    /// 账号禁止 Fast 时删除根级 Fast 申请，并保留其它字段的相对顺序。
+    ///
+    /// @param body 当前账号待发送的逻辑 JSON 正文。
+    /// @param account 已选中的请求账号，决定是否允许 Fast。
+    /// @return 只有实际删除根级 `speed: "fast"` 时返回新正文，其它情况返回 None。
+    pub(crate) fn filter_account_fast_mode_body(body: &Value, account: &Account) -> Option<Value> {
+        if account.allow_fast_mode || body.get("speed").and_then(Value::as_str) != Some("fast") {
+            return None;
+        }
+        let mut filtered = body.as_object()?.clone();
+        // 稳定删除避免交换尾键，账号策略不应改变其它字段的 wire 顺序。
+        filtered.shift_remove("speed");
+        Some(Value::Object(filtered))
+    }
+
+    /// 正文策略实际修改后，按请求账号画像刷新最终正文中已有的唯一 billing CCH。
     ///
     /// @param body 三分支完成其它改写后的最终正文。
     /// @param account 已冻结请求画像的账号副本。
     /// @return 刷新已有五位 CCH；无合法唯一目标时保持输入，不生成 billing 或身份块。
-    pub(crate) fn refresh_message_top_field_filter_cch(
+    pub(crate) fn refresh_message_body_policy_cch(
         &self,
         body: Vec<u8>,
         account: &Account,
@@ -6786,7 +6802,7 @@ mod tests {
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use base64::Engine;
     use chrono::Utc;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
 
     // 历史回归固定 280，新增 293 用例显式选择新画像，避免默认升级改变旧用例含义。
@@ -11426,6 +11442,43 @@ mod tests {
     }
 
     #[test]
+    fn fast_mode_body_filter_preserves_nested_fields_and_order() {
+        let account = test_account();
+        let body: Value = serde_json::from_str(
+            r#"{"before":1,"speed":"fast","nested":{"speed":"fast"},"after":2}"#,
+        )
+        .unwrap();
+        let filtered = Rewriter::filter_account_fast_mode_body(&body, &account).unwrap();
+        assert_eq!(
+            filtered.to_string(),
+            r#"{"before":1,"nested":{"speed":"fast"},"after":2}"#
+        );
+        assert_eq!(body["speed"], "fast", "公共输入必须保留供下一个账号使用");
+        let mut allowed = account;
+        allowed.allow_fast_mode = true;
+        assert!(Rewriter::filter_account_fast_mode_body(&body, &allowed).is_none());
+    }
+
+    #[test]
+    fn fast_mode_body_filter_only_matches_exact_root_string() {
+        let account = test_account();
+        for body in [
+            json!({}),
+            json!({"speed":"standard"}),
+            json!({"speed":"FAST"}),
+            json!({"speed":" fast "}),
+            json!({"speed":null}),
+            json!({"speed":true}),
+            json!({"speed":1}),
+            json!({"nested":{"speed":"fast"}}),
+            json!([{"speed":"fast"}]),
+            json!("speed=fast"),
+        ] {
+            assert!(Rewriter::filter_account_fast_mode_body(&body, &account).is_none());
+        }
+    }
+
+    #[test]
     fn fast_mode_beta_is_filtered_by_default_without_reordering_other_client_tokens() {
         let account = test_account();
         let rewriter = Rewriter::new();
@@ -13838,7 +13891,7 @@ mod tests {
                             ),
                         };
                         let final_body = rewriter
-                            .refresh_message_top_field_filter_cch(intermediate.clone(), &account);
+                            .refresh_message_body_policy_cch(intermediate.clone(), &account);
                         let parsed: serde_json::Value =
                             serde_json::from_slice(&final_body).unwrap();
                         assert!(parsed.get("settings").is_none());

@@ -1491,7 +1491,7 @@ async function copyText(text: string) {
                 允许透传
               </button>
             </div>
-            <p class="text-xs text-[#b5b0a6]">默认禁止。允许后仅透传客户端携带的 fast-mode-2026-02-01，可能增加计费和限流风险。</p>
+            <p class="text-xs text-[#b5b0a6]">默认禁止，客户端 Fast 请求回落普通模式。允许后保留客户端申请，可能增加计费和限流风险。</p>
           </div>
           <div class="space-y-3 rounded-lg border border-[#e8e2d9] bg-[#f9f6f1] p-3">
             <div class="space-y-2">

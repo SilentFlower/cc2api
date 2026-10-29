@@ -11,6 +11,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::LengthLimitError;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::io::Read;
@@ -1685,13 +1686,27 @@ impl GatewayService {
             };
             let account = selected.account;
             let request_account = account_for_request_profile(&account, request_profile);
+            let filtered_body_map =
+                Rewriter::filter_account_fast_mode_body(&body_map, &request_account);
+            // 每个账号都从公共正文重新派生，禁止账号的删除不能污染后续允许账号。
+            let account_body: Cow<'_, [u8]> = if let Some(filtered) = filtered_body_map.as_ref() {
+                let serialized = serde_json::to_vec(filtered).map_err(|error| {
+                    AppError::Internal(format!("serialize count_tokens fast mode body: {error}"))
+                })?;
+                Cow::Owned(
+                    self.rewriter
+                        .refresh_message_body_policy_cch(serialized, &request_account),
+                )
+            } else {
+                Cow::Borrowed(&final_body)
+            };
             let mut final_headers = self.rewriter.rewrite_headers(
                 &headers,
                 COUNT_TOKENS_PATH,
                 &request_account,
                 client_type,
                 &model_id,
-                &body_map,
+                filtered_body_map.as_ref().unwrap_or(&body_map),
             );
             apply_count_tokens_beta_header(
                 &mut final_headers,
@@ -1731,13 +1746,13 @@ impl GatewayService {
                 "count_tokens_forward account={} model={} body={}",
                 account.id,
                 model_id,
-                safe_body_summary(&final_body)
+                safe_body_summary(&account_body)
             );
 
             let mut resp = self
                 .forward_count_tokens_request(
                     &final_headers,
-                    &final_body,
+                    &account_body,
                     &request_encoding,
                     &account,
                 )
@@ -1757,7 +1772,7 @@ impl GatewayService {
                 resp = self
                     .forward_count_tokens_request(
                         &final_headers,
-                        &final_body,
+                        &account_body,
                         &request_encoding,
                         &account,
                     )
@@ -2261,20 +2276,38 @@ impl GatewayService {
                         context_sanitizer_config,
                     )
                 };
-            let rewritten_body = if filtered_message_body.is_some() {
-                self.rewriter
-                    .refresh_message_top_field_filter_cch(rewritten_body, &request_account)
+            let mut rewritten_body_map: serde_json::Value =
+                serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
+            let filtered_fast_body = if path == "/v1/messages" {
+                Rewriter::filter_account_fast_mode_body(&rewritten_body_map, &request_account)
+            } else {
+                None
+            };
+            let fast_mode_filtered = filtered_fast_body.is_some();
+            let rewritten_body = if let Some(filtered) = filtered_fast_body {
+                rewritten_body_map = filtered;
+                serde_json::to_vec(&rewritten_body_map).map_err(|error| {
+                    AppError::Internal(format!("serialize account fast mode body: {error}"))
+                })?
             } else {
                 rewritten_body
             };
+            let rewritten_body = if filtered_message_body.is_some() || fast_mode_filtered {
+                self.rewriter
+                    .refresh_message_body_policy_cch(rewritten_body, &request_account)
+            } else {
+                rewritten_body
+            };
+            if filtered_message_body.is_some() || fast_mode_filtered {
+                // 后续 header 与观测都读取最终正文，包括策略删减后刷新的已有 CCH。
+                rewritten_body_map =
+                    serde_json::from_slice(&rewritten_body).unwrap_or(rewritten_body_map);
+            }
             debug!(
                 "request body summary AFTER rewrite: {}",
                 safe_body_summary(&rewritten_body)
             );
 
-            // 重新解析改写后的 body
-            let rewritten_body_map: serde_json::Value =
-                serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
             let cache_usage_context = if path.starts_with("/v1/messages") {
                 Some(CacheUsageLogContext::from_request(
                     &body_map,
@@ -7635,7 +7668,7 @@ mod tests {
     use crate::service::request_body_codec::{REQUEST_BODY_LIMIT, RequestBodyEncoding};
     use crate::service::rewriter::{
         CLAUDE_CODE_SYSTEM_PROMPT, ClientType, Rewriter, StatefulCacheUsage,
-        UpstreamSessionRewrite, extract_session_id_from_body,
+        UpstreamSessionRewrite, extract_session_id_from_body, strip_empty_text_blocks,
     };
     use crate::service::session_hello_probe::{SessionHelloProbeConfig, SessionHelloProbeDecision};
     use crate::service::telemetry::MessageTelemetryUsage;
@@ -8820,6 +8853,445 @@ mod tests {
             .await
             .expect("create account");
         account
+    }
+
+    /// 实际消息和 count_tokens 出站遵守账号 Fast 开关，并保持客户端入口及画像差异。
+    /// @return 无；Fast 申请、配套 beta、CCH 或嵌套字段不符合账号策略时失败。
+    #[tokio::test]
+    async fn gateway_fast_mode_policy_covers_clients_profiles_and_count_tokens() {
+        const FAST_BETA: &str = "fast-mode-2026-02-01";
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "fast-mode-matrix@example.invalid",
+            "synthetic-compressed-matrix",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        for version in ["2.1.280", "2.1.293"] {
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "claude_code_version_profile".into(),
+                    version.into(),
+                )]))
+                .await
+                .unwrap();
+            service.reload_access_profile_config().await.unwrap();
+            for allow in [false, true] {
+                account.allow_fast_mode = allow;
+                service.account_svc.update_account(&account).await.unwrap();
+                let selected =
+                    account_for_request_profile(&account, Some(profile_for_key(version).unwrap()));
+                for ua in [
+                    format!("claude-code/{version}"),
+                    "python-httpx/0.28.1".into(),
+                ] {
+                    for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+                        let streams: &[Option<bool>] = if path == COUNT_TOKENS_PATH {
+                            &[None]
+                        } else {
+                            &[None, Some(false), Some(true)]
+                        };
+                        for &stream in streams {
+                            for with_beta in [false, true] {
+                                let mut payload = profile_messages_payload_for(version);
+                                payload["model"] = json!(if version == "2.1.293" {
+                                    "claude-opus-5-5"
+                                } else {
+                                    "claude-opus-4-8"
+                                });
+                                payload["speed"] = json!("fast");
+                                payload["fast_mode_nested"] = json!({"speed":"fast"});
+                                payload.as_object_mut().unwrap().shift_remove("stream");
+                                if let Some(stream) = stream {
+                                    payload["stream"] = json!(stream);
+                                }
+                                if path == COUNT_TOKENS_PATH {
+                                    // 计数入口保留原生正文；先构造合法 CCH，避免夹具自身失配。
+                                    strip_empty_text_blocks(&mut payload);
+                                    sanitize_count_tokens_body(&mut payload);
+                                    payload = serde_json::from_slice(
+                                        &service.rewriter.refresh_cch_attestation(
+                                            payload.to_string().into_bytes(),
+                                            &selected,
+                                            ClientType::API,
+                                        ),
+                                    )
+                                    .unwrap();
+                                }
+                                let request = duplicate_beta_request(
+                                    path,
+                                    &ua,
+                                    payload,
+                                    if with_beta { &[FAST_BETA] } else { &[] },
+                                );
+                                let response = if path == COUNT_TOKENS_PATH {
+                                    service.handle_count_tokens_request(request, None).await
+                                } else {
+                                    service.handle_request(request, None).await
+                                };
+                                assert_eq!(response.status(), StatusCode::OK);
+                                body::to_bytes(response.into_body(), 1024 * 1024)
+                                    .await
+                                    .unwrap();
+                                let requests = state.requests.lock().await;
+                                let (headers, bytes) = requests.last().unwrap();
+                                let sent: Value = serde_json::from_slice(bytes).unwrap();
+                                assert_eq!(
+                                    sent.get("speed").and_then(Value::as_str),
+                                    allow.then_some("fast"),
+                                    "入口={path} 画像={version} UA={ua} 允许={allow} beta={with_beta}"
+                                );
+                                assert_eq!(sent["fast_mode_nested"], json!({"speed":"fast"}));
+                                let betas = headers["anthropic-beta"].to_str().unwrap();
+                                let has_fast = betas.split(',').any(|token| token == FAST_BETA);
+                                if !allow || !with_beta {
+                                    assert!(!has_fast);
+                                } else if ua.starts_with("claude-") || path == COUNT_TOKENS_PATH {
+                                    assert!(has_fast);
+                                }
+                                if path == COUNT_TOKENS_PATH {
+                                    assert!(
+                                        betas
+                                            .split(',')
+                                            .any(|token| token == "token-counting-2024-11-01")
+                                    );
+                                }
+                                assert!(sent["system"].to_string().contains("cch="));
+                                assert_eq!(
+                                    service.rewriter.refresh_cch_attestation(
+                                        bytes.to_vec(),
+                                        &selected,
+                                        ClientType::API,
+                                    ),
+                                    bytes.to_vec()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
+    /// Fast 策略覆盖身份旁路和归因旁路，独立于固定根键清理开关。
+    /// @return 无；已有 CCH 漏刷新、未请求删除时重序列化或额外改写时失败。
+    #[tokio::test]
+    async fn gateway_fast_mode_policy_covers_classifier_bypasses() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "fast-mode-classifier@example.invalid",
+            "synthetic-fast-classifier",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Strip;
+        *service.message_top_field_filter_enabled.write().await = false;
+        for version in ["2.1.280", "2.1.293"] {
+            for injection in [false, true] {
+                service
+                    .cli_bg_status_classifier_config
+                    .write()
+                    .await
+                    .identity_injection_enabled = injection;
+                for allow in [false, true] {
+                    account.allow_fast_mode = allow;
+                    service.account_svc.update_account(&account).await.unwrap();
+                    let mut payload =
+                        cli_bg_status_classifier_body("working", "合成 Fast 策略验证");
+                    payload.as_object_mut().unwrap().shift_remove("metadata");
+                    payload["speed"] = json!("fast");
+                    if injection {
+                        payload["system"].as_array_mut().unwrap().insert(
+                            0,
+                            json!({"type":"text","text":format!("x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint=cli; cch=abcde;")}),
+                        );
+                    }
+                    let original = serde_json::to_vec_pretty(&payload).unwrap();
+                    let mut request = cli_status_classifier_request(payload.clone(), "cli-bg");
+                    request.headers_mut().insert(
+                        "user-agent",
+                        format!("claude-code/{version}").parse().unwrap(),
+                    );
+                    request
+                        .headers_mut()
+                        .insert("anthropic-beta", "fast-mode-2026-02-01".parse().unwrap());
+                    *request.body_mut() = Body::from(original.clone());
+                    let request_headers = extract_headers(request.headers());
+                    if injection {
+                        assert!(
+                            detect_claude_code_status_classifier_request(
+                                "/v1/messages",
+                                &request_headers,
+                                &payload,
+                                ClientType::ClaudeCode,
+                            )
+                            .is_some()
+                        );
+                    } else {
+                        let models = service
+                            .cli_bg_status_classifier_config
+                            .read()
+                            .await
+                            .models
+                            .clone();
+                        assert!(is_cli_bg_status_classifier_request(
+                            "/v1/messages",
+                            &request_headers,
+                            &payload,
+                            ClientType::ClaudeCode,
+                            &models,
+                        ));
+                    }
+                    let response = service.handle_request(request, None).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let requests = state.requests.lock().await;
+                    let (headers, bytes) = requests.last().unwrap();
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    assert_eq!(
+                        sent.get("speed").and_then(Value::as_str),
+                        allow.then_some("fast")
+                    );
+                    assert_eq!(sent["messages"], payload["messages"]);
+                    assert_eq!(sent["thinking"], payload["thinking"]);
+                    assert_eq!(
+                        sent["system"].as_array().unwrap().len(),
+                        if injection { 3 } else { 1 }
+                    );
+                    if !allow {
+                        assert!(
+                            !headers["anthropic-beta"]
+                                .to_str()
+                                .unwrap()
+                                .split(',')
+                                .any(|token| token == "fast-mode-2026-02-01")
+                        );
+                    }
+                    if injection {
+                        let selected = account_for_request_profile(
+                            &account,
+                            Some(profile_for_key(version).unwrap()),
+                        );
+                        assert_eq!(
+                            service.rewriter.refresh_cch_attestation(
+                                bytes.to_vec(),
+                                &selected,
+                                ClientType::API
+                            ),
+                            bytes.to_vec()
+                        );
+                    } else {
+                        assert_eq!(
+                            sent["system"], payload["system"],
+                            "Fast 策略不能给身份旁路新增归因块"
+                        );
+                        if allow {
+                            assert_eq!(bytes.as_ref(), original, "允许时身份旁路保留原始字节");
+                        }
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
+    /// 原始 TCP 验证 Fast 删减后各编码及明文的实际 CE、CL 和 CCH。
+    /// @return 无；编码声明、线上长度或账号策略与发送字节不一致时失败。
+    #[tokio::test]
+    async fn gateway_fast_mode_policy_reencodes_final_wire_body() {
+        let mut cases = vec![(Vec::new(), Vec::new(), "")];
+        cases.extend(gateway_test_encoding_cases());
+        let (base, mut received, server) = spawn_compressed_wire_upstream(cases.len() * 4).await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "fast-mode-wire@example.invalid",
+            "synthetic-fast-wire",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        for allow in [false, true] {
+            account.allow_fast_mode = allow;
+            service.account_svc.update_account(&account).await.unwrap();
+            let selected =
+                account_for_request_profile(&account, Some(profile_for_key("2.1.293").unwrap()));
+            for ua in ["claude-code/2.1.293", "python-httpx/0.28.1"] {
+                for (codings, rows, outgoing) in &cases {
+                    let mut payload = profile_messages_payload_for("2.1.293");
+                    payload["model"] = json!("claude-opus-5-5");
+                    payload["speed"] = json!("fast");
+                    let request = encode_gateway_test_request(
+                        duplicate_beta_request(
+                            "/v1/messages",
+                            ua,
+                            payload,
+                            &["fast-mode-2026-02-01"],
+                        ),
+                        codings,
+                        rows,
+                    )
+                    .await;
+                    let response = service.handle_request(request, None).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let (head, headers, wire) = received.recv().await.unwrap();
+                    assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+                    assert_eq!(
+                        headers
+                            .get(CONTENT_ENCODING)
+                            .map(|value| value.to_str().unwrap()),
+                        (!outgoing.is_empty()).then_some(*outgoing)
+                    );
+                    assert_eq!(
+                        head.lines()
+                            .filter(|line| line
+                                .split_once(':')
+                                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("content-length")))
+                            .count(),
+                        1
+                    );
+                    assert!(!headers.contains_key(TRANSFER_ENCODING));
+                    let logical = decode_upstream_error_body(&wire, &headers);
+                    let sent: Value = serde_json::from_slice(&logical).unwrap();
+                    assert_eq!(
+                        sent.get("speed").and_then(Value::as_str),
+                        allow.then_some("fast")
+                    );
+                    assert_eq!(
+                        service.rewriter.refresh_cch_attestation(
+                            logical.clone(),
+                            &selected,
+                            ClientType::API
+                        ),
+                        logical
+                    );
+                }
+            }
+        }
+        server.await.unwrap();
+    }
+
+    /// 换号后从公共原文按新账号重判 Fast，不能沿用前次账号的删减或放行。
+    /// @return 无；Messages 429 或 count_tokens 401 换号后的 Fast 申请不匹配时失败。
+    #[tokio::test]
+    async fn gateway_fast_mode_policy_is_reapplied_after_account_switch() {
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            for first_allows in [false, true] {
+                let (base, state, server) = spawn_auth_mock_server().await;
+                let service = test_gateway_service_with_urls(base, String::new()).await;
+                let first_token = if path == COUNT_TOKENS_PATH {
+                    "setup-bad"
+                } else {
+                    "setup-rate-limited"
+                };
+                let mut first = create_setup_gateway_account(
+                    &service,
+                    "fast-first@example.invalid",
+                    first_token,
+                    10,
+                )
+                .await;
+                let mut second = create_setup_gateway_account(
+                    &service,
+                    "fast-second@example.invalid",
+                    "synthetic-fast-good",
+                    20,
+                )
+                .await;
+                first.allow_fast_mode = first_allows;
+                second.allow_fast_mode = !first_allows;
+                for account in [&mut first, &mut second] {
+                    account.billing_mode = BillingMode::Rewrite;
+                    service.account_svc.update_account(account).await.unwrap();
+                }
+                let mut payload = profile_messages_payload_for("2.1.293");
+                payload["model"] = json!("claude-opus-5-5");
+                payload["speed"] = json!("fast");
+                if path == COUNT_TOKENS_PATH {
+                    strip_empty_text_blocks(&mut payload);
+                    sanitize_count_tokens_body(&mut payload);
+                    let selected = account_for_request_profile(
+                        &first,
+                        Some(profile_for_key("2.1.293").unwrap()),
+                    );
+                    payload = serde_json::from_slice(&service.rewriter.refresh_cch_attestation(
+                        payload.to_string().into_bytes(),
+                        &selected,
+                        ClientType::API,
+                    ))
+                    .unwrap();
+                }
+                let request = encode_gateway_test_request(
+                    duplicate_beta_request(
+                        path,
+                        "claude-code/2.1.293",
+                        payload,
+                        &["fast-mode-2026-02-01"],
+                    ),
+                    &["gzip", "br"],
+                    &["gzip, br"],
+                )
+                .await;
+                let response = if path == COUNT_TOKENS_PATH {
+                    service.handle_count_tokens_request(request, None).await
+                } else {
+                    service.handle_request(request, None).await
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let requests = state.requests.lock().await;
+                assert_eq!(requests.len(), 2);
+                for ((headers, wire), account) in requests.iter().zip([&first, &second]) {
+                    assert_eq!(headers[CONTENT_ENCODING], "gzip, br");
+                    assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
+                    assert_eq!(
+                        headers["authorization"],
+                        format!("Bearer {}", account.setup_token)
+                    );
+                    let logical = decode_upstream_error_body(wire, headers);
+                    let sent: Value = serde_json::from_slice(&logical).unwrap();
+                    assert_eq!(
+                        sent.get("speed").and_then(Value::as_str),
+                        account.allow_fast_mode.then_some("fast")
+                    );
+                    assert_eq!(
+                        headers["anthropic-beta"]
+                            .to_str()
+                            .unwrap()
+                            .split(',')
+                            .any(|token| token == "fast-mode-2026-02-01"),
+                        account.allow_fast_mode
+                    );
+                    let selected = account_for_request_profile(
+                        account,
+                        Some(profile_for_key("2.1.293").unwrap()),
+                    );
+                    assert_eq!(
+                        service.rewriter.refresh_cch_attestation(
+                            logical.clone(),
+                            &selected,
+                            ClientType::API
+                        ),
+                        logical
+                    );
+                }
+                server.abort();
+            }
+        }
     }
 
     /// 消息请求实际跳过达线账号，全部达线时本地拒绝，count_tokens 继续可用。
@@ -11069,12 +11541,10 @@ mod tests {
             .await;
             account.billing_mode = BillingMode::Rewrite;
             service.account_svc.update_account(&account).await.unwrap();
+            let mut payload = profile_messages_payload_for("2.1.293");
+            payload["speed"] = json!("fast");
             let request = encode_gateway_test_request(
-                profile_request(
-                    path,
-                    Some("claude-code/2.1.293"),
-                    profile_messages_payload_for("2.1.293"),
-                ),
+                profile_request(path, Some("claude-code/2.1.293"), payload),
                 &["gzip", "br"],
                 &["gzip", "BR"],
             )
@@ -11100,6 +11570,11 @@ mod tests {
                 assert_eq!(headers[CONTENT_ENCODING], "gzip, br");
                 assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
                 let logical = decode_upstream_error_body(wire, headers);
+                let sent: Value = serde_json::from_slice(&logical).unwrap();
+                assert!(
+                    sent.get("speed").is_none(),
+                    "401 前后均执行当前账号的 Fast 禁止策略"
+                );
                 if path == "/v1/messages" {
                     assert_profile_message(
                         headers,
@@ -11190,6 +11665,7 @@ mod tests {
         let selected =
             account_for_request_profile(&account, Some(profile_for_key("2.1.293").unwrap()));
         let mut payload = profile_messages_payload_for("2.1.293");
+        payload["speed"] = json!("fast");
         payload["messages"] = json!([
             {"role":"user","content":[{"type":"text","text":"合成历史"}]},
             {"role":"assistant","content":[{"type":"thinking","thinking":"合成思考","signature":"synthetic-invalid"},{"type":"tool_use","id":"synthetic-tool","name":"synthetic","input":{}}]},
@@ -11214,6 +11690,10 @@ mod tests {
             assert_eq!(headers[CONTENT_LENGTH], wire.len().to_string());
             let logical = decode_upstream_error_body(wire, headers);
             let sent: Value = serde_json::from_slice(&logical).unwrap();
+            assert!(
+                sent.get("speed").is_none(),
+                "signature 修复不能恢复已禁止的 Fast 申请"
+            );
             let types: Vec<_> = sent["messages"]
                 .as_array()
                 .unwrap()
