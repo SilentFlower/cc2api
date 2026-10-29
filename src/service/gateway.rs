@@ -7100,23 +7100,16 @@ impl SlotGuardBody {
         }
     }
 
-    fn with_usage_capture(mut self, capture: Option<UsageCapture>) -> Self {
+    fn with_usage_capture(mut self, mut capture: Option<UsageCapture>) -> Self {
+        if let Some(capture) = capture.as_mut() {
+            capture.configure_codings(&self.response_content_codings);
+        }
         self.usage_capture = capture;
         self
     }
 
     fn finish_usage_capture(&mut self, complete: bool) {
-        if let Some(mut capture) = self.usage_capture.take() {
-            if !self.response_content_codings.is_empty() {
-                if self.stateful_cache_usage_side_tap_truncated {
-                    capture.mark_partial();
-                } else {
-                    capture.observe_encoded(
-                        &self.stateful_cache_usage_side_tap,
-                        &self.response_content_codings,
-                    );
-                }
-            }
+        if let Some(capture) = self.usage_capture.take() {
             capture.finish(complete);
         }
     }
@@ -7170,10 +7163,8 @@ impl http_body::Body for SlotGuardBody {
             self.stateful_cache_usage = usage;
             self.stateful_cache_usage_buffer = buffer;
             if let Some(bytes) = frame.data_ref() {
-                if self.response_content_codings.is_empty() {
-                    if let Some(capture) = self.usage_capture.as_mut() {
-                        capture.observe(bytes);
-                    }
+                if let Some(capture) = self.usage_capture.as_mut() {
+                    capture.observe(bytes);
                 }
                 let mut message_usage = self.message_telemetry_usage;
                 let mut message_buffer = std::mem::take(&mut self.message_telemetry_buffer);
@@ -11837,6 +11828,552 @@ mod tests {
                 .is_empty()
         );
         server.abort();
+    }
+
+    /// 合成响应样本，原字节既用于上游发送，也用于客户端逐字节断言。
+    #[derive(Clone)]
+    struct UsageResponseCase {
+        label: String,
+        content_type: &'static str,
+        encoding: String,
+        wire: Bytes,
+    }
+
+    fn usage_response_case(
+        label: &str,
+        source: &[u8],
+        content_type: &'static str,
+        codings: &[&str],
+    ) -> UsageResponseCase {
+        UsageResponseCase {
+            label: label.to_owned(),
+            content_type,
+            encoding: codings
+                .iter()
+                .map(|value| {
+                    if *value == "raw-deflate" {
+                        "deflate"
+                    } else {
+                        *value
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            wire: Bytes::from(encode_gateway_test_body(source, codings)),
+        }
+    }
+
+    fn usage_response_sse(text: &[u8], multiline: bool, newline: &str) -> Vec<u8> {
+        let mut output = String::from("\u{feff}: synthetic-response-secret\n\n");
+        let mut append = |value: Value| {
+            output.push_str("event: synthetic\n");
+            let data = if multiline {
+                serde_json::to_string_pretty(&value).unwrap()
+            } else {
+                value.to_string()
+            };
+            for line in data.lines() {
+                output.push_str("data: ");
+                output.push_str(line);
+                output.push('\n');
+            }
+            output.push('\n');
+        };
+        append(
+            json!({"type":"message_start","message":{"id":"msg_usage_synthetic","model":"claude-sonnet-5","usage":{"input_tokens":1000,"output_tokens":0,"cache_read_input_tokens":500,"cache_creation_input_tokens":60,"cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":20}}}}),
+        );
+        for part in text.chunks(2048) {
+            append(
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":from_utf8(part).unwrap()}}),
+            );
+        }
+        append(
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":100}}),
+        );
+        append(json!({"type":"message_stop"}));
+        output.replace('\n', newline).into_bytes()
+    }
+
+    async fn usage_response_gateway(
+        cases: Arc<Vec<UsageResponseCase>>,
+    ) -> (GatewayService, Account, Arc<AtomicUsize>, JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let case = cases[handler_calls.fetch_add(1, Ordering::SeqCst)].clone();
+                async move {
+                    let mut response = Response::builder()
+                        .header(CONTENT_TYPE, case.content_type)
+                        .header("request-id", "req_usage_synthetic");
+                    if !case.encoding.is_empty() {
+                        response = response.header(CONTENT_ENCODING, case.encoding);
+                    }
+                    let body = if case.content_type == "application/json" {
+                        // 确定长度响应同时覆盖末帧后不再 poll EOF 的路径。
+                        Body::from(case.wire)
+                    } else {
+                        let frames: Vec<_> = case
+                            .wire
+                            .chunks(4093)
+                            .map(|part| Ok::<_, Infallible>(Bytes::copy_from_slice(part)))
+                            .collect();
+                        Body::from_stream(tokio_stream::iter(frames))
+                    };
+                    response.body(body).unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let account = create_setup_gateway_account(
+            &service,
+            "response-usage@example.invalid",
+            "synthetic-response-usage",
+            50,
+        )
+        .await;
+        assert!(!account.auto_telemetry);
+        (service, account, calls, server)
+    }
+
+    async fn wait_for_usage_count(service: &GatewayService, account: &Account, count: i64) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = service.request_usage(&[account.clone()]).await.unwrap();
+                let requests = stats[&account.id].five_hour.requests;
+                if requests >= count {
+                    assert_eq!(requests, count, "不得重复写入用量");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("用量应异步完成");
+    }
+
+    fn usage_response_noise(length: usize) -> Vec<u8> {
+        let mut noise = Vec::with_capacity(length);
+        let mut state = 0x5197_d86a_3f04_2b61_u64;
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            noise.push(alphabet[(state & 63) as usize]);
+        }
+        noise
+    }
+
+    async fn assert_complete_usage_cases(cases: Vec<UsageResponseCase>) {
+        let cases = Arc::new(cases);
+        let (service, account, calls, server) = usage_response_gateway(cases.clone()).await;
+        for (index, case) in cases.iter().enumerate() {
+            let user_agent =
+                ["python-httpx/0.28.1", "claude-cli/2.1.293 (external, cli)"][index % 2];
+            let response = service.handle_request(profile_request("/v1/messages", Some(user_agent), json!({
+                "model":"claude-sonnet-5","max_tokens":1024,"stream":case.content_type=="text/event-stream",
+                "messages":[{"role":"user","content":"synthetic-response-secret"}]
+            })), None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{}", case.label);
+            assert_eq!(response.headers()[CONTENT_TYPE], case.content_type);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or(""),
+                case.encoding
+            );
+            let request_id = response.headers()["x-cc2api-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes, case.wire, "原始响应必须不变：{}", case.label);
+            wait_for_usage_count(&service, &account, index as i64 + 1).await;
+            let diagnostics = service.diagnostics_store().unwrap();
+            diagnostics.flush().await.unwrap();
+            let detail = diagnostics.detail(&request_id).await.unwrap();
+            assert_eq!(detail.request.outcome, "success", "{}", case.label);
+            assert_eq!(detail.request.attempt_count, 1);
+            assert_eq!(detail.attempts.len(), 1);
+            let attempt = &detail.attempts[0];
+            assert_eq!(attempt.outcome, "success");
+            assert!(!attempt.partial);
+            assert_eq!(attempt.tokens.input_tokens, Some(1000));
+            assert_eq!(attempt.tokens.output_tokens, Some(100));
+            assert_eq!(attempt.tokens.cache_read_tokens, Some(500));
+            assert_eq!(attempt.tokens.cache_write_tokens, Some(60));
+            assert_eq!(attempt.tokens.cache_write_5m_tokens, Some(40));
+            assert_eq!(attempt.tokens.cache_write_1h_tokens, Some(20));
+            assert_eq!(attempt.response_model.as_deref(), Some("claude-sonnet-5"));
+            assert!(attempt.ttft_ms.is_some());
+            let serialized = serde_json::to_string(&detail).unwrap();
+            assert!(!serialized.contains("synthetic-response-secret"));
+            assert!(!serialized.contains("msg_usage_synthetic"));
+        }
+        let stats = service.request_usage(&[account.clone()]).await.unwrap();
+        let window = &stats[&account.id].five_hour;
+        assert_eq!(window.requests, cases.len() as i64);
+        assert_eq!(window.tokens, cases.len() as i64 * 1660);
+        assert_eq!(window.partial_requests, 0);
+        assert_eq!(window.unpriced_requests, 0);
+        assert!(window.cost_usd > 0.0);
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        assert_eq!(
+            diagnostics
+                .list(DiagnosticQuery::default())
+                .await
+                .unwrap()
+                .health
+                .observation_failures,
+            0
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), cases.len());
+        server.abort();
+    }
+
+    /// 真实 Gateway 比较所有编码与合法 SSE 排版，覆盖 JSON 末帧和两个客户端入口。
+    /// @return 无；响应被改动、漏采或重复写入时失败。
+    #[tokio::test]
+    async fn gateway_usage_observes_all_sse_layouts_and_response_codings() {
+        let json = json!({"type":"message","id":"msg_usage_synthetic","model":"claude-sonnet-5","content":[{"type":"text","text":"synthetic-response-secret"}],"usage":{
+            "input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":500,"cache_creation_input_tokens":60,
+            "cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":20}
+        }}).to_string();
+        let layouts = [
+            ("json", json.into_bytes(), "application/json"),
+            (
+                "multiline",
+                usage_response_sse(b"synthetic-response-secret", true, "\n"),
+                "text/event-stream",
+            ),
+            (
+                "cr",
+                usage_response_sse(b"synthetic-response-secret", true, "\r"),
+                "text/event-stream",
+            ),
+            (
+                "crlf",
+                usage_response_sse(b"synthetic-response-secret", false, "\r\n"),
+                "text/event-stream",
+            ),
+        ];
+        let mut cases = Vec::new();
+        for (name, source, content_type) in layouts {
+            for codings in [
+                vec![],
+                vec!["gzip"],
+                vec!["x-gzip"],
+                vec!["deflate"],
+                vec!["raw-deflate"],
+                vec!["br"],
+                vec!["zstd"],
+                vec!["gzip", "br"],
+                vec!["gzip", "br", "deflate", "zstd"],
+            ] {
+                let case = usage_response_case(
+                    &format!("{name}/{codings:?}"),
+                    &source,
+                    content_type,
+                    &codings,
+                );
+                cases.push(case.clone());
+                cases.push(case);
+            }
+        }
+        assert_complete_usage_cases(cases).await;
+    }
+
+    /// 真实 Gateway 验证 decoded 和压缩原字节分别超过旧整包上限的长 SSE。
+    /// @return 无；头尾用量丢失或原响应改变时失败。
+    #[tokio::test]
+    async fn gateway_usage_long_compressed_responses_keep_head_and_tail() {
+        let noise = usage_response_noise(2 * 1024 * 1024);
+        let mut cases = Vec::new();
+        for (name, text) in [
+            ("compressible", vec![b'x'; 2 * 1024 * 1024]),
+            ("large-wire", noise),
+        ] {
+            let source = usage_response_sse(&text, false, "\n");
+            assert!(source.len() > 1024 * 1024);
+            for codings in [
+                vec![],
+                vec!["gzip"],
+                vec!["x-gzip"],
+                vec!["deflate"],
+                vec!["raw-deflate"],
+                vec!["br"],
+                vec!["zstd"],
+                vec!["gzip", "br"],
+            ] {
+                let case = usage_response_case(
+                    &format!("{name}/{codings:?}"),
+                    &source,
+                    "text/event-stream",
+                    &codings,
+                );
+                if name == "large-wire" {
+                    assert!(case.wire.len() > 1024 * 1024, "{codings:?}");
+                }
+                let clone = case.clone();
+                cases.push(case);
+                cases.push(clone);
+            }
+        }
+        assert_complete_usage_cases(cases).await;
+    }
+
+    /// 损坏 footer、未知编码和超大 JSON 保留业务响应，但不能假装完整零消耗。
+    /// @return 无；观察错误影响转发或计数时失败。
+    #[tokio::test]
+    async fn gateway_usage_response_failures_preserve_bytes_and_partial_semantics() {
+        let source = usage_response_sse(b"synthetic-response-secret", true, "\r");
+        let gzip = usage_response_case("gzip-crc", &source, "text/event-stream", &["gzip"]);
+        let mut broken = gzip.wire.to_vec();
+        let footer = broken.len() - 8;
+        broken[footer] ^= 1;
+        let mut oversized_json =
+            br#"{"usage":{"input_tokens":9999,"output_tokens":9999}}"#.to_vec();
+        oversized_json.resize(1024 * 1024 + 1, b' ');
+        let complete = usage_response_sse(b"synthetic-response-secret", false, "\n");
+        let stop = b"event: synthetic\ndata: {\"type\":\"message_stop\"}\n\n";
+        assert!(complete.ends_with(stop));
+        let cases = Arc::new(vec![
+            UsageResponseCase {
+                wire: Bytes::from(broken),
+                ..gzip.clone()
+            },
+            UsageResponseCase {
+                label: "gzip-truncated".into(),
+                wire: gzip.wire.slice(..gzip.wire.len() - 1),
+                ..gzip
+            },
+            UsageResponseCase {
+                label: "unknown".into(),
+                encoding: "unknown".into(),
+                ..usage_response_case("unknown", &source, "text/event-stream", &[])
+            },
+            usage_response_case(
+                "oversized-json",
+                &oversized_json,
+                "application/json",
+                &["gzip"],
+            ),
+            usage_response_case(
+                "missing-stop",
+                &complete[..complete.len() - stop.len()],
+                "text/event-stream",
+                &[],
+            ),
+        ]);
+        let (service, account, calls, server) = usage_response_gateway(cases.clone()).await;
+        for (index, case) in cases.iter().enumerate() {
+            let response = service.handle_request(messages_request(), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or(""),
+                case.encoding
+            );
+            let request_id = response.headers()["x-cc2api-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .unwrap(),
+                case.wire
+            );
+            wait_for_usage_count(&service, &account, index as i64 + 1).await;
+            let diagnostics = service.diagnostics_store().unwrap();
+            diagnostics.flush().await.unwrap();
+            let detail = diagnostics.detail(&request_id).await.unwrap();
+            assert_eq!(detail.request.outcome, "incomplete", "{}", case.label);
+            assert_eq!(detail.attempts.len(), 1);
+            let attempt = &detail.attempts[0];
+            assert!(attempt.partial);
+            assert_eq!(
+                attempt.error_type.as_deref(),
+                match index {
+                    3 => Some("sampling_limit"),
+                    4 => None,
+                    _ => Some("decode_error"),
+                }
+            );
+            assert_eq!(
+                attempt.tokens.input_tokens,
+                if index < 2 || index == 4 {
+                    Some(1000)
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                attempt.tokens.output_tokens,
+                if index < 2 || index == 4 {
+                    Some(100)
+                } else {
+                    None
+                }
+            );
+        }
+        let stats = service.request_usage(&[account.clone()]).await.unwrap();
+        let window = &stats[&account.id].five_hour;
+        assert_eq!(window.requests, 5);
+        assert_eq!(window.partial_requests, 5);
+        assert_eq!(window.unpriced_requests, 2);
+        assert_eq!(window.tokens, 3 * 1660);
+        let diagnostics = service.diagnostics_store().unwrap();
+        assert_eq!(
+            diagnostics
+                .list(DiagnosticQuery::default())
+                .await
+                .unwrap()
+                .health
+                .observation_failures,
+            4
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        server.abort();
+    }
+
+    /// 用客户端控制的通道制造取消与读错，确保压缩前缀已经经过实际网络转发。
+    /// @return 无；部分用量丢失、错误被吞或重复终结时失败。
+    #[tokio::test]
+    async fn gateway_usage_compressed_cancellation_and_body_error_finalize_once() {
+        let source = usage_response_sse(&usage_response_noise(256 * 1024), false, "\n");
+        let wire = encode_gateway_test_body(&source, &["gzip"]);
+        let prefix = Bytes::copy_from_slice(&wire[..64 * 1024]);
+        for user_agent in ["python-httpx/0.28.1", "claude-cli/2.1.293 (external, cli)"] {
+            for end in ["cancelled", "body_error"] {
+                let control = Arc::new(Mutex::new(None::<mpsc::Sender<Result<Bytes, IoError>>>));
+                let handler_control = control.clone();
+                let handler_prefix = prefix.clone();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let handler_calls = calls.clone();
+                let app = Router::new().route(
+                    "/v1/messages",
+                    post(move || {
+                        let control = handler_control.clone();
+                        let prefix = handler_prefix.clone();
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            let (sender, receiver) = mpsc::channel(2);
+                            sender.send(Ok(prefix)).await.unwrap();
+                            *control.lock().await = Some(sender);
+                            (
+                                [
+                                    (CONTENT_TYPE, "text/event-stream"),
+                                    (CONTENT_ENCODING, "gzip"),
+                                ],
+                                Body::from_stream(ReceiverStream::new(receiver)),
+                            )
+                        }
+                    }),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let service = test_gateway_service_with_urls(base, String::new()).await;
+                let account = create_setup_gateway_account(
+                    &service,
+                    "usage-cancel@example.invalid",
+                    "synthetic-usage-cancel",
+                    50,
+                )
+                .await;
+                let response = service
+                    .handle_request(
+                        profile_request(
+                            "/v1/messages",
+                            Some(user_agent),
+                            json!({
+                                "model":"claude-sonnet-5","max_tokens":1024,"stream":true,
+                                "messages":[{"role":"user","content":"synthetic-cancel-secret"}]
+                            }),
+                        ),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+                let request_id = response.headers()["x-cc2api-request-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let mut body = response.into_body();
+                let mut received = 0;
+                while received < 32 * 1024 {
+                    let frame = timeout(Duration::from_secs(5), body.frame())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    received += frame.data_ref().map_or(0, Bytes::len);
+                }
+                if end == "body_error" {
+                    control
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap()
+                        .send(Err(IoError::other("synthetic-error-secret")))
+                        .await
+                        .unwrap();
+                    timeout(Duration::from_secs(5), async {
+                        loop {
+                            match body.frame().await {
+                                Some(Err(_)) => break,
+                                Some(Ok(_)) => {}
+                                None => panic!("上游读取错误不得变成正常结束"),
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                drop(body);
+                let _ = control.lock().await.take();
+                wait_for_usage_count(&service, &account, 1).await;
+                let diagnostics = service.diagnostics_store().unwrap();
+                diagnostics.flush().await.unwrap();
+                let detail = diagnostics.detail(&request_id).await.unwrap();
+                assert_eq!(detail.request.outcome, end);
+                assert_eq!(detail.attempts.len(), 1);
+                let attempt = &detail.attempts[0];
+                assert_eq!(attempt.outcome, end);
+                assert!(attempt.partial);
+                assert_eq!(attempt.tokens.input_tokens, Some(1000));
+                assert_eq!(attempt.tokens.output_tokens, Some(0));
+                assert_eq!(attempt.tokens.cache_write_tokens, Some(60));
+                let encoded = serde_json::to_string(&detail).unwrap();
+                assert!(!encoded.contains("synthetic-error-secret"));
+                assert!(!encoded.contains("synthetic-cancel-secret"));
+                let stats = service.request_usage(&[account.clone()]).await.unwrap();
+                assert_eq!(stats[&account.id].five_hour.requests, 1);
+                assert_eq!(stats[&account.id].five_hour.partial_requests, 1);
+                assert_eq!(stats[&account.id].five_hour.unpriced_requests, 0);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                server.abort();
+            }
+        }
     }
 
     async fn create_setup_gateway_account(

@@ -22,7 +22,7 @@ use crate::model::request_diagnostics::{
     RequestDiagnostic, normalize_correlation_id,
 };
 use crate::service::rewriter::extract_session_id_from_body;
-use crate::service::usage::{USAGE_BUFFER_LIMIT, UsageCapture};
+use crate::service::usage::UsageCapture;
 use crate::service::version_profile::profile_for_version;
 use crate::store::cache::UpstreamSessionPoolResolve;
 use crate::store::diagnostics_store::{DiagnosticEvent, DiagnosticsStore};
@@ -224,9 +224,6 @@ pub(crate) struct AttemptTrace {
     record: Option<AttemptDiagnostic>,
     capture: Option<UsageCapture>,
     start: Instant,
-    codings: Vec<String>,
-    compressed: Vec<u8>,
-    truncated: bool,
 }
 
 /// 在实际发送边界创建独立尝试，记录最终请求参数。
@@ -281,9 +278,6 @@ pub(crate) fn begin_attempt(account: &Account, body: &[u8]) -> Option<AttemptTra
                 record: Some(record),
                 capture: Some(UsageCapture::observer(&body)),
                 start: Instant::now(),
-                codings: Vec::new(),
-                compressed: Vec::new(),
-                truncated: false,
             }
         })
         .ok()
@@ -313,24 +307,17 @@ impl AttemptTrace {
                 .find_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
                 .map(normalize_correlation_id);
         }
-        self.codings = codings;
+        if let Some(capture) = self.capture.as_mut() {
+            capture.configure_codings(&codings);
+        }
         if let Some(record) = self.record.as_ref() {
             self.trace.emit(Some(record.clone()));
         }
     }
 
     fn observe(&mut self, bytes: &[u8]) {
-        if self.codings.is_empty() {
-            if let Some(capture) = self.capture.as_mut() {
-                capture.observe(bytes);
-            }
-        } else if self.compressed.len().saturating_add(bytes.len()) <= USAGE_BUFFER_LIMIT
-            && !self.truncated
-        {
-            self.compressed.extend_from_slice(bytes);
-        } else {
-            self.truncated = true;
-            self.compressed.clear();
+        if let Some(capture) = self.capture.as_mut() {
+            capture.observe(bytes);
         }
     }
 
@@ -368,12 +355,7 @@ impl AttemptTrace {
         let Some(mut record) = self.record.take() else {
             return;
         };
-        if let Some(mut capture) = self.capture.take() {
-            if self.truncated {
-                capture.mark_partial();
-            } else if !self.codings.is_empty() {
-                capture.observe_encoded(&self.compressed, &self.codings);
-            }
+        if let Some(capture) = self.capture.take() {
             let observed = capture.observation(end == "complete");
             record.tokens = observed.tokens.into();
             record.partial = observed.partial;
@@ -635,10 +617,13 @@ mod tests {
     use crate::store::diagnostics_store::DiagnosticsStore;
     use axum::body::{Body, Bytes, to_bytes};
     use axum::response::Response;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use http_body_util::BodyExt;
     use serde_json::json;
     use sqlx::any::AnyPoolOptions;
     use std::convert::Infallible;
+    use std::io::Write;
     use std::sync::Arc;
     use tokio_stream::StreamExt;
 
@@ -824,6 +809,56 @@ mod tests {
         );
         unavailable.flush().await.unwrap();
         assert!(unavailable.list(DiagnosticQuery::default()).await.is_err());
+    }
+
+    /// 既有缓冲分支复用相同解码与事件解析，传输未完成时仍保守终结。
+    /// @return 无；重复终结、丢用量或根状态错误时失败。
+    #[tokio::test]
+    async fn diagnostics_buffered_compression_uses_the_same_event_observer() {
+        let source = b"data: {\"type\":\"message_start\",\rdata: \"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":123,\"output_tokens\":0}}}\r\rdata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":8}}\r\rdata: {\"type\":\"message_stop\"}\r\r";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(source).unwrap();
+        let wire = encoder.finish().unwrap();
+        let store = store().await;
+        for complete in [true, false] {
+            let trace = TraceContext::new(store.clone());
+            let guard = RequestTraceGuard::new(trace.clone());
+            let response = CURRENT_TRACE
+                .scope(trace, async {
+                    let mut attempt =
+                        begin_attempt(&account(), br#"{"model":"claude-sonnet-5"}"#).unwrap();
+                    let response = Response::builder()
+                        .header("content-encoding", "gzip")
+                        .body(Body::from(wire.clone()))
+                        .unwrap();
+                    attempt.headers(200, response.headers(), vec!["gzip".into()]);
+                    attempt.buffered(&wire, complete);
+                    drop(attempt);
+                    guard.wrap(response)
+                })
+                .await;
+            let id = response.headers()["x-cc2api-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(to_bytes(response.into_body(), 4096).await.unwrap(), wire);
+            store.flush().await.unwrap();
+            let detail = store.detail(&id).await.unwrap();
+            assert_eq!(detail.attempts.len(), 1);
+            let attempt = &detail.attempts[0];
+            assert_eq!(attempt.tokens.input_tokens, Some(123));
+            assert_eq!(attempt.tokens.output_tokens, Some(8));
+            assert_eq!(attempt.partial, !complete);
+            assert_eq!(
+                attempt.outcome,
+                if complete { "success" } else { "body_error" }
+            );
+            assert_eq!(detail.request.outcome, attempt.outcome);
+        }
+        assert_eq!(
+            store.list(DiagnosticQuery::default()).await.unwrap().total,
+            2
+        );
     }
 
     /// 损坏压缩、采样超限和非法 JSON 应报告观察缺口，同时保留原始响应。
