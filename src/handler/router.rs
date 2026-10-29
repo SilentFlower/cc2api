@@ -61,13 +61,14 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
     DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PROXY_CLIENT_POOL_ENABLED,
-    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
-    DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
-    DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
-    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
-    SettingsStore,
+    DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+    DEFAULT_PROXY_CLIENT_POOL_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, DEFAULT_SESSION_HELLO_PROBE_ENABLED,
+    DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS, DEFAULT_SESSION_HELLO_PROBE_STRICT,
+    DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS, DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
+    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
+    normalize_message_top_field_filter_enabled,
 };
 use crate::store::token_store::TokenStore;
 
@@ -1364,6 +1365,10 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("message_body_order_fingerprint_enabled".into())
         .or_insert_with(|| DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED.to_string());
+    let top_field_filter = settings
+        .entry("message_top_field_filter_enabled".into())
+        .or_insert_with(|| DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED.to_string());
+    *top_field_filter = normalize_message_top_field_filter_enabled(top_field_filter).into();
     settings
         .entry("fable_sticky_quota_fallback_enabled".into())
         .or_insert_with(|| DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED.to_string());
@@ -1593,6 +1598,7 @@ async fn update_settings(
         "non_stream_probe_cache_enabled",
         "stream_keepalive_enabled",
         "message_body_order_fingerprint_enabled",
+        "message_top_field_filter_enabled",
         "fable_sticky_quota_fallback_enabled",
         "session_hello_probe_enabled",
         "session_hello_probe_strict",
@@ -1686,6 +1692,12 @@ async fn update_settings(
         state
             .gateway_svc
             .reload_message_body_order_fingerprint_enabled()
+            .await?;
+    }
+    if body.contains_key("message_top_field_filter_enabled") {
+        state
+            .gateway_svc
+            .reload_message_top_field_filter_enabled()
             .await?;
     }
     if body.contains_key("fable_sticky_quota_fallback_enabled") {
@@ -1879,12 +1891,22 @@ mod tests {
     use axum::http::{Method, Request, StatusCode, header};
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
+    use sqlx::AnyPool;
     use sqlx::any::AnyPoolOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
 
     async fn test_router_with_gateway() -> (Router, Arc<GatewayService>) {
+        let (router, gateway, _, _) = test_router_with_gateway_and_settings().await;
+        (router, gateway)
+    }
+
+    /// 构造可校验历史设置与 Gateway 热刷新的管理路由。
+    /// @return 管理路由、网关、设置存储及隔离内存连接池。
+    async fn test_router_with_gateway_and_settings()
+    -> (Router, Arc<GatewayService>, Arc<SettingsStore>, AnyPool) {
         sqlx::any::install_default_drivers();
         let pool = AnyPoolOptions::new()
             .max_connections(1)
@@ -1944,12 +1966,12 @@ mod tests {
             account_svc,
             Arc::new(TokenTester::new()),
             Arc::new(TokenStore::new(pool.clone(), "sqlite".into())),
-            settings_store,
-            Arc::new(PrimeLogStore::new(pool)),
+            settings_store.clone(),
+            Arc::new(PrimeLogStore::new(pool.clone())),
             Arc::new(OAuthFlowService::new()),
             telemetry_svc,
         );
-        (router, gateway_svc)
+        (router, gateway_svc, settings_store, pool)
     }
 
     /// 诊断查询只对管理员开放，并支持关联 ID 反查和受控参数错误。
@@ -2792,6 +2814,141 @@ mod tests {
                 .cli_bg_status_classifier_identity_injection_enabled_for_test()
                 .await
         );
+    }
+
+    /// 非法新开关在其它设置写入前被拒绝，防止同次请求部分保存。
+    /// @return 无；校验或原子拒绝失效时失败。
+    #[tokio::test]
+    async fn settings_message_top_field_filter_rejects_invalid_values_atomically() {
+        let app = test_router().await;
+        for value in ["", "TRUE", "1", " true", "false "] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({
+                                "message_top_field_filter_enabled":value,
+                                "allow_system_role_models":"synthetic-no-partial-write"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "值={value:?}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                payload["allow_system_role_models"],
+                "synthetic-no-partial-write"
+            );
+        }
+    }
+
+    /// 管理 GET 规范存量值，PUT 字符串开关保存后立即刷新 Gateway。
+    /// @return 无；展示、生效值或字符串保存合同失配时失败。
+    #[tokio::test]
+    async fn settings_message_top_field_filter_normalizes_get_and_hot_reloads_put() {
+        let (app, gateway, settings, pool) = test_router_with_gateway_and_settings().await;
+        for (stored, expected) in [
+            (None, "true"),
+            (Some("invalid"), "true"),
+            (Some("TRUE"), "true"),
+            (Some("false"), "false"),
+            (Some("true"), "true"),
+        ] {
+            sqlx::query("DELETE FROM settings WHERE key=$1")
+                .bind("message_top_field_filter_enabled")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if let Some(stored) = stored {
+                settings
+                    .upsert_many(&HashMap::from([(
+                        "message_top_field_filter_enabled".into(),
+                        stored.into(),
+                    )]))
+                    .await
+                    .unwrap();
+            }
+            gateway
+                .reload_message_top_field_filter_enabled()
+                .await
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(payload["message_top_field_filter_enabled"], expected);
+            assert_eq!(
+                gateway.message_top_field_filter_enabled_for_test().await,
+                expected == "true"
+            );
+        }
+        for expected in ["false", "true", "false"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"message_top_field_filter_enabled":expected}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                settings
+                    .get_value("message_top_field_filter_enabled", "missing")
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                gateway.message_top_field_filter_enabled_for_test().await,
+                expected == "true"
+            );
+        }
     }
 
     #[tokio::test]

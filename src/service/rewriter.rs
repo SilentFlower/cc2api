@@ -21,6 +21,66 @@ use crate::service::version_profile::{
 };
 use crate::store::cache::UpstreamSessionPoolResolve;
 
+/// 固定采用 vm2api 073a04a 的完整 DROP_TOP 集合，只匹配 JSON 根对象的精确键名。
+const MESSAGE_TOP_FIELD_DROP_KEYS: &[&str] = &[
+    "settings",
+    "claude_settings",
+    "env",
+    "user",
+    "user_id",
+    "extra_body",
+    "extra_headers",
+    "extra",
+    "n",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "functions",
+    "function_call",
+    "response_format",
+    "seed",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "store",
+    "modalities",
+    "audio",
+    "prediction",
+    "stream_options",
+    "tool_resources",
+    "instructions",
+    "input",
+    "truncation",
+    "include",
+    "previous_response_id",
+    "reasoning",
+    "prompt",
+    "suffix",
+    "best_of",
+    "echo",
+    "workspace",
+    "rewrite",
+    "frequencyPenalty",
+    "presencePenalty",
+    "logitBias",
+    "functionCall",
+    "responseFormat",
+    "maxCompletionTokens",
+    "parallelToolCalls",
+    "toolResources",
+    "streamOptions",
+    "previousResponseId",
+    "reasoningEffort",
+    "session",
+    "machine_id",
+    "device_id",
+    "account_uuid",
+    "web_search",
+];
+
 /// header wire 大小写映射。
 /// Go 的 HTTP 服务器规范化 header，此映射还原 Claude CLI 抓包原始大小写。
 static HEADER_WIRE_CASING: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
@@ -1850,6 +1910,50 @@ impl Rewriter {
             upstream_session_rewrite,
             context_sanitizer_config,
         )
+    }
+
+    /// 为 Messages 的三条转发分支准备可选的根字段清理正文。
+    ///
+    /// @param body 已解析的原始入站正文，仍由 Gateway 保留用于准入和调度。
+    /// @param path 请求路径，仅精确 `/v1/messages` 适用。
+    /// @param enabled 本请求冻结的清理开关。
+    /// @return 真正删除字段后返回新正文；其它情况返回 None，供调用方复用原字节。
+    pub(crate) fn filter_message_top_fields(
+        body: &serde_json::Value,
+        path: &str,
+        enabled: bool,
+    ) -> Option<Vec<u8>> {
+        if !enabled || path != "/v1/messages" {
+            return None;
+        }
+        let object = body.as_object()?;
+        if !MESSAGE_TOP_FIELD_DROP_KEYS
+            .iter()
+            .any(|key| object.contains_key(*key))
+        {
+            return None;
+        }
+        let mut filtered = object.clone();
+        for key in MESSAGE_TOP_FIELD_DROP_KEYS {
+            // preserve_order 的 remove 会交换尾键；稳定删除才能保留其它根键的相对顺序。
+            filtered.shift_remove(*key);
+        }
+        serde_json::to_vec(&filtered).ok()
+    }
+
+    /// 根字段确实被清理后，按请求账号画像刷新最终正文中已有的唯一 billing CCH。
+    ///
+    /// @param body 三分支完成其它改写后的最终正文。
+    /// @param account 已冻结请求画像的账号副本。
+    /// @return 刷新已有五位 CCH；无合法唯一目标时保持输入，不生成 billing 或身份块。
+    pub(crate) fn refresh_message_top_field_filter_cch(
+        &self,
+        body: Vec<u8>,
+        account: &Account,
+    ) -> Vec<u8> {
+        let profile = device_profile(account);
+        // Strip 的 identity-only 旁路仍可能保留已有 CCH，不受公开签名重试入口的门禁限制。
+        refresh_cch_attestation(body, normalize_version(&profile.env.version))
     }
 
     /// 仅改写 Claude Code 请求中的账号身份与上游 session 映射。
@@ -13650,6 +13754,116 @@ mod tests {
         assert_eq!(super::random_cc_version_suffix([0, 1]), "000");
         assert_eq!(super::random_cc_version_suffix([0x0f, 0xff]), "0ff");
         assert_eq!(super::random_cc_version_suffix([0xff, 0xff]), "fff");
+    }
+
+    /// 根键清理保持其余键序与嵌套顺序，并把无变化情况交回原字节路径。
+    /// @return 无；作用域、稳定顺序或按需序列化失效时失败。
+    #[test]
+    fn message_top_field_filter_preserves_order_and_no_change_boundary() {
+        let original = br#"{ "settings": 1, "keep_first": {"env":2,"user_id":3}, "env":4, "keep_middle":5, "extra_headers":{"Authorization":"synthetic"}, "keep_last":6, "web_search":7 }"#;
+        let parsed: serde_json::Value = serde_json::from_slice(original).unwrap();
+        let before = parsed.clone();
+        let filtered = Rewriter::filter_message_top_fields(&parsed, "/v1/messages", true).unwrap();
+        assert_eq!(
+            filtered,
+            br#"{"keep_first":{"env":2,"user_id":3},"keep_middle":5,"keep_last":6}"#
+        );
+        assert_eq!(parsed, before);
+        assert!(Rewriter::filter_message_top_fields(&parsed, "/v1/messages", false).is_none());
+        for path in [
+            "/v1/messages/count_tokens",
+            "/v1/messages/",
+            "/api/eval/test",
+        ] {
+            assert!(Rewriter::filter_message_top_fields(&parsed, path, true).is_none());
+        }
+        for value in [
+            json!(null),
+            json!([]),
+            json!("settings"),
+            json!({"Settings":1,"nested":{"env":2}}),
+        ] {
+            assert!(Rewriter::filter_message_top_fields(&value, "/v1/messages", true).is_none());
+        }
+        let frozen: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messages-top-field-drop-keys.json"
+        ))
+        .unwrap();
+        assert_eq!(super::MESSAGE_TOP_FIELD_DROP_KEYS, frozen);
+    }
+
+    /// 三分支完成后只刷新已有合法 CCH，Strip 旁路也使用请求画像。
+    /// @return 无；旧公开门禁变化、失败开放失效或最终 CCH 无效时失败。
+    #[test]
+    fn message_top_field_filter_final_cch_covers_profiles_modes_and_fail_open() {
+        let rewriter = Rewriter::new();
+        for version in ["2.1.280", "2.1.293"] {
+            for mode in [BillingMode::Rewrite, BillingMode::Strip] {
+                let mut account = test_account_with_profile(version);
+                account.billing_mode = mode.clone();
+                for branch in ["ordinary", "identity", "attribution"] {
+                    for system in [
+                        json!([{"type":"text","text":format!("x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint=cli; cch=abcde;")}]),
+                        json!([{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli;"}]),
+                        json!([{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.abc; cch=invalid;"}]),
+                        json!([{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.abc; cch=abcde; cch=12345;"}]),
+                        json!([]),
+                    ] {
+                        let input = json!({"model":"claude-sonnet-5-5", "settings":1, "system":system,
+                            "messages":[{"role":"user","content":"普通文本 cch=00000 cch=12345"}], "max_tokens":32});
+                        let filtered =
+                            Rewriter::filter_message_top_fields(&input, "/v1/messages", true)
+                                .unwrap();
+                        let intermediate = match branch {
+                            "ordinary" => rewriter.rewrite_body(
+                                &filtered,
+                                "/v1/messages",
+                                &account,
+                                ClientType::ClaudeCode,
+                                EnvPassthrough::default(),
+                                CacheControlTtlRewrite::Off,
+                                MessageCacheControlRewrite::Off,
+                                true,
+                            ),
+                            "identity" => rewriter.rewrite_claude_code_identity_only(
+                                &filtered,
+                                &account,
+                                &UpstreamSessionRewrite::default(),
+                            ),
+                            // 不符合归因形状的正文必须失败开放；最终刷新仍应处理已有唯一目标。
+                            _ => rewriter.rewrite_claude_code_status_classifier_attribution(
+                                &filtered,
+                                &account,
+                                &UpstreamSessionRewrite::default(),
+                            ),
+                        };
+                        let final_body = rewriter
+                            .refresh_message_top_field_filter_cch(intermediate.clone(), &account);
+                        let parsed: serde_json::Value =
+                            serde_json::from_slice(&final_body).unwrap();
+                        assert!(parsed.get("settings").is_none());
+                        assert_eq!(parsed["messages"], input["messages"]);
+                        assert_eq!(
+                            super::refresh_cch_attestation(final_body.clone(), version),
+                            final_body
+                        );
+                        if super::find_cch_value(&intermediate).is_none() {
+                            assert_eq!(final_body, intermediate);
+                        }
+                        if branch == "identity" && mode == BillingMode::Strip {
+                            assert_eq!(
+                                rewriter.refresh_cch_attestation(
+                                    intermediate.clone(),
+                                    &account,
+                                    ClientType::ClaudeCode
+                                ),
+                                intermediate
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

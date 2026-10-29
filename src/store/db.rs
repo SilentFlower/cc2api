@@ -1,5 +1,6 @@
 use crate::service::version_profile::ClaudeCodeProfile;
 use crate::store::diagnostics_store::DiagnosticsStore;
+use crate::store::settings_store::DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED;
 use crate::store::usage_store::UsageStore;
 use sqlx::{AnyConnection, AnyPool};
 use std::path::Path;
@@ -286,6 +287,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         (
             "message_body_order_fingerprint_enabled",
             crate::store::settings_store::DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED,
+        ),
+        (
+            "message_top_field_filter_enabled",
+            DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED,
         ),
         // Fable 周用量明确耗尽时默认允许打破 sticky,避免有可用账号却持续命中满额账号。
         (
@@ -1335,6 +1340,36 @@ mod tests {
             blocked_versions,
             crate::store::settings_store::DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS_SETTING
         );
+    }
+
+    /// 新库与旧库缺键默认开启，重复迁移保留显式关闭。
+    /// @return 无；缺省补齐或幂等保留失效时失败。
+    #[tokio::test]
+    async fn migrate_message_top_field_filter_defaults_and_preserves_false() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.unwrap();
+        for stored in [None, Some("false"), Some("false")] {
+            sqlx::query("DELETE FROM settings WHERE key=$1")
+                .bind("message_top_field_filter_enabled")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if let Some(stored) = stored {
+                sqlx::query("INSERT INTO settings (key,value) VALUES ($1,$2)")
+                    .bind("message_top_field_filter_enabled")
+                    .bind(stored)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            migrate(&pool, "sqlite").await.unwrap();
+            let value: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=$1")
+                .bind("message_top_field_filter_enabled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(value, stored.unwrap_or("true"));
+        }
     }
 
     #[tokio::test]

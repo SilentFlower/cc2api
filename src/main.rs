@@ -145,6 +145,10 @@ async fn main() {
         .await
         .expect("load message body order fingerprint setting failed");
     gateway_svc
+        .reload_message_top_field_filter_enabled()
+        .await
+        .expect("读取 Messages 顶层字段清理设置失败");
+    gateway_svc
         .reload_fable_sticky_quota_fallback_enabled()
         .await
         .expect("load fable sticky quota fallback setting failed");

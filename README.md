@@ -643,6 +643,24 @@ Claude Code 2.1.280 的 Opus Auto 与 Plan 模式会把 `dangerous_tool_use` 分
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、`userType`、`rateLimitTier`、`entrypoint`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
 
+系统设置中的「Messages 顶层字段清理」默认开启（`message_top_field_filter_enabled=true`），
+对精确 `/v1/messages` 的 API、Claude Code 和状态分类转发统一清理固定 56 个根级附带字段，
+包括本地设置、身份包装、`extra_body`／`extra_headers` 以及 OpenAI 残留参数。
+只按精确键名删除，保留未知根键、嵌套同名键、`metadata.user_id`、工具 schema／输入和文本，
+不展开包装字段或进行协议转换。清理后按最终正文刷新已有唯一有效 billing CCH；
+状态分类旁路只增加本项清理及必要刷新。保存开关后对新请求立即生效，关闭可回滚本项清理；
+`count_tokens` 和其它路径不适用。固定集合如下：
+
+```text
+settings claude_settings env user user_id extra_body extra_headers extra n
+presence_penalty frequency_penalty logit_bias logprobs top_logprobs functions function_call
+response_format seed parallel_tool_calls reasoning_effort max_completion_tokens max_output_tokens
+store modalities audio prediction stream_options tool_resources instructions input truncation include
+previous_response_id reasoning prompt suffix best_of echo workspace rewrite frequencyPenalty presencePenalty
+logitBias functionCall responseFormat maxCompletionTokens parallelToolCalls toolResources streamOptions
+previousResponseId reasoningEffort session machine_id device_id account_uuid web_search
+```
+
 2.1.280 对 Opus 5.5、Sonnet 5、Fable 5.1、Haiku、Opus 4.8 和 Sonnet 4.5 使用精确模型画像，分别对齐
 `anthropic-beta`、`max_tokens`、`thinking`、`output_config.effort`、fallback、CCH 与
 bootstrap `cwk_cfg_key`。2.1.280 的 CCH 会清空请求体内所有字符串类型的精确 `model`

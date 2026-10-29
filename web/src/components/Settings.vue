@@ -60,6 +60,9 @@ const messageCacheControlRewrite = ref<'off' | 'auto' | 'rolling' | 'stateful' |
 /** API mimicry /v1/messages 顶层字段顺序指纹对齐开关 */
 const messageBodyOrderFingerprintEnabled = ref(true);
 
+/** Messages 固定根字段清理开关 */
+const messageTopFieldFilterEnabled = ref(true);
+
 /** thinking.type=disabled 兼容改写配置 */
 const rewriteDisabledThinkingEnabled = ref(false);
 const rewriteDisabledThinkingModels = ref('claude-fable-5');
@@ -513,6 +516,7 @@ async function loadSettings() {
       messageCacheControlRewrite.value = 'off';
     }
     messageBodyOrderFingerprintEnabled.value = (data.message_body_order_fingerprint_enabled ?? 'true') === 'true';
+    messageTopFieldFilterEnabled.value = data.message_top_field_filter_enabled !== 'false';
     proxyClientPoolEnabled.value = (data.proxy_client_pool_enabled ?? 'true') === 'true';
     sessionHelloProbeEnabled.value = (data.session_hello_probe_enabled ?? 'false') === 'true';
     sessionHelloProbeStrict.value = (data.session_hello_probe_strict ?? 'false') === 'true';
@@ -658,6 +662,7 @@ async function saveSettings() {
       cache_control_ttl_rewrite: cacheControlTtlRewrite.value,
       message_cache_control_rewrite: messageCacheControlRewrite.value,
       message_body_order_fingerprint_enabled: messageBodyOrderFingerprintEnabled.value ? 'true' : 'false',
+      message_top_field_filter_enabled: messageTopFieldFilterEnabled.value ? 'true' : 'false',
       proxy_client_pool_enabled: proxyClientPoolEnabled.value ? 'true' : 'false',
       session_hello_probe_enabled: sessionHelloProbeEnabled.value ? 'true' : 'false',
       session_hello_probe_strict: sessionHelloProbeStrict.value ? 'true' : 'false',
@@ -1475,6 +1480,26 @@ onMounted(async () => {
           </label>
           <p class="text-[11px] text-[#b5b0a6]">
             排序发生在 API body 改写之后、CCH attestation 计算之前；未知字段保留在已知字段之后。
+          </p>
+        </div>
+
+        <div class="pt-3 border-t border-[#f0ebe4] space-y-3">
+          <div>
+            <Label class="text-[#5c5647] text-sm">Messages 顶层字段清理</Label>
+            <p class="text-[11px] text-[#b5b0a6] mt-1">
+              默认开启，对 API、Claude Code 和状态分类请求按固定 56 键清理 Messages 根级附带字段，保留嵌套内容和未知扩展。
+            </p>
+          </div>
+          <label class="flex items-center gap-2 h-9 px-3 rounded-md border border-[#e8e2d9] bg-[#f9f6f1] cursor-pointer select-none">
+            <input
+              v-model="messageTopFieldFilterEnabled"
+              type="checkbox"
+              class="accent-[#c4704f] w-4 h-4"
+            />
+            <span class="text-sm text-[#29261e]">{{ messageTopFieldFilterEnabled ? '已启用' : '已关闭' }}</span>
+          </label>
+          <p class="text-[11px] text-[#b5b0a6]">
+            只删除固定根键，不展开 extra_body、extra_headers，不转换 OpenAI 参数。关闭可停用此项清理，保存后新请求即时生效。
           </p>
         </div>
 

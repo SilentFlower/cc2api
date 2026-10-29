@@ -42,6 +42,8 @@ pub const DEFAULT_CACHE_CONTROL_TTL_REWRITE: &str = "off";
 pub const DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE: &str = "off";
 /// API mimicry `/v1/messages` 顶层字段顺序指纹对齐默认开启,用于贴近 2.1.195 抓包。
 pub const DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED: &str = "true";
+/// Messages 固定 56 个根级附带字段的清理默认开启。
+pub const DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED: &str = "true";
 /// Fable 周用量明确耗尽时,粘性会话默认允许切换到其他可用账号。
 pub const DEFAULT_FABLE_STICKY_QUOTA_FALLBACK_ENABLED: &str = "true";
 /// Fable 周用量全局控制线默认保留一半额度。
@@ -101,6 +103,17 @@ pub const DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS: &str = "5";
 pub const DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS: &str = "3600";
 /// 有效上游 Session 首次 Hello 失败状态默认固定冷却秒数。
 pub const DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS: &str = "300";
+
+/// 规范 Messages 根字段清理的存量设置，使展示与运行时使用相同默认值。
+/// @param raw 已存储的字符串；缺键时由调用方传入默认常量。
+/// @return 合法 true/false 原值；历史非法值回退默认 true。
+pub(crate) fn normalize_message_top_field_filter_enabled(raw: &str) -> &'static str {
+    match raw {
+        "true" => "true",
+        "false" => "false",
+        _ => DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED,
+    }
+}
 
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {

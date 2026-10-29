@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{
-    HeaderMap, StatusCode,
+    HeaderMap, HeaderValue, StatusCode,
     header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
     response::Parts,
 };
@@ -69,14 +69,14 @@ use crate::store::settings_store::{
     DEFAULT_INTERCEPT_WARMUP_TITLE_ENABLED, DEFAULT_LOG_429_REQUEST_BODY_LIMIT,
     DEFAULT_LOG_429_REQUEST_ENABLED, DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED,
     DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
-    DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED, DEFAULT_PASSTHROUGH_OS_VERSION,
-    DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
+    DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
+    DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
     DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
     DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
     DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
     DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
     DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
-    SettingsStore,
+    SettingsStore, normalize_message_top_field_filter_enabled,
 };
 use crate::store::usage_store::UsageStore;
 
@@ -123,6 +123,65 @@ fn align_mapped_upstream_session_header(
         "X-Claude-Code-Session-Id".into(),
         upstream_session_id.to_string(),
     );
+}
+
+/// 判断是否属于允许 Session header/body 不同的单 token 探针形状。
+/// @param body 原始请求体，避免后续正文改写影响兼容分类。
+/// @return 非流、无工具且只有一条 user 消息的整数单 token 请求返回 true。
+fn is_session_header_alignment_probe(body: &serde_json::Value) -> bool {
+    let no_tools = match body.get("tools") {
+        None => true,
+        Some(tools) => tools.as_array().is_some_and(|tools| tools.is_empty()),
+    };
+    body.get("max_tokens").and_then(|tokens| tokens.as_u64()) == Some(1)
+        && !is_streaming_messages_request(body)
+        && no_tools
+        && body
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .is_some_and(|messages| {
+                messages.len() == 1
+                    && messages[0].get("role").and_then(|role| role.as_str()) == Some("user")
+            })
+}
+
+/// 将普通 CC Messages 的已有非空 Session header 对齐到最终 body。
+/// @param headers 已完成规范头名改写和池映射对齐的出站头。
+/// @param path 不含查询参数的请求路径。
+/// @param client_type 根据入站 UA 识别的客户端类型。
+/// @param original_body 原始请求体，仅用于探针兼容分类。
+/// @param rewritten_body 已完成全部正文改写和 CCH 封口的最终请求体。
+/// @return 无；只更新可安全且保真表示为 HTTP header 的既有值，不改正文或补头。
+fn align_claude_code_session_header(
+    headers: &mut HashMap<String, String>,
+    path: &str,
+    client_type: ClientType,
+    original_body: &serde_json::Value,
+    rewritten_body: &serde_json::Value,
+) {
+    if path != "/v1/messages"
+        || client_type != ClientType::ClaudeCode
+        || is_session_header_alignment_probe(original_body)
+    {
+        return;
+    }
+    let Some(session_id) = extract_session_id_from_body(rewritten_body) else {
+        return;
+    };
+    let Some(header) = headers.get_mut("X-Claude-Code-Session-Id") else {
+        return;
+    };
+    // HTTP/1 会去掉头值首尾 SP/HTAB，直接跳过以保留原头和正文会话，不做修剪写回。
+    if session_id.trim().is_empty()
+        || session_id.starts_with([' ', '\t'])
+        || session_id.ends_with([' ', '\t'])
+        || header.trim().is_empty()
+        || header == &session_id
+        || HeaderValue::from_str(&session_id).is_err()
+    {
+        return;
+    }
+    *header = session_id;
 }
 
 fn session_hello_probe_session_id(
@@ -495,6 +554,7 @@ pub struct GatewayService {
     cache_control_ttl_rewrite: RwLock<CacheControlTtlRewrite>,
     message_cache_control_rewrite: RwLock<MessageCacheControlRewrite>,
     message_body_order_fingerprint_enabled: RwLock<bool>,
+    message_top_field_filter_enabled: RwLock<bool>,
     fable_sticky_quota_fallback_enabled: RwLock<bool>,
     fable_weekly_usage_limit_percent: RwLock<u32>,
     warmup_intercept_config: RwLock<WarmupInterceptConfig>,
@@ -554,6 +614,9 @@ impl GatewayService {
             message_cache_control_rewrite: RwLock::new(default_message_cache_control_rewrite()),
             message_body_order_fingerprint_enabled: RwLock::new(
                 default_message_body_order_fingerprint_enabled(),
+            ),
+            message_top_field_filter_enabled: RwLock::new(
+                DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED == "true",
             ),
             fable_sticky_quota_fallback_enabled: RwLock::new(
                 default_fable_sticky_quota_fallback_enabled(),
@@ -821,6 +884,22 @@ impl GatewayService {
             )
             .await?;
         *self.message_body_order_fingerprint_enabled.write().await = parse_setting_flag(&raw);
+        Ok(())
+    }
+
+    /// 从全局设置刷新 Messages 根字段清理开关，读取失败保留旧内存值。
+    ///
+    /// @return 成功读取并替换返回 Ok；数据库错误向上传递。
+    pub async fn reload_message_top_field_filter_enabled(&self) -> Result<(), AppError> {
+        let mut enabled = self.message_top_field_filter_enabled.write().await;
+        let raw = self
+            .settings_store
+            .get_value(
+                "message_top_field_filter_enabled",
+                DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED,
+            )
+            .await?;
+        *enabled = normalize_message_top_field_filter_enabled(&raw) == "true";
         Ok(())
     }
 
@@ -1210,6 +1289,13 @@ impl GatewayService {
     #[cfg(test)]
     pub(crate) async fn fable_weekly_usage_limit_percent_for_test(&self) -> u32 {
         *self.fable_weekly_usage_limit_percent.read().await
+    }
+
+    /// 返回测试使用的 Messages 根字段清理开关。
+    /// @return 当前热加载开关值。
+    #[cfg(test)]
+    pub(crate) async fn message_top_field_filter_enabled_for_test(&self) -> bool {
+        *self.message_top_field_filter_enabled.read().await
     }
 
     /// 返回测试使用的后台状态分类请求处理模式。
@@ -1809,6 +1895,12 @@ impl GatewayService {
             request_model,
         };
 
+        // 每个请求只冻结一次；保留原始 body_map/body_bytes，换号和重试复用相同清理正文。
+        let message_top_field_filter_enabled = *self.message_top_field_filter_enabled.read().await;
+        let filtered_message_body =
+            Rewriter::filter_message_top_fields(&body_map, &path, message_top_field_filter_enabled);
+        let rewrite_input = filtered_message_body.as_deref().unwrap_or(&body_bytes);
+
         // 429 自动换号 / 并发降级重试循环
         let mut exclude_ids = blocked_ids.clone();
         let mut backoff_retry_ids: Vec<i64> = Vec::new();
@@ -2089,7 +2181,7 @@ impl GatewayService {
                     (
                         self.rewriter
                             .rewrite_claude_code_status_classifier_attribution(
-                                &body_bytes,
+                                rewrite_input,
                                 &request_account,
                                 &upstream_session_rewrite,
                             ),
@@ -2100,7 +2192,7 @@ impl GatewayService {
                 {
                     (
                         self.rewriter.rewrite_claude_code_identity_only(
-                            &body_bytes,
+                            rewrite_input,
                             &request_account,
                             &upstream_session_rewrite,
                         ),
@@ -2108,7 +2200,7 @@ impl GatewayService {
                     )
                 } else {
                     self.rewriter.rewrite_body_with_stateful_completion(
-                        &body_bytes,
+                        rewrite_input,
                         &path,
                         &request_account,
                         client_type,
@@ -2121,6 +2213,12 @@ impl GatewayService {
                         context_sanitizer_config,
                     )
                 };
+            let rewritten_body = if filtered_message_body.is_some() {
+                self.rewriter
+                    .refresh_message_top_field_filter_cch(rewritten_body, &request_account)
+            } else {
+                rewritten_body
+            };
             debug!(
                 "request body summary AFTER rewrite: {}",
                 safe_body_summary(&rewritten_body)
@@ -2153,6 +2251,13 @@ impl GatewayService {
                 &rewritten_body_map,
             );
             align_mapped_upstream_session_header(&mut rewritten_headers, &upstream_session_rewrite);
+            align_claude_code_session_header(
+                &mut rewritten_headers,
+                &path,
+                client_type,
+                &body_map,
+                &rewritten_body_map,
+            );
 
             let telemetry_context = if account.auto_telemetry && path.starts_with("/v1/messages") {
                 Some(build_message_telemetry_context(
@@ -3101,12 +3206,30 @@ impl GatewayService {
     }
 }
 
-fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
+/// 提取可转为字符串的请求头，仅对 beta 合并所有同名值。
+/// @param headers 原始请求头，同名 beta 值按插入顺序读取。
+/// @return 保留有效空 beta、跳过非法值且其它头仍取最后有效值的映射。
+fn extract_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut map = HashMap::new();
     for (k, v) in headers {
+        if k.as_str() == "anthropic-beta" {
+            continue;
+        }
         if let Ok(val) = v.to_str() {
             map.insert(k.to_string(), val.to_string());
         }
+    }
+    let mut beta: Option<String> = None;
+    for value in headers.get_all("anthropic-beta").iter() {
+        if let Ok(value) = value.to_str() {
+            beta = Some(merge_anthropic_beta(
+                beta.as_deref().unwrap_or_default(),
+                value,
+            ));
+        }
+    }
+    if let Some(beta) = beta {
+        map.insert("anthropic-beta".into(), beta);
     }
     map
 }
@@ -3126,12 +3249,27 @@ fn upstream_url(path: &str, query: &str) -> String {
 fn upstream_url_with_base(upstream_base: &str, path: &str, query: &str) -> String {
     let mut target_url = format!("{}{}", upstream_base, path);
     let mut query = query.to_string();
-    if requires_upstream_beta_query(path) && !query_contains_beta_true(&query) {
-        if query.is_empty() {
-            query = "beta=true".to_string();
-        } else {
-            query.push_str("&beta=true");
+    if requires_upstream_beta_query(path) {
+        let mut beta_seen = false;
+        let mut parts = Vec::new();
+        if !query.is_empty() {
+            // 只替换 beta 片段，避免整条 query 解码重编码改变其它参数及空片段。
+            for part in query.split('&') {
+                let key = part.split_once('=').map_or(part, |(key, _)| key);
+                if is_beta_query_key(key) {
+                    if !beta_seen {
+                        parts.push("beta=true");
+                        beta_seen = true;
+                    }
+                } else {
+                    parts.push(part);
+                }
+            }
         }
+        if !beta_seen {
+            parts.push("beta=true");
+        }
+        query = parts.join("&");
     }
     if !query.is_empty() {
         target_url = format!("{}?{}", target_url, query);
@@ -3139,10 +3277,29 @@ fn upstream_url_with_base(upstream_base: &str, path: &str, query: &str) -> Strin
     target_url
 }
 
-fn query_contains_beta_true(query: &str) -> bool {
-    query
-        .split('&')
-        .any(|part| matches!(part.split_once('='), Some(("beta", "true"))))
+/// 一次百分号解码后精确比较 query 键，避免误合并相似键或递归解码。
+/// @param key 原始 query 片段中第一个等号之前的键。
+/// @return 仅解码后精确等于小写 beta 时返回 true，畸形编码保持不匹配。
+fn is_beta_query_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    for expected in b"beta" {
+        let Some(mut actual) = bytes.next() else {
+            return false;
+        };
+        if actual == b'%' {
+            let Some(high) = bytes.next().and_then(|byte| char::from(byte).to_digit(16)) else {
+                return false;
+            };
+            let Some(low) = bytes.next().and_then(|byte| char::from(byte).to_digit(16)) else {
+                return false;
+            };
+            actual = ((high << 4) | low) as u8;
+        }
+        if actual != *expected {
+            return false;
+        }
+    }
+    bytes.next().is_none()
 }
 
 fn count_tokens_upstream_url() -> String {
@@ -7286,10 +7443,10 @@ mod tests {
         classify_cli_bg_status, classify_non_stream_probe_text, cli_bg_status_json,
         default_cli_bg_status_classifier_config, default_fable_weekly_usage_limit_percent,
         detect_auto_mode_classifier_request, detect_claude_code_status_classifier_request,
-        detect_non_stream_probe_type, detect_warmup_intercept, extract_message_session_id,
-        extract_passive_usage, extract_rejected_passive_usage_windows, extract_upstream_request_id,
-        flush_stateful_cache_usage_buffer, format_request_capture, format_response_capture,
-        has_system_role_message, is_cacheable_non_stream_probe_response,
+        detect_non_stream_probe_type, detect_warmup_intercept, extract_headers,
+        extract_message_session_id, extract_passive_usage, extract_rejected_passive_usage_windows,
+        extract_upstream_request_id, flush_stateful_cache_usage_buffer, format_request_capture,
+        format_response_capture, has_system_role_message, is_cacheable_non_stream_probe_response,
         is_cli_bg_status_classifier_request, is_signature_related_error_body,
         is_signature_related_error_response_body, is_system_role_model_allowed,
         mock_warmup_intercept_json_response, non_stream_probe_cache_create_log_payload,
@@ -7317,13 +7474,15 @@ mod tests {
         HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, UsageObservationKind,
     };
     use crate::service::rewriter::{
-        CLAUDE_CODE_SYSTEM_PROMPT, ClientType, Rewriter, StatefulCacheUsage, UpstreamSessionRewrite,
+        CLAUDE_CODE_SYSTEM_PROMPT, ClientType, Rewriter, StatefulCacheUsage,
+        UpstreamSessionRewrite, extract_session_id_from_body,
     };
     use crate::service::session_hello_probe::{SessionHelloProbeConfig, SessionHelloProbeDecision};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
-        ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_VERSION,
+        COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_VERSION,
+        OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293,
         SONNET_5_MESSAGE_BETA_TOKENS_2_1_260, SONNET_5_MESSAGE_BETA_TOKENS_2_1_280,
         STAINLESS_PACKAGE_VERSION, account_for_request_profile, claude_cli_user_agent,
         claude_code_user_agent, profile_for_key,
@@ -7342,7 +7501,7 @@ mod tests {
     use axum::body::{self, Body};
     use axum::extract::{Request, State};
     use axum::http::{
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
     };
     use axum::response::{IntoResponse, Response};
@@ -7355,6 +7514,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use sqlx::AnyPool;
+    use sqlx::any::AnyPoolOptions;
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::io::Write;
@@ -7363,7 +7523,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Mutex, mpsc};
     use tokio::time::timeout;
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
@@ -7891,6 +8051,7 @@ mod tests {
         }
     }
 
+    /// 保存合成上游实际收到的请求与认证测试状态。
     #[derive(Clone, Default)]
     struct AuthMockState {
         authorization_headers: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -7901,25 +8062,34 @@ mod tests {
         hello_calls: Arc<AtomicUsize>,
         hello_status: Arc<AtomicU16>,
         requests: Arc<tokio::sync::Mutex<Vec<(HeaderMap, Bytes)>>>,
+        request_uris: Arc<Mutex<Vec<Uri>>>,
         pause_first_request: Arc<AtomicBool>,
         request_started: Arc<tokio::sync::Notify>,
         request_resume: Arc<tokio::sync::Notify>,
     }
 
-    struct PoolResolveFailureCache {
+    /// 统计池解析次数，并按测试场景选择真实内存池或失败开放。
+    struct SessionPoolTestCache {
         inner: MemoryStore,
+        fail_resolution: bool,
+        resolve_calls: AtomicUsize,
     }
 
-    impl PoolResolveFailureCache {
-        fn new() -> Self {
+    impl SessionPoolTestCache {
+        /// 创建带计数的会话池测试缓存。
+        /// @param fail_resolution 是否在解析上游会话池时返回合成错误。
+        /// @return 其它缓存操作均委托内存存储的测试缓存。
+        fn new(fail_resolution: bool) -> Self {
             Self {
                 inner: MemoryStore::new(),
+                fail_resolution,
+                resolve_calls: AtomicUsize::new(0),
             }
         }
     }
 
     #[axum::async_trait]
-    impl CacheStore for PoolResolveFailureCache {
+    impl CacheStore for SessionPoolTestCache {
         async fn get_session_account_id(
             &self,
             session_hash: &str,
@@ -7972,14 +8142,27 @@ mod tests {
 
         async fn resolve_upstream_session_pool(
             &self,
-            _account_id: i64,
-            _real_session_id: &str,
-            _pool_size: i32,
-            _ttl: Duration,
-            _refresh_policy: UpstreamSessionRefreshPolicy,
-            _allow_insert: bool,
+            account_id: i64,
+            real_session_id: &str,
+            pool_size: i32,
+            ttl: Duration,
+            refresh_policy: UpstreamSessionRefreshPolicy,
+            allow_insert: bool,
         ) -> Result<UpstreamSessionPoolResolve, AppError> {
-            Err(AppError::Internal("测试上游 session 池不可用".into()))
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_resolution {
+                return Err(AppError::Internal("测试上游 session 池不可用".into()));
+            }
+            self.inner
+                .resolve_upstream_session_pool(
+                    account_id,
+                    real_session_id,
+                    pool_size,
+                    ttl,
+                    refresh_policy,
+                    allow_insert,
+                )
+                .await
         }
 
         async fn get_upstream_session_pool_status(
@@ -8030,6 +8213,7 @@ mod tests {
 
     async fn mock_upstream_response(
         State(state): State<AuthMockState>,
+        uri: Uri,
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
@@ -8055,6 +8239,7 @@ mod tests {
             .lock()
             .await
             .push((headers.clone(), body.clone()));
+        state.request_uris.lock().await.push(uri);
         state.request_bodies.lock().await.push(body.clone());
         if state.pause_first_request.swap(false, Ordering::SeqCst) {
             state.request_started.notify_one();
@@ -8499,6 +8684,1301 @@ mod tests {
         server.abort();
     }
 
+    /// 通过实际上游验证冻结的 56 键，并保留大小写变体、嵌套数据和工具顺序。
+    /// @return 无；出站字段范围或合法内容变化时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_covers_frozen_keys_and_nested_data() {
+        let keys: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messages-top-field-drop-keys.json"
+        ))
+        .unwrap();
+        assert_eq!(keys.len(), 56);
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "top-fields@example.invalid",
+            "synthetic-top-fields",
+            50,
+        )
+        .await;
+        for (ua, enabled) in [
+            ("python-httpx/0.28.1", true),
+            ("claude-code/2.1.293", true),
+            ("python-httpx/0.28.1", false),
+            ("claude-code/2.1.293", false),
+        ] {
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "message_top_field_filter_enabled".into(),
+                    enabled.to_string(),
+                )]))
+                .await
+                .unwrap();
+            service
+                .reload_message_top_field_filter_enabled()
+                .await
+                .unwrap();
+            for selected in keys
+                .iter()
+                .map(std::slice::from_ref)
+                .chain([keys.as_slice()])
+            {
+                let mut payload = json!({
+                    "model": "claude-sonnet-5-5",
+                    "max_tokens": 32,
+                    "messages": [{"role":"user", "content":[
+                        {"type":"text", "text":"settings user_id cch=abcde"},
+                        {"type":"tool_result", "tool_use_id":"synthetic", "content":"ok"}
+                    ]}, {"role":"assistant", "content":[{"type":"tool_use", "id":"synthetic", "name":"synthetic",
+                        "input":{"settings":1,"user_id":"keep","session":"keep","env":{"machine_id":2}}}]}],
+                    "tools": [{"name":"synthetic", "input_schema":{
+                        "type":"object", "properties":{"settings":{"type":"string"}, "user_id":{"type":"string"}},
+                        "required":["settings", "user_id"]
+                    }}],
+                    "metadata":{"user_id":"synthetic-user", "settings":{"env":"keep"}},
+                    "unknown_extension":{"seed":1, "session":"keep"},
+                    "Settings":"case-sensitive",
+                    "stream":false
+                });
+                let preserved_tools = payload["tools"].clone();
+                let preserved_input = payload["messages"][1].clone();
+                for key in selected {
+                    payload[key] = json!({"authorization":"synthetic-body-only", "nested":"keep"});
+                }
+                let response = service
+                    .handle_request(
+                        profile_request("/v1/messages", Some(ua), payload.clone()),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let requests = state.requests.lock().await;
+                let (headers, bytes) = requests.last().unwrap();
+                let sent: Value = serde_json::from_slice(bytes).unwrap();
+                for key in selected {
+                    if enabled {
+                        assert!(sent.get(key).is_none(), "客户端={ua} 残留根键={key}");
+                    } else {
+                        assert_eq!(
+                            sent.get(key),
+                            payload.get(key),
+                            "客户端={ua} 关闭时改变根键={key}"
+                        );
+                    }
+                }
+                assert_eq!(sent["Settings"], "case-sensitive");
+                assert_eq!(sent["tools"].to_string(), preserved_tools.to_string());
+                assert_eq!(sent["messages"][1].to_string(), preserved_input.to_string());
+                assert_eq!(sent["metadata"]["settings"], json!({"env":"keep"}));
+                assert!(sent["metadata"].get("user_id").is_some());
+                assert_eq!(
+                    sent["unknown_extension"],
+                    json!({"seed":1,"session":"keep"})
+                );
+                assert_eq!(
+                    sent["messages"][0]["content"][0]["text"],
+                    "settings user_id cch=abcde"
+                );
+                assert_eq!(sent["stream"], false);
+                assert_ne!(headers["authorization"], "synthetic-body-only");
+            }
+        }
+        server.abort();
+    }
+
+    /// 两条 classifier 旁路均清理根键，归因 CCH 必须匹配最终上游字节。
+    /// @return 无；旁路被遗漏、通用改写泄入或 CCH 失效时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_covers_classifier_bypasses_and_cch() {
+        let keys: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messages-top-field-drop-keys.json"
+        ))
+        .unwrap();
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "classifier-filter@example.invalid",
+            "synthetic-classifier",
+            50,
+        )
+        .await;
+        for mode in [BillingMode::Rewrite, BillingMode::Strip] {
+            account.billing_mode = mode;
+            service.account_svc.update_account(&account).await.unwrap();
+            for version in ["2.1.280", "2.1.293"] {
+                for (enabled, injection, model) in [
+                    (true, false, "claude-fable-5-1"),
+                    (true, true, "claude-fable-5-1"),
+                    (false, false, "claude-fable-5-1"),
+                    (false, true, "claude-fable-5-1"),
+                    (true, false, "claude-haiku-4-5"),
+                    (true, true, "claude-haiku-4-5"),
+                    (false, false, "claude-haiku-4-5"),
+                    (false, true, "claude-haiku-4-5"),
+                ] {
+                    service
+                        .settings_store
+                        .upsert_many(&HashMap::from([(
+                            "message_top_field_filter_enabled".into(),
+                            enabled.to_string(),
+                        )]))
+                        .await
+                        .unwrap();
+                    service
+                        .reload_message_top_field_filter_enabled()
+                        .await
+                        .unwrap();
+                    {
+                        let mut config = service.cli_bg_status_classifier_config.write().await;
+                        config.identity_injection_enabled = injection;
+                        config.models = vec![model.into()];
+                    }
+                    let mut payload =
+                        cli_bg_status_classifier_body("working", "继续检查合成文件 cch=12345");
+                    payload["model"] = json!(model);
+                    payload["unknown_extension"] = json!({"session":"keep"});
+                    for key in &keys {
+                        payload[key] = json!({"env":"drop"});
+                    }
+                    let mut request = cli_status_classifier_request(payload.clone(), "cli-bg");
+                    request.headers_mut().insert(
+                        "user-agent",
+                        format!("claude-code/{version}").parse().unwrap(),
+                    );
+                    let response = service.handle_request(request, None).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let requests = state.requests.lock().await;
+                    let (_, bytes) = requests.last().unwrap();
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    for key in &keys {
+                        assert_eq!(
+                            sent.get(key).is_none(),
+                            enabled,
+                            "画像={version} 模型={model} 归因={injection} 清理={enabled} 根键={key}"
+                        );
+                    }
+                    assert_eq!(sent["unknown_extension"], payload["unknown_extension"]);
+                    assert_eq!(sent["messages"], payload["messages"]);
+                    assert_eq!(sent["thinking"], payload["thinking"]);
+                    assert_eq!(sent["fallbacks"], "default");
+                    assert_eq!(sent["max_tokens"], 3072);
+                    let attribution = injection && !model.contains("haiku");
+                    assert_eq!(
+                        sent["system"].as_array().unwrap().len(),
+                        if attribution { 3 } else { 1 }
+                    );
+                    if attribution {
+                        let selected = account_for_request_profile(
+                            &account,
+                            Some(profile_for_key(version).unwrap()),
+                        );
+                        assert_eq!(
+                            service.rewriter.refresh_cch_attestation(
+                                bytes.to_vec(),
+                                &selected,
+                                ClientType::API
+                            ),
+                            bytes.to_vec()
+                        );
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
+    /// 已有 classifier billing 仅刷新原 CCH，不为缺少 CCH 的旧块补值。
+    /// @return 无；已有归因规则或最终 CCH 被清理步骤破坏时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_classifier_existing_cch() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "filter-existing-cch@example.invalid",
+            "synthetic-existing-cch",
+            50,
+        )
+        .await;
+        service
+            .cli_bg_status_classifier_config
+            .write()
+            .await
+            .identity_injection_enabled = true;
+        for mode in [BillingMode::Rewrite, BillingMode::Strip] {
+            account.billing_mode = mode;
+            service.account_svc.update_account(&account).await.unwrap();
+            for version in ["2.1.280", "2.1.293"] {
+                for has_cch in [true, false] {
+                    for enabled in [true, false] {
+                        *service.message_top_field_filter_enabled.write().await = enabled;
+                        let mut payload =
+                            cli_bg_status_classifier_body("working", "合成已有归因 cch=12345");
+                        let billing = format!(
+                            "x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint=cli;{}",
+                            if has_cch { " cch=abcde;" } else { "" }
+                        );
+                        payload["system"]
+                            .as_array_mut()
+                            .unwrap()
+                            .insert(0, json!({"type":"text", "text":billing}));
+                        payload["settings"] = json!({"drop":true});
+                        let mut request = cli_status_classifier_request(payload.clone(), "cli");
+                        request.headers_mut().insert(
+                            "user-agent",
+                            format!("claude-code/{version}").parse().unwrap(),
+                        );
+                        let response = service.handle_request(request, None).await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        let requests = state.request_bodies.lock().await;
+                        let bytes = requests.last().unwrap();
+                        let sent: Value = serde_json::from_slice(bytes).unwrap();
+                        assert_eq!(sent.get("settings").is_none(), enabled);
+                        assert_eq!(sent["messages"], payload["messages"]);
+                        assert_eq!(sent["system"].as_array().unwrap().len(), 3);
+                        let text = sent["system"][0]["text"].as_str().unwrap();
+                        assert_eq!(text.contains("cch="), has_cch);
+                        if has_cch {
+                            assert!(!text.contains("cch=abcde"));
+                            let selected = account_for_request_profile(
+                                &account,
+                                Some(profile_for_key(version).unwrap()),
+                            );
+                            assert_eq!(
+                                service.rewriter.refresh_cch_attestation(
+                                    bytes.to_vec(),
+                                    &selected,
+                                    ClientType::API
+                                ),
+                                bytes.to_vec()
+                            );
+                        } else {
+                            assert_eq!(text, billing);
+                        }
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
+    /// 无命中或关闭时，identity-only 旁路保留原始字节和普通 CCH 字面量。
+    /// @return 无；新增清理引入多余序列化或刷新时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_preserves_bypass_bytes_without_deletion() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "filter-bytes@example.invalid",
+            "synthetic-filter-bytes",
+            50,
+        )
+        .await;
+        for (enabled, include_drop_key) in [(true, false), (false, false), (false, true)] {
+            *service.message_top_field_filter_enabled.write().await = enabled;
+            let mut payload = cli_bg_status_classifier_body("working", "合成字面量 cch=abcde");
+            payload.as_object_mut().unwrap().shift_remove("metadata");
+            if include_drop_key {
+                payload["settings"] = json!(1);
+            }
+            let raw = serde_json::to_vec_pretty(&payload).unwrap();
+            let mut request = cli_status_classifier_request(payload, "cli-bg");
+            *request.body_mut() = Body::from(raw.clone());
+            let response = service.handle_request(request, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.request_bodies.lock().await.last().unwrap().as_ref(),
+                raw
+            );
+        }
+        server.abort();
+    }
+
+    /// 实际上游覆盖两种画像、billing 模式与客户端，校验最终 CCH 及未知根键顺序。
+    /// @return 无；CCH 时序、画像选择或根键顺序发生回归时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_final_cch_profiles_and_modes() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "filter-cch@example.invalid",
+            "synthetic-filter-cch",
+            50,
+        )
+        .await;
+        for mode in [BillingMode::Rewrite, BillingMode::Strip] {
+            account.billing_mode = mode.clone();
+            service.account_svc.update_account(&account).await.unwrap();
+            for version in ["2.1.280", "2.1.293"] {
+                // API 画像使用全局默认，CC 则使用入站 UA；两者都必须沿用请求副本。
+                service
+                    .settings_store
+                    .upsert_many(&HashMap::from([(
+                        "claude_code_version_profile".into(),
+                        version.into(),
+                    )]))
+                    .await
+                    .unwrap();
+                service.reload_access_profile_config().await.unwrap();
+                for ua in [
+                    "python-httpx/0.28.1".to_string(),
+                    format!("claude-code/{version}"),
+                ] {
+                    let mut payload = profile_messages_payload_for(version);
+                    payload["unknown_before"] = json!({"settings":1,"env":2});
+                    payload["settings"] = json!({"drop":true});
+                    payload["unknown_middle"] = json!({"session":"keep","seed":3});
+                    payload["env"] = json!("drop");
+                    payload["unknown_after"] = json!(4);
+                    let response = service
+                        .handle_request(profile_request("/v1/messages", Some(&ua), payload), None)
+                        .await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let requests = state.requests.lock().await;
+                    let (headers, bytes) = requests.last().unwrap();
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    assert!(sent.get("settings").is_none());
+                    assert!(sent.get("env").is_none());
+                    let survivors = sent
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .filter(|key| key.starts_with("unknown_"))
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        survivors,
+                        ["unknown_before", "unknown_middle", "unknown_after"]
+                    );
+                    assert_eq!(
+                        sent["unknown_before"].to_string(),
+                        r#"{"settings":1,"env":2}"#
+                    );
+                    let selected = account_for_request_profile(
+                        &account,
+                        Some(profile_for_key(version).unwrap()),
+                    );
+                    assert_eq!(
+                        service.rewriter.refresh_cch_attestation(
+                            bytes.to_vec(),
+                            &selected,
+                            ClientType::API
+                        ),
+                        bytes.to_vec()
+                    );
+                    assert_eq!(headers["user-agent"], claude_cli_user_agent(version));
+                    if mode == BillingMode::Rewrite || ua.starts_with("python") {
+                        assert!(sent["system"].as_array().unwrap().iter().any(|block| {
+                            block["text"].as_str().is_some_and(|text| {
+                                text.starts_with("x-anthropic-billing-header:")
+                                    && text.contains("cch=")
+                                    && !text.contains("cch=00000")
+                            })
+                        }));
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
+    /// 同一请求的 401 重试复用清理快照，新请求则立即采用热刷新后的值。
+    /// @return 无；重试策略跳变或新请求未热生效时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_freezes_retry_snapshot_and_hot_reloads() {
+        for initially_enabled in [true, false] {
+            let (base, state, server) = spawn_auth_mock_server().await;
+            let service = Arc::new(
+                test_gateway_service_with_urls(base.clone(), format!("{base}/oauth/token")).await,
+            );
+            create_oauth_gateway_account(&service, "filter-retry@example.invalid", "access-old")
+                .await;
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "message_top_field_filter_enabled".into(),
+                    initially_enabled.to_string(),
+                )]))
+                .await
+                .unwrap();
+            service
+                .reload_message_top_field_filter_enabled()
+                .await
+                .unwrap();
+            state.pause_first_request.store(true, Ordering::SeqCst);
+            let request_service = service.clone();
+            let payload = json!({"model":"claude-sonnet-5-5", "settings":1, "max_tokens":32,
+                "messages":[{"role":"user","content":"合成重试请求"}], "stream":false});
+            let retry_payload = payload.clone();
+            let pending = tokio::spawn(async move {
+                let response = request_service
+                    .handle_request(
+                        profile_request("/v1/messages", Some("claude-code/2.1.293"), retry_payload),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+            });
+            timeout(Duration::from_secs(3), state.request_started.notified())
+                .await
+                .unwrap();
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "message_top_field_filter_enabled".into(),
+                    (!initially_enabled).to_string(),
+                )]))
+                .await
+                .unwrap();
+            service
+                .reload_message_top_field_filter_enabled()
+                .await
+                .unwrap();
+            state.request_resume.notify_one();
+            timeout(Duration::from_secs(5), pending)
+                .await
+                .unwrap()
+                .unwrap();
+            {
+                let requests = state.request_bodies.lock().await;
+                assert_eq!(requests.len(), 2);
+                for bytes in requests.iter() {
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    assert_eq!(sent.get("settings").is_none(), initially_enabled);
+                }
+            }
+            let response = service
+                .handle_request(
+                    profile_request("/v1/messages", Some("claude-code/2.1.293"), payload),
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.request_bodies.lock().await;
+            let sent: Value = serde_json::from_slice(requests.last().unwrap()).unwrap();
+            assert_eq!(sent.get("settings").is_none(), !initially_enabled);
+            server.abort();
+        }
+    }
+
+    /// 缺键及历史非法值使用默认开启，数据库读取失败不能覆盖已有缓存。
+    /// @return 无；默认值、启动读取语义或错误保留失效时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_reload_defaults_and_read_failure() {
+        let mut service = test_gateway_service().await;
+        assert!(*service.message_top_field_filter_enabled.read().await);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        service.settings_store = Arc::new(SettingsStore::new(pool.clone()));
+        // 与 main 启动时调用同一个 reload，显式关闭必须替换构造默认值。
+        for (stored, expected) in [
+            (Some("false"), false),
+            (None, true),
+            (Some("TRUE"), true),
+            (Some(""), true),
+            (Some("true"), true),
+            (Some("false"), false),
+        ] {
+            sqlx::query("DELETE FROM settings")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if let Some(stored) = stored {
+                service
+                    .settings_store
+                    .upsert_many(&HashMap::from([(
+                        "message_top_field_filter_enabled".into(),
+                        stored.into(),
+                    )]))
+                    .await
+                    .unwrap();
+            }
+            service
+                .reload_message_top_field_filter_enabled()
+                .await
+                .unwrap();
+            assert_eq!(
+                *service.message_top_field_filter_enabled.read().await,
+                expected
+            );
+        }
+        pool.close().await;
+        assert!(
+            service
+                .reload_message_top_field_filter_enabled()
+                .await
+                .is_err()
+        );
+        assert!(!*service.message_top_field_filter_enabled.read().await);
+    }
+
+    /// 实际 Gateway 的 count_tokens 与其它路径保留同名根键。
+    /// @return 无；路径边界被扩大时失败。
+    #[tokio::test]
+    async fn gateway_message_top_field_filter_excludes_other_paths() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "filter-paths@example.invalid",
+            "synthetic-filter-paths",
+            50,
+        )
+        .await;
+        for path in [COUNT_TOKENS_PATH, "/api/eval/test"] {
+            let payload = json!({"model":"claude-opus-4-8", "messages":[{"role":"user","content":"合成路径边界"}], "settings":{"env":"keep"}, "extra_headers":{"authorization":"body-only"}, "seed":42});
+            let request = profile_request(path, Some("claude-code/2.1.293"), payload.clone());
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(request, None).await
+            } else {
+                service.handle_request(request, None).await
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.request_bodies.lock().await;
+            let sent: Value = serde_json::from_slice(requests.last().unwrap()).unwrap();
+            for key in ["settings", "extra_headers", "seed"] {
+                assert_eq!(sent[key], payload[key], "路径={path} 根键={key}");
+            }
+        }
+        server.abort();
+    }
+
+    /// 普通 CC 消息在实际上游按最终 body 对齐已有头，保留流选择、身份与最终 CCH。
+    /// @return 无；JSON/legacy、头名大小写或清理开关组合不符合契约时失败。
+    #[tokio::test]
+    async fn gateway_session_header_alignment_ordinary_messages() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "session-ordinary@example.invalid",
+            "synthetic-session-ordinary",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        service.account_svc.update_account(&account).await.unwrap();
+        let selected =
+            account_for_request_profile(&account, Some(profile_for_key("2.1.293").unwrap()));
+        let session = "ordinary-body-session";
+        for enabled in [false, true] {
+            *service.message_top_field_filter_enabled.write().await = enabled;
+            for legacy in [false, true] {
+                for (index, stream) in [Some(false), Some(true), None].into_iter().enumerate() {
+                    let mut payload = profile_messages_payload_for("2.1.293");
+                    payload["metadata"]["user_id"] = if legacy {
+                        json!(format!(
+                            "user_client-device_account_client-account_session_{session}"
+                        ))
+                    } else {
+                        json!(
+                            json!({
+                                "device_id":"client-device", "account_uuid":"client-account",
+                                "session_id":session
+                            })
+                            .to_string()
+                        )
+                    };
+                    payload["metadata"]["settings"] = json!({"session":"nested-keep"});
+                    payload["settings"] = json!({"session":"root-drop"});
+                    payload["session"] = json!("root-session");
+                    payload.as_object_mut().unwrap().shift_remove("stream");
+                    if let Some(stream) = stream {
+                        payload["stream"] = json!(stream);
+                    }
+                    let mut previous_body = None;
+                    for consistent in [false, true] {
+                        let mut request = profile_request(
+                            "/v1/messages",
+                            Some("claude-code/2.1.293"),
+                            payload.clone(),
+                        );
+                        let header_name = [
+                            "X-Claude-Code-Session-Id",
+                            "x-claude-code-session-id",
+                            "X-CLAUDE-CODE-SESSION-ID",
+                        ][index];
+                        request.headers_mut().insert(
+                            header_name,
+                            if consistent {
+                                session
+                            } else {
+                                "header-session"
+                            }
+                            .parse()
+                            .unwrap(),
+                        );
+                        let response = service.handle_request(request, None).await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        let requests = state.requests.lock().await;
+                        let (headers, bytes) = requests.last().unwrap();
+                        let sent: Value = serde_json::from_slice(bytes).unwrap();
+                        assert_eq!(
+                            headers["x-claude-code-session-id"], session,
+                            "清理={enabled} legacy={legacy} stream={stream:?} 原先一致={consistent}"
+                        );
+                        assert_eq!(
+                            extract_session_id_from_body(&sent).as_deref(),
+                            Some(session)
+                        );
+                        assert_eq!(sent.get("stream"), stream.map(Value::Bool).as_ref());
+                        assert_eq!(
+                            sent["metadata"]["settings"],
+                            json!({"session":"nested-keep"})
+                        );
+                        for key in ["settings", "session"] {
+                            assert_eq!(
+                                sent.get(key),
+                                if enabled { None } else { payload.get(key) }
+                            );
+                        }
+                        assert_eq!(
+                            service.rewriter.refresh_cch_attestation(
+                                bytes.to_vec(),
+                                &selected,
+                                ClientType::ClaudeCode
+                            ),
+                            bytes.to_vec()
+                        );
+                        if let Some(previous_body) = previous_body {
+                            assert_eq!(bytes, &previous_body, "仅头不同时正文必须相同");
+                        }
+                        previous_body = Some(bytes.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 24);
+        server.abort();
+    }
+
+    /// 实际 Gateway 对会话首尾 SP/HTAB 保留原头和会话，内部空白仍允许对齐。
+    /// @return 无；JSON/legacy 或清理开关组合中修剪会话、误改原头或扩大跳过范围时失败。
+    #[tokio::test]
+    async fn gateway_session_header_alignment_preserves_sessions_with_edge_ows() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "session-edge-ows@example.invalid",
+            "synthetic-session-edge-ows",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        service.account_svc.update_account(&account).await.unwrap();
+        let selected =
+            account_for_request_profile(&account, Some(profile_for_key("2.1.293").unwrap()));
+        for enabled in [false, true] {
+            *service.message_top_field_filter_enabled.write().await = enabled;
+            for legacy in [false, true] {
+                for (case, session, expected_header) in [
+                    ("正常会话", "body-session", "body-session"),
+                    ("内部空白", "body session\tmiddle", "body session\tmiddle"),
+                    ("前导SP", " body-session", "header-session"),
+                    ("尾随SP", "body-session ", "header-session"),
+                    ("前导HTAB", "\tbody-session", "header-session"),
+                    ("尾随HTAB", "body-session\t", "header-session"),
+                    ("两端混合OWS", " \tbody-session\t ", "header-session"),
+                ] {
+                    let mut payload = profile_messages_payload_for("2.1.293");
+                    payload["metadata"]["user_id"] = if legacy {
+                        json!(format!(
+                            "user_client-device_account_client-account_session_{session}"
+                        ))
+                    } else {
+                        json!(json!({"device_id":"client-device", "account_uuid":"client-account", "session_id":session}).to_string())
+                    };
+                    payload["metadata"]["settings"] = json!({"session":"nested-keep"});
+                    payload["settings"] = json!({"session":"root-drop"});
+                    let mut request = profile_request(
+                        "/v1/messages",
+                        Some("claude-code/2.1.293"),
+                        payload.clone(),
+                    );
+                    request.headers_mut().insert(
+                        "x-claude-code-session-id",
+                        "header-session".parse().unwrap(),
+                    );
+                    let response = service.handle_request(request, None).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let requests = state.requests.lock().await;
+                    let (headers, bytes) = requests.last().unwrap();
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    assert_eq!(
+                        headers["x-claude-code-session-id"], expected_header,
+                        "清理={enabled} legacy={legacy} 场景={case}"
+                    );
+                    assert_eq!(
+                        extract_session_id_from_body(&sent)
+                            .as_deref()
+                            .map(str::as_bytes),
+                        Some(session.as_bytes()),
+                        "会话原字节必须保留：清理={enabled} legacy={legacy} 场景={case}"
+                    );
+                    assert_eq!(
+                        sent["metadata"]["settings"],
+                        json!({"session":"nested-keep"})
+                    );
+                    assert_eq!(
+                        sent.get("settings"),
+                        if enabled {
+                            None
+                        } else {
+                            payload.get("settings")
+                        }
+                    );
+                    assert_eq!(sent.get("stream"), payload.get("stream"));
+                    assert_eq!(
+                        service.rewriter.refresh_cch_attestation(
+                            bytes.to_vec(),
+                            &selected,
+                            ClientType::ClaudeCode
+                        ),
+                        bytes.to_vec()
+                    );
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 28);
+        server.abort();
+    }
+
+    /// 通过实际上游验证缺头、空头、异常会话及非目标入口均保留既有行为。
+    /// @return 无；新增分支扩大范围、补头或发送不安全头值时失败。
+    #[tokio::test]
+    async fn gateway_session_header_alignment_input_and_path_boundaries() {
+        let (base, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "session-boundaries@example.invalid",
+            "synthetic-session-boundaries",
+            50,
+        )
+        .await;
+        let valid_user_id = json!({"session_id":"body-session"}).to_string();
+        let cases = [
+            ("缺头", Some(json!(valid_user_id)), None),
+            ("空头", Some(json!(valid_user_id)), Some("")),
+            ("空白头", Some(json!(valid_user_id)), Some(" \t ")),
+            ("缺会话身份", None, Some("header-session")),
+            ("null身份", Some(Value::Null), Some("header-session")),
+            (
+                "对象身份",
+                Some(json!({"session_id":"body-session"})),
+                Some("header-session"),
+            ),
+            (
+                "损坏身份",
+                Some(json!("{broken-user-id")),
+                Some("header-session"),
+            ),
+            ("缺会话键", Some(json!("{}")), Some("header-session")),
+            (
+                "非字符串会话",
+                Some(json!(json!({"session_id":7}).to_string())),
+                Some("header-session"),
+            ),
+            (
+                "空会话",
+                Some(json!(json!({"session_id":""}).to_string())),
+                Some("header-session"),
+            ),
+            (
+                "空白会话",
+                Some(json!(json!({"session_id":" \t "}).to_string())),
+                Some("header-session"),
+            ),
+            (
+                "换行会话",
+                Some(json!(json!({"session_id":"unsafe\nvalue"}).to_string())),
+                Some("header-session"),
+            ),
+            (
+                "回车会话",
+                Some(json!(json!({"session_id":"unsafe\rvalue"}).to_string())),
+                Some("header-session"),
+            ),
+            (
+                "NUL会话",
+                Some(json!(
+                    json!({"session_id":"unsafe\u{0000}value"}).to_string()
+                )),
+                Some("header-session"),
+            ),
+            (
+                "空legacy会话",
+                Some(json!("user_device_account_account_session_")),
+                Some("header-session"),
+            ),
+        ];
+        for (case, user_id, header) in cases {
+            let mut payload = json!({
+                "model":"claude-sonnet-5-5", "max_tokens":32,
+                "messages":[{"role":"user","content":"合成边界请求"}],
+                "metadata":{}, "stream":false
+            });
+            if let Some(user_id) = user_id {
+                payload["metadata"]["user_id"] = user_id;
+            }
+            let expected_session = extract_session_id_from_body(&payload);
+            let mut request = profile_request("/v1/messages", Some("claude-code/2.1.293"), payload);
+            if let Some(header) = header {
+                request
+                    .headers_mut()
+                    .insert("x-claude-code-session-id", header.parse().unwrap());
+            }
+            let response = service.handle_request(request, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.requests.lock().await;
+            let (headers, bytes) = requests.last().unwrap();
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(
+                extract_session_id_from_body(&sent),
+                expected_session,
+                "{case}"
+            );
+            // HTTP 解析会去掉头值两端空白，这里核对实际发送后的空值边界。
+            assert_eq!(
+                headers
+                    .get("x-claude-code-session-id")
+                    .map(|value| value.to_str().unwrap()),
+                header.map(str::trim),
+                "{case}"
+            );
+        }
+        let malformed = b"{broken-body";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("user-agent", "claude-code/2.1.293")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "header-session")
+            .body(Body::from(malformed.as_slice()))
+            .unwrap();
+        let response = service.handle_request(request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        {
+            let requests = state.requests.lock().await;
+            let (headers, bytes) = requests.last().unwrap();
+            assert_eq!(headers["x-claude-code-session-id"], "header-session");
+            assert_eq!(bytes.as_ref(), malformed);
+        }
+        for path in [COUNT_TOKENS_PATH, "/v1/messages/", "/api/eval/test"] {
+            let payload = json!({
+                "model":"claude-sonnet-5-5", "max_tokens":32,
+                "messages":[{"role":"user","content":"合成路径请求"}],
+                "metadata":{"user_id":valid_user_id}
+            });
+            let mut request = profile_request(path, Some("claude-code/2.1.293"), payload);
+            request.headers_mut().insert(
+                "x-claude-code-session-id",
+                "header-session".parse().unwrap(),
+            );
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(request, None).await
+            } else {
+                service.handle_request(request, None).await
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.requests.lock().await;
+            let (headers, bytes) = requests.last().unwrap();
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(
+                headers["x-claude-code-session-id"], "header-session",
+                "{path}"
+            );
+            assert_eq!(
+                extract_session_id_from_body(&sent).as_deref(),
+                Some("body-session")
+            );
+        }
+        for header in [None, Some("header-session")] {
+            let mut request = profile_request(
+                "/v1/messages",
+                Some("python-httpx/0.28.1"),
+                json!({
+                    "model":"claude-sonnet-5-5", "max_tokens":32,
+                    "messages":[{"role":"user","content":"合成 API 请求"}],
+                    "metadata":{"user_id":valid_user_id}
+                }),
+            );
+            if let Some(header) = header {
+                request
+                    .headers_mut()
+                    .insert("x-claude-code-session-id", header.parse().unwrap());
+            }
+            let response = service.handle_request(request, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.requests.lock().await;
+            let (headers, bytes) = requests.last().unwrap();
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(
+                headers["x-claude-code-session-id"].to_str().unwrap(),
+                extract_session_id_from_body(&sent).unwrap()
+            );
+        }
+        assert_eq!(state.requests.lock().await.len(), 21);
+        server.abort();
+    }
+
+    /// 原始单 token 探针保留差异，任一必要形状条件不满足时对齐。
+    /// @return 无；173/280 合成探针或流、工具、消息数等反例分类错误时失败。
+    #[tokio::test]
+    async fn gateway_session_header_alignment_probe_shape() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "session-probes@example.invalid",
+            "synthetic-session-probes",
+            50,
+        )
+        .await;
+        {
+            let mut config = service.warmup_intercept_config.write().await;
+            config.haiku_probe_enabled = false;
+            config.title_enabled = false;
+            config.suggestion_enabled = false;
+        }
+        service.non_stream_probe_cache_config.write().await.enabled = false;
+        let base_payload = json!({
+            "model":"claude-haiku-4-5", "max_tokens":1,
+            "messages":[{"role":"user","content":"Warmup"}],
+            "metadata":{"user_id":json!({"session_id":"probe-body-session"}).to_string()}
+        });
+        let variants = [
+            ("173最小形状", json!({}), true),
+            ("显式非流", json!({"stream":false}), true),
+            ("空工具数组", json!({"tools":[]}), true),
+            ("非布尔流沿用既有解释", json!({"stream":"true"}), true),
+            (
+                "不绑定模型与文本",
+                json!({"model":"claude-sonnet-5-5", "messages":[{"role":"user","content":"合成单 token 业务请求"}]}),
+                true,
+            ),
+            ("流式单 token", json!({"stream":true}), false),
+            (
+                "实际工具",
+                json!({"tools":[{"name":"synthetic","input_schema":{"type":"object"}}]}),
+                false,
+            ),
+            ("null工具", json!({"tools":null}), false),
+            ("异常工具", json!({"tools":{}}), false),
+            (
+                "多消息",
+                json!({"messages":[{"role":"user","content":"一"},{"role":"user","content":"二"}]}),
+                false,
+            ),
+            (
+                "非user消息",
+                json!({"messages":[{"role":"assistant","content":"合成助手消息"}]}),
+                false,
+            ),
+            ("空消息", json!({"messages":[]}), false),
+            ("非整数token", json!({"max_tokens":1.0}), false),
+            ("字符串token", json!({"max_tokens":"1"}), false),
+            ("多token", json!({"max_tokens":2}), false),
+        ];
+        let mut expected_count = 0;
+        for version in ["2.1.173", "2.1.280"] {
+            for enabled in [false, true] {
+                *service.message_top_field_filter_enabled.write().await = enabled;
+                for (case, overrides, exempt) in &variants {
+                    let mut payload = base_payload.clone();
+                    payload
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(overrides.as_object().unwrap().clone());
+                    payload["settings"] = json!({"session":"root-drop"});
+                    let mut request = profile_request(
+                        "/v1/messages",
+                        Some(&format!("claude-code/{version}")),
+                        payload,
+                    );
+                    request.headers_mut().insert(
+                        "x-claude-code-session-id",
+                        "probe-header-session".parse().unwrap(),
+                    );
+                    let response = service.handle_request(request, None).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{case}");
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    expected_count += 1;
+                    let requests = state.requests.lock().await;
+                    assert_eq!(requests.len(), expected_count, "{case} 必须实际转发");
+                    let (headers, bytes) = requests.last().unwrap();
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    assert_eq!(
+                        extract_session_id_from_body(&sent).as_deref(),
+                        Some("probe-body-session")
+                    );
+                    assert_eq!(
+                        headers["x-claude-code-session-id"],
+                        if *exempt {
+                            "probe-header-session"
+                        } else {
+                            "probe-body-session"
+                        },
+                        "版本={version} 清理={enabled} 场景={case}"
+                    );
+                    assert_eq!(sent.get("settings").is_none(), enabled);
+                }
+            }
+        }
+        assert_eq!(expected_count, 60);
+        server.abort();
+    }
+
+    /// 池关闭、入池、owner-hit、真实映射与解析失败均保持各自优先级和本地会话维度。
+    /// @return 无；重复解析、探针撤销 mapped 补头、TTL 或 Hello 去重改变时失败。
+    #[tokio::test]
+    async fn gateway_session_header_alignment_pool_precedence() {
+        for (admitted_probe, fail_resolution) in [(false, false), (true, false), (false, true)] {
+            let (base, state, server) = spawn_auth_mock_server().await;
+            let cache = Arc::new(SessionPoolTestCache::new(fail_resolution));
+            let mut service = test_gateway_service_with_cache_and_urls(
+                cache.clone(),
+                base.clone(),
+                String::new(),
+            )
+            .await;
+            service
+                .session_hello_probe_svc
+                .set_endpoint_for_test(format!("{base}/api/hello"));
+            *service.session_hello_probe_config.write().await = SessionHelloProbeConfig {
+                enabled: true,
+                strict: true,
+                timeout: Duration::from_secs(1),
+                success_ttl: Duration::from_secs(60),
+                failure_cooldown: Duration::from_secs(10),
+            };
+            service
+                .warmup_intercept_config
+                .write()
+                .await
+                .haiku_probe_enabled = false;
+            service.non_stream_probe_cache_config.write().await.enabled = false;
+            let mut account = create_setup_gateway_account(
+                &service,
+                "session-pool@example.invalid",
+                "synthetic-session-pool",
+                50,
+            )
+            .await;
+            account.upstream_session_pool_size = 1;
+            account.upstream_session_refresh_policy = "owner_only".into();
+            let mut last_owner_times = None;
+            let mut owner_real_hash = None;
+            for (enabled, real_session, probe, header, action) in [
+                (false, "pool-owner", false, Some("header-session"), None),
+                (
+                    true,
+                    "pool-owner",
+                    admitted_probe,
+                    Some("header-session"),
+                    Some("admitted"),
+                ),
+                (
+                    true,
+                    "pool-owner",
+                    false,
+                    Some("header-session"),
+                    Some("owner_hit"),
+                ),
+                (
+                    true,
+                    "pool-owner",
+                    true,
+                    Some("header-session"),
+                    Some("owner_hit"),
+                ),
+                (
+                    true,
+                    "pool-borrower",
+                    false,
+                    Some("header-session"),
+                    Some("mapped"),
+                ),
+                (true, "pool-probe-missing", true, None, Some("mapped")),
+                (
+                    true,
+                    "pool-probe-header",
+                    true,
+                    Some("header-session"),
+                    Some("mapped"),
+                ),
+                (true, "pool-probe-empty", true, Some(""), Some("mapped")),
+            ] {
+                account.upstream_session_pool_enabled = enabled;
+                service.account_svc.update_account(&account).await.unwrap();
+                let payload = json!({
+                    "model":"claude-sonnet-5-5", "max_tokens":if probe {1} else {32},
+                    "messages":[{"role":"user","content":"合成会话池请求"}],
+                    "metadata":{"user_id":json!({"session_id":real_session}).to_string()}
+                });
+                let mut request =
+                    profile_request("/v1/messages", Some("claude-code/2.1.293"), payload);
+                if let Some(header) = header {
+                    request
+                        .headers_mut()
+                        .insert("x-claude-code-session-id", header.parse().unwrap());
+                }
+                let resolve_before = cache.resolve_calls.load(Ordering::SeqCst);
+                let response = service.handle_request(request, None).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let diagnostic_id = response.headers()["x-cc2api-request-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    cache.resolve_calls.load(Ordering::SeqCst) - resolve_before,
+                    usize::from(enabled),
+                    "每个请求只复用既有的一次池解析"
+                );
+                let mapped = enabled && !fail_resolution && real_session != "pool-owner";
+                let target = if mapped { "pool-owner" } else { real_session };
+                let expected_header = if mapped {
+                    Some(target)
+                } else if probe {
+                    header
+                } else {
+                    header.map(|_| target)
+                };
+                {
+                    let requests = state.requests.lock().await;
+                    let (headers, bytes) = requests.last().unwrap();
+                    let sent: Value = serde_json::from_slice(bytes).unwrap();
+                    assert_eq!(extract_session_id_from_body(&sent).as_deref(), Some(target));
+                    assert_eq!(
+                        headers
+                            .get("x-claude-code-session-id")
+                            .map(|value| value.to_str().unwrap()),
+                        expected_header,
+                        "入池探针={admitted_probe} 池失败={fail_resolution} 动作={action:?}"
+                    );
+                }
+                let diagnostics = service.diagnostics_store().unwrap();
+                diagnostics.flush().await.unwrap();
+                let detail = diagnostics.detail(&diagnostic_id).await.unwrap();
+                assert_eq!(detail.attempts.len(), 1);
+                let sessions = &detail.attempts[0].sessions;
+                assert_eq!(
+                    sessions.mapping_action.as_deref(),
+                    Some(if fail_resolution {
+                        "passthrough"
+                    } else {
+                        action.unwrap_or("passthrough")
+                    })
+                );
+                if real_session == "pool-owner" {
+                    if let Some(previous) = owner_real_hash.as_ref() {
+                        assert_eq!(sessions.real_session_hash.as_ref(), Some(previous));
+                    }
+                    owner_real_hash = sessions.real_session_hash.clone();
+                }
+                if mapped {
+                    assert_ne!(sessions.real_session_hash, sessions.upstream_session_hash);
+                    assert_eq!(sessions.upstream_session_hash, owner_real_hash);
+                }
+                assert_eq!(
+                    cache.get_session_account_id(real_session).await.unwrap(),
+                    Some(account.id)
+                );
+                assert_eq!(
+                    cache
+                        .get_session_account_id("header-session")
+                        .await
+                        .unwrap(),
+                    None
+                );
+                if enabled && !fail_resolution {
+                    let status = cache
+                        .get_upstream_session_pool_status(account.id, 1, Duration::from_secs(3600))
+                        .await
+                        .unwrap();
+                    let times = (status.oldest_last_seen_ms, status.newest_last_seen_ms);
+                    if mapped {
+                        assert_eq!(
+                            Some(times),
+                            last_owner_times,
+                            "owner_only 的借用请求不得刷新 TTL"
+                        );
+                    } else {
+                        last_owner_times = Some(times);
+                    }
+                    assert_eq!(status.active_count, 1);
+                }
+            }
+            assert_eq!(state.requests.lock().await.len(), 8);
+            assert_eq!(
+                state.hello_calls.load(Ordering::SeqCst),
+                if fail_resolution { 5 } else { 1 }
+            );
+            assert_eq!(cache.resolve_calls.load(Ordering::SeqCst), 7);
+            server.abort();
+        }
+    }
+
     /// 验证真实网关按调用方选择发送请求，并返回上游对应的 JSON 或 SSE。
     /// @return 无；出站 stream、响应协议或非流完整消息不符时测试失败。
     #[tokio::test]
@@ -8924,6 +10404,27 @@ mod tests {
         builder.body(Body::from(payload.to_string())).unwrap()
     }
 
+    /// 构造真实同名 beta 多值，避免画像请求助手自动添加的 beta 干扰用例。
+    /// @param path 含原始 query 的请求目标。
+    /// @param ua 用于入口准入与画像选择的客户端 UA。
+    /// @param payload 合成请求体。
+    /// @param beta_rows 按插入顺序提供的同名 beta 头值。
+    /// @return 仅携带指定 beta 行的请求，交替使用大小写头名。
+    fn duplicate_beta_request(path: &str, ua: &str, payload: Value, beta_rows: &[&str]) -> Request {
+        let mut request = profile_request(path, Some(ua), payload);
+        request.headers_mut().remove("anthropic-beta");
+        for (index, value) in beta_rows.iter().enumerate() {
+            let name = HeaderName::from_bytes(if index % 2 == 0 {
+                b"AnThRoPiC-BeTa"
+            } else {
+                b"anthropic-beta"
+            })
+            .unwrap();
+            request.headers_mut().append(name, value.parse().unwrap());
+        }
+        request
+    }
+
     fn profile_messages_payload() -> serde_json::Value {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/claude-code-2.1.260-profile.json"
@@ -9019,6 +10520,636 @@ mod tests {
             rewriter.refresh_cch_attestation(bytes.to_vec(), &other, ClientType::ClaudeCode),
             bytes.to_vec()
         );
+    }
+
+    /// 实际 Gateway 在重复 beta 合并后执行账号能力过滤，并保留画像与首次 token 顺序。
+    /// @return 无；280/293、1M/Fast 开关或两行交换导致最终出站头丢值时失败。
+    #[tokio::test]
+    async fn gateway_beta_headers_merge_before_account_filters() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "beta-headers@example.invalid",
+            "synthetic-beta-headers",
+            50,
+        )
+        .await;
+        account.billing_mode = BillingMode::Rewrite;
+        let rows = [
+            " context-1m-2025-08-07 , fast-mode-2026-02-01,client-first-2099-01-01, ,oauth-2025-04-20 ",
+            "oauth-2025-04-20, client-second-2099-01-01,client-first-2099-01-01,context-1m-2025-08-08,fast-mode-2026-02-01-extra,,",
+        ];
+        for (version, base_beta) in [
+            ("2.1.280", OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280),
+            ("2.1.293", OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293),
+        ] {
+            for allow_1m in [false, true] {
+                for allow_fast in [false, true] {
+                    account.allow_1m_models = if allow_1m { "opus" } else { "" }.into();
+                    account.allow_fast_mode = allow_fast;
+                    service.account_svc.update_account(&account).await.unwrap();
+                    let mut previous_body = None;
+                    for reverse in [false, true] {
+                        let mut payload = profile_messages_payload_for(version);
+                        payload["model"] = json!("claude-opus-5-5");
+                        let request = duplicate_beta_request(
+                            "/v1/messages",
+                            &format!("claude-code/{version}"),
+                            payload,
+                            &if reverse { [rows[1], rows[0]] } else { rows },
+                        );
+                        let response = service.handle_request(request, None).await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        let requests = state.requests.lock().await;
+                        let (headers, bytes) = requests.last().unwrap();
+                        let mut expected: Vec<_> = base_beta.split(',').collect();
+                        if allow_1m {
+                            expected.insert(2, "context-1m-2025-08-07");
+                        }
+                        if allow_fast && !reverse {
+                            expected.push("fast-mode-2026-02-01");
+                        }
+                        expected.extend(if reverse {
+                            ["client-second-2099-01-01", "client-first-2099-01-01"]
+                        } else {
+                            ["client-first-2099-01-01", "client-second-2099-01-01"]
+                        });
+                        expected.extend(["context-1m-2025-08-08", "fast-mode-2026-02-01-extra"]);
+                        if allow_fast && reverse {
+                            expected.push("fast-mode-2026-02-01");
+                        }
+                        assert_eq!(
+                            headers["anthropic-beta"],
+                            expected.join(","),
+                            "版本={version} 1M={allow_1m} Fast={allow_fast} 交换={reverse}"
+                        );
+                        assert_eq!(headers.get_all("anthropic-beta").iter().count(), 1);
+                        assert_eq!(
+                            service.rewriter.refresh_cch_attestation(
+                                bytes.to_vec(),
+                                &account_for_request_profile(
+                                    &account,
+                                    Some(profile_for_key(version).unwrap())
+                                ),
+                                ClientType::ClaudeCode
+                            ),
+                            bytes.to_vec()
+                        );
+                        if let Some(previous_body) = previous_body {
+                            assert_eq!(bytes, &previous_body, "交换 beta 行不得改写正文");
+                        }
+                        previous_body = Some(bytes.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 16);
+        server.abort();
+    }
+
+    /// 实际上游区分缺头、有效空头和非法值，其它重复头保持最后有效值语义。
+    /// @return 无；普通与 count_tokens 入口拼接其它头、透传入站认证或丢失有效 beta 时失败。
+    #[tokio::test]
+    async fn gateway_beta_headers_preserve_empty_invalid_and_single_value_semantics() {
+        let (base, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "beta-boundary@example.invalid",
+            "synthetic-beta-boundary",
+            50,
+        )
+        .await;
+        let invalid = HeaderValue::from_bytes(&[0xff]).unwrap();
+        let cases = [
+            ("缺失", vec![], None),
+            ("有效空值", vec![HeaderValue::from_static("")], Some("")),
+            (
+                "有效空段",
+                vec![HeaderValue::from_static(" ,\t, ")],
+                Some(""),
+            ),
+            ("全部非法", vec![invalid.clone(), invalid.clone()], None),
+            (
+                "非法后有效",
+                vec![
+                    invalid.clone(),
+                    HeaderValue::from_static(" client-first,, "),
+                ],
+                Some("client-first"),
+            ),
+            (
+                "有效后非法",
+                vec![HeaderValue::from_static("client-first"), invalid.clone()],
+                Some("client-first"),
+            ),
+            (
+                "非法后空",
+                vec![invalid.clone(), HeaderValue::from_static("")],
+                Some(""),
+            ),
+            (
+                "空后非法",
+                vec![HeaderValue::from_static(""), invalid.clone()],
+                Some(""),
+            ),
+            (
+                "重叠空段",
+                vec![
+                    HeaderValue::from_static("client-first, ,client-first"),
+                    HeaderValue::from_static("\t,client-second,client-first,"),
+                ],
+                Some("client-first,client-second"),
+            ),
+        ];
+        for (label, values, expected) in cases {
+            // Registry 无画像必需 beta，可直接观察有效空头与缺头的差别。
+            let mut request = duplicate_beta_request(
+                "/mcp-registry/v0/servers",
+                "claude-code/2.1.293",
+                json!({}),
+                &[],
+            );
+            for value in values {
+                request.headers_mut().append("anthropic-beta", value);
+            }
+            let extracted = extract_headers(request.headers());
+            assert_eq!(
+                extracted.get("anthropic-beta").map(String::as_str),
+                expected,
+                "{label}"
+            );
+            let response = service.handle_request(request, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.requests.lock().await;
+            let (headers, _) = requests.last().unwrap();
+            assert_eq!(
+                headers
+                    .get("anthropic-beta")
+                    .map(|value| value.to_str().unwrap()),
+                expected,
+                "{label}"
+            );
+        }
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            let mut request = duplicate_beta_request(
+                path,
+                "claude-code/2.1.280",
+                profile_messages_payload_for("2.1.293"),
+                &["client-first", "client-second"],
+            );
+            for (name, first, last) in [
+                ("user-agent", "claude-code/2.1.280", "claude-code/2.1.293"),
+                ("x-client-request-id", "synthetic-first", "synthetic-last"),
+                ("request-id", "synthetic-first", "synthetic-last"),
+                (
+                    "authorization",
+                    "Bearer synthetic-first",
+                    "Bearer synthetic-last",
+                ),
+            ] {
+                request.headers_mut().remove(name);
+                request.headers_mut().append(name, first.parse().unwrap());
+                request.headers_mut().append(name, last.parse().unwrap());
+                request.headers_mut().append(name, invalid.clone());
+            }
+            let extracted = extract_headers(request.headers());
+            assert_eq!(extracted["user-agent"], "claude-code/2.1.293");
+            assert_eq!(extracted["x-client-request-id"], "synthetic-last");
+            assert_eq!(extracted["request-id"], "synthetic-last");
+            assert_eq!(extracted["authorization"], "Bearer synthetic-last");
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(request, None).await
+            } else {
+                service.handle_request(request, None).await
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = state.requests.lock().await;
+            let (headers, _) = requests.last().unwrap();
+            assert_eq!(headers["user-agent"], claude_cli_user_agent("2.1.293"));
+            assert_eq!(headers["x-stainless-package-version"], "0.128.0");
+            assert_eq!(headers["x-client-request-id"], "synthetic-last");
+            assert!(!headers.contains_key("request-id"));
+            assert_eq!(headers["authorization"], "Bearer synthetic-beta-boundary");
+            for name in ["user-agent", "x-client-request-id", "authorization"] {
+                assert_eq!(headers.get_all(name).iter().count(), 1);
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 11);
+        server.abort();
+    }
+
+    /// count_tokens 实际入口共用多值收集和账号过滤，保留专用 beta 与固定 URL。
+    /// @return 无；280/293/API、能力开关、行交换或固定 query 合同回退时失败。
+    #[tokio::test]
+    async fn gateway_beta_count_tokens_merges_before_account_filters() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "beta-count@example.invalid",
+            "synthetic-beta-count",
+            50,
+        )
+        .await;
+        let rows = [
+            "context-1m-2025-08-07, client-first,token-counting-2024-11-01",
+            "fast-mode-2026-02-01, client-second,client-first,fast-mode-2026-02-01-extra",
+        ];
+        for ua in [
+            "claude-code/2.1.280",
+            "claude-code/2.1.293",
+            "python-httpx/0.28.1",
+        ] {
+            for allow_1m in [false, true] {
+                for allow_fast in [false, true] {
+                    account.allow_1m_models = if allow_1m { "opus" } else { "" }.into();
+                    account.allow_fast_mode = allow_fast;
+                    service.account_svc.update_account(&account).await.unwrap();
+                    for reverse in [false, true] {
+                        let mut payload = profile_messages_payload_for("2.1.293");
+                        payload["model"] = json!("claude-opus-5-5");
+                        payload["fallbacks"] = json!("default");
+                        let request = duplicate_beta_request(
+                            "/v1/messages/count_tokens?beta=false&raw=%2f&%62eta=&beta=true",
+                            ua,
+                            payload,
+                            &if reverse { [rows[1], rows[0]] } else { rows },
+                        );
+                        let response = service.handle_count_tokens_request(request, None).await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        let uris = state.request_uris.lock().await;
+                        let uri = uris.last().unwrap();
+                        assert_eq!(uri.path(), COUNT_TOKENS_PATH);
+                        assert_eq!(uri.query(), Some("beta=true"));
+                        let requests = state.requests.lock().await;
+                        let (headers, bytes) = requests.last().unwrap();
+                        let mut expected: Vec<_> = COUNT_TOKENS_BETA_TOKENS.split(',').collect();
+                        if allow_1m {
+                            expected.insert(2, "context-1m-2025-08-07");
+                        }
+                        let mut tail = if reverse {
+                            vec![
+                                "client-second",
+                                "client-first",
+                                "fast-mode-2026-02-01-extra",
+                            ]
+                        } else {
+                            vec![
+                                "client-first",
+                                "client-second",
+                                "fast-mode-2026-02-01-extra",
+                            ]
+                        };
+                        if allow_fast {
+                            tail.insert(if reverse { 0 } else { 1 }, "fast-mode-2026-02-01");
+                        }
+                        expected.extend(tail);
+                        assert_eq!(
+                            headers["anthropic-beta"],
+                            expected.join(","),
+                            "UA={ua} 1M={allow_1m} Fast={allow_fast} 交换={reverse}"
+                        );
+                        assert_eq!(headers.get_all("anthropic-beta").iter().count(), 1);
+                        let sent: Value = serde_json::from_slice(bytes).unwrap();
+                        assert!(sent.get("stream").is_none());
+                        assert!(sent.get("max_tokens").is_none());
+                    }
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 24);
+        server.abort();
+    }
+
+    /// 重复 beta 不扩大 293 safeguard、标题、后台窄表和 API 生成画像。
+    /// @return 无；未知 token、Fast 或 API 1M 被引入精确画像，或合法可选项丢失时失败。
+    #[tokio::test]
+    async fn gateway_beta_headers_preserve_special_and_api_profiles() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.293-profile.json"
+        ))
+        .unwrap();
+        let (base, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "beta-special@example.invalid",
+            "synthetic-beta-special",
+            50,
+        )
+        .await;
+        let rows = [
+            "context-1m-2025-08-07,fast-mode-2026-02-01,client-first",
+            "client-second,claude-code-20250219,extended-cache-ttl-2025-04-11",
+        ];
+        for allow_1m in [false, true] {
+            for allow_fast in [false, true] {
+                account.allow_1m_models = if allow_1m { "opus" } else { "" }.into();
+                account.allow_fast_mode = allow_fast;
+                service.account_svc.update_account(&account).await.unwrap();
+                for reverse in [false, true] {
+                    let beta_rows = if reverse { [rows[1], rows[0]] } else { rows };
+                    for permission_mode in ["auto", "plan"] {
+                        let mut payload = profile_messages_payload_for("2.1.293");
+                        payload["model"] = json!("claude-opus-5-5");
+                        payload["safeguards"] = json!([{
+                            "type": "dangerous_tool_use",
+                            "classifier_context": {
+                                "v": 1, "permission_mode": permission_mode,
+                                "auto_mode": {"allow":[], "soft_deny":[], "hard_deny":[], "environment":[]}
+                            }
+                        }]);
+                        let response = service
+                            .handle_request(
+                                duplicate_beta_request(
+                                    "/v1/messages",
+                                    "claude-code/2.1.293",
+                                    payload,
+                                    &beta_rows,
+                                ),
+                                None,
+                            )
+                            .await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        let expected =
+                            fixture["request_profiles"]["claude-opus-5-5"]["safeguard_beta"]
+                                .as_str()
+                                .unwrap();
+                        let expected = if allow_1m {
+                            expected.to_string()
+                        } else {
+                            expected.replace(",context-1m-2025-08-07", "")
+                        };
+                        assert_eq!(
+                            state.requests.lock().await.last().unwrap().0["anthropic-beta"],
+                            expected,
+                            "safeguard={permission_mode} 1M={allow_1m} Fast={allow_fast} 交换={reverse}"
+                        );
+                    }
+                    for ua in ["claude-code/2.1.293", "python-httpx/0.28.1"] {
+                        let payload = json!({
+                            "model": "claude-haiku-5-5",
+                            "messages": [{"role":"user", "content":"合成标题请求"}],
+                            "max_tokens": 128000, "stream": true, "tools": [],
+                            "output_config": fixture["haiku_title"]["output_config"]
+                        });
+                        let response = service
+                            .handle_request(
+                                duplicate_beta_request("/v1/messages", ua, payload, &beta_rows),
+                                None,
+                            )
+                            .await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            state.requests.lock().await.last().unwrap().0["anthropic-beta"],
+                            fixture["haiku_title"]["beta"].as_str().unwrap(),
+                            "标题 UA={ua} 1M={allow_1m} Fast={allow_fast} 交换={reverse}"
+                        );
+                    }
+                }
+            }
+        }
+        for (version, expected) in [
+            ("2.1.280", OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280),
+            ("2.1.293", OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293),
+        ] {
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "claude_code_version_profile".into(),
+                    version.into(),
+                )]))
+                .await
+                .unwrap();
+            service.reload_profile_selection_config().await.unwrap();
+            for beta_rows in [rows, [rows[1], rows[0]]] {
+                let mut payload = profile_messages_payload_for(version);
+                payload["model"] = json!("claude-opus-5-5");
+                let response = service
+                    .handle_request(
+                        duplicate_beta_request(
+                            "/v1/messages",
+                            "python-httpx/0.28.1",
+                            payload,
+                            &beta_rows,
+                        ),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    state.requests.lock().await.last().unwrap().0["anthropic-beta"],
+                    expected
+                );
+            }
+        }
+        for (path, expected) in [
+            ("/api/eval/test", "oauth-2025-04-20"),
+            ("/v1/mcp_servers", "mcp-servers-2025-12-04"),
+            ("/api/claude_code_penguin_mode", "oauth-2025-04-20"),
+        ] {
+            for ua in ["claude-code/2.1.293", "python-httpx/0.28.1"] {
+                for beta_rows in [rows, [rows[1], rows[0]]] {
+                    let response = service
+                        .handle_request(
+                            duplicate_beta_request(path, ua, json!({}), &beta_rows),
+                            None,
+                        )
+                        .await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        state.requests.lock().await.last().unwrap().0["anthropic-beta"],
+                        expected,
+                        "{path}"
+                    );
+                }
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 48);
+        server.abort();
+    }
+
+    /// 从本地上游观察完整 URI，确认 beta 归一且其它原始 query 片段保持不变。
+    /// @return 无；缺省、重复、编码同名键或原始片段保真不符合契约时失败。
+    #[tokio::test]
+    async fn gateway_beta_query_normalizes_keys_and_preserves_raw_fragments() {
+        let (base, state, server) = spawn_auth_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        let mut account = create_setup_gateway_account(
+            &service,
+            "beta-query@example.invalid",
+            "synthetic-beta-query",
+            50,
+        )
+        .await;
+        account.allow_1m_models = "opus".into();
+        account.allow_fast_mode = true;
+        service.account_svc.update_account(&account).await.unwrap();
+        let cases = [
+            (None, "beta=true"),
+            (Some(""), "beta=true"),
+            (Some("beta=true"), "beta=true"),
+            (Some("beta=false"), "beta=true"),
+            (Some("beta="), "beta=true"),
+            (Some("beta"), "beta=true"),
+            (Some("beta=TRUE"), "beta=true"),
+            (Some("beta=false&beta=true&beta=&beta"), "beta=true"),
+            (Some("x=1&beta=false&x=2&beta=true"), "x=1&beta=true&x=2"),
+            (
+                Some("%62eta=false&b%65t%61=&%62%65%74%61=true"),
+                "beta=true",
+            ),
+            (
+                Some(
+                    "raw=%2f%2F+%20&dup=a%2Bb&beta=false&&dup=%7e&empty=&flag&literal=%26beta%3Dfalse&beta=true&",
+                ),
+                "raw=%2f%2F+%20&dup=a%2Bb&beta=true&&dup=%7e&empty=&flag&literal=%26beta%3Dfalse&",
+            ),
+            (
+                Some("%=one&%6=two&%GG=three&be%74a%=four&b%65ta%0=5"),
+                "%=one&%6=two&%GG=three&be%74a%=four&b%65ta%0=5&beta=true",
+            ),
+            (
+                Some("%2562eta=false&%252562eta=true&%62eta=true"),
+                "%2562eta=false&%252562eta=true&beta=true",
+            ),
+            (
+                Some("Beta=false&BETA=&%42eta=true&%62ETA=1"),
+                "Beta=false&BETA=&%42eta=true&%62ETA=1&beta=true",
+            ),
+            (
+                Some("b+eta=false&beta+=true&%62eta%20=false"),
+                "b+eta=false&beta+=true&%62eta%20=false&beta=true",
+            ),
+            (
+                Some("beta%3Dfalse=x&%62eta%26x=y&x=beta%3Dfalse"),
+                "beta%3Dfalse=x&%62eta%26x=y&x=beta%3Dfalse&beta=true",
+            ),
+            (Some("&beta=false&&beta=true&"), "&beta=true&&"),
+            (Some("&&"), "&&&beta=true"),
+            (Some("raw=x&"), "raw=x&&beta=true"),
+            (
+                Some("synthetic_client_id=keep&dup=1&dup=2"),
+                "synthetic_client_id=keep&dup=1&dup=2&beta=true",
+            ),
+        ];
+        for (ua, version) in [
+            ("claude-code/2.1.280", "2.1.280"),
+            ("claude-code/2.1.293", "2.1.293"),
+            ("python-httpx/0.28.1", "2.1.293"),
+        ] {
+            let mut previous_body = None;
+            for (query, expected) in cases {
+                let target = query.map_or_else(
+                    || "/v1/messages".to_string(),
+                    |query| format!("/v1/messages?{query}"),
+                );
+                let response = service
+                    .handle_request(
+                        duplicate_beta_request(
+                            &target,
+                            ua,
+                            profile_messages_payload_for(version),
+                            &["oauth-2025-04-20", "fast-mode-2026-02-01"],
+                        ),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK, "UA={ua} query={query:?}");
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let uris = state.request_uris.lock().await;
+                let uri = uris.last().unwrap();
+                assert_eq!(uri.path(), "/v1/messages");
+                assert_eq!(uri.query(), Some(expected), "UA={ua} query={query:?}");
+                let requests = state.requests.lock().await;
+                let (headers, bytes) = requests.last().unwrap();
+                assert_eq!(headers.get_all("anthropic-beta").iter().count(), 1);
+                if let Some(previous_body) = previous_body {
+                    assert_eq!(bytes, &previous_body, "query 不得改变出站正文");
+                }
+                previous_body = Some(bytes.clone());
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 60);
+        server.abort();
+    }
+
+    /// 非目标路径的实际 URI 保留原始 query，包括近似 Messages/count_tokens 路径。
+    /// @return 无；目标端点范围被扩大或其它 query 被解析重编码时失败。
+    #[tokio::test]
+    async fn gateway_beta_query_preserves_non_target_paths() {
+        let (base, state, server) = spawn_http_proxy_mock_server().await;
+        let service = test_gateway_service_with_urls(base, String::new()).await;
+        create_setup_gateway_account(
+            &service,
+            "beta-paths@example.invalid",
+            "synthetic-beta-paths",
+            50,
+        )
+        .await;
+        let query = "raw=%2f+%20&beta=false&%62eta=&beta=true&&raw=%2F&";
+        for ua in ["claude-code/2.1.280", "claude-code/2.1.293"] {
+            for path in [
+                "/v1/messages/",
+                "/v1/messages/extra",
+                "/v1/messagesish",
+                "/v1/messages/count_tokens/",
+                "/v1/messages/count_tokens/extra",
+                "/mcp-registry/v0/servers",
+                "/api/eval/test",
+                "/synthetic/beta",
+            ] {
+                let response = service
+                    .handle_request(
+                        duplicate_beta_request(
+                            &format!("{path}?{query}"),
+                            ua,
+                            profile_messages_payload_for("2.1.293"),
+                            &["client-first", "client-second"],
+                        ),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK, "UA={ua} path={path}");
+                body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let uris = state.request_uris.lock().await;
+                let uri = uris.last().unwrap();
+                assert_eq!(uri.path(), path);
+                assert_eq!(uri.query(), Some(query), "UA={ua} path={path}");
+            }
+        }
+        assert_eq!(state.requests.lock().await.len(), 16);
+        server.abort();
     }
 
     #[tokio::test]
@@ -10377,7 +12508,7 @@ mod tests {
     async fn gateway_hello_probe_falls_back_to_real_session_when_pool_resolution_fails() {
         let (base_url, state, server) = spawn_auth_mock_server().await;
         let mut service = test_gateway_service_with_cache_and_urls(
-            Arc::new(PoolResolveFailureCache::new()),
+            Arc::new(SessionPoolTestCache::new(true)),
             base_url.clone(),
             crate::service::oauth::OAUTH_TOKEN_URL.to_string(),
         )
@@ -10838,6 +12969,10 @@ mod tests {
         assert_eq!(
             super::upstream_url("/v1/messages", "foo=bar"),
             "https://api.anthropic.com/v1/messages?foo=bar&beta=true"
+        );
+        assert_eq!(
+            super::upstream_url(COUNT_TOKENS_PATH, "raw=%2f&%62eta=false&beta=true&raw=%2F"),
+            "https://api.anthropic.com/v1/messages/count_tokens?raw=%2f&beta=true&raw=%2F"
         );
         assert_eq!(
             super::upstream_url("/api/event_logging/v2/batch", ""),
