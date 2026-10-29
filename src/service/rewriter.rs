@@ -1,7 +1,7 @@
 use base64::Engine;
 use once_cell::sync::Lazy;
 use rand::Rng;
-use regex::Regex;
+use regex::{NoExpand, Regex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -2659,7 +2659,8 @@ static CLAUDE_CODE_BILLING_BLOCK_REGEX: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
-static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
+// 用户名只占当前行的文本，不能跨过标签边界或吞掉 CRLF 的回车。
+static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:[ \t]*[^\r\n<]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
 static CLAUDE_MD_CONTENTS_REGEX: Lazy<Regex> =
@@ -6661,8 +6662,9 @@ fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &
     let scrub = |text: &str| -> String {
         SYSTEM_REMINDER_REGEX
             .replace_all(text, |caps: &regex::Captures| {
+                // 账号名称是字面量，不能把其中的 $1、$0 或 ${name} 当成捕获组展开。
                 GIT_USER_REGEX
-                    .replace_all(&caps[0], replacement.as_str())
+                    .replace_all(&caps[0], NoExpand(replacement.as_str()))
                     .to_string()
             })
             .to_string()
@@ -6780,7 +6782,7 @@ mod tests {
         MessageCacheControlRewrite, Rewriter, UpstreamSessionRewrite, cch_attestation_input,
         cch_attestation_seed, compute_cc_version_suffix, compute_cch_attestation,
         extract_first_user_message, matches_1m_whitelist, ordered_anthropic_headers,
-        strip_beta_token,
+        scrub_git_user_in_reminders, strip_beta_token,
     };
     use crate::model::account::{
         Account, AccountAuthType, AccountStatus, BillingMode, CanonicalEnvData,
@@ -10887,6 +10889,126 @@ mod tests {
 
         assert_eq!(existing["max_tokens"], json!(128000));
         assert!(missing.get("max_tokens").is_none());
+    }
+
+    /// 同行结束标签、相邻提醒与提醒中的其它标签必须保留。
+    /// @return 无；任一相邻结构或非用户名内容丢失时失败。
+    #[test]
+    fn git_user_scrub_preserves_inline_tags_and_adjacent_reminders() {
+        let mut body = json!({"system":[{"type":"text","text":concat!(
+            "前缀 <system-reminder>Git user: caller</system-reminder>",
+            " 中间 <system-reminder>Git user: other<note>保留</note></system-reminder> 后缀"
+        )}]});
+        scrub_git_user_in_reminders(&mut body, "合成账号");
+        assert_eq!(
+            body["system"][0]["text"],
+            concat!(
+                "前缀 <system-reminder>Git user: 合成账号</system-reminder>",
+                " 中间 <system-reminder>Git user: 合成账号<note>保留</note></system-reminder> 后缀"
+            )
+        );
+    }
+
+    /// 账号显示名称中的正则替换符必须按原字符发送。
+    /// @return 无；美元符号、捕获组样式或 Unicode 名称变化时失败。
+    #[test]
+    fn git_user_scrub_preserves_literal_account_names() {
+        for name in ["合成$1账号", "$0", "${missing}$$", "账号$", "普通名字"] {
+            let mut body =
+                json!({"system":"<system-reminder>\nGit user: caller\n</system-reminder>"});
+            scrub_git_user_in_reminders(&mut body, name);
+            assert_eq!(
+                body["system"],
+                format!("<system-reminder>\nGit user: {name}\n</system-reminder>")
+            );
+        }
+    }
+
+    /// 空用户名不能吃掉下一行，正常替换保留原有换行格式。
+    /// @return 无；相邻环境字段或 CRLF/CR/LF 被改动时失败。
+    #[test]
+    fn git_user_scrub_respects_line_boundaries() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let mut body = json!({"system":format!("<system-reminder>Git user: caller{newline}Other: keep</system-reminder>")});
+            scrub_git_user_in_reminders(&mut body, "合成账号");
+            assert_eq!(
+                body["system"],
+                format!(
+                    "<system-reminder>Git user: 合成账号{newline}Other: keep</system-reminder>"
+                )
+            );
+            let original =
+                format!("<system-reminder>Git user:{newline}Other: keep</system-reminder>");
+            let mut empty = json!({"system":original});
+            scrub_git_user_in_reminders(&mut empty, "合成账号");
+            assert_eq!(empty["system"], original);
+        }
+    }
+
+    /// 用户资料、工具描述、标签外文本及带缓存字段的块维持原有透传边界。
+    /// @return 无；替换扩大到非目标位置或缓存块时失败。
+    #[test]
+    fn git_user_scrub_keeps_non_target_and_cached_content() {
+        let reminder = "<system-reminder>Git user: caller</system-reminder>";
+        let mut body = json!({
+            "system":[
+                {"type":"text","text":reminder,"cache_control":{"type":"ephemeral"}},
+                {"type":"text","text":reminder,"cache_control":null},
+                {"type":"text","text":"Git user: outside"}
+            ],
+            "messages":[{"role":"user","content":reminder}],
+            "tools":[{"name":"synthetic","description":reminder}]
+        });
+        let original = body.clone();
+        scrub_git_user_in_reminders(&mut body, "合成账号");
+        assert_eq!(body, original);
+    }
+
+    /// 真实正文改写链应保留标签与账号原文，并在替换后完成版本化 CCH。
+    /// @return 无；280/293 的最终提醒或已有 CCH 不正确时失败。
+    #[test]
+    fn git_user_scrub_keeps_profile_cch_valid() {
+        for version in ["2.1.280", "2.1.293"] {
+            let mut account = test_account_with_profile(version);
+            account.name = "合成$1账号".into();
+            account.billing_mode = BillingMode::Rewrite;
+            let body = json!({
+                "model":"claude-opus-4-8",
+                "system":[
+                    {"type":"text","text":format!("x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint=cli; cch=00000;")},
+                    {"type":"text","text":"<system-reminder>Git user: caller</system-reminder>"}
+                ],
+                "messages":[{"role":"user","content":"合成用户名替换验证"}],
+                "max_tokens":32
+            });
+            let rewriter = Rewriter::new();
+            let output = rewriter.rewrite_body(
+                &body.to_string().into_bytes(),
+                "/v1/messages",
+                &account,
+                ClientType::ClaudeCode,
+                EnvPassthrough::default(),
+                CacheControlTtlRewrite::Off,
+                MessageCacheControlRewrite::Off,
+                true,
+            );
+            let sent: Value = serde_json::from_slice(&output).unwrap();
+            assert!(
+                sent["system"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|block| block["text"]
+                        == "<system-reminder>Git user: 合成$1账号</system-reminder>")
+            );
+            let billing = sent["system"][0]["text"].as_str().unwrap();
+            assert!(billing.contains("cch="));
+            assert!(!billing.contains("cch=00000"));
+            assert_eq!(
+                rewriter.refresh_cch_attestation(output.clone(), &account, ClientType::API),
+                output
+            );
+        }
     }
 
     #[test]
