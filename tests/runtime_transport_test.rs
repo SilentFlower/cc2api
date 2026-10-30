@@ -1,5 +1,6 @@
 //! v3 传输保真、长流和取消验证；只使用本地合成服务。
 
+use claude_code_gateway::tlsfp::TlsProfileId;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -66,6 +67,7 @@ async fn sender(origin: &str) -> (String, SenderConfig, String, tokio::task::Joi
 
 fn prepared(config: &SenderConfig, url: String) -> PreparedRequest {
     PreparedRequest {
+        tls_profile: TlsProfileId::default(),
         account_id: config.binding.account_id,
         environment_id: config.binding.environment_id.clone(),
         generation: config.binding.generation,

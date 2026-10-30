@@ -31,7 +31,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 use crate::model::account::Account;
-use crate::tlsfp::get_request_client;
+use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
 
 const META_HEADER: &str = "x-v3-request";
 const ERROR_HEADER: &str = "x-v3-transport-error";
@@ -60,6 +60,9 @@ pub struct PreparedRequest {
     pub target_url: String,
     pub headers: Vec<(String, String)>,
     pub preserve_header_casing: bool,
+    /// 网关冻结的已注册 TLS 标识；历史报文缺字段时保留原内置默认。
+    #[serde(default)]
+    pub tls_profile: TlsProfileId,
 }
 
 /// 账号进程的受限配置；由管理进程原子写入，CLI 用户不可读取。
@@ -139,7 +142,7 @@ pub async fn send_direct(
     prepared: &PreparedRequest,
     body: Vec<u8>,
 ) -> Result<reqwest::Response, AppError> {
-    let client = get_request_client(proxy_url)
+    let client = get_request_client_for_profile(proxy_url, prepared.tls_profile)
         .map_err(|_| AppError::BadGateway("upstream request client unavailable".into()))?;
     send_with_client(&client, prepared, body).await
 }
@@ -489,12 +492,147 @@ pub fn sender_router(config_path: String) -> Router {
 mod tests {
     use super::*;
 
-    use crate::tlsfp::test_request_client;
+    use crate::tlsfp::{parse_test_clienthello, test_request_client};
     use rustls_pki_types::CertificateDer;
+    use serde_json::{Value, json};
+    use std::env::temp_dir;
     use std::io::{BufRead, BufReader};
     use std::net::{Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn sender_preserves_tls_profile_legacy_default_and_rejects_unknown_before_submission() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let capture = tokio::spawn(async move {
+            let mut records = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = proxy.accept().await.unwrap();
+                let mut connect = Vec::new();
+                while !connect.ends_with(b"\r\n\r\n") {
+                    assert!(connect.len() < 8192);
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    connect.extend_from_slice(&byte);
+                }
+                assert!(connect.starts_with(b"CONNECT api.anthropic.com:443 "));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                let size = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                assert!(size <= 16384);
+                let mut wire = header.to_vec();
+                wire.resize(5 + size, 0);
+                stream.read_exact(&mut wire[5..]).await.unwrap();
+                records.push(wire);
+            }
+            // 不再接受上游；若未知 ID 错误放行，将表现为提交失败而不是预期的本地400。
+            records
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = SenderConfig {
+            binding: TransportBinding {
+                account_id: 7,
+                environment_id: "synthetic-tls".into(),
+                generation: 1,
+                endpoint: endpoint.clone(),
+                secret: "synthetic-private-sender-key".repeat(3),
+                release_id: "test".into(),
+            },
+            proxy_url,
+            allowed_origin: "https://api.anthropic.com".into(),
+            evidence_file: None,
+            quota_identity: String::new(),
+        };
+        let path = temp_dir().join(format!("sender-tls-{}.json", Uuid::new_v4()));
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let app = sender_router(path.to_string_lossy().into_owned());
+        let sender = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let request = PreparedRequest {
+            account_id: 7,
+            environment_id: config.binding.environment_id.clone(),
+            generation: 1,
+            request_id: Uuid::new_v4().to_string(),
+            deadline_unix_ms: now_ms() + 30_000,
+            method: "POST".into(),
+            target_url: "https://api.anthropic.com/v1/messages".into(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            preserve_header_casing: true,
+            tls_profile: TlsProfileId::default(),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for profile in [
+            Some(TlsProfileId::ClaudeCode293),
+            Some(TlsProfileId::TestReordered),
+            None,
+        ] {
+            let mut meta = serde_json::to_value(&request).unwrap();
+            match profile {
+                Some(profile) => meta["tls_profile"] = serde_json::to_value(profile).unwrap(),
+                None => {
+                    meta.as_object_mut().unwrap().remove("tls_profile");
+                }
+            }
+            let response = client
+                .post(format!("{endpoint}/internal/send"))
+                .bearer_auth(&config.binding.secret)
+                .header(
+                    META_HEADER,
+                    STANDARD.encode(serde_json::to_vec(&meta).unwrap()),
+                )
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 502);
+        }
+        let records = timeout(Duration::from_secs(5), capture)
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: Vec<Value> = records
+            .iter()
+            .map(|wire| parse_test_clienthello(wire))
+            .collect();
+        assert_eq!(parsed[0]["ja3"]["md5"], "1523504b38f0fae0d881d4b6554aac1b");
+        assert_ne!(parsed[0]["ja3"], parsed[1]["ja3"]);
+        assert_eq!(parsed[0]["ja3"], parsed[2]["ja3"]);
+        let mut meta = serde_json::to_value(&request).unwrap();
+        meta["tls_profile"] = json!("unknown-unregistered");
+        let response = client
+            .post(format!("{endpoint}/internal/send"))
+            .bearer_auth(&config.binding.secret)
+            .header(
+                META_HEADER,
+                STANDARD.encode(serde_json::to_vec(&meta).unwrap()),
+            )
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(response.headers()[ERROR_HEADER], "before-send");
+        let status: Value = client
+            .get(format!("{endpoint}/internal/status"))
+            .bearer_auth(&config.binding.secret)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["active"], 0);
+        sender.abort();
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn gateway_accepts_short_account_dns_and_rejects_foreign_bindings() {
@@ -590,6 +728,7 @@ mod tests {
 
         fn request(&self, hostname: &str, path: &str) -> PreparedRequest {
             PreparedRequest {
+                tls_profile: TlsProfileId::default(),
                 account_id: 7,
                 environment_id: "synthetic".into(),
                 generation: 1,
@@ -740,6 +879,7 @@ mod tests {
             quota_identity: String::new(),
         };
         let mut prepared = PreparedRequest {
+            tls_profile: TlsProfileId::default(),
             account_id: 7,
             environment_id: "env-a".into(),
             generation: 2,

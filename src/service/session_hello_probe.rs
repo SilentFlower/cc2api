@@ -12,6 +12,7 @@ use crate::model::account::Account;
 use crate::model::identity::device_profile;
 use crate::service::version_profile::profile_for_version;
 use crate::store::cache::{CacheStore, SessionHelloProbeState};
+use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
 
 const DEFAULT_HELLO_ENDPOINT: &str = "https://api.anthropic.com/api/hello";
 const HELLO_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
@@ -137,6 +138,7 @@ impl SessionHelloProbeService {
     /// @param real_session_id 未经上游 session 池改写的真实下游 session。
     /// @param upstream_session_id 最终发往上游的有效 session；池关闭时等于真实 session。
     /// @param config 当前热加载配置。
+    /// @param tls_profile 业务入口冻结的 TLS 画像。
     /// @return 返回继续业务请求或严格模式阻断原因。
     pub async fn ensure_ready(
         &self,
@@ -144,6 +146,7 @@ impl SessionHelloProbeService {
         real_session_id: &str,
         upstream_session_id: &str,
         config: SessionHelloProbeConfig,
+        tls_profile: TlsProfileId,
     ) -> SessionHelloProbeDecision {
         if !config.enabled {
             return SessionHelloProbeDecision::Proceed;
@@ -156,6 +159,7 @@ impl SessionHelloProbeService {
             upstream_session_id,
             &account.proxy_url,
             profile_key,
+            tls_profile,
         );
         let session_logs = ProbeSessionLogs::new(real_session_id, upstream_session_id);
         let lock_key = format!("{}:lock", state_key);
@@ -244,6 +248,7 @@ impl SessionHelloProbeService {
                                     &lock_key,
                                     &owner,
                                     config,
+                                    tls_profile,
                                 )
                                 .await;
                         }
@@ -298,32 +303,34 @@ impl SessionHelloProbeService {
         lock_key: &str,
         owner: &str,
         config: SessionHelloProbeConfig,
+        tls_profile: TlsProfileId,
     ) -> SessionHelloProbeDecision {
         let started_at = Instant::now();
-        let (state, http_status) = match crate::tlsfp::get_request_client(&account.proxy_url) {
-            Err(_) => (SessionHelloProbeState::Failure, None),
-            Ok(client) => {
-                let user_agent = hello_user_agent_for_account(account);
-                let request = client
-                    .head(&self.endpoint)
-                    .header(USER_AGENT, user_agent)
-                    .header(ACCEPT, "*/*")
-                    .header(ACCEPT_ENCODING, HELLO_ACCEPT_ENCODING)
-                    .header(CONNECTION, "keep-alive");
-                match tokio::time::timeout(config.timeout, request.send()).await {
-                    Err(_) => (SessionHelloProbeState::Timeout, None),
-                    Ok(Err(_)) => (SessionHelloProbeState::Failure, None),
-                    Ok(Ok(response)) if response.status() == reqwest::StatusCode::OK => (
-                        SessionHelloProbeState::Success,
-                        Some(response.status().as_u16()),
-                    ),
-                    Ok(Ok(response)) => (
-                        SessionHelloProbeState::Failure,
-                        Some(response.status().as_u16()),
-                    ),
+        let (state, http_status) =
+            match get_request_client_for_profile(&account.proxy_url, tls_profile) {
+                Err(_) => (SessionHelloProbeState::Failure, None),
+                Ok(client) => {
+                    let user_agent = hello_user_agent_for_account(account);
+                    let request = client
+                        .head(&self.endpoint)
+                        .header(USER_AGENT, user_agent)
+                        .header(ACCEPT, "*/*")
+                        .header(ACCEPT_ENCODING, HELLO_ACCEPT_ENCODING)
+                        .header(CONNECTION, "keep-alive");
+                    match tokio::time::timeout(config.timeout, request.send()).await {
+                        Err(_) => (SessionHelloProbeState::Timeout, None),
+                        Ok(Err(_)) => (SessionHelloProbeState::Failure, None),
+                        Ok(Ok(response)) if response.status() == reqwest::StatusCode::OK => (
+                            SessionHelloProbeState::Success,
+                            Some(response.status().as_u16()),
+                        ),
+                        Ok(Ok(response)) => (
+                            SessionHelloProbeState::Failure,
+                            Some(response.status().as_u16()),
+                        ),
+                    }
                 }
-            }
-        };
+            };
 
         let ttl = if state == SessionHelloProbeState::Success {
             config.success_ttl
@@ -408,11 +415,13 @@ fn probe_state_key(
     upstream_session_id: &str,
     proxy_url: &str,
     profile_key: &str,
+    tls_profile: TlsProfileId,
 ) -> String {
     format!(
-        "session_hello_probe:v2:{}:{}:{}:{}",
+        "session_hello_probe:v3:{}:{}:{}:{}:{}",
         account_id,
         profile_key,
+        tls_profile.as_str(),
         hex::encode(Sha256::digest(upstream_session_id.as_bytes())),
         hex::encode(Sha256::digest(proxy_url.as_bytes()))
     )
@@ -458,6 +467,7 @@ fn cache_failure_decision(
 
 #[cfg(test)]
 mod tests {
+    use crate::tlsfp::TlsProfileId;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -744,13 +754,25 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-a", "session-a", config)
+                .ensure_ready(
+                    &account,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
         assert_eq!(
             service
-                .ensure_ready(&account, "session-a", "session-a", config)
+                .ensure_ready(
+                    &account,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
@@ -772,7 +794,13 @@ mod tests {
         let older = account_for_request_profile(&account, Some(profile));
         assert_eq!(
             service
-                .ensure_ready(&older, "session-a", "session-a", config)
+                .ensure_ready(
+                    &older,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
@@ -783,7 +811,13 @@ mod tests {
         assert_eq!(headers.get(USER_AGENT).unwrap(), "Bun/1.4.1");
         assert_eq!(
             service
-                .ensure_ready(&older, "session-a", "session-a", config)
+                .ensure_ready(
+                    &older,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
@@ -827,7 +861,13 @@ mod tests {
             let account = account.clone();
             tokio::spawn(async move {
                 service
-                    .ensure_ready(&account, "session-a", "session-a", config)
+                    .ensure_ready(
+                        &account,
+                        "session-a",
+                        "session-a",
+                        config,
+                        TlsProfileId::default(),
+                    )
                     .await
             })
         };
@@ -836,7 +876,13 @@ mod tests {
             let account = account.clone();
             tokio::spawn(async move {
                 service
-                    .ensure_ready(&account, "session-a", "session-a", config)
+                    .ensure_ready(
+                        &account,
+                        "session-a",
+                        "session-a",
+                        config,
+                        TlsProfileId::default(),
+                    )
                     .await
             })
         };
@@ -889,7 +935,13 @@ mod tests {
             let account = account.clone();
             tokio::spawn(async move {
                 service
-                    .ensure_ready(&account, "session-write", "session-write", config)
+                    .ensure_ready(
+                        &account,
+                        "session-write",
+                        "session-write",
+                        config,
+                        TlsProfileId::default(),
+                    )
                     .await
             })
         };
@@ -898,7 +950,13 @@ mod tests {
             let account = account.clone();
             tokio::spawn(async move {
                 service
-                    .ensure_ready(&account, "session-write", "session-write", config)
+                    .ensure_ready(
+                        &account,
+                        "session-write",
+                        "session-write",
+                        config,
+                        TlsProfileId::default(),
+                    )
                     .await
             })
         };
@@ -915,13 +973,25 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-write", "session-write", config)
+                .ensure_ready(
+                    &account,
+                    "session-write",
+                    "session-write",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
         assert_eq!(
             service
-                .ensure_ready(&account, "session-write", "session-write", config)
+                .ensure_ready(
+                    &account,
+                    "session-write",
+                    "session-write",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
@@ -962,14 +1032,26 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-a", "session-a", config)
+                .ensure_ready(
+                    &account,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
         config.strict = true;
         assert_eq!(
             service
-                .ensure_ready(&account, "session-a", "session-a", config)
+                .ensure_ready(
+                    &account,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::BlockFailure
         );
@@ -1011,7 +1093,13 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-a", "session-a", config)
+                .ensure_ready(
+                    &account,
+                    "session-a",
+                    "session-a",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::BlockFailure
         );
@@ -1064,7 +1152,13 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-proxy", "session-proxy", config)
+                .ensure_ready(
+                    &account,
+                    "session-proxy",
+                    "session-proxy",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
@@ -1108,13 +1202,25 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-timeout", "session-timeout", config)
+                .ensure_ready(
+                    &account,
+                    "session-timeout",
+                    "session-timeout",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::BlockTimeout
         );
         assert_eq!(
             service
-                .ensure_ready(&account, "session-timeout", "session-timeout", config)
+                .ensure_ready(
+                    &account,
+                    "session-timeout",
+                    "session-timeout",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::BlockTimeout
         );
@@ -1138,14 +1244,26 @@ mod tests {
 
         assert_eq!(
             service
-                .ensure_ready(&account, "session-cache", "session-cache", config)
+                .ensure_ready(
+                    &account,
+                    "session-cache",
+                    "session-cache",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::Proceed
         );
         config.strict = true;
         assert_eq!(
             service
-                .ensure_ready(&account, "session-cache", "session-cache", config)
+                .ensure_ready(
+                    &account,
+                    "session-cache",
+                    "session-cache",
+                    config,
+                    TlsProfileId::default()
+                )
                 .await,
             SessionHelloProbeDecision::BlockUnavailable
         );
@@ -1209,7 +1327,13 @@ mod tests {
             let session = session.clone();
             tokio::spawn(async move {
                 service
-                    .ensure_ready(&account, &session, &session, config)
+                    .ensure_ready(
+                        &account,
+                        &session,
+                        &session,
+                        config,
+                        TlsProfileId::default(),
+                    )
                     .await
             })
         };
@@ -1219,7 +1343,13 @@ mod tests {
             let session = session.clone();
             tokio::spawn(async move {
                 service
-                    .ensure_ready(&account, &session, &session, config)
+                    .ensure_ready(
+                        &account,
+                        &session,
+                        &session,
+                        config,
+                        TlsProfileId::default(),
+                    )
                     .await
             })
         };
@@ -1237,11 +1367,34 @@ mod tests {
 
     #[test]
     fn state_key_changes_with_account_upstream_session_and_proxy_without_leaking_values() {
-        let first = probe_state_key(1, "secret-upstream", "http://proxy-a:8080", "2.1.280");
-        let second_account =
-            probe_state_key(2, "secret-upstream", "http://proxy-a:8080", "2.1.280");
-        let second_session = probe_state_key(1, "other-upstream", "http://proxy-a:8080", "2.1.280");
-        let second_proxy = probe_state_key(1, "secret-upstream", "http://proxy-b:8080", "2.1.280");
+        let first = probe_state_key(
+            1,
+            "secret-upstream",
+            "http://proxy-a:8080",
+            "2.1.280",
+            TlsProfileId::default(),
+        );
+        let second_account = probe_state_key(
+            2,
+            "secret-upstream",
+            "http://proxy-a:8080",
+            "2.1.280",
+            TlsProfileId::default(),
+        );
+        let second_session = probe_state_key(
+            1,
+            "other-upstream",
+            "http://proxy-a:8080",
+            "2.1.280",
+            TlsProfileId::default(),
+        );
+        let second_proxy = probe_state_key(
+            1,
+            "secret-upstream",
+            "http://proxy-b:8080",
+            "2.1.280",
+            TlsProfileId::default(),
+        );
 
         assert_ne!(first, second_account);
         assert_ne!(first, second_session);

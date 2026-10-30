@@ -19,9 +19,10 @@ use crate::service::account::AccountService;
 use crate::service::rewriter::ordered_anthropic_headers;
 use crate::service::version_profile::{
     ClaudeCodeProfile, EVENT_LOGGING_V2_PATH, OAUTH_BETA_TOKEN, TelemetryShape,
-    claude_code_user_agent, is_event_logging_path, profile_for_version,
+    claude_code_user_agent, is_event_logging_path, profile_for_version, tls_profile_for_account,
 };
 use crate::store::account_store::AccountStore;
+use crate::tlsfp::{configured_default_tls_profile, get_request_client_for_profile};
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -545,7 +546,14 @@ async fn telemetry_loop(
     proxy_url: String,
 ) {
     let account_id = key.0;
-    let client = match crate::tlsfp::get_request_client(&proxy_url) {
+    let mut tls_profile = {
+        let map = sessions.lock().await;
+        let Some(session) = map.get(&key) else {
+            return;
+        };
+        tls_profile_for_account(&session.account, configured_default_tls_profile())
+    };
+    let mut client = match get_request_client_for_profile(&proxy_url, tls_profile) {
         Ok(client) => client,
         Err(_) => {
             warn!(
@@ -583,6 +591,29 @@ async fn telemetry_loop(
             break;
         }
 
+        // 已结束的轮次可以跟随新默认，正在发送的响应继续由原客户端完成。
+        let current_tls =
+            tls_profile_for_account(&session.account, configured_default_tls_profile());
+        if current_tls != tls_profile {
+            client = match get_request_client_for_profile(&proxy_url, current_tls) {
+                Ok(client) => client,
+                Err(_) => {
+                    let count = session.send_count;
+                    session.running = false;
+                    map.remove(&key);
+                    drop(map);
+                    if count > 0 {
+                        let _ = store.increment_telemetry_count(account_id, count).await;
+                    }
+                    warn!(
+                        "telemetry: TLS client unavailable for account {}",
+                        account_id
+                    );
+                    return;
+                }
+            };
+            tls_profile = current_tls;
+        }
         let now = Instant::now();
 
         // --- event_logging/v2/batch ---

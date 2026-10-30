@@ -58,6 +58,7 @@ use crate::service::version_profile::{
     COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile,
     ClaudeCodeProfileSelectionConfig, ClaudeCodeProfileSelectionMode, account_for_request_profile,
     default_profile, is_event_logging_path, profile_for_key, profile_for_version,
+    tls_profile_for_account,
 };
 use crate::store::cache::CacheStore;
 use crate::store::diagnostics_store::DiagnosticsStore;
@@ -86,6 +87,10 @@ use crate::store::settings_store::{
     SettingsStore, normalize_message_top_field_filter_enabled,
 };
 use crate::store::usage_store::UsageStore;
+use crate::tlsfp::{
+    TlsProfileId, configured_default_tls_profile, get_request_client_for_profile,
+    set_configured_default_tls_profile,
+};
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
@@ -225,7 +230,8 @@ fn session_hello_probe_block_response(decision: SessionHelloProbeDecision) -> Op
 }
 
 fn upstream_request_client(account: &Account) -> Result<reqwest::Client, AppError> {
-    crate::tlsfp::get_request_client(&account.proxy_url).map_err(|_| {
+    let profile = tls_profile_for_account(account, configured_default_tls_profile());
+    get_request_client_for_profile(&account.proxy_url, profile).map_err(|_| {
         // 代理 URL 可能含凭据，失败日志只记录是否配置代理，不输出原值或底层错误文本。
         warn!(
             "upstream request client unavailable: account={} proxy_configured={}",
@@ -1367,13 +1373,12 @@ impl GatewayService {
             DEFAULT_CLAUDE_CODE_VERSION_PROFILE_SETTING,
         ))
         .unwrap_or_else(|_| default_profile());
-        *snapshot = AccessProfileConfig {
-            policy,
-            selection: ClaudeCodeProfileSelectionConfig {
-                mode,
-                default_profile,
-            },
+        let selection = ClaudeCodeProfileSelectionConfig {
+            mode,
+            default_profile,
         };
+        set_configured_default_tls_profile(selection.default_tls_profile());
+        *snapshot = AccessProfileConfig { policy, selection };
         Ok(())
     }
 
@@ -1570,7 +1575,7 @@ impl GatewayService {
             .cloned()
             .unwrap_or_default();
 
-        let request_profile = {
+        let (request_profile, default_tls_profile) = {
             let snapshot = self.access_profile_config.read().await;
             if let Err(rejection) = snapshot.policy.check_user_agent(&ua) {
                 warn!(
@@ -1580,7 +1585,10 @@ impl GatewayService {
                 return Ok(access_policy_error_response(&rejection));
             }
             // 准入通过后，在同一个读锁内冻结；body 与重试不重新决定画像。
-            snapshot.selection.resolve(&ua)
+            (
+                snapshot.selection.resolve(&ua),
+                snapshot.selection.default_tls_profile(),
+            )
         };
 
         let request_encoding = match RequestBodyEncoding::from_headers(req.headers()) {
@@ -1686,6 +1694,7 @@ impl GatewayService {
             };
             let account = selected.account;
             let request_account = account_for_request_profile(&account, request_profile);
+            let tls_profile = tls_profile_for_account(&request_account, default_tls_profile);
             let filtered_body_map =
                 Rewriter::filter_account_fast_mode_body(&body_map, &request_account);
             // 每个账号都从公共正文重新派生，禁止账号的删除不能污染后续允许账号。
@@ -1755,6 +1764,7 @@ impl GatewayService {
                     &account_body,
                     &request_encoding,
                     &account,
+                    tls_profile,
                 )
                 .await?;
             if resp.status() != StatusCode::UNAUTHORIZED {
@@ -1775,6 +1785,7 @@ impl GatewayService {
                         &account_body,
                         &request_encoding,
                         &account,
+                        tls_profile,
                     )
                     .await?;
                 if resp.status() != StatusCode::UNAUTHORIZED {
@@ -1810,7 +1821,7 @@ impl GatewayService {
             .cloned()
             .unwrap_or_default();
 
-        let request_profile = {
+        let (request_profile, default_tls_profile) = {
             let snapshot = self.access_profile_config.read().await;
             if let Err(rejection) = snapshot.policy.check_user_agent(&ua) {
                 diagnostics::error_stage("access_policy");
@@ -1821,7 +1832,10 @@ impl GatewayService {
                 return Ok(access_policy_error_response(&rejection));
             }
             // 准入通过后，在同一个读锁内冻结；body 与重试不重新决定画像。
-            snapshot.selection.resolve(&ua)
+            (
+                snapshot.selection.resolve(&ua),
+                snapshot.selection.default_tls_profile(),
+            )
         };
 
         diagnostics::profile_selection(request_profile.is_some());
@@ -2172,6 +2186,7 @@ impl GatewayService {
             }
             let mut slot_guard = SlotReleaseGuard::new(admission.permit);
             let request_account = account_for_request_profile(&account, request_profile);
+            let tls_profile = tls_profile_for_account(&request_account, default_tls_profile);
 
             // Hello 必须按最终上游 session 去重，因此先解析账号级 session 池，
             // 但 sticky、RPM 与本地缓存仍继续使用未经改写的真实下游 session。
@@ -2199,6 +2214,7 @@ impl GatewayService {
                         &real_session_id,
                         upstream_session_id,
                         hello_config,
+                        tls_profile,
                     )
                     .await;
                 if let Some(response) = session_hello_probe_block_response(hello_decision) {
@@ -2474,6 +2490,7 @@ impl GatewayService {
                     &final_body,
                     &request_encoding,
                     &request_account,
+                    tls_profile,
                     &account_selection_context,
                     request_capture_policy,
                 )
@@ -2525,6 +2542,7 @@ impl GatewayService {
                                 &final_body,
                                 &request_encoding,
                                 &request_account,
+                                tls_profile,
                                 &account_selection_context,
                                 request_capture_policy,
                             )
@@ -2563,6 +2581,7 @@ impl GatewayService {
                     &final_body,
                     &request_encoding,
                     &request_account,
+                    tls_profile,
                     client_type,
                     &account_selection_context,
                     request_capture_policy,
@@ -2718,6 +2737,7 @@ impl GatewayService {
     /// @param body 已改写后的原始上游请求体。
     /// @param request_encoding 入站冻结的编码链，所有修复阶段都按该链重新编码。
     /// @param account 当前已选账号，重试必须复用该账号。
+    /// @param tls_profile 请求入口冻结的 TLS 标识。
     /// @param client_type 原始客户端类型，用于判断 API mimicry 生成的 CCH 是否需要刷新。
     /// @param account_selection_context 当前请求模型与 Fable 配额 fallback 开关上下文。
     /// @param request_capture_policy 当前请求是否允许写入全文请求/响应捕获日志。
@@ -2732,6 +2752,7 @@ impl GatewayService {
         body: &[u8],
         request_encoding: &RequestBodyEncoding,
         account: &Account,
+        tls_profile: TlsProfileId,
         client_type: ClientType,
         account_selection_context: &AccountSelectionContext,
         request_capture_policy: RequestCapturePolicy,
@@ -2780,6 +2801,7 @@ impl GatewayService {
                     &retry_body,
                     request_encoding,
                     account,
+                    tls_profile,
                     account_selection_context,
                     request_capture_policy,
                 )
@@ -2829,6 +2851,7 @@ impl GatewayService {
     /// @param body 已完成本次改写与 CCH 封口的逻辑正文。
     /// @param request_encoding 入站冻结的编码链。
     /// @param account 当前请求画像副本。
+    /// @param tls_profile 请求入口冻结的 TLS 标识。
     /// @param account_selection_context 账号限额选择上下文。
     /// @param request_capture_policy 请求捕获策略。
     /// @return 既有上游响应或本地编解码错误；编码失败不提交本次业务请求。
@@ -2841,6 +2864,7 @@ impl GatewayService {
         body: &[u8],
         request_encoding: &RequestBodyEncoding,
         account: &Account,
+        tls_profile: TlsProfileId,
         account_selection_context: &AccountSelectionContext,
         request_capture_policy: RequestCapturePolicy,
     ) -> Result<Response, AppError> {
@@ -2858,6 +2882,7 @@ impl GatewayService {
         };
         let wire_headers = request_headers_for_encoding(headers, request_encoding);
         let prepared = PreparedRequest {
+            tls_profile,
             account_id: account.id,
             environment_id: String::new(),
             generation: 0,
@@ -3180,6 +3205,7 @@ impl GatewayService {
     /// @param body 计数请求的最终逻辑正文。
     /// @param request_encoding 入站冻结的编码链。
     /// @param account 当前选定账号。
+    /// @param tls_profile 请求入口冻结的 TLS 标识。
     /// @return 上游计数结果或本地编解码错误。
     async fn forward_count_tokens_request(
         &self,
@@ -3187,6 +3213,7 @@ impl GatewayService {
         body: &[u8],
         request_encoding: &RequestBodyEncoding,
         account: &Account,
+        tls_profile: TlsProfileId,
     ) -> Result<Response, AppError> {
         let target_url = count_tokens_upstream_url_with_base(&self.upstream_base);
         debug!("count_tokens upstream URL: {}", target_url);
@@ -3197,6 +3224,7 @@ impl GatewayService {
         };
         let wire_headers = request_headers_for_encoding(headers, request_encoding);
         let prepared = PreparedRequest {
+            tls_profile,
             account_id: account.id,
             environment_id: String::new(),
             generation: 0,
@@ -7674,7 +7702,8 @@ mod tests {
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
     use crate::service::version_profile::{
-        COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_VERSION,
+        COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile, ClaudeCodeProfileSelectionConfig,
+        ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_VERSION,
         OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_280, OPUS_5_5_MESSAGE_BETA_TOKENS_2_1_293,
         SONNET_5_MESSAGE_BETA_TOKENS_2_1_260, SONNET_5_MESSAGE_BETA_TOKENS_2_1_280,
         STAINLESS_PACKAGE_VERSION, account_for_request_profile, claude_cli_user_agent,
@@ -7694,6 +7723,7 @@ mod tests {
     };
     use crate::store::token_store::TokenStore;
     use crate::store::usage_store::UsageStore;
+    use crate::tlsfp::{TlsProfileId, parse_test_clienthello};
     use axum::body::{self, Body};
     use axum::extract::{Request, State};
     use axum::http::{
@@ -8650,6 +8680,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_messages_and_count_tokens_select_actual_tls_by_effective_profile() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let capture = tokio::spawn(async move {
+            let mut records = Vec::new();
+            for _ in 0..12 {
+                let (mut stream, _) = proxy.accept().await.unwrap();
+                let mut connect = Vec::new();
+                while !connect.ends_with(b"\r\n\r\n") {
+                    assert!(connect.len() < 8192);
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    connect.extend_from_slice(&byte);
+                }
+                assert!(connect.starts_with(b"CONNECT api.anthropic.com:443 "));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                let size = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                assert!(size <= 16384);
+                let mut wire = header.to_vec();
+                wire.resize(5 + size, 0);
+                stream.read_exact(&mut wire[5..]).await.unwrap();
+                records.push(wire);
+            }
+            records
+        });
+        let (service, store) = test_gateway_service_with_cache_store_and_urls(
+            Arc::new(MemoryStore::new()),
+            "https://api.anthropic.com".into(),
+            String::new(),
+        )
+        .await;
+        let service = Arc::new(service);
+        let mut account = create_setup_gateway_account(
+            &service,
+            "tls-profiles@example.invalid",
+            "synthetic-tls",
+            50,
+        )
+        .await;
+        account.proxy_url = proxy_url;
+        let synthetic_default = Box::leak(Box::new(ClaudeCodeProfile {
+            tls_profile: Some(TlsProfileId::TestReordered),
+            ..*profile_for_key("2.1.280").unwrap()
+        }));
+        for (mode, account_version, ua_version) in [
+            (
+                ClaudeCodeProfileSelectionMode::ClientVersion,
+                "2.1.293",
+                "2.1.280",
+            ),
+            (
+                ClaudeCodeProfileSelectionMode::ClientVersion,
+                "2.1.280",
+                "2.1.293",
+            ),
+            (
+                ClaudeCodeProfileSelectionMode::Account,
+                "2.1.280",
+                "2.1.293",
+            ),
+            (
+                ClaudeCodeProfileSelectionMode::Account,
+                "2.1.293",
+                "2.1.280",
+            ),
+        ] {
+            account = account_for_request_profile(
+                &account,
+                Some(profile_for_key(account_version).unwrap()),
+            );
+            service.account_svc.update_account(&account).await.unwrap();
+            // 普通账号配置保存刻意不写 canonical_env，测试沿现有版本更新专用入口。
+            store
+                .update_all_canonical_env_identity(
+                    &profile_for_key(account_version).unwrap().identity,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .account_svc
+                    .get_account(account.id)
+                    .await
+                    .unwrap()
+                    .canonical_env["version"],
+                account_version
+            );
+            service.access_profile_config.write().await.selection =
+                ClaudeCodeProfileSelectionConfig {
+                    mode,
+                    default_profile: synthetic_default,
+                };
+            for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+                let payload = if path == COUNT_TOKENS_PATH {
+                    json!({"model":"claude-sonnet-5-5","messages":[{"role":"user","content":"synthetic"}]})
+                } else {
+                    profile_messages_payload_for(ua_version)
+                };
+                let request =
+                    profile_request(path, Some(&format!("claude-cli/{ua_version}")), payload);
+                let response = if path == COUNT_TOKENS_PATH {
+                    service.handle_count_tokens_request(request, None).await
+                } else {
+                    service.handle_request(request, None).await
+                };
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            }
+        }
+        for path in ["/v1/messages", COUNT_TOKENS_PATH] {
+            service.access_profile_config.write().await.selection =
+                ClaudeCodeProfileSelectionConfig {
+                    mode: ClaudeCodeProfileSelectionMode::ClientVersion,
+                    default_profile: synthetic_default,
+                };
+            let payload = if path == COUNT_TOKENS_PATH {
+                json!({"model":"claude-sonnet-5-5","messages":[{"role":"user","content":"synthetic"}]})
+            } else {
+                profile_messages_payload_for("2.1.280")
+            };
+            let (observed, observed_wait) = tokio::sync::oneshot::channel();
+            let (resume, resume_wait) = tokio::sync::oneshot::channel();
+            let bytes = Bytes::from(serde_json::to_vec(&payload).unwrap());
+            let delayed = Body::from_stream(futures_util::stream::once(async move {
+                observed.send(()).unwrap();
+                resume_wait.await.unwrap();
+                Ok::<_, std::io::Error>(bytes)
+            }));
+            let request =
+                profile_request(path, Some("claude-cli/2.1.280"), payload.clone()).map(|_| delayed);
+            let running = service.clone();
+            let pending = tokio::spawn(async move {
+                if path == COUNT_TOKENS_PATH {
+                    running.handle_count_tokens_request(request, None).await
+                } else {
+                    running.handle_request(request, None).await
+                }
+            });
+            timeout(Duration::from_secs(5), observed_wait)
+                .await
+                .unwrap()
+                .unwrap();
+            // 请求已通过准入并开始读体，之后配置变化不得改变本次 TLS。
+            service.access_profile_config.write().await.selection =
+                ClaudeCodeProfileSelectionConfig::default();
+            resume.send(()).unwrap();
+            assert_eq!(pending.await.unwrap().status(), StatusCode::BAD_GATEWAY);
+            let next = profile_request(path, Some("claude-cli/2.1.280"), payload);
+            let response = if path == COUNT_TOKENS_PATH {
+                service.handle_count_tokens_request(next, None).await
+            } else {
+                service.handle_request(next, None).await
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+        let records = timeout(Duration::from_secs(10), capture)
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: Vec<_> = records
+            .iter()
+            .map(|wire| parse_test_clienthello(wire))
+            .collect();
+        for (index, value) in parsed.iter().enumerate() {
+            let native = matches!(index, 2 | 3 | 6 | 7 | 9 | 11);
+            assert_eq!(
+                value["cipher_suites"][0],
+                if native { 4865 } else { 4866 },
+                "request {index}"
+            );
+            assert_eq!(
+                value["ja3"]["md5"] == "1523504b38f0fae0d881d4b6554aac1b",
+                native
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn business_forwarding_preserves_actual_http1_casing_and_telemetry_default() {
         for path in [
             "/v1/messages",
@@ -8724,6 +8936,7 @@ mod tests {
                         b"{}",
                         &RequestBodyEncoding::default(),
                         &account,
+                        TlsProfileId::default(),
                     )
                     .await
                     .unwrap()
@@ -8737,6 +8950,7 @@ mod tests {
                         b"{}",
                         &RequestBodyEncoding::default(),
                         &account,
+                        TlsProfileId::default(),
                         &AccountSelectionContext::disabled(),
                         RequestCapturePolicy::SummaryOnly,
                     )

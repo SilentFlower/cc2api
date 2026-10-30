@@ -4,6 +4,7 @@ use crate::error::AppError;
 use crate::model::account::{Account, CanonicalEnvData};
 use crate::model::identity::device_profile;
 use crate::service::access_policy::extract_claude_code_version;
+use crate::tlsfp::TlsProfileId;
 
 /// 默认 Claude Code 版本画像 key。
 pub const DEFAULT_CLAUDE_CODE_VERSION_PROFILE: &str = "2.1.293";
@@ -132,6 +133,8 @@ pub const EVENT_LOGGING_LEGACY_PATH: &str = "/api/event_logging/batch";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeCodeProfile {
     pub key: &'static str,
+    /// 仅绑定已经采样验证的 TLS；空值沿系统默认画像兼容。
+    pub tls_profile: Option<TlsProfileId>,
     pub identity: IdentityProfile,
     pub access_policy: AccessPolicyProfile,
     pub request: RequestProfile,
@@ -181,6 +184,15 @@ impl Default for ClaudeCodeProfileSelectionConfig {
 }
 
 impl ClaudeCodeProfileSelectionConfig {
+    /// 解析当前默认画像的 TLS；未采样的默认版本沿内置默认兼容。
+    /// @return 本次选择快照对应的默认 TLS 标识。
+    pub fn default_tls_profile(self) -> TlsProfileId {
+        self.default_profile
+            .tls_profile
+            .or_else(|| default_profile().tls_profile)
+            .expect("内置默认版本必须绑定已验证 TLS")
+    }
+
     /// 仅依据原始 UA 冻结本请求的画像选择。
     ///
     /// @param user_agent 原始请求 User-Agent。
@@ -198,6 +210,31 @@ impl ClaudeCodeProfileSelectionConfig {
         };
         Some(matched.unwrap_or(self.default_profile))
     }
+}
+
+/// 按最终版本解析 TLS 绑定，未知或未绑定版本沿调用方冻结的默认值。
+/// @param version 软件版本。@param fallback 请求快照中的默认 TLS。@return 已注册的标识。
+pub fn tls_profile_for_version(version: &str, fallback: TlsProfileId) -> TlsProfileId {
+    // HTTP 的空版本归一化会补内置版本；TLS 缺版本必须沿本次配置默认，不能提前吞掉兜底。
+    if version.is_empty() {
+        return fallback;
+    }
+    exact_profile_for_version(version)
+        .and_then(|profile| profile.tls_profile)
+        .unwrap_or(fallback)
+}
+
+/// 从请求账号副本读取软件版本，不修改持久身份。
+/// @param account 请求级账号。@param fallback 冻结或当前配置的默认值。@return TLS 标识。
+pub fn tls_profile_for_account(account: &Account, fallback: TlsProfileId) -> TlsProfileId {
+    tls_profile_for_version(
+        account
+            .canonical_env
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        fallback,
+    )
 }
 
 /// 创建改写专用的账号副本，持久设备身份与账号容量均沿用原账号。
@@ -842,6 +879,7 @@ const BOOTSTRAP_MODELS_2_1_293: [BootstrapModelProfile; 4] = [
 
 const PROFILE_2_1_293: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.293",
+    tls_profile: Some(TlsProfileId::ClaudeCode293),
     identity: IdentityProfile {
         version: "2.1.293",
         version_base: "2.1.293",
@@ -893,6 +931,7 @@ const PROFILE_2_1_293: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_280: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.280",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.280",
         version_base: "2.1.280",
@@ -944,6 +983,7 @@ const PROFILE_2_1_280: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.260",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.260",
         version_base: "2.1.260",
@@ -997,6 +1037,7 @@ const PROFILE_2_1_260: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.257",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.257",
         version_base: "2.1.257",
@@ -1050,6 +1091,7 @@ const PROFILE_2_1_257: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.220",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.220",
         version_base: "2.1.220",
@@ -1101,6 +1143,7 @@ const PROFILE_2_1_220: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.185",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.185",
         version_base: "2.1.185",
@@ -1133,6 +1176,7 @@ const PROFILE_2_1_185: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_195: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.195",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.195",
         version_base: "2.1.195",
@@ -1165,6 +1209,7 @@ const PROFILE_2_1_195: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_187: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.187",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.187",
         version_base: "2.1.187",
@@ -1197,6 +1242,7 @@ const PROFILE_2_1_187: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.173",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.173",
         version_base: "2.1.173",
@@ -1229,6 +1275,7 @@ const PROFILE_2_1_173: ClaudeCodeProfile = ClaudeCodeProfile {
 
 const PROFILE_2_1_197: ClaudeCodeProfile = ClaudeCodeProfile {
     key: "2.1.197",
+    tls_profile: None,
     identity: IdentityProfile {
         version: "2.1.197",
         version_base: "2.1.197",
@@ -1395,6 +1442,59 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn tls_bindings_use_configured_default_without_inventing_native_versions() {
+        let synthetic_default = ClaudeCodeProfile {
+            tls_profile: Some(TlsProfileId::TestReordered),
+            ..*profile_for_key("2.1.280").unwrap()
+        };
+        let selection = ClaudeCodeProfileSelectionConfig {
+            mode: ClaudeCodeProfileSelectionMode::ClientVersion,
+            default_profile: Box::leak(Box::new(synthetic_default)),
+        };
+        let fallback = selection.default_tls_profile();
+        assert_eq!(fallback, TlsProfileId::TestReordered);
+        assert_eq!(
+            tls_profile_for_version("2.1.293", fallback),
+            TlsProfileId::ClaudeCode293
+        );
+        for version in ["2.1.280", "2.1.260", "2.1.999", "", "2.1.293-beta"] {
+            assert_eq!(
+                tls_profile_for_version(version, fallback),
+                fallback,
+                "{version}"
+            );
+        }
+        // HTTP 默认尚无原生 TLS 绑定时，兼容行为仍取注册表的内置默认。
+        let compatible = ClaudeCodeProfileSelectionConfig {
+            default_profile: profile_for_key("2.1.280").unwrap(),
+            ..selection
+        };
+        assert_eq!(compatible.default_tls_profile(), TlsProfileId::default());
+    }
+
+    #[test]
+    fn tls_default_snapshot_survives_change_and_shared_profiles_reuse_id() {
+        let before = ClaudeCodeProfileSelectionConfig::default().default_tls_profile();
+        let changed = ClaudeCodeProfileSelectionConfig {
+            mode: ClaudeCodeProfileSelectionMode::Account,
+            default_profile: Box::leak(Box::new(ClaudeCodeProfile {
+                tls_profile: Some(TlsProfileId::TestReordered),
+                ..*default_profile()
+            })),
+        }
+        .default_tls_profile();
+        assert_ne!(before, changed);
+        assert_eq!(tls_profile_for_version("2.1.280", before), before);
+        assert_eq!(tls_profile_for_version("2.1.280", changed), changed);
+        assert_eq!(tls_profile_for_version("2.1.260", changed), changed);
+        assert_eq!(
+            serde_json::to_value(TlsProfileId::default()).unwrap(),
+            "claude-code-2.1.293"
+        );
+        assert!(serde_json::from_str::<TlsProfileId>("\"unknown-future-profile\"").is_err());
+    }
+
+    #[test]
     fn request_profile_matches_only_exact_supported_claude_ua_versions() {
         let config = ClaudeCodeProfileSelectionConfig::default();
         for (ua, expected) in [
@@ -1456,6 +1556,7 @@ mod tests {
 
     #[test]
     fn profiles_are_complete_and_unique() {
+        assert!(default_profile().tls_profile.is_some());
         let mut keys = HashSet::new();
         let mut versions = HashSet::new();
         for profile in all_profiles() {

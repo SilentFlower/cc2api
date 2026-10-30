@@ -2,9 +2,11 @@ use crate::error::AppError;
 use crate::model::account::CanonicalEnvData;
 use crate::service::version_profile::{
     OAUTH_BETA_TOKEN, claude_cli_user_agent, claude_code_user_agent, normalize_version,
-    profile_for_version,
+    profile_for_version, tls_profile_for_version,
 };
+#[cfg(test)]
 use crate::tlsfp::get_request_client;
+use crate::tlsfp::{TlsProfileId, configured_default_tls_profile, get_request_client_for_profile};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -23,12 +25,20 @@ const OAUTH_SCOPES: &[&str] = &[
 ];
 
 fn oauth_request_client(proxy_url: &str) -> Result<reqwest::Client, AppError> {
+    oauth_request_client_for_profile(proxy_url, configured_default_tls_profile())
+}
+
+/// 版本探针和默认 OAuth 共用同一代理保护。@param proxy_url 代理。@param profile TLS 标识。@return 客户端或错误。
+fn oauth_request_client_for_profile(
+    proxy_url: &str,
+    profile: TlsProfileId,
+) -> Result<reqwest::Client, AppError> {
     validate_oauth_proxy(
         proxy_url,
         &env::var("V3_RUNTIME_URL").unwrap_or_default(),
         &env::var("V3_DEPLOYMENT_ID").unwrap_or_default(),
     )?;
-    get_request_client(proxy_url)
+    get_request_client_for_profile(proxy_url, profile)
         .map_err(|_| AppError::Internal("OAuth request client unavailable".into()))
 }
 
@@ -136,7 +146,13 @@ impl TokenTester {
         proxy_url: &str,
         canonical_env: &Value,
     ) -> Result<(), AppError> {
-        let client = oauth_request_client(proxy_url)?;
+        let env: CanonicalEnvData =
+            serde_json::from_value(canonical_env.clone()).unwrap_or_default();
+        let tls_profile = tls_profile_for_version(
+            normalize_version(&env.version),
+            configured_default_tls_profile(),
+        );
+        let client = oauth_request_client_for_profile(proxy_url, tls_profile)?;
         let request = build_test_token_request(&client, token, canonical_env)?;
 
         let resp = client

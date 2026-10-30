@@ -1,3 +1,5 @@
+use crate::service::version_profile::tls_profile_for_account;
+use crate::tlsfp::configured_default_tls_profile;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -694,6 +696,7 @@ impl PrimePollerService {
         body: &[u8],
     ) -> Result<reqwest::Response, String> {
         let prepared = PreparedRequest {
+            tls_profile: tls_profile_for_account(account, configured_default_tls_profile()),
             account_id: account.id,
             environment_id: String::new(),
             generation: 0,

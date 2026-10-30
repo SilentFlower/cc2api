@@ -23,6 +23,8 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use super::profile::TlsProfileId;
+
 // ---------------------------------------------------------------------------
 // X25519MLKEM768 混合密钥交换（真实实现）
 // 按 draft-ietf-tls-ecdhe-mlkem：
@@ -133,8 +135,10 @@ impl ActiveKeyExchange for X25519Mlkem768ActiveKx {
 
 static X25519MLKEM768_KX: X25519Mlkem768KxGroup = X25519Mlkem768KxGroup;
 static REQUEST_CLIENT_POOL_ENABLED: AtomicBool = AtomicBool::new(true);
-static REQUEST_CLIENT_CACHE: Lazy<RwLock<HashMap<String, reqwest::Client>>> =
+static REQUEST_CLIENT_CACHE: Lazy<RwLock<HashMap<(String, TlsProfileId), reqwest::Client>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+static CONFIGURED_DEFAULT_TLS_PROFILE: Lazy<RwLock<TlsProfileId>> =
+    Lazy::new(|| RwLock::new(TlsProfileId::default()));
 
 macro_rules! static_ref {
     ($val:expr, $type:ty) => {{
@@ -215,8 +219,30 @@ pub static CLAUDE_CODE_293_FINGERPRINT: Fingerprint = Fingerprint {
     shuffle_extensions: false,
 };
 
-/// 构建原生 293 主请求 TLS 配置。@return 保持生产信任根与证书校验的配置。
-fn build_tls_config() -> ClientConfig {
+#[cfg(test)]
+#[dynamic]
+static TEST_REORDERED_CIPHERS: Vec<GreaseOrCipher> = {
+    let mut values: Vec<_> = CLAUDE_CODE_293_CIPHERS
+        .iter()
+        .map(|cipher| match cipher {
+            GreaseOrCipher::T(value) => GreaseOrCipher::T(*value),
+            GreaseOrCipher::Grease => GreaseOrCipher::Grease,
+        })
+        .collect();
+    values.swap(0, 1);
+    values
+};
+
+#[cfg(test)]
+#[dynamic]
+static TEST_REORDERED_FINGERPRINT: Fingerprint = Fingerprint {
+    extensions: &CLAUDE_CODE_293_EXTENSIONS,
+    cipher: &TEST_REORDERED_CIPHERS,
+    shuffle_extensions: false,
+};
+
+/// 按已注册画像构建 TLS 配置。@param profile 冻结标识。@return 保持生产信任根与证书校验的配置。
+fn build_tls_config(profile: TlsProfileId) -> ClientConfig {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -231,15 +257,29 @@ fn build_tls_config() -> ClientConfig {
             .expect("隔离验证 CA 无效");
         roots
     };
-    build_tls_config_with_roots(root_store)
+    build_tls_config_with_roots_for_profile(root_store, profile)
 }
 
 /// 使用指定信任根构建同一生产画像。@param root_store 信任根。@return TLS 配置。
+#[cfg(test)]
 fn build_tls_config_with_roots(root_store: RootCertStore) -> ClientConfig {
+    build_tls_config_with_roots_for_profile(root_store, TlsProfileId::default())
+}
+
+/// 按已注册标识构建配置。@param root_store 信任根。@param profile TLS 标识。@return TLS 配置。
+fn build_tls_config_with_roots_for_profile(
+    root_store: RootCertStore,
+    profile: TlsProfileId,
+) -> ClientConfig {
+    let fingerprint = match profile {
+        TlsProfileId::ClaudeCode293 => &*CLAUDE_CODE_293_FINGERPRINT,
+        #[cfg(test)]
+        TlsProfileId::TestReordered => &*TEST_REORDERED_FINGERPRINT,
+    };
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()
-        .with_fingerprint(CLAUDE_CODE_293_FINGERPRINT.builder());
+        .with_fingerprint(fingerprint.builder());
 
     // 只保留实际可完成交换的组，避免 HRR 选中只声明却无法执行的占位实现。
     let mut provider = config.provider.as_ref().clone();
@@ -256,6 +296,20 @@ fn build_tls_config_with_roots(root_store: RootCertStore) -> ClientConfig {
     config.provider = Arc::new(provider);
 
     config
+}
+
+/// 读取无显式版本调用的配置默认值。@return 当前默认 TLS 标识。
+pub fn configured_default_tls_profile() -> TlsProfileId {
+    *CONFIGURED_DEFAULT_TLS_PROFILE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 同步系统默认版本的 TLS 绑定。@param profile 已解析的标识。@return 无。
+pub fn set_configured_default_tls_profile(profile: TlsProfileId) {
+    *CONFIGURED_DEFAULT_TLS_PROFILE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = profile;
 }
 
 /// 设置带代理的 reqwest 客户端连接池是否启用。
@@ -282,7 +336,7 @@ pub fn request_client_pool_enabled() -> bool {
 
 /// 获取带 TLS 指纹伪装的缓存 reqwest 客户端。
 ///
-/// 相同代理地址返回同一个内部连接池的 clone；不同代理地址使用独立客户端，避免代理配置串用。
+/// 使用当前配置默认画像；相同代理及画像复用连接池，不同代理或画像使用独立客户端。
 ///
 /// # 参数
 /// - `proxy_url`: 代理地址。空字符串表示直连，非空时沿用 reqwest 支持的 HTTP/SOCKS 代理格式。
@@ -290,11 +344,20 @@ pub fn request_client_pool_enabled() -> bool {
 /// # 返回
 /// 成功时返回可直接发起请求的 `reqwest::Client` clone；代理配置或客户端构建失败时返回错误。
 pub fn get_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::Error> {
+    get_request_client_for_profile(proxy_url, configured_default_tls_profile())
+}
+
+/// 获取代理与 TLS 画像共同隔离的客户端；每个客户端持有独立连接和恢复存储。
+/// @param proxy_url 账号代理。@param profile 已冻结的 TLS 标识。@return 客户端或构建错误。
+pub fn get_request_client_for_profile(
+    proxy_url: &str,
+    profile: TlsProfileId,
+) -> Result<reqwest::Client, reqwest::Error> {
     if !request_client_pool_enabled() {
-        return make_request_client(proxy_url);
+        return make_request_client_for_profile(proxy_url, profile);
     }
 
-    let cache_key = proxy_url.to_string();
+    let cache_key = (proxy_url.to_string(), profile);
     {
         let cache = REQUEST_CLIENT_CACHE
             .read()
@@ -304,7 +367,7 @@ pub fn get_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::E
         }
     }
 
-    let client = make_request_client(proxy_url)?;
+    let client = make_request_client_for_profile(proxy_url, profile)?;
     let mut cache = REQUEST_CLIENT_CACHE
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -325,7 +388,15 @@ pub fn get_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::E
 /// # 返回
 /// 成功时返回新建的 `reqwest::Client`；代理配置或客户端构建失败时返回错误。
 pub fn make_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::Error> {
-    let tls_config = build_tls_config();
+    make_request_client_for_profile(proxy_url, configured_default_tls_profile())
+}
+
+/// 新建指定画像的客户端。@param proxy_url 代理。@param profile TLS 标识。@return 客户端或错误。
+fn make_request_client_for_profile(
+    proxy_url: &str,
+    profile: TlsProfileId,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let tls_config = build_tls_config(profile);
 
     // 不设整体 timeout，也不用 read_timeout（reqwest 0.12.4 不支持该 API）：
     // 整体超时会误杀健康长流（Opus 扩展思考可持续数十分钟）；
@@ -373,6 +444,30 @@ pub(crate) fn test_request_client(
         .build()
 }
 
+/// 用独立夹具解析实际单记录 ClientHello。@param wire TLS 字节。@return 公开字段。
+#[cfg(test)]
+pub(crate) fn parse_test_clienthello(wire: &[u8]) -> serde_json::Value {
+    use serde_json::from_slice;
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    assert_eq!(wire[0], 22);
+    assert_eq!(wire[5], 1);
+    assert_eq!(
+        wire.len(),
+        5 + usize::from(u16::from_be_bytes([wire[3], wire[4]]))
+    );
+    let mut child = Command::new("python3")
+        .arg("-B").arg("-c")
+        .arg("import json,sys; sys.path.insert(0,sys.argv[1]); from tls_clienthello import parse_body; print(json.dumps(parse_body(sys.stdin.buffer.read()[9:])))")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"))
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(wire).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success());
+    from_slice(&result.stdout).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,10 +481,11 @@ mod tests {
     use std::env::temp_dir;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{Ipv4Addr, TcpStream};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::Mutex;
+    use std::thread;
     use uuid::Uuid;
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
@@ -475,6 +571,73 @@ mod tests {
 
         assert!(get_request_client("://invalid-proxy").is_err());
         assert_eq!(request_client_cache_len_for_test(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_proxy_different_tls_profiles_emit_distinct_actual_clienthellos() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _state_guard = RequestClientPoolStateGuard::new();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let capture = thread::spawn(move || {
+            let mut records = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut connect = Vec::new();
+                while !connect.ends_with(b"\r\n\r\n") {
+                    assert!(connect.len() < 8192);
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    connect.extend_from_slice(&byte);
+                }
+                assert!(connect.starts_with(b"CONNECT api.anthropic.com:443 "));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .unwrap();
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).unwrap();
+                let size = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                assert!(size <= 16384);
+                let mut record = header.to_vec();
+                record.resize(5 + size, 0);
+                stream.read_exact(&mut record[5..]).unwrap();
+                records.push(record);
+            }
+            records
+        });
+        for profile in [TlsProfileId::ClaudeCode293, TlsProfileId::TestReordered] {
+            let client = get_request_client_for_profile(&proxy, profile).unwrap();
+            // 观察器在首个握手后关闭，不提供 TLS 服务端或业务响应。
+            assert!(
+                client
+                    .get("https://api.anthropic.com/")
+                    .send()
+                    .await
+                    .is_err()
+            );
+            assert!(get_request_client_for_profile(&proxy, profile).is_ok());
+        }
+        let records = capture.join().unwrap();
+        let native = parse_test_clienthello(&records[0]);
+        let reordered = parse_test_clienthello(&records[1]);
+        let fixture: Value = from_str(include_str!(
+            "../../tests/fixtures/claude_code_293_tls.json"
+        ))
+        .unwrap();
+        assert_eq!(native["ja3"], fixture["fingerprint"]["ja3"]);
+        let mut expected = fixture["fingerprint"]["cipher_suites"]
+            .as_array()
+            .unwrap()
+            .clone();
+        expected.swap(0, 1);
+        assert_eq!(reordered["cipher_suites"], json!(expected));
+        assert_ne!(native["ja3"], reordered["ja3"]);
+        let cache = REQUEST_CLIENT_CACHE.read().unwrap();
+        assert!(cache.contains_key(&(proxy.clone(), TlsProfileId::ClaudeCode293)));
+        assert!(cache.contains_key(&(proxy, TlsProfileId::TestReordered)));
     }
 
     #[test]
@@ -783,5 +946,37 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn distinct_tls_configs_keep_resumption_tickets_separate() {
+        let fixture = FingerprintServer::start("tls13");
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(
+                fs::read(fixture.root.join("ca.der")).unwrap(),
+            ))
+            .unwrap();
+        let native = Arc::new(build_tls_config_with_roots_for_profile(
+            roots.clone(),
+            TlsProfileId::ClaudeCode293,
+        ));
+        let other = Arc::new(build_tls_config_with_roots_for_profile(
+            roots,
+            TlsProfileId::TestReordered,
+        ));
+        for (index, config) in [native.clone(), native.clone(), other.clone(), other, native]
+            .into_iter()
+            .enumerate()
+        {
+            let mut stream = fixture.connect(config);
+            fixture.request(&mut stream, &format!("/profile-{index}"));
+        }
+        let requests = fixture.records("requests.jsonl");
+        assert_eq!(requests.len(), 5);
+        let resumed: Vec<_> = requests
+            .iter()
+            .map(|value| value["session_reused"].as_bool().unwrap())
+            .collect();
+        assert_eq!(resumed, [false, true, false, true, true]);
     }
 }
