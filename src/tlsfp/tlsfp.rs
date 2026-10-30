@@ -1,13 +1,15 @@
 use once_cell::sync::Lazy;
 use rustls::craft::{
     CraftExtension, ExtensionSpec, Fingerprint, GreaseOrCipher, GreaseOrCurve, GreaseOrVersion,
-    KeepExtension,
+    KeepExtension, OCSP_REQ,
 };
 use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
-use rustls::internal::msgs::handshake::ClientExtension;
-use rustls::{CipherSuite, Error, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme};
+use rustls::internal::msgs::handshake::{ClientExtension, ClientSessionTicket};
+use rustls::{
+    CipherSuite, ClientConfig, Error, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme,
+};
 #[cfg(any(test, feature = "v3-verification"))]
 use rustls_pki_types::CertificateDer;
 use static_init::dynamic;
@@ -105,6 +107,12 @@ impl ActiveKeyExchange for X25519Mlkem768ActiveKx {
             .map_err(|_| Error::General("X25519: invalid peer key".into()))?;
         let x25519_peer_pub = x25519_dalek::PublicKey::from(x25519_peer_key);
         let x25519_ss = self.x25519_secret.diffie_hellman(&x25519_peer_pub);
+        // 混合 KEM 不能掩盖低阶 X25519 输入；全零秘密必须按协议拒绝。
+        if !x25519_ss.was_contributory() {
+            return Err(Error::General(
+                "X25519MLKEM768: invalid X25519 peer key".into(),
+            ));
+        }
 
         // shared_secret = mlkem_ss (32) || x25519_ss (32)
         let mut shared = Vec::with_capacity(64);
@@ -123,24 +131,7 @@ impl ActiveKeyExchange for X25519Mlkem768ActiveKx {
     }
 }
 
-// X448 fake group（ring 不支持，只声明不使用）
-#[derive(Debug)]
-struct FakeKxGroup(NamedGroup);
-
-impl SupportedKxGroup for FakeKxGroup {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        Err(Error::General(format!(
-            "key exchange not supported for {:?}",
-            self.0
-        )))
-    }
-    fn name(&self) -> NamedGroup {
-        self.0
-    }
-}
-
 static X25519MLKEM768_KX: X25519Mlkem768KxGroup = X25519Mlkem768KxGroup;
-static FAKE_X448: FakeKxGroup = FakeKxGroup(NamedGroup::Unknown(0x001E));
 static REQUEST_CLIENT_POOL_ENABLED: AtomicBool = AtomicBool::new(true);
 static REQUEST_CLIENT_CACHE: Lazy<RwLock<HashMap<String, reqwest::Client>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -152,169 +143,80 @@ macro_rules! static_ref {
     }};
 }
 
-// ---------------------------------------------------------------------------
-// Node.js 密码套件（52 个，与 tls.peet.ws 实测对齐）
-// ---------------------------------------------------------------------------
+/// 原版 Claude Code 2.1.293 主请求的有序 cipher offer，依据正式握手与无 MITM 对照。
 #[dynamic]
-pub static NODEJS_CIPHER: Vec<GreaseOrCipher> = vec![
-    GreaseOrCipher::T(CipherSuite::TLS13_AES_256_GCM_SHA384),
-    GreaseOrCipher::T(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
-    GreaseOrCipher::T(CipherSuite::TLS13_AES_128_GCM_SHA256),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC02F)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC02B)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC030)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC02C)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x009E)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC027)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0067)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC028)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x006B)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x00A3)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x009F)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xCCA9)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xCCA8)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xCCAA)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC0AD)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC09F)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC05D)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC061)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC057)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC053)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x00A2)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC0AC)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC09E)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC05C)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC060)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC056)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC052)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC024)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x006A)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC023)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0040)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC00A)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC014)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0039)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0038)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC009)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC013)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0033)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0032)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x009D)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC09D)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC051)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x009C)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC09C)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0xC050)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x003D)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x003C)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x0035)),
-    GreaseOrCipher::T(CipherSuite::Unknown(0x002F)),
-];
+pub static CLAUDE_CODE_293_CIPHERS: Vec<GreaseOrCipher> = vec![
+    4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49161, 49171, 49162, 49172, 156,
+    157, 47, 53,
+]
+.into_iter()
+.map(|value| GreaseOrCipher::T(CipherSuite::from(value)))
+.collect();
 
-// ---------------------------------------------------------------------------
-// Node.js 扩展列表（12 个，精确顺序匹配 tls.peet.ws 实测）
-// ---------------------------------------------------------------------------
+/// 原版 293 主请求的扩展顺序；恢复材料只接受 rustls 本次真实生成的值。
 #[dynamic]
-pub static NODEJS_EXTENSION: Vec<ExtensionSpec> = {
+pub static CLAUDE_CODE_293_EXTENSIONS: Vec<ExtensionSpec> = {
     use ExtensionSpec::*;
     use KeepExtension::*;
     vec![
-        // 1. renegotiation_info (65281)
-        Craft(CraftExtension::RenegotiationInfo),
-        // 2. server_name (0)
         Keep(Must(ExtensionType::ServerName)),
-        // 3. ec_point_formats (11)
-        Rustls(ClientExtension::EcPointFormats(vec![
-            ECPointFormat::Uncompressed,
-            ECPointFormat::ANSIX962CompressedPrime,
-            ECPointFormat::ANSIX962CompressedChar2,
-        ])),
-        // 4. supported_groups (10)
+        Rustls(ClientExtension::ExtendedMasterSecretRequest),
+        Craft(CraftExtension::RenegotiationInfo),
         Rustls(ClientExtension::NamedGroups(vec![
-            NamedGroup::Unknown(0x11EC), // X25519MLKEM768
+            X25519MLKEM768_GROUP,
             NamedGroup::X25519,
             NamedGroup::secp256r1,
-            NamedGroup::Unknown(0x001E), // X448
             NamedGroup::secp384r1,
-            NamedGroup::secp521r1,
-            NamedGroup::FFDHE2048,
-            NamedGroup::FFDHE3072,
         ])),
-        // 5. session_ticket (35)
+        Rustls(ClientExtension::EcPointFormats(vec![
+            ECPointFormat::Uncompressed,
+        ])),
         Keep(OrDefault(
             ExtensionType::SessionTicket,
-            ClientExtension::SessionTicket(
-                rustls::internal::msgs::handshake::ClientSessionTicket::Offer(Payload(vec![])),
-            ),
+            ClientExtension::SessionTicket(ClientSessionTicket::Offer(Payload(vec![]))),
         )),
-        // 6. ALPN (16)
         Craft(CraftExtension::Protocols(&[b"http/1.1"])),
-        // 7. encrypt_then_mac (22)
-        Rustls(ClientExtension::Unknown(
-            rustls::internal::msgs::handshake::UnknownExtension {
-                typ: ExtensionType::Unknown(22),
-                payload: Payload(vec![]),
-            },
+        Rustls(ClientExtension::CertificateStatusRequest(OCSP_REQ.clone())),
+        Rustls(ClientExtension::SignatureAlgorithms(
+            vec![1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 513]
+                .into_iter()
+                .map(SignatureScheme::from)
+                .collect(),
         )),
-        // 8. extended_master_secret (23)
-        Rustls(ClientExtension::ExtendedMasterSecretRequest),
-        // 9. signature_algorithms (13)
-        Rustls(ClientExtension::SignatureAlgorithms(vec![
-            SignatureScheme::Unknown(0x0905),
-            SignatureScheme::Unknown(0x0906),
-            SignatureScheme::Unknown(0x0904),
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::Unknown(0x0603),
-            SignatureScheme::Unknown(0x0807),
-            SignatureScheme::Unknown(0x0808),
-            SignatureScheme::Unknown(0x081a),
-            SignatureScheme::Unknown(0x081b),
-            SignatureScheme::Unknown(0x081c),
-            SignatureScheme::Unknown(0x0809),
-            SignatureScheme::Unknown(0x080a),
-            SignatureScheme::Unknown(0x080b),
-            SignatureScheme::Unknown(0x0804),
-            SignatureScheme::Unknown(0x0805),
-            SignatureScheme::Unknown(0x0806),
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::Unknown(0x0303),
-            SignatureScheme::Unknown(0x0301),
-            SignatureScheme::Unknown(0x0302),
-            SignatureScheme::Unknown(0x0402),
-            SignatureScheme::Unknown(0x0502),
-            SignatureScheme::Unknown(0x0602),
-        ])),
-        // 10. supported_versions (43)
-        Craft(CraftExtension::SupportedVersions(static_ref!(
+        Craft(CraftExtension::SignedCertificateTimestamp),
+        Craft(CraftExtension::KeyShare(static_ref!(
             &[
-                GreaseOrVersion::T(ProtocolVersion::TLSv1_3),
-                GreaseOrVersion::T(ProtocolVersion::TLSv1_2),
+                GreaseOrCurve::T(X25519MLKEM768_GROUP),
+                GreaseOrCurve::T(NamedGroup::X25519)
             ],
-            &[GreaseOrVersion]
+            &[GreaseOrCurve]
         ))),
-        // 11. psk_key_exchange_modes (45)
         Rustls(ClientExtension::PresharedKeyModes(vec![
             PSKKeyExchangeMode::PSK_DHE_KE,
         ])),
-        // 12. key_share (51)
-        Craft(CraftExtension::KeyShare(&[GreaseOrCurve::T(
-            NamedGroup::X25519,
-        )])),
+        Craft(CraftExtension::SupportedVersions(static_ref!(
+            &[
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_3),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_2)
+            ],
+            &[GreaseOrVersion]
+        ))),
+        // Cookie 仅在真实 HRR 时出现；PSK 必须是最后扩展，binder 由 rustls 计算。
+        Keep(Optional(ExtensionType::Cookie)),
+        Keep(Optional(ExtensionType::PreSharedKey)),
     ]
 };
 
+/// 统一出站模板目前以原版 293 主 messages 为基线，辅助接口及其他版本另需实测。
 #[dynamic]
-pub static NODEJS_FINGERPRINT: Fingerprint = Fingerprint {
-    extensions: &NODEJS_EXTENSION,
-    cipher: &NODEJS_CIPHER,
+pub static CLAUDE_CODE_293_FINGERPRINT: Fingerprint = Fingerprint {
+    extensions: &CLAUDE_CODE_293_EXTENSIONS,
+    cipher: &CLAUDE_CODE_293_CIPHERS,
     shuffle_extensions: false,
 };
 
-/// 构建带 Node.js TLS 指纹的 rustls ClientConfig。
-fn build_tls_config() -> rustls::ClientConfig {
+/// 构建原生 293 主请求 TLS 配置。@return 保持生产信任根与证书校验的配置。
+fn build_tls_config() -> ClientConfig {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -332,17 +234,25 @@ fn build_tls_config() -> rustls::ClientConfig {
     build_tls_config_with_roots(root_store)
 }
 
-fn build_tls_config_with_roots(root_store: RootCertStore) -> rustls::ClientConfig {
-    let mut config = rustls::ClientConfig::builder()
+/// 使用指定信任根构建同一生产画像。@param root_store 信任根。@return TLS 配置。
+fn build_tls_config_with_roots(root_store: RootCertStore) -> ClientConfig {
+    let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()
-        .with_fingerprint(NODEJS_FINGERPRINT.builder());
+        .with_fingerprint(CLAUDE_CODE_293_FINGERPRINT.builder());
 
-    // 将 supported_groups 中声明但 ring 不支持的 group 注册为 fake KxGroup，
-    // 确保 HRR 验证时 find_kx_group() 能找到它们。
+    // 只保留实际可完成交换的组，避免 HRR 选中只声明却无法执行的占位实现。
     let mut provider = config.provider.as_ref().clone();
     provider.kx_groups.insert(0, &X25519MLKEM768_KX);
-    provider.kx_groups.push(&FAKE_X448);
+    provider.kx_groups.retain(|group| {
+        matches!(
+            group.name(),
+            X25519MLKEM768_GROUP
+                | NamedGroup::X25519
+                | NamedGroup::secp256r1
+                | NamedGroup::secp384r1
+        )
+    });
     config.provider = Arc::new(provider);
 
     config
@@ -433,7 +343,7 @@ pub fn make_request_client(proxy_url: &str) -> Result<reqwest::Client, reqwest::
     builder.build()
 }
 
-fn request_client_builder(tls_config: rustls::ClientConfig) -> reqwest::ClientBuilder {
+fn request_client_builder(tls_config: ClientConfig) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
         .connect_timeout(Duration::from_secs(30))
@@ -466,7 +376,22 @@ pub(crate) fn test_request_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ml_kem::kem::{Encapsulate, EncapsulationKey};
+    use ml_kem::{EncodedSizeUser, MlKem768Params};
+    use rand::thread_rng;
+    use rustls::client::{ClientSessionMemoryCache, ClientSessionStore, Resumption};
+    use rustls::{ClientConnection, StreamOwned};
+    use rustls_pki_types::ServerName;
+    use serde_json::{Value, from_slice, from_str, json};
+    use std::env::temp_dir;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
     use std::sync::Mutex;
+    use uuid::Uuid;
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -550,5 +475,313 @@ mod tests {
 
         assert!(get_request_client("://invalid-proxy").is_err());
         assert_eq!(request_client_cache_len_for_test(), 0);
+    }
+
+    #[test]
+    fn clienthello_wire_matches_native_293_even_after_cached_group_hint() {
+        let cache = Arc::new(ClientSessionMemoryCache::new(256));
+        let mut config = build_tls_config_with_roots(RootCertStore::empty());
+        config.resumption = Resumption::store(cache.clone());
+        let config = Arc::new(config);
+        for group in [
+            X25519MLKEM768_GROUP,
+            NamedGroup::X25519,
+            NamedGroup::secp256r1,
+        ] {
+            let hostname = ServerName::try_from("api.anthropic.com")
+                .unwrap()
+                .to_owned();
+            cache.set_kx_hint(hostname.clone(), group);
+            assert_eq!(cache.kx_hint(&hostname), Some(group));
+            let mut connection = ClientConnection::new(config.clone(), hostname).unwrap();
+            let mut wire = Vec::new();
+            connection.write_tls(&mut wire).unwrap();
+            let mut child = Command::new("python3")
+                .arg("-B")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls_clienthello.py"),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&wire).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let value: Value = from_slice(&result.stdout).unwrap();
+            assert_eq!(value["ja3"]["md5"], "1523504b38f0fae0d881d4b6554aac1b");
+            assert_eq!(value["fields"]["sni"], "api.anthropic.com");
+        }
+    }
+
+    #[test]
+    fn explicit_keyshare_override_disabled_preserves_cached_group_hint() {
+        let mut config = build_tls_config_with_roots(RootCertStore::empty()).with_fingerprint(
+            CLAUDE_CODE_293_FINGERPRINT
+                .builder()
+                .dangerous_disable_override_keyshare(),
+        );
+        // 只关闭测试配置中的 share 覆盖，验证未启用的新分支仍沿原缓存提示机制。
+        let cache = Arc::new(ClientSessionMemoryCache::new(256));
+        cache.set_kx_hint(
+            ServerName::try_from("api.anthropic.com")
+                .unwrap()
+                .to_owned(),
+            NamedGroup::secp256r1,
+        );
+        assert_eq!(
+            cache.kx_hint(&ServerName::try_from("api.anthropic.com").unwrap()),
+            Some(NamedGroup::secp256r1)
+        );
+        config.resumption = Resumption::store(cache);
+        assert!(
+            config
+                .provider
+                .kx_groups
+                .iter()
+                .any(|group| group.name() == NamedGroup::secp256r1)
+        );
+        let mut connection = ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("api.anthropic.com")
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let mut wire = Vec::new();
+        connection.write_tls(&mut wire).unwrap();
+        // 独立解析结果由 Python 返回，避免从模板常量直接推断实际发送组。
+        let program = "import json,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); from tls_clienthello import parse_body; data=sys.stdin.buffer.read(); print(json.dumps(parse_body(data[9:])['key_share']))";
+        let mut child = Command::new("python3")
+            .arg("-B")
+            .arg("-c")
+            .arg(program)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&wire).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success());
+        let shares: Value = from_slice(&result.stdout).unwrap();
+        assert_eq!(shares, json!([{"group":23,"key_exchange_length":65}]));
+    }
+
+    #[test]
+    fn hybrid_exchange_matches_independent_server_and_rejects_invalid_peers() {
+        let client = X25519MLKEM768_KX.start().unwrap();
+        assert_eq!(client.pub_key().len(), 1216);
+        let encoded = client.pub_key()[..1184].try_into().unwrap();
+        let peer_key = EncapsulationKey::<MlKem768Params>::from_bytes(&encoded);
+        let mut rng = thread_rng();
+        let (ciphertext, kem_secret) = peer_key.encapsulate(&mut rng).unwrap();
+        let server_secret = X25519Secret::random_from_rng(&mut rng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let client_public =
+            X25519PublicKey::from(<[u8; 32]>::try_from(&client.pub_key()[1184..]).unwrap());
+        let dh_secret = server_secret.diffie_hellman(&client_public);
+        let mut peer = ciphertext.to_vec();
+        peer.extend_from_slice(server_public.as_bytes());
+        assert_eq!(peer.len(), 1120);
+        let actual = client.complete(&peer).unwrap();
+        let mut expected = kem_secret.to_vec();
+        expected.extend_from_slice(dh_secret.as_bytes());
+        assert_eq!(actual.secret_bytes(), expected);
+        for size in [0, 1119, 1121] {
+            assert!(
+                X25519MLKEM768_KX
+                    .start()
+                    .unwrap()
+                    .complete(&vec![0; size])
+                    .is_err()
+            );
+        }
+        let client = X25519MLKEM768_KX.start().unwrap();
+        let encoded = client.pub_key()[..1184].try_into().unwrap();
+        let (ciphertext, _) = EncapsulationKey::<MlKem768Params>::from_bytes(&encoded)
+            .encapsulate(&mut rng)
+            .unwrap();
+        let mut invalid = ciphertext.to_vec();
+        invalid.extend_from_slice(&[0; 32]);
+        assert!(client.complete(&invalid).is_err());
+    }
+
+    /// 临时本地HTTPS服务器，退出时定向收口子进程与合成资料。
+    struct FingerprintServer {
+        root: PathBuf,
+        child: Child,
+        address: SocketAddr,
+    }
+
+    impl FingerprintServer {
+        /// 创建指定TLS验证模式。@param mode TLS1.2、TLS1.3或HRR。@return 就绪服务器。
+        fn start(mode: &str) -> Self {
+            let root = temp_dir().join(format!("cc2api-tls-fingerprint-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let child = Command::new("python3")
+                .arg("-B")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/tls_fingerprint_server.py"),
+                )
+                .arg(&root)
+                .arg(mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut fixture = Self {
+                root,
+                child,
+                address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            };
+            let mut line = String::new();
+            BufReader::new(fixture.child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let value: Value = from_str(&line).unwrap();
+            fixture
+                .address
+                .set_port(value["port"].as_u64().unwrap().try_into().unwrap());
+            fixture
+        }
+
+        /// 建立实际生产TLS配置的回环连接。@param config 同一会话配置。@return 可读写TLS流。
+        fn connect(&self, config: Arc<ClientConfig>) -> StreamOwned<ClientConnection, TcpStream> {
+            let socket = TcpStream::connect_timeout(&self.address, Duration::from_secs(5)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            StreamOwned::new(
+                ClientConnection::new(
+                    config,
+                    ServerName::try_from("api.anthropic.com")
+                        .unwrap()
+                        .to_owned(),
+                )
+                .unwrap(),
+                socket,
+            )
+        }
+
+        /// 发送并读取一条完整合成响应。@param stream TLS流。@param path 测试路径。@return None。
+        fn request(&self, stream: &mut StreamOwned<ClientConnection, TcpStream>, path: &str) {
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: keep-alive\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(body, b"{\"synthetic\":true}");
+        }
+
+        /// 读取仅含公开字段的夹具结果。@param name 文件。@return JSON行。
+        fn records(&self, name: &str) -> Vec<Value> {
+            fs::read_to_string(self.root.join(name))
+                .unwrap()
+                .lines()
+                .map(|line| from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    impl Drop for FingerprintServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn local_https_native_fingerprint_tls12_tls13_resumption_and_hrr() {
+        let expected: Value = from_str(include_str!(
+            "../../tests/fixtures/claude_code_293_tls.json"
+        ))
+        .unwrap();
+        for mode in ["tls12", "tls13", "hrr"] {
+            let fixture = FingerprintServer::start(mode);
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(
+                    fs::read(fixture.root.join("ca.der")).unwrap(),
+                ))
+                .unwrap();
+            let config = Arc::new(build_tls_config_with_roots(roots));
+            let mut connection = fixture.connect(config.clone());
+            fixture.request(&mut connection, "/first");
+            fixture.request(&mut connection, "/keepalive");
+            drop(connection);
+            let mut connection = fixture.connect(config);
+            fixture.request(&mut connection, "/second-connection");
+            drop(connection);
+            let requests = fixture.records("requests.jsonl");
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests[0]["tls"],
+                if mode == "tls12" {
+                    "TLSv1.2"
+                } else {
+                    "TLSv1.3"
+                }
+            );
+            assert_eq!(requests[0]["session_reused"], false);
+            assert_eq!(requests[1]["session_reused"], false);
+            assert_eq!(requests[2]["session_reused"], true, "{mode}");
+            assert!(requests.iter().all(|value| value["alpn"] == "http/1.1"));
+            let hellos = fixture.records("hellos.jsonl");
+            assert_eq!(hellos[0]["ja3"], expected["fingerprint"]["ja3"]);
+            assert_eq!(hellos[0]["key_share"], expected["fingerprint"]["key_share"]);
+            if mode == "hrr" {
+                assert_eq!(hellos.len(), 4);
+                for hello in [&hellos[1], &hellos[3]] {
+                    assert_eq!(
+                        hello["key_share"],
+                        json!([{"group":23,"key_exchange_length":65}])
+                    );
+                }
+            } else {
+                assert_eq!(hellos.len(), 2);
+                assert_eq!(hellos[1]["key_share"], expected["fingerprint"]["key_share"]);
+            }
+            if mode == "tls13" {
+                assert_eq!(hellos[1]["ja3"]["md5"], expected["resumption_ja3_md5"]);
+                assert_eq!(
+                    hellos[1]["extensions"].as_array().unwrap().last().unwrap()["type"],
+                    41
+                );
+            }
+        }
     }
 }

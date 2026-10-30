@@ -29,6 +29,25 @@ use static_init::dynamic;
 pub(crate) struct CraftOptions(Option<FingerprintBuilder>);
 
 impl CraftOptions {
+    /// 取得显式 key_share 模板的首个真实组，避免会话 hint 改变已声明的顺序。
+    /// @return 未覆盖或没有真实组时为 None，继续使用原有协商提示。
+    pub(crate) fn initial_key_share_group(&self) -> Option<NamedGroup> {
+        let builder = self.0.as_ref()?;
+        if !builder.override_keyshare {
+            return None;
+        }
+        builder.fingerprint.extensions.iter().find_map(|extension| {
+            if let ExtensionSpec::Craft(CraftExtension::KeyShare(groups)) = extension {
+                groups.iter().find_map(|group| match group {
+                    GreaseOr::T(value) => Some(*value),
+                    GreaseOr::Grease => None,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
     fn get(&self) -> &FingerprintBuilder {
         assert!(self.0.is_some(), "The tls client config doesn't contain a fingerprint, please consider calling ClientConfig::with_fingerprint(...)");
         self.0.as_ref().unwrap()

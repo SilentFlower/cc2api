@@ -1,0 +1,137 @@
+{
+  "version": "2.1.293",
+  "evidence": "official_cli_direct_to_loopback_and_correlated_messages",
+  "fingerprint": {
+    "legacy_version": 771,
+    "cipher_suites": [
+      4865,
+      4866,
+      4867,
+      49195,
+      49199,
+      49196,
+      49200,
+      52393,
+      52392,
+      49161,
+      49171,
+      49162,
+      49172,
+      156,
+      157,
+      47,
+      53
+    ],
+    "signature_algorithms": [
+      1027,
+      2052,
+      1025,
+      1283,
+      2053,
+      1281,
+      2054,
+      1537,
+      513
+    ],
+    "supported_groups": [
+      4588,
+      29,
+      23,
+      24
+    ],
+    "supported_versions": [
+      772,
+      771
+    ],
+    "ec_point_formats": [
+      0
+    ],
+    "key_share": [
+      {
+        "group": 4588,
+        "key_exchange_length": 1216
+      },
+      {
+        "group": 29,
+        "key_exchange_length": 32
+      }
+    ],
+    "alpn_protocols": [
+      {
+        "text": "http/1.1",
+        "base64": "aHR0cC8xLjE="
+      }
+    ],
+    "ja3": {
+      "string": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,4588-29-23-24,0",
+      "md5": "1523504b38f0fae0d881d4b6554aac1b"
+    },
+    "session_id_length": 32,
+    "compression_methods": [
+      0
+    ]
+  },
+  "extensions": [
+    {
+      "type": 0,
+      "length": 22
+    },
+    {
+      "type": 23,
+      "length": 0,
+      "public_payload_hex": ""
+    },
+    {
+      "type": 65281,
+      "length": 1,
+      "public_payload_hex": "00"
+    },
+    {
+      "type": 10,
+      "length": 10
+    },
+    {
+      "type": 11,
+      "length": 2,
+      "public_payload_hex": "0100"
+    },
+    {
+      "type": 35,
+      "length": 0
+    },
+    {
+      "type": 16,
+      "length": 11
+    },
+    {
+      "type": 5,
+      "length": 5,
+      "public_payload_hex": "0100000000"
+    },
+    {
+      "type": 13,
+      "length": 20,
+      "public_payload_hex": "0012040308040401050308050501080606010201"
+    },
+    {
+      "type": 18,
+      "length": 0,
+      "public_payload_hex": ""
+    },
+    {
+      "type": 51,
+      "length": 1258
+    },
+    {
+      "type": 45,
+      "length": 2,
+      "public_payload_hex": "0101"
+    },
+    {
+      "type": 43,
+      "length": 5,
+      "public_payload_hex": "0403040303"
+    }
+  ],
+  "resumption_ja3_md5": "ae5f2d34331c18f27df379f7d4b72e35"
+}

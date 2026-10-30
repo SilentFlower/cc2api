@@ -218,10 +218,11 @@ pub(super) fn initial_key_share(
     config: &ClientConfig,
     server_name: &ServerName<'_>,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    // 显式画像的初始 offer 不随上次协商组变化；HRR 仍由重试路径选择服务端要求的组。
     let group = config
-        .resumption
-        .store
-        .kx_hint(server_name)
+        .craft
+        .initial_key_share_group()
+        .or_else(|| config.resumption.store.kx_hint(server_name))
         .and_then(|group_name| config.find_kx_group(group_name))
         .unwrap_or_else(|| {
             config
