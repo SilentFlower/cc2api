@@ -28,6 +28,9 @@ struct UsageParser {
     speed: String,
     buffer: Vec<u8>,
     is_sse: Option<bool>,
+    // JSON 限额包含按行丢弃的初始空白，不能只统计实际保留的缓冲区。
+    json_bytes_seen: usize,
+    invalid_json_prefix: bool,
     prefix: Vec<u8>,
     bom_checked: bool,
     event_data: Vec<u8>,
@@ -210,6 +213,8 @@ impl UsageParser {
             speed: request["speed"].as_str().unwrap_or("").to_owned(),
             buffer: Vec::new(),
             is_sse: None,
+            json_bytes_seen: 0,
+            invalid_json_prefix: false,
             prefix: Vec::with_capacity(3),
             bom_checked: false,
             event_data: Vec::new(),
@@ -247,25 +252,39 @@ impl UsageParser {
         self.observe_content(bytes);
     }
 
-    fn observe_content(&mut self, bytes: &[u8]) {
+    fn observe_content(&mut self, mut bytes: &[u8]) {
         if self.is_sse.is_none() {
-            self.is_sse = bytes
+            let start = bytes
                 .iter()
-                .find(|byte| !byte.is_ascii_whitespace())
-                .map(|byte| *byte != b'{');
-            if self.is_sse == Some(true) {
-                let prefix = take(&mut self.buffer);
-                self.observe_sse(&prefix);
+                .position(|byte| !byte.is_ascii_whitespace())
+                .unwrap_or(bytes.len());
+            let whitespace = &bytes[..start];
+            self.json_bytes_seen = self.json_bytes_seen.saturating_add(whitespace.len());
+            self.invalid_json_prefix |= whitespace
+                .iter()
+                .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+            // 先按行消费初始空白，只保留当前行；JSON 的原始总长度单独计数，不能借此绕过上限。
+            self.observe_sse(whitespace);
+            bytes = &bytes[start..];
+            let Some(first) = bytes.first() else {
+                return;
+            };
+            self.is_sse = Some(*first != b'{');
+            if self.is_sse == Some(false) && self.invalid_json_prefix {
+                self.mark_observation_error("invalid_payload");
+                self.discard_line = true;
+                self.buffer.clear();
             }
         }
         if self.is_sse == Some(true) {
             self.observe_sse(bytes);
-        } else if !self.discard_line {
-            if self.buffer.len().saturating_add(bytes.len()) > USAGE_BUFFER_LIMIT {
+        } else {
+            self.json_bytes_seen = self.json_bytes_seen.saturating_add(bytes.len());
+            if self.json_bytes_seen > USAGE_BUFFER_LIMIT {
                 self.mark_observation_error("sampling_limit");
                 self.discard_line = true;
                 self.buffer.clear();
-            } else {
+            } else if !self.discard_line {
                 extend_bounded(&mut self.buffer, bytes);
             }
         }
@@ -504,6 +523,8 @@ impl UsageParser {
                 || self.discard_line
                 || self.discard_event;
             self.record.partial |= pending_data;
+        } else if self.json_bytes_seen > USAGE_BUFFER_LIMIT {
+            self.mark_observation_error("sampling_limit");
         } else if !self.discard_line {
             match serde_json::from_slice::<Value>(&self.buffer) {
                 Ok(value) => self.observe_value(&value),
@@ -549,6 +570,8 @@ fn extend_bounded(buffer: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::request_body_codec::RequestBodyEncoding;
+    use axum::http::HeaderMap;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use serde_json::json;
@@ -706,6 +729,103 @@ mod tests {
                     assert!(observed.observation_error.is_none());
                 }
             }
+        }
+    }
+
+    /// 初始空行按 SSE 行处理，等价编码和网络分块必须产生相同用量摘要。
+    #[tokio::test]
+    async fn long_initial_blank_lines_preserve_usage_across_codings_and_chunks() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for event_line in [false, true] {
+                let mut source = newline
+                    .repeat((USAGE_BUFFER_LIMIT + 16384) / newline.len())
+                    .into_bytes();
+                let prefix = if event_line {
+                    "event: message_start\n"
+                } else {
+                    ""
+                };
+                let data = format!(
+                    "{prefix}data: {{\"usage\":{{\"input_tokens\":100,\"output_tokens\":2}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                )
+                .replace('\n', newline);
+                source.extend_from_slice(data.as_bytes());
+                for coding in [
+                    "identity", "gzip", "x-gzip", "deflate", "br", "zstd", "gzip, br",
+                ] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert("content-encoding", coding.parse().unwrap());
+                    let encoding = RequestBodyEncoding::from_headers(&headers).unwrap();
+                    let wire = encoding.encode(&source).await.unwrap();
+                    let codings: Vec<_> = coding.split(", ").map(str::to_owned).collect();
+                    for chunk in [1, 4096, wire.len()] {
+                        let mut capture = UsageCapture::observer(&json!({}));
+                        capture.configure_codings(&codings);
+                        for bytes in wire.chunks(chunk) {
+                            capture.observe(bytes);
+                        }
+                        let observed = capture.observation(true);
+                        assert_eq!(
+                            observed.tokens[..2],
+                            [Some(100), Some(2)],
+                            "{newline:?}/{event_line}/{coding}/{chunk}"
+                        );
+                        assert!(!observed.partial, "{coding}/{chunk}");
+                        assert_eq!(observed.observation_error, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 丢弃初始空行后，完整 JSON 仍按原始字节总长限额，非法 JSON 空白也不能被洗掉。
+    #[test]
+    fn initial_whitespace_preserves_json_limit_and_validation() {
+        let json = br#"{"usage":{"input_tokens":100,"output_tokens":2}}"#;
+        for size in [USAGE_BUFFER_LIMIT, USAGE_BUFFER_LIMIT + 1] {
+            let mut source = vec![b'\n'; size - json.len()];
+            source.extend_from_slice(json);
+            for chunk in [1, 4096, source.len()] {
+                let observed = observe_parts(&source, chunk);
+                assert_eq!(observed.partial, size > USAGE_BUFFER_LIMIT);
+                assert_eq!(
+                    observed.tokens[..2],
+                    if size == USAGE_BUFFER_LIMIT {
+                        [Some(100), Some(2)]
+                    } else {
+                        [None, None]
+                    }
+                );
+                if size > USAGE_BUFFER_LIMIT {
+                    assert_eq!(observed.observation_error, Some("sampling_limit"));
+                }
+            }
+        }
+        for (prefix, error) in [
+            (b"\x0b\n".as_slice(), None),
+            (b"\x0c\r\n".as_slice(), Some("invalid_payload")),
+        ] {
+            let source = [prefix, json].concat();
+            let observed = observe_parts(&source, 1);
+            assert_eq!(observed.tokens[..2], [None, None]);
+            assert!(observed.partial);
+            assert_eq!(observed.observation_error, error);
+        }
+        let whitespace = vec![b'\n'; USAGE_BUFFER_LIMIT + 1];
+        assert_eq!(
+            observe_parts(&whitespace, 4096).observation_error,
+            Some("sampling_limit")
+        );
+    }
+
+    /// 初始空行之后的行内缩进仍属于 SSE 字段，不能误把带缩进的 data 当成有效事件。
+    #[test]
+    fn initial_blank_lines_keep_indented_sse_fields_ignored() {
+        let source = b"\r\n \tdata: {\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}\r\n\r\ndata: {\"usage\":{\"input_tokens\":100,\"output_tokens\":2}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
+        for chunk in [1, 7, source.len()] {
+            let observed = observe_parts(source, chunk);
+            assert_eq!(observed.tokens[..2], [Some(100), Some(2)]);
+            assert!(!observed.partial);
         }
     }
 

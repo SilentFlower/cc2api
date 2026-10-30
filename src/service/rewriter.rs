@@ -2907,24 +2907,65 @@ fn find_cch_value(body: &[u8]) -> Option<usize> {
         let value = billing_cch_value_range(&text)?;
         let field_start = value.start.checked_sub(4)?;
         let field = &text.as_bytes()[field_start..value.end];
-        // 解码偏移不能直接加到原始 JSON 下标上；局部解码前缀确认映射，值被转义时保守跳过。
-        let raw_position = raw
-            .windows(field.len())
-            .enumerate()
-            .find_map(|(index, bytes)| {
-                if bytes != field {
-                    return None;
-                }
-                let mut prefix = raw[..index + 4].to_vec();
-                prefix.push(b'"');
-                (parse_json_string_bytes(&prefix).as_deref() == Some(&text[..value.start]))
-                    .then_some(range.start + index + 4)
-            })?;
+        // 单次映射解码偏移，避免每个同名示例都重新解析整个前缀；字段被转义时仍保守跳过。
+        let raw_start = json_string_raw_offset(raw, field_start)?;
+        if raw.get(raw_start..raw_start + field.len())? != field {
+            return None;
+        }
+        let raw_position = range.start + raw_start + 4;
         if target.replace(raw_position).is_some() {
             return None;
         }
     }
     target
+}
+
+/// 将已通过 JSON 校验的字符串解码字节偏移映射回原始字节，不分配前缀副本。
+/// @param raw 包含双引号的原始 JSON 字符串，调用方已完成严格解码校验。
+/// @param offset 目标在解码后 UTF-8 字符串中的字节偏移。
+/// @return 对应的原始字节下标；偏移位于转义字符内部或越界时返回 None。
+fn json_string_raw_offset(raw: &[u8], offset: usize) -> Option<usize> {
+    if raw.first() != Some(&b'"') {
+        return None;
+    }
+    let mut raw_offset = 1;
+    let mut decoded_offset = 0;
+    while decoded_offset < offset {
+        match *raw.get(raw_offset)? {
+            b'"' => return None,
+            b'\\' => match *raw.get(raw_offset + 1)? {
+                b'u' => {
+                    let unit = raw.get(raw_offset + 2..raw_offset + 6)?.iter().try_fold(
+                        0u16,
+                        |value, byte| {
+                            char::from(*byte)
+                                .to_digit(16)
+                                .map(|digit| (value << 4) | digit as u16)
+                        },
+                    )?;
+                    if (0xD800..=0xDBFF).contains(&unit) {
+                        // 严格 JSON 解码已经验证后续低代理项；整个代理对对应一个四字节字符。
+                        raw_offset += 12;
+                        decoded_offset += 4;
+                    } else {
+                        raw_offset += 6;
+                        decoded_offset += char::from_u32(u32::from(unit))?.len_utf8();
+                    }
+                }
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    raw_offset += 2;
+                    decoded_offset += 1;
+                }
+                _ => return None,
+            },
+            _ => {
+                // 未转义 UTF-8 的原始与解码字节相同，可以逐字节计数。
+                raw_offset += 1;
+                decoded_offset += 1;
+            }
+        }
+    }
+    (decoded_offset == offset && raw_offset < raw.len()).then_some(raw_offset)
 }
 
 /// 与 CCH 投影的首字段查找分开，归因定位遇到重复键或无效结构必须停止写入。
@@ -6806,6 +6847,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::{Value, json};
     use std::collections::HashMap;
+    use xxhash_rust::xxh64::xxh64;
 
     // 历史回归固定 280，新增 293 用例显式选择新画像，避免默认升级改变旧用例含义。
     const TEST_VERSION: &str = "2.1.280";
@@ -14327,6 +14369,54 @@ mod tests {
             .into_bytes();
             assert_eq!(compute_cch_attestation(raw.clone(), "2.1.293"), raw);
             assert_eq!(super::refresh_cch_attestation(raw.clone(), "2.1.293"), raw);
+        }
+    }
+
+    /// 原始偏移映射覆盖短转义、不同 UTF-8 宽度和 UTF-16 代理对。
+    #[test]
+    fn cch_raw_offset_preserves_json_escape_boundaries() {
+        for raw in [
+            r#""中文😀 cch=00000;""#,
+            r#""\"\\\/\b\f\n\r\t cch=00000;""#,
+            r#""\u0020\u007F\u0080\u07FF\u0800\u4e2d\u6587 cch=00000;""#,
+            r#""\uD83D\uDE00\uD800\uDC00\uDBFF\uDFFF cch=00000;""#,
+        ] {
+            let decoded: String = serde_json::from_str(raw).unwrap();
+            let offset = decoded.find("cch=00000").unwrap();
+            assert_eq!(
+                super::json_string_raw_offset(raw.as_bytes(), offset),
+                raw.find("cch=00000"),
+                "{raw}"
+            );
+        }
+        let raw = br#""\uD83D\uDE00cch=00000;""#;
+        for offset in 1..4 {
+            assert_eq!(super::json_string_raw_offset(raw, offset), None);
+        }
+    }
+
+    /// 大量字段值中的同名示例不能影响唯一目标，也不能改写其它原始字节。
+    #[test]
+    fn cch_many_decoys_preserve_exact_bytes_and_unicode_offsets() {
+        for count in [4096, 8192] {
+            let text = format!(
+                "x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; note=中文😀\\\"/; {}cch=00000;",
+                "note=cch=00000; ".repeat(count)
+            );
+            let raw = serde_json::to_string(&json!({"system":[{"type":"text","text":text}]}))
+                .unwrap()
+                .replace("中文😀", r"\u4e2d\u6587\uD83D\uDE00")
+                .into_bytes();
+            let position = raw
+                .windows(b"cch=00000".len())
+                .rposition(|bytes| bytes == b"cch=00000")
+                .unwrap()
+                + 4;
+            let mut expected = raw.clone();
+            let hash = xxh64(&raw, 0x4D659218E32A3268);
+            expected[position..position + 5]
+                .copy_from_slice(format!("{:05x}", hash & 0xFFFFF).as_bytes());
+            assert_eq!(compute_cch_attestation(raw, "2.1.293"), expected);
         }
     }
 

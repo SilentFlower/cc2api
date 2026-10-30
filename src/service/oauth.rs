@@ -4,10 +4,9 @@ use crate::service::version_profile::{
     OAUTH_BETA_TOKEN, claude_cli_user_agent, claude_code_user_agent, normalize_version,
     profile_for_version, tls_profile_for_version,
 };
-#[cfg(test)]
-use crate::tlsfp::get_request_client;
 use crate::tlsfp::{TlsProfileId, configured_default_tls_profile, get_request_client_for_profile};
 use chrono::{DateTime, Utc};
+use reqwest::{Client, Request};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::env;
@@ -140,20 +139,22 @@ impl TokenTester {
     }
 
     /// 通过发送最小消息请求验证 Setup Token 有效性。
+    /// @param token 待验证的令牌。
+    /// @param proxy_url 账号上游代理。
+    /// @param canonical_env 账号持久环境，用于 HTTP 画像及 TLS 绑定。
+    /// @return 上游接受令牌时返回 Ok，否则返回请求或验证错误。
     pub async fn test_token(
         &self,
         token: &str,
         proxy_url: &str,
         canonical_env: &Value,
     ) -> Result<(), AppError> {
-        let env: CanonicalEnvData =
-            serde_json::from_value(canonical_env.clone()).unwrap_or_default();
-        let tls_profile = tls_profile_for_version(
-            normalize_version(&env.version),
+        let (client, request) = build_test_token_request(
+            token,
+            proxy_url,
+            canonical_env,
             configured_default_tls_profile(),
-        );
-        let client = oauth_request_client_for_profile(proxy_url, tls_profile)?;
-        let request = build_test_token_request(&client, token, canonical_env)?;
+        )?;
 
         let resp = client
             .execute(request)
@@ -172,11 +173,25 @@ impl TokenTester {
     }
 }
 
+/// 从同一环境构造令牌测试客户端与请求，TLS 缺版本沿配置默认，HTTP 画像独立归一化。
+/// @param token 待验证的令牌。
+/// @param proxy_url 账号代理。
+/// @param canonical_env 账号持久环境。
+/// @param default_tls 本次测试冻结的配置默认 TLS。
+/// @return 具有正确 TLS 选择的客户端及尚未发送的最小测试请求。
 fn build_test_token_request(
-    client: &reqwest::Client,
     token: &str,
+    proxy_url: &str,
     canonical_env: &Value,
-) -> Result<reqwest::Request, AppError> {
+    default_tls: TlsProfileId,
+) -> Result<(Client, Request), AppError> {
+    // TLS 只读取原始版本字段，不能因其它环境字段缺失而丢掉一个已有的明确绑定。
+    let version = canonical_env
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let tls_profile = tls_profile_for_version(version, default_tls);
+    let client = oauth_request_client_for_profile(proxy_url, tls_profile)?;
     let env: CanonicalEnvData = serde_json::from_value(canonical_env.clone()).unwrap_or_default();
     let version = normalize_version(&env.version);
     let version_profile = profile_for_version(version);
@@ -191,7 +206,7 @@ fn build_test_token_request(
         "messages": [{"role": "user", "content": "hi"}]
     });
 
-    client
+    let request = client
         .post("https://api.anthropic.com/v1/messages?beta=true")
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
@@ -221,7 +236,8 @@ fn build_test_token_request(
         .header("X-Stainless-Timeout", "600")
         .json(&body)
         .build()
-        .map_err(|e| AppError::Internal(format!("request build failed: {:?}", e)))
+        .map_err(|e| AppError::Internal(format!("request build failed: {:?}", e)))?;
+    Ok((client, request))
 }
 
 /// 使用 refresh token 刷新 OAuth access token。
@@ -381,7 +397,12 @@ fn scoped_weekly_usage_window(usage: &Value, model_name: &str) -> Option<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tlsfp::parse_test_clienthello;
     use serde_json::json;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn v3_oauth_requires_proxy_even_when_runtime_configuration_is_partial() {
@@ -429,18 +450,81 @@ mod tests {
         })
     }
 
+    /// 经过令牌测试的真实请求准备链捕获 ClientHello，空版本不能被 HTTP 画像吞掉。
+    #[tokio::test]
+    async fn token_test_tls_uses_raw_version_and_configured_fallback() {
+        for (canonical_env, expected_cipher) in [
+            (json!({}), 4866),
+            (json!({"version":null}), 4866),
+            (json!({"version":"2.1.293"}), 4865),
+            (test_canonical_env(""), 4866),
+            (test_canonical_env("2.1.280"), 4866),
+            (test_canonical_env("2.1.999"), 4866),
+            (test_canonical_env("2.1.293"), 4865),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let proxy = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut connect = Vec::new();
+                while !connect.ends_with(b"\r\n\r\n") {
+                    assert!(connect.len() < 8192);
+                    connect.push(stream.read_u8().await.unwrap());
+                }
+                assert!(connect.starts_with(b"CONNECT api.anthropic.com:443 "));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                let size = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                assert!(size <= 16384);
+                let mut record = header.to_vec();
+                record.resize(5 + size, 0);
+                stream.read_exact(&mut record[5..]).await.unwrap();
+                record
+            });
+            let (client, request) = build_test_token_request(
+                "synthetic-token",
+                &proxy,
+                &canonical_env,
+                TlsProfileId::TestReordered,
+            )
+            .unwrap();
+            // 回环代理在握手首包后关闭；不提供业务响应，也不访问真实上游。
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), client.execute(request))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            let wire = tokio::time::timeout(Duration::from_secs(5), capture)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parse_test_clienthello(&wire)["cipher_suites"][0],
+                json!(expected_cipher)
+            );
+        }
+    }
+
     #[test]
     fn token_test_request_uses_selected_version_profile_headers() {
-        let client = get_request_client("").expect("构造无代理请求客户端");
-        let current =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.260"))
-                .expect("构造当前画像请求");
-        let previous =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.257"))
-                .expect("构造上一画像请求");
-        let rollback =
-            build_test_token_request(&client, "test-token", &test_canonical_env("2.1.220"))
-                .expect("构造回滚画像请求");
+        let prepare = |version| {
+            build_test_token_request(
+                "test-token",
+                "http://127.0.0.1:9",
+                &test_canonical_env(version),
+                TlsProfileId::default(),
+            )
+            .expect("构造账号画像请求")
+            .1
+        };
+        let current = prepare("2.1.260");
+        let previous = prepare("2.1.257");
+        let rollback = prepare("2.1.220");
 
         assert_eq!(
             request_header(&current, "user-agent"),
