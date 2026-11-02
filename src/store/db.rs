@@ -1,6 +1,8 @@
 use crate::service::version_profile::ClaudeCodeProfile;
 use crate::store::diagnostics_store::DiagnosticsStore;
+use crate::store::scheduling_store::SchedulingStore;
 use crate::store::settings_store::DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED;
+use crate::store::settings_store::V3_SCHEDULING_DEFAULTS;
 use crate::store::usage_store::UsageStore;
 use sqlx::{AnyConnection, AnyPool};
 use std::path::Path;
@@ -75,6 +77,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     .await?;
     UsageStore::migrate(pool).await?;
     DiagnosticsStore::migrate(pool).await?;
+    SchedulingStore::migrate(pool).await?;
     // 增量迁移
     sqlx::query("ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'")
         .execute(pool)
@@ -222,7 +225,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         sqlx::query(stmt).execute(pool).await?;
     }
     // 插入默认评分权重与峰值预热配置（仅当 key 不存在时）
-    for (key, val) in &[
+    for (key, val) in [
         ("score_weight_7d", "0.5"),
         ("score_weight_5h", "0.3"),
         ("score_weight_concurrency", "0.2"),
@@ -418,7 +421,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "session_hello_probe_failure_cooldown_secs",
             crate::store::settings_store::DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
         ),
-    ] {
+    ].into_iter().chain(V3_SCHEDULING_DEFAULTS.iter().copied()) {
         let insert_sql = if driver == "sqlite" {
             "INSERT OR IGNORE INTO settings (key, value) VALUES ($1, $2)"
         } else {

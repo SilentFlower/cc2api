@@ -24,6 +24,21 @@ const { show: toast } = useToast();
 const w7d = ref('0.5');
 const w5h = ref('0.3');
 const wconc = ref('0.2');
+/** v3 配置只影响新会话排序，稳定绑定和平滑发送持续生效。 */
+const v3Mode = ref('smart');
+const v3WaitSeconds = ref<string | number>('120');
+const v3Weights = ref<Array<string | number>>(['1', '0.8', '1', '0.5']);
+const v3WeightLabels = ['可用负载', '有效额度', '真实健康', '响应头延迟'];
+const isValidV3 = computed(() => {
+  const wait = String(v3WaitSeconds.value).trim();
+  const weights = v3Weights.value.map(value => Number(String(value).trim()));
+  return ['smart', 'legacy_score'].includes(v3Mode.value)
+    && /^\d+$/.test(wait) && Number(wait) >= 1 && Number(wait) <= 120
+    && v3Weights.value.every(value => String(value).trim() !== '')
+    && weights.every(value => Number.isFinite(value) && value >= 0 && value <= 10 && Math.abs(value * 10 - Math.round(value * 10)) < 1e-8)
+    && weights.reduce((a, b) => a + b, 0) > 0;
+});
+
 const fableStickyQuotaFallbackEnabled = ref(true);
 const fableWeeklyUsageLimitPercent = ref('50');
 
@@ -488,6 +503,10 @@ async function loadSettings() {
     w7d.value = data.score_weight_7d ?? '0.5';
     w5h.value = data.score_weight_5h ?? '0.3';
     wconc.value = data.score_weight_concurrency ?? '0.2';
+    v3Mode.value = data.v3_scheduling_mode ?? 'smart';
+    v3WaitSeconds.value = data.v3_admission_wait_seconds ?? '120';
+    v3Weights.value = [data.v3_smart_weight_load ?? '1', data.v3_smart_weight_quota ?? '0.8', data.v3_smart_weight_health ?? '1', data.v3_smart_weight_latency ?? '0.5'];
+
     fableStickyQuotaFallbackEnabled.value = (data.fable_sticky_quota_fallback_enabled ?? 'true') === 'true';
     fableWeeklyUsageLimitPercent.value = data.fable_weekly_usage_limit_percent ?? '50';
     primeEnabled.value = (data.peak_prime_enabled ?? 'true') === 'true';
@@ -638,12 +657,23 @@ async function saveSettings() {
     toast('bootstrap 模型选项必须是 JSON 数组,且每项包含合法 model');
     return;
   }
+  if (!isValidV3.value) {
+    toast('v3 等待上限须为 1–120 秒；权重须为 0–10、最多一位小数，且不能全部为零');
+    return;
+  }
   saving.value = true;
   try {
     await api.updateSettings({
       score_weight_7d: String(w7d.value),
       score_weight_5h: String(w5h.value),
       score_weight_concurrency: String(wconc.value),
+      v3_scheduling_mode: v3Mode.value,
+      v3_admission_wait_seconds: String(v3WaitSeconds.value).trim(),
+      v3_smart_weight_load: String(v3Weights.value[0]).trim(),
+      v3_smart_weight_quota: String(v3Weights.value[1]).trim(),
+      v3_smart_weight_health: String(v3Weights.value[2]).trim(),
+      v3_smart_weight_latency: String(v3Weights.value[3]).trim(),
+
       fable_sticky_quota_fallback_enabled: fableStickyQuotaFallbackEnabled.value ? 'true' : 'false',
       fable_weekly_usage_limit_percent: trimFormString(fableWeeklyUsageLimitPercent.value),
       peak_prime_enabled: primeEnabled.value ? 'true' : 'false',
@@ -734,11 +764,25 @@ onMounted(async () => {
       <h2 class="text-lg font-semibold text-[#29261e]">设置</h2>
     </div>
 
+    <!-- v3 调度配置与旧评分分开，防止切换排序时误认为关闭发送限制。 -->
+    <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="p-6 space-y-4">
+        <div><h3 class="text-sm font-semibold text-[#29261e]">v3 会话与发送调度</h3><p class="text-xs text-[#8c8475] mt-1">仅在 v3 生效。老会话保持有效绑定；新会话先检查资格和容量。两种排序都按账号 RPM 平滑提交，排队超时保留绑定。</p></div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div class="space-y-1.5"><Label>新会话排序</Label><select v-model="v3Mode" aria-label="v3 新会话排序" class="w-full h-9 rounded-md border border-[#e8e2d9] px-3 text-sm"><option value="smart">智能排序</option><option value="legacy_score">旧评分排序</option></select></div>
+          <div class="space-y-1.5"><Label for="v3-wait-seconds">准入等待上限（秒）</Label><Input id="v3-wait-seconds" v-model="v3WaitSeconds" type="number" min="1" max="120" step="1" class="border-[#e8e2d9]" /></div>
+        </div>
+        <p class="text-xs text-[#8c8475]">并发、环境准备和发送间隔共用一个等待期限，重试不重置；不会中断已提交的健康长流。</p>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3"><div v-for="(label, index) in v3WeightLabels" :key="label" class="space-y-1.5"><Label :for="'v3-weight-' + index">{{ label }}</Label><Input :id="'v3-weight-' + index" v-model="v3Weights[index]" type="number" min="0" max="10" step="0.1" class="border-[#e8e2d9]" /></div></div>
+        <p class="text-xs" :class="isValidV3 ? 'text-[#8c8475]' : 'text-amber-700'">智能因素归一化后高分优先；近优账号轮转。权重 0–10、最多一位小数，不能全零。健康与延迟来自真实请求，不主动探测。</p>
+      </div>
+    </Card>
+
     <!-- 评分权重 -->
     <Card class="bg-white border-[#e8e2d9] rounded-xl overflow-hidden">
       <div class="p-6 space-y-4">
         <div>
-          <h3 class="text-sm font-semibold text-[#29261e]">评分权重</h3>
+          <h3 class="text-sm font-semibold text-[#29261e]">旧评分权重（兼容排序）</h3>
           <p class="text-xs text-[#8c8475] mt-1">
             调度评分公式：score = eff_7d × W1 + eff_5h × W2 + 负载% × W3，分数越低越优先分配。负载% =（活跃标准槽位+排队预计槽位）/并发 × 100；普通请求=1，Haiku=0.5。时间衰减使用阶梯档位（1.0/0.8/0.6）替代线性比例。
           </p>

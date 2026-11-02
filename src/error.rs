@@ -14,6 +14,12 @@ pub enum AppError {
     Unauthorized,
     #[error("too many requests: {0}")]
     TooManyRequests(String),
+    /// 本地准入拒绝，携带保守重试提示，保持账号绑定。
+    #[error("本地准入容量不足或等待超时")]
+    AdmissionLimited { retry_after: u64 },
+    /// 发送前绑定 CAS 冲突，仅供网关重新选择，不能盲目提交。
+    #[error("会话绑定已变化")]
+    SchedulingConflict,
     #[error("bad gateway: {0}")]
     BadGateway(String),
     #[error("service unavailable: {0}")]
@@ -36,10 +42,18 @@ impl From<sqlx::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::AdmissionLimited { retry_after } = &self {
+            return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", retry_after.to_string())], axum::Json(json!({"type":"error","error":{"type":"rate_limit_error","message":"本地准入容量不足或等待超时，请稍后重试"}}))).into_response();
+        }
+
         let (status, msg) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, ""),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AppError::AdmissionLimited { .. } => unreachable!(),
+            AppError::SchedulingConflict => {
+                (StatusCode::SERVICE_UNAVAILABLE, "会话绑定已更新，请重试")
+            }
             AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, ""),
             AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, ""),
             AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, ""),

@@ -115,6 +115,31 @@ pub(crate) fn normalize_message_top_field_filter_enabled(raw: &str) -> &'static 
     }
 }
 
+/// v3 新会话默认使用智能排序。
+pub const DEFAULT_V3_SCHEDULING_MODE: &str = "smart";
+/// 所有本地准入阶段共用的默认等待秒数。
+pub const DEFAULT_V3_ADMISSION_WAIT_SECONDS: &str = "120";
+/// 智能负载权重默认值。
+pub const DEFAULT_V3_SMART_WEIGHT_LOAD: &str = "1";
+/// 智能额度权重默认值。
+pub const DEFAULT_V3_SMART_WEIGHT_QUOTA: &str = "0.8";
+/// 智能健康权重默认值。
+pub const DEFAULT_V3_SMART_WEIGHT_HEALTH: &str = "1";
+/// 智能响应头延迟权重默认值。
+pub const DEFAULT_V3_SMART_WEIGHT_LATENCY: &str = "0.5";
+/// 迁移、设置展示与解析共用的 v3 默认值。
+pub const V3_SCHEDULING_DEFAULTS: &[(&str, &str)] = &[
+    ("v3_scheduling_mode", DEFAULT_V3_SCHEDULING_MODE),
+    (
+        "v3_admission_wait_seconds",
+        DEFAULT_V3_ADMISSION_WAIT_SECONDS,
+    ),
+    ("v3_smart_weight_load", DEFAULT_V3_SMART_WEIGHT_LOAD),
+    ("v3_smart_weight_quota", DEFAULT_V3_SMART_WEIGHT_QUOTA),
+    ("v3_smart_weight_health", DEFAULT_V3_SMART_WEIGHT_HEALTH),
+    ("v3_smart_weight_latency", DEFAULT_V3_SMART_WEIGHT_LATENCY),
+];
+
 /// 全局设置存储，key-value 结构。
 pub struct SettingsStore {
     pool: AnyPool,

@@ -2,6 +2,8 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { api, type Account, type OAuthExchangeResult, type UsageWindow } from '../api';
 import UsageWindowStats from './UsageWindowStats.vue';
+import SchedulingDetails from './SchedulingDetails.vue';
+import { schedulingReasonLabel } from '../lib/scheduling';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -31,6 +33,13 @@ const currentPage = ref(1);
 const totalPages = ref(1);
 const totalCount = ref(0);
 const pageSize = 12;
+/** 只读调度详情，保留已有账号卡片布局。 */
+const schedulingAccount = ref<Account | null>(null);
+const showScheduling = ref(false);
+const accountLoadFailed = ref(false);
+let accountLoadGeneration = 0;
+let accountLoading = false;
+
 /** 表单弹窗是否可见 */
 const showForm = ref(false);
 /** 删除确认弹窗是否可见 */
@@ -114,16 +123,35 @@ type UsageWindowKey = 'five_hour' | 'seven_day' | 'seven_day_sonnet' | 'seven_da
 
 /** 加载账号列表 */
 async function load() {
+  if (document.hidden) return;
+  const generation = ++accountLoadGeneration;
+  accountLoading = true;
   try {
     const res = await api.listAccounts(currentPage.value, pageSize);
+    if (generation !== accountLoadGeneration) return;
+    accountLoadFailed.value = false;
     accounts.value = res.data ?? [];
     profileSelectionMode.value = res.claude_code_profile_selection_mode ?? null;
     defaultVersionProfile.value = res.claude_code_version_profile ?? null;
     totalPages.value = res.total_pages;
     totalCount.value = res.total;
   } catch {
-    accounts.value = [];
+    // 读取失败不把原有负载伪装成空列表；旧快照保留并明确标记。
+    if (generation === accountLoadGeneration) accountLoadFailed.value = true;
+  } finally {
+    if (generation === accountLoadGeneration) accountLoading = false;
   }
+}
+
+/** 页面恢复可见时立即更新，隐藏时不继续拉取。@return 无。 */
+function refreshVisibleAccounts() {
+  if (!document.hidden) void load();
+}
+
+/** 打开只读会话和发送视图。@param account 当前账号。@return 无。 */
+function openScheduling(account: Account) {
+  schedulingAccount.value = account;
+  showScheduling.value = true;
 }
 
 /** 翻页 */
@@ -150,13 +178,16 @@ let autoReloadTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(() => {
   load();
+  document.addEventListener('visibilitychange', refreshVisibleAccounts);
   // 每 5 秒静默重拉账户列表，保证秒级 soft backoff 状态能被看到。
   autoReloadTimer = setInterval(() => {
-    load();
+    if (!document.hidden && !accountLoading) void load();
   }, 5 * 1000);
 });
 
 onUnmounted(() => {
+  accountLoadGeneration++;
+  document.removeEventListener('visibilitychange', refreshVisibleAccounts);
   if (autoReloadTimer) {
     clearInterval(autoReloadTimer);
     autoReloadTimer = null;
@@ -569,6 +600,7 @@ function authTypeLabel(authType: string): string {
  * @param account 账号对象
  */
 function rpmLabel(account: Account): string {
+  if (account.v3_scheduling) return `${account.v3_scheduling.submissions_last_60s}/${account.rpm_limit > 0 ? account.rpm_limit : '不限'}`;
   if (!account.rpm_limit || account.rpm_limit <= 0) return '未限制';
   const current = account.rpm_current ?? 0;
   return account.rpm_saturated ? `已满 ${current}/${account.rpm_limit}` : `${current}/${account.rpm_limit}`;
@@ -579,6 +611,7 @@ function rpmLabel(account: Account): string {
  * @param account 账号对象
  */
 function rpmClass(account: Account): string {
+  if (account.v3_scheduling) return account.v3_scheduling.capacity.reason === 'pacing' ? 'text-amber-600' : 'text-[#29261e]';
   if (!account.rpm_limit || account.rpm_limit <= 0) return 'text-[#8c8475]';
   if (account.rpm_saturated) return 'text-red-500';
   const current = account.rpm_current ?? 0;
@@ -873,6 +906,7 @@ async function copyText(text: string) {
       </div>
     </div>
 
+    <p v-if="accountLoadFailed" role="alert" class="text-xs text-amber-700">账号刷新失败，当前展示上次快照；负载与调度状态可能已陈旧。</p>
     <!-- 账号卡片列表 -->
     <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       <Card
@@ -904,7 +938,7 @@ async function copyText(text: string) {
               <div class="text-center relative"
                    @mouseenter="showScoreTooltip($event, a)"
                    @mouseleave="hideScoreTooltip">
-                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">评分</p>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">{{ a.v3_scheduling ? '旧评分' : '评分' }}</p>
                 <p class="text-sm font-medium cursor-help" :class="(a.scheduling_score ?? 0) >= 70 ? 'text-red-500' : (a.scheduling_score ?? 0) >= 40 ? 'text-amber-600' : 'text-emerald-600'">
                   {{ a.scheduling_score?.toFixed(2) ?? '0.00' }}
                 </p>
@@ -930,12 +964,19 @@ async function copyText(text: string) {
                 </p>
               </div>
               <div class="text-center">
-                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">RPM</p>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">{{ a.v3_scheduling ? '60秒提交 / RPM' : 'RPM' }}</p>
                 <p class="text-sm font-medium" :class="rpmClass(a)">
                   {{ rpmLabel(a) }}
                 </p>
               </div>
             </div>
+            <div v-if="a.v3_scheduling" class="rounded-lg border border-[#e8e2d9] bg-[#fcfaf7] p-3 space-y-2">
+              <div class="flex justify-between items-center gap-2 text-xs"><span class="font-medium text-[#5c5647]">{{ a.v3_scheduling.config.mode === 'smart' ? '智能调度' : '旧评分排序' }}</span><span :class="a.v3_scheduling.capacity.immediate ? 'text-emerald-700' : 'text-amber-700'">{{ schedulingReasonLabel(a.v3_scheduling.capacity.reason) }}</span></div>
+              <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-[#8c8475]"><span>绑定 {{ a.v3_scheduling.bound_sessions }} 个会话</span><span>活跃 {{ a.v3_scheduling.active_sessions }} 个</span><span>执行 {{ a.v3_scheduling.phases.running }} 个请求</span></div>
+              <p class="text-[11px] text-[#8c8475]">等槽 {{ a.v3_scheduling.phases.waiting_concurrency }} · 准备 {{ a.v3_scheduling.phases.preparing }} · 等发 {{ a.v3_scheduling.phases.waiting_send }} · 退避 {{ a.v3_scheduling.phases.backoff }}</p>
+              <div class="flex justify-between items-center"><span class="text-[10px] text-[#b5b0a6]">{{ a.v3_scheduling.config.mode === 'smart' ? '智能偏好 ' + (a.v3_scheduling.factors.score * 100).toFixed(1) + '（高优）' : '旧评分低分优先' }}</span><Button variant="outline" size="sm" class="text-xs h-7" @click="openScheduling(a)">调度详情</Button></div>
+            </div>
+            <div v-else-if="a.v3_scheduling_error" class="rounded-lg bg-amber-50 p-3 text-xs text-amber-700">{{ a.v3_scheduling_error }}，不代表零负载。<button class="underline ml-2" @click="openScheduling(a)">查看详情</button></div>
             <div class="grid grid-cols-3 gap-3">
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">优先级</p>
@@ -948,7 +989,7 @@ async function copyText(text: string) {
                 </p>
               </div>
               <div class="text-center">
-                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">上游 Session</p>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">上游池槽位</p>
                 <p class="text-sm font-medium" :class="upstreamSessionPoolClass(a)">
                   {{ upstreamSessionPoolLabel(a) }}
                 </p>
@@ -1240,6 +1281,8 @@ async function copyText(text: string) {
     </div>
 
     <!-- 新建/编辑账号弹窗 -->
+    <SchedulingDetails v-model:open="showScheduling" :account-id="schedulingAccount?.id ?? 0" :account-name="schedulingAccount?.name || schedulingAccount?.email || ''" />
+
     <Dialog v-model:open="showForm">
       <DialogContent class="bg-white border-[#e8e2d9] rounded-2xl text-[#29261e] sm:max-w-md max-h-[85vh] flex flex-col">
         <DialogHeader class="flex-shrink-0">

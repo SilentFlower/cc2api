@@ -1,8 +1,10 @@
 use claude_code_gateway::config;
 use claude_code_gateway::handler;
 use claude_code_gateway::service;
+use claude_code_gateway::service::v3_scheduling::V3Scheduler;
 use claude_code_gateway::store;
 use claude_code_gateway::store::diagnostics_store::DiagnosticsStore;
+use claude_code_gateway::store::scheduling_store::SchedulingStore;
 use claude_code_gateway::tlsfp;
 
 use std::env;
@@ -97,11 +99,26 @@ async fn main() {
         }
     );
 
-    let account_svc = Arc::new(service::account::AccountService::new(
+    let mut account_service = service::account::AccountService::new(
         account_store.clone(),
         cache.clone(),
         settings_store.clone(),
-    ));
+    );
+    if ["V3_RUNTIME_URL", "V3_DEPLOYMENT_ID"]
+        .iter()
+        .any(|key| env::var(key).is_ok_and(|value| !value.is_empty()))
+    {
+        let scheduler = Arc::new(V3Scheduler::new(Arc::new(SchedulingStore::new(
+            pool.clone(),
+        ))));
+        scheduler
+            .reload(&settings_store)
+            .await
+            .expect("加载 v3 调度设置失败");
+        scheduler.start_cleanup();
+        account_service = account_service.with_scheduler(scheduler);
+    }
+    let account_svc = Arc::new(account_service);
     // 启动时加载评分权重到内存缓存
     account_svc.reload_score_weights().await;
     let rewriter = Arc::new(service::rewriter::Rewriter::new());

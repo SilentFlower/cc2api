@@ -24,6 +24,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
 use futures_util::stream::unfold;
+use reqwest::Client;
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -148,7 +149,7 @@ pub async fn send_direct(
 }
 
 async fn send_with_client(
-    client: &reqwest::Client,
+    client: &Client,
     prepared: &PreparedRequest,
     body: Vec<u8>,
 ) -> Result<reqwest::Response, AppError> {
@@ -174,19 +175,29 @@ async fn send_with_client(
         .map_err(|_| AppError::BadGateway("upstream submission status unknown".into()))
 }
 
-/// 网关发送入口；配置 v3 时只向对应账号容器发送，解析失败绝不直连。
-///
+/// 已完成环境准备的发送通道；不持有正文或发送许可。
+pub struct PreparedTransport {
+    account_id: i64,
+    route: PreparedRoute,
+}
+
+/// 已确认归属的内部通道或原有直连兼容通道。
+enum PreparedRoute {
+    Direct(String),
+    V3 {
+        client: Client,
+        binding: TransportBinding,
+    },
+}
+
+/// 准备传输环境，供 v3 在环境就绪后取得平滑发送许可。
 /// @param account 已选定账号。
-/// @param prepared 已改写请求的传输元信息。
-/// @param body 不再修改的原始 body。
-/// @param ttfb_timeout 沿用原客户端的响应首字节期限；环境唤醒单独计时。
-/// @return 上游响应或不可安全重放的传输错误。
-pub async fn send(
+/// @param preparation_timeout 本请求剩余准入预算。
+/// @return 已验证账号、环境、代次和发布归属的通道。
+pub async fn prepare(
     account: &Account,
-    mut prepared: PreparedRequest,
-    body: &[u8],
-    ttfb_timeout: Duration,
-) -> Result<reqwest::Response, AppError> {
+    preparation_timeout: Duration,
+) -> Result<PreparedTransport, AppError> {
     let base = std::env::var("V3_RUNTIME_URL").unwrap_or_default();
     if base.is_empty() {
         if !std::env::var("V3_DEPLOYMENT_ID")
@@ -197,18 +208,16 @@ pub async fn send(
                 "v3 runtime is required".into(),
             ));
         }
-        return timeout(
-            ttfb_timeout,
-            send_direct(&account.proxy_url, &prepared, body.to_vec()),
-        )
-        .await
-        .map_err(|_| AppError::BadGateway("upstream TTFB timeout".into()))?;
+        return Ok(PreparedTransport {
+            account_id: account.id,
+            route: PreparedRoute::Direct(account.proxy_url.clone()),
+        });
     }
     let secret = std::env::var("V3_INTERNAL_TOKEN").map_err(|_| {
         AppError::ServiceUnavailable("v3 runtime authentication unavailable".into())
     })?;
-    // 内部 HTTP 不继承宿主代理，不使用上游 TLS 画像，也不设置会误杀长流的总超时。
-    let client = reqwest::Client::builder()
+    // 内部传输不继承代理或上游 TLS，也不设置会误杀长流的总超时。
+    let client = Client::builder()
         .no_proxy()
         .redirect(Policy::none())
         .no_gzip()
@@ -217,6 +226,38 @@ pub async fn send(
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|_| AppError::ServiceUnavailable("v3 bridge unavailable".into()))?;
+    let deployment = std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default();
+    let release = std::env::var("V3_RELEASE").unwrap_or_default();
+    prepare_from_runtime(
+        account,
+        client,
+        &base,
+        &secret,
+        &deployment,
+        &release,
+        preparation_timeout,
+    )
+    .await
+}
+
+/// 分离配置来源与传输，测试可注入仅解析到回环地址的客户端。
+/// @param account 当前账号。
+/// @param client 不继承代理的内部客户端。
+/// @param base 调度器入口。
+/// @param secret 内部鉴权值。
+/// @param deployment 部署归属。
+/// @param release 发布归属。
+/// @param preparation_timeout 剩余准备期限。
+/// @return 身份验证后的发送通道。
+async fn prepare_from_runtime(
+    account: &Account,
+    client: Client,
+    base: &str,
+    secret: &str,
+    deployment: &str,
+    release: &str,
+    preparation_timeout: Duration,
+) -> Result<PreparedTransport, AppError> {
     let binding: TransportBinding = client
         .get(format!(
             "{}/internal/v3/transport/{}",
@@ -224,7 +265,7 @@ pub async fn send(
             account.id
         ))
         .bearer_auth(secret)
-        .timeout(Duration::from_secs(120))
+        .timeout(preparation_timeout.min(Duration::from_secs(120)))
         .send()
         .await
         .map_err(|_| AppError::ServiceUnavailable("account environment unavailable".into()))?
@@ -233,45 +274,91 @@ pub async fn send(
         .json()
         .await
         .map_err(|_| AppError::ServiceUnavailable("invalid runtime binding".into()))?;
-    let deployment = std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default();
-    let release = std::env::var("V3_RELEASE").unwrap_or_default();
-    validate_binding(&binding, account.id, &deployment, &release)?;
-    if prepared.request_id.is_empty() {
-        prepared.request_id = Uuid::new_v4().to_string();
-    } else if Uuid::parse_str(&prepared.request_id).is_err() {
-        return Err(AppError::BadRequest("内部请求标识无效".into()));
+    validate_binding(&binding, account.id, deployment, release)?;
+    Ok(PreparedTransport {
+        account_id: account.id,
+        route: PreparedRoute::V3 { client, binding },
+    })
+}
+
+impl PreparedTransport {
+    /// 提交冻结请求；调用者必须已经完成本次准入。
+    /// @param prepared 不再改写的协议元信息。
+    /// @param body 不再修改的原始传输字节。
+    /// @param ttfb_timeout 从本次提交开始的响应头期限。
+    /// @return 上游响应或提交未知错误；不会自动重放。
+    pub async fn submit(
+        self,
+        mut prepared: PreparedRequest,
+        body: &[u8],
+        ttfb_timeout: Duration,
+    ) -> Result<reqwest::Response, AppError> {
+        let PreparedRoute::V3 { client, binding } = self.route else {
+            let PreparedRoute::Direct(proxy_url) = self.route else {
+                unreachable!()
+            };
+            return timeout(
+                ttfb_timeout,
+                send_direct(&proxy_url, &prepared, body.to_vec()),
+            )
+            .await
+            .map_err(|_| AppError::BadGateway("upstream TTFB timeout".into()))?;
+        };
+        if prepared.request_id.is_empty() {
+            prepared.request_id = Uuid::new_v4().to_string();
+        } else if Uuid::parse_str(&prepared.request_id).is_err() {
+            return Err(AppError::BadRequest("内部请求标识无效".into()));
+        }
+        prepared.deadline_unix_ms = now_ms() + ttfb_timeout.as_millis() as u64;
+        prepared.account_id = self.account_id;
+        prepared.environment_id = binding.environment_id;
+        prepared.generation = binding.generation;
+        let meta = STANDARD.encode(
+            serde_json::to_vec(&prepared)
+                .map_err(|_| AppError::Internal("serialize runtime request".into()))?,
+        );
+        let response = timeout(
+            ttfb_timeout,
+            client
+                .post(format!(
+                    "{}/internal/send",
+                    binding.endpoint.trim_end_matches('/')
+                ))
+                .bearer_auth(binding.secret)
+                .header(META_HEADER, meta)
+                .body(body.to_vec())
+                .send(),
+        )
+        .await
+        .map_err(|_| AppError::BadGateway("account submission status unknown".into()))?
+        .map_err(|_| AppError::BadGateway("account submission status unknown".into()))?;
+        if let Some(error) = response.headers().get(ERROR_HEADER) {
+            return Err(if error == "before-send" {
+                AppError::ServiceUnavailable("account request rejected before submission".into())
+            } else {
+                AppError::BadGateway("account submission status unknown".into())
+            });
+        }
+        Ok(response)
     }
-    prepared.deadline_unix_ms = now_ms() + ttfb_timeout.as_millis() as u64;
-    prepared.account_id = account.id;
-    prepared.environment_id = binding.environment_id;
-    prepared.generation = binding.generation;
-    let meta = STANDARD.encode(
-        serde_json::to_vec(&prepared)
-            .map_err(|_| AppError::Internal("serialize runtime request".into()))?,
-    );
-    let response = timeout(
-        ttfb_timeout,
-        client
-            .post(format!(
-                "{}/internal/send",
-                binding.endpoint.trim_end_matches('/')
-            ))
-            .bearer_auth(binding.secret)
-            .header(META_HEADER, meta)
-            .body(body.to_vec())
-            .send(),
-    )
-    .await
-    .map_err(|_| AppError::BadGateway("account submission status unknown".into()))?
-    .map_err(|_| AppError::BadGateway("account submission status unknown".into()))?;
-    if let Some(error) = response.headers().get(ERROR_HEADER) {
-        return Err(if error == "before-send" {
-            AppError::ServiceUnavailable("account request rejected before submission".into())
-        } else {
-            AppError::BadGateway("account submission status unknown".into())
-        });
-    }
-    Ok(response)
+}
+
+/// 兼容发送入口，环境准备与原有 TTFB 分开计时。
+/// @param account 已选定账号。
+/// @param prepared 冻结的传输元信息。
+/// @param body 原始 body 字节。
+/// @param ttfb_timeout 提交后的响应头期限。
+/// @return 原有传输响应或错误。
+pub async fn send(
+    account: &Account,
+    prepared: PreparedRequest,
+    body: &[u8],
+    ttfb_timeout: Duration,
+) -> Result<reqwest::Response, AppError> {
+    prepare(account, Duration::from_secs(120))
+        .await?
+        .submit(prepared, body, ttfb_timeout)
+        .await
 }
 
 /// 按调度器的短 DNS 名核对部署归属，防止旧前缀条件拒绝合法账号环境。
@@ -568,7 +655,7 @@ mod tests {
             preserve_header_casing: true,
             tls_profile: TlsProfileId::default(),
         };
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
         for profile in [
             Some(TlsProfileId::ClaudeCode293),
             Some(TlsProfileId::TestReordered),
@@ -720,7 +807,7 @@ mod tests {
             fixture
         }
 
-        fn client(&self, trusted: bool, hostname: &str) -> reqwest::Client {
+        fn client(&self, trusted: bool, hostname: &str) -> Client {
             let certificate =
                 trusted.then(|| CertificateDer::from(fs::read(self.root.join("ca.der")).unwrap()));
             test_request_client(certificate, hostname, self.address).unwrap()
@@ -896,5 +983,197 @@ mod tests {
         prepared.generation = 2;
         prepared.target_url = "http://169.254.169.254/api/metadata".into();
         assert!(validate_request(&prepared, &config).is_err());
+    }
+    /// 冷环境 HTTP 请求同时就绪后，真实提交仍经过同一账号闸门，压缩流字节不改变。
+    #[tokio::test]
+    async fn cold_environment_ready_cohort_still_submits_smoothly() {
+        use crate::service::v3_scheduling::{RequestPhase, V3Scheduler};
+        use crate::store::scheduling_store::SchedulingStore;
+        use flate2::{Compression, write::GzEncoder};
+        use futures_util::future::join_all;
+        use sqlx::any::AnyPoolOptions;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Instant as StdInstant;
+        use tokio::sync::Barrier;
+
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE accounts(id BIGINT PRIMARY KEY,rpm_limit INTEGER NOT NULL DEFAULT 300)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO accounts(id) VALUES(7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        SchedulingStore::migrate(&pool).await.unwrap();
+        let scheduler = Arc::new(V3Scheduler::new(Arc::new(SchedulingStore::new(
+            pool.clone(),
+        ))));
+        let account:Account=serde_json::from_value(json!({"id":7,"name":"合成账号","email":"runtime@example.invalid","status":"active","device_id":"synthetic","canonical_env":{},"canonical_prompt_env":{},"canonical_process":{},"billing_mode":"strip","concurrency":4,"rpm_limit":300,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now()})).unwrap();
+        let ip = Ipv4Addr::new(
+            127,
+            77,
+            rand::random::<u8>().max(1),
+            rand::random::<u8>().max(1),
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((ip, 8091)))
+            .await
+            .unwrap();
+        let deployment = "synthetic-deployment";
+        let release = "synthetic-release";
+        let env = "abcdef0123456789abcdef0123456789";
+        let hash = format!("{:x}", Sha256::digest(deployment.as_bytes()));
+        let host = format!("v3-{}-account-{env}", &hash[..12]);
+        let binding = TransportBinding {
+            account_id: 7,
+            environment_id: env.into(),
+            generation: 3,
+            endpoint: format!("http://{host}:8091"),
+            secret: "s".repeat(32),
+            release_id: release.into(),
+        };
+        let ready = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(5));
+        let received = Arc::new(Mutex::new(Vec::<StdInstant>::new()));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(b"data: {\"type\":\"message_stop\"}\n\n")
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+        let app = Router::new()
+            .route(
+                "/internal/v3/transport/:id",
+                get({
+                    let binding = binding.clone();
+                    let ready = ready.clone();
+                    let barrier = barrier.clone();
+                    move || {
+                        let binding = binding.clone();
+                        let ready = ready.clone();
+                        let barrier = barrier.clone();
+                        async move {
+                            ready.fetch_add(1, Ordering::SeqCst);
+                            barrier.wait().await;
+                            Json(binding)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/send",
+                post({
+                    let received = received.clone();
+                    let compressed = compressed.clone();
+                    move |headers: HeaderMap, body: Bytes| {
+                        let received = received.clone();
+                        let compressed = compressed.clone();
+                        async move {
+                            let meta: PreparedRequest = serde_json::from_slice(
+                                &STANDARD.decode(headers[META_HEADER].as_bytes()).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(meta.account_id, 7);
+                            assert_eq!(meta.generation, 3);
+                            assert_eq!(meta.target_url, "https://synthetic.invalid/v1/messages");
+                            assert_eq!(body.as_ref(), b"{\"synthetic\":true}");
+                            received.lock().unwrap().push(StdInstant::now());
+                            (
+                                [
+                                    ("content-type", "text/event-stream"),
+                                    ("content-encoding", "gzip"),
+                                ],
+                                compressed,
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .resolve(&host, SocketAddr::from((ip, 8091)))
+            .build()
+            .unwrap();
+        let base = format!("http://{ip}:8091");
+        let mut jobs = Vec::new();
+        for _ in 0..4 {
+            let scheduler = scheduler.clone();
+            let account = account.clone();
+            let client = client.clone();
+            let base = base.clone();
+            jobs.push(tokio::spawn(async move {
+                let request = scheduler.begin(1, None);
+                request.selected(&account, None);
+                request.phase(RequestPhase::Preparing);
+                let transport = prepare_from_runtime(
+                    &account,
+                    client,
+                    &base,
+                    "synthetic-control",
+                    deployment,
+                    release,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+                let permit = request.admit(&account).await.unwrap();
+                let prepared = PreparedRequest {
+                    account_id: 7,
+                    environment_id: String::new(),
+                    generation: 0,
+                    request_id: Uuid::new_v4().to_string(),
+                    deadline_unix_ms: 0,
+                    method: "POST".into(),
+                    target_url: "https://synthetic.invalid/v1/messages".into(),
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                    preserve_header_casing: true,
+                    tls_profile: TlsProfileId::default(),
+                };
+                permit.submitted();
+                transport
+                    .submit(prepared, b"{\"synthetic\":true}", Duration::from_secs(5))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            }));
+        }
+        timeout(Duration::from_secs(5), async {
+            while ready.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(scheduler.snapshot(7).events.is_empty());
+        barrier.wait().await;
+        for result in join_all(jobs).await {
+            assert_eq!(result.unwrap().as_ref(), compressed.as_slice());
+        }
+        let observed = received.lock().unwrap();
+        assert_eq!(observed.len(), 4);
+        assert!(observed[3].duration_since(observed[0]) >= Duration::from_millis(400));
+        let events = scheduler.snapshot(7).events;
+        assert_eq!(events.len(), 4);
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[1].submitted_at_ms - pair[0].submitted_at_ms >= 195)
+        );
+        server.abort();
     }
 }

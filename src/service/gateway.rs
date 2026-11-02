@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::future::Future;
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -54,6 +55,7 @@ use crate::service::telemetry::{
     merge_message_usage,
 };
 use crate::service::usage::UsageCapture;
+use crate::service::v3_scheduling::{RequestPhase, SchedulingRequest};
 use crate::service::version_profile::{
     COUNT_TOKENS_BETA_TOKEN, COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile,
     ClaudeCodeProfileSelectionConfig, ClaudeCodeProfileSelectionMode, account_for_request_profile,
@@ -91,6 +93,23 @@ use crate::tlsfp::{
     TlsProfileId, configured_default_tls_profile, get_request_client_for_profile,
     set_configured_default_tls_profile,
 };
+
+/// 让 v3 的前置异步准备共用原期限；兼容路径不改变等待行为。
+/// @param request 可选 v3 请求租约。
+/// @param work 不包含实际上游提交的准备过程。
+/// @return 原结果，或本地准入超时；不会重置计时器。
+async fn await_preparation<F: Future>(
+    request: Option<&SchedulingRequest>,
+    work: F,
+) -> Result<F::Output, AppError> {
+    if let Some(request) = request {
+        tokio::time::timeout_at(request.deadline(), work)
+            .await
+            .map_err(|_| AppError::AdmissionLimited { retry_after: 1 })
+    } else {
+        Ok(work.await)
+    }
+}
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
@@ -808,6 +827,41 @@ impl GatewayService {
         Ok(GatewayAccountAdmission { permit, slot_wait })
     }
 
+    /// 使用请求级期限取得 v3 并发许可，不提前消耗发送预算。
+    /// @param account 当前账号。
+    /// @param request 冻结的请求期限和状态租约。
+    /// @param slot_units 请求的加权单位。
+    /// @return 随流存活的许可或明确本地 429。
+    async fn acquire_v3_admission(
+        &self,
+        account: &Account,
+        request: &SchedulingRequest,
+        slot_units: u32,
+    ) -> Result<GatewayAccountAdmission, GatewayAdmissionError> {
+        let started = std::time::Instant::now();
+        request.phase(RequestPhase::WaitingConcurrency);
+        let queue = await_preparation(
+            Some(request),
+            self.account_svc
+                .get_or_create_queue(account.id, account.concurrency),
+        )
+        .await
+        .map_err(GatewayAdmissionError::Rpm)?;
+        let timeout = request.remaining().map_err(GatewayAdmissionError::Rpm)?;
+        let permit = queue
+            .acquire(timeout, slot_units)
+            .await
+            .map_err(|error| match error {
+                QueueWaitError::Closed => GatewayAdmissionError::Queue(error),
+                _ => GatewayAdmissionError::Rpm(AppError::AdmissionLimited { retry_after: 1 }),
+            })?;
+        request.phase(RequestPhase::Preparing);
+        Ok(GatewayAccountAdmission {
+            permit: permit.with_scheduling_request(request.clone()),
+            slot_wait: started.elapsed(),
+        })
+    }
+
     /// 从全局设置刷新允许 `messages[].role=system` 的模型白名单。
     ///
     /// @return 刷新成功返回 `Ok(())`,读取 settings 失败时返回业务错误。
@@ -1517,7 +1571,13 @@ impl GatewayService {
         else {
             return match self.handle_request_inner(req, api_token).await {
                 Ok(resp) => resp,
-                Err(e) => e.into_response(),
+                Err(e) => {
+                    if self.account_svc.scheduler().is_some() {
+                        count_tokens_app_error_response(e)
+                    } else {
+                        e.into_response()
+                    }
+                }
             };
         };
         let trace = TraceContext::new(store.clone());
@@ -1529,7 +1589,11 @@ impl GatewayService {
             Ok(resp) => resp,
             Err(e) => {
                 guard.error(&e);
-                e.into_response()
+                if self.account_svc.scheduler().is_some() {
+                    count_tokens_app_error_response(e)
+                } else {
+                    e.into_response()
+                }
             }
         };
         guard.wrap(response)
@@ -1952,6 +2016,18 @@ impl GatewayService {
         let session_hash =
             crate::service::account::generate_session_hash(&ua, &body_map, client_type);
 
+        let scheduling_request = self
+            .account_svc
+            .scheduler()
+            .filter(|_| path == "/v1/messages")
+            .map(|scheduler| {
+                let explicit_sid = extract_session_id_from_body(&body_map);
+                scheduler.begin(
+                    api_token.map(|t| t.id).unwrap_or(0),
+                    explicit_sid.as_deref(),
+                )
+            });
+
         // 根据令牌限制构建账号过滤条件
         let (allowed_ids, blocked_ids) = if let Some(t) = api_token {
             (t.allowed_account_ids(), t.blocked_account_ids())
@@ -1989,16 +2065,30 @@ impl GatewayService {
             let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
             // 选择账号
             let t0 = std::time::Instant::now();
-            let selected = match self
-                .account_svc
-                .select_account_with_selection_context(
-                    &session_hash,
-                    &exclude_ids,
-                    &allowed_ids,
-                    &account_selection_context,
+            let selection = if let Some(request) = scheduling_request.as_ref() {
+                tokio::time::timeout_at(
+                    request.deadline(),
+                    self.account_svc.select_v3_account(
+                        request,
+                        &exclude_ids,
+                        &allowed_ids,
+                        &account_selection_context,
+                        request_slot_units(&path, &body_map),
+                    ),
                 )
                 .await
-            {
+                .map_err(|_| AppError::AdmissionLimited { retry_after: 1 })?
+            } else {
+                self.account_svc
+                    .select_account_with_selection_context(
+                        &session_hash,
+                        &exclude_ids,
+                        &allowed_ids,
+                        &account_selection_context,
+                    )
+                    .await
+            };
+            let selected = match selection {
                 Ok(selected) => {
                     info!(
                         "[耗时] 账号选择: {:.0}ms → {}",
@@ -2018,7 +2108,10 @@ impl GatewayService {
                     // 无可用账号但有上一次的 429 响应，返回给客户端
                     return Ok(last_resp.unwrap());
                 }
-                Err(e @ AppError::TooManyRequests(_)) => return Err(e),
+                Err(e @ (AppError::TooManyRequests(_) | AppError::AdmissionLimited { .. })) => {
+                    return Err(e);
+                }
+                Err(e) if scheduling_request.is_some() => return Err(e),
                 Err(e) => {
                     if auth_failure_excluded {
                         return Err(AppError::ServiceUnavailable(
@@ -2128,16 +2221,29 @@ impl GatewayService {
 
             // 瞬时 429 软退避是账号级、进程内状态。等待放在并发/RPM 前,
             // 避免把上游临时锁定窗口算进本地 RPM 或占住账号并发槽。
-            self.account_svc
-                .wait_transient_rate_limit_backoff(&account)
-                .await;
+            if let Some(request) = scheduling_request.as_ref() {
+                request.phase(RequestPhase::Backoff);
+                tokio::time::timeout_at(
+                    request.deadline(),
+                    self.account_svc.wait_transient_rate_limit_backoff(&account),
+                )
+                .await
+                .map_err(|_| AppError::AdmissionLimited { retry_after: 1 })?;
+            } else {
+                self.account_svc
+                    .wait_transient_rate_limit_backoff(&account)
+                    .await;
+            }
 
             let slot_units = request_slot_units(&path, &body_map);
 
             // 先获得并发槽位，再做 RPM admission：排队中的请求还没有准备发往上游，
             // 不能提前占用当前分钟 RPM。若 RPM 饱和导致换号，返回前会释放本账号槽位。
-            let admission = match self
-                .acquire_account_admission(
+            let admission_result = if let Some(request) = scheduling_request.as_ref() {
+                self.acquire_v3_admission(&account, request, slot_units)
+                    .await
+            } else {
+                self.acquire_account_admission(
                     &account,
                     sticky_account,
                     &session_hash,
@@ -2145,7 +2251,8 @@ impl GatewayService {
                     slot_units,
                 )
                 .await
-            {
+            };
+            let admission = match admission_result {
                 Ok(admission) => admission,
                 Err(GatewayAdmissionError::Queue(QueueWaitError::QueueFull)) => {
                     warn!(
@@ -2190,9 +2297,11 @@ impl GatewayService {
 
             // Hello 必须按最终上游 session 去重，因此先解析账号级 session 池，
             // 但 sticky、RPM 与本地缓存仍继续使用未经改写的真实下游 session。
-            let upstream_session_rewrite = self
-                .build_upstream_session_rewrite(&account, &path, &body_map, client_type)
-                .await;
+            let upstream_session_rewrite = await_preparation(
+                scheduling_request.as_ref(),
+                self.build_upstream_session_rewrite(&account, &path, &body_map, client_type),
+            )
+            .await?;
             diagnostics::session_context(
                 account.id,
                 extract_session_id_from_body(&body_map).as_deref(),
@@ -2207,16 +2316,17 @@ impl GatewayService {
                     .and_then(|resolved| resolved.upstream_session_id.as_deref())
                     .unwrap_or(&real_session_id);
                 let hello_config = *self.session_hello_probe_config.read().await;
-                let hello_decision = self
-                    .session_hello_probe_svc
-                    .ensure_ready(
+                let hello_decision = await_preparation(
+                    scheduling_request.as_ref(),
+                    self.session_hello_probe_svc.ensure_ready(
                         &request_account,
                         &real_session_id,
                         upstream_session_id,
                         hello_config,
                         tls_profile,
-                    )
-                    .await;
+                    ),
+                )
+                .await?;
                 if let Some(response) = session_hello_probe_block_response(hello_decision) {
                     diagnostics::error_stage("session_hello_probe");
                     return Ok(response);
@@ -2377,7 +2487,12 @@ impl GatewayService {
             let final_body = rewritten_body.clone();
 
             let upstream_token = if requires_upstream_authorization(&path) {
-                match self.account_svc.resolve_upstream_token(account.id).await {
+                match await_preparation(
+                    scheduling_request.as_ref(),
+                    self.account_svc.resolve_upstream_token(account.id),
+                )
+                .await?
+                {
                     Ok(t) => Some(t),
                     Err(AppError::PermanentCredential(reason)) => {
                         diagnostics::error_stage("credentials");
@@ -2430,20 +2545,25 @@ impl GatewayService {
             let non_stream_probe_cache_lookup = if cli_status_classifier_summary_only {
                 None
             } else {
-                self.non_stream_probe_cache_lookup(
-                    &path,
-                    profile_for_version(&device_profile(&request_account).env.version).key,
-                    client_type,
-                    &rewritten_body_map,
-                    &final_headers,
-                    &final_body,
+                await_preparation(
+                    scheduling_request.as_ref(),
+                    self.non_stream_probe_cache_lookup(
+                        &path,
+                        profile_for_version(&device_profile(&request_account).env.version).key,
+                        client_type,
+                        &rewritten_body_map,
+                        &final_headers,
+                        &final_body,
+                    ),
                 )
-                .await?
+                .await??
             };
             if let Some(lookup) = &non_stream_probe_cache_lookup {
-                if let Some(resp) = self
-                    .try_non_stream_probe_cache_hit(lookup, &account)
-                    .await?
+                if let Some(resp) = await_preparation(
+                    scheduling_request.as_ref(),
+                    self.try_non_stream_probe_cache_hit(lookup, &account),
+                )
+                .await??
                 {
                     if should_bind_session {
                         let _ = self
@@ -2460,11 +2580,18 @@ impl GatewayService {
                 // 遥测会话会启动后台上游请求，必须等 RPM/槽位/改写/Token 全部成功后再激活，
                 // 避免被 RPM 跳过的账号产生额外上游副作用。
                 let t_tel = std::time::Instant::now();
-                self.telemetry_svc.activate_session(&request_account).await;
+                await_preparation(
+                    scheduling_request.as_ref(),
+                    self.telemetry_svc.activate_session(&request_account),
+                )
+                .await?;
                 if let Some(context) = telemetry_context.clone() {
-                    self.telemetry_svc
-                        .record_message_request(&request_account, context)
-                        .await;
+                    await_preparation(
+                        scheduling_request.as_ref(),
+                        self.telemetry_svc
+                            .record_message_request(&request_account, context),
+                    )
+                    .await?;
                 }
                 info!("[耗时] 遥测激活: {:.0}ms", t_tel.elapsed().as_millis());
             }
@@ -2493,10 +2620,12 @@ impl GatewayService {
                     tls_profile,
                     &account_selection_context,
                     request_capture_policy,
+                    scheduling_request.as_ref(),
                 )
                 .await
             {
                 Ok(r) => r,
+                Err(AppError::SchedulingConflict) => continue,
                 Err(e) => {
                     if let Some(context) = telemetry_context.clone() {
                         self.telemetry_svc
@@ -2523,9 +2652,15 @@ impl GatewayService {
             if resp.status() == StatusCode::UNAUTHORIZED
                 && let Some(failed_access_token) = upstream_token.as_deref()
             {
-                match self
-                    .recover_account_after_unauthorized(&account, failed_access_token, "gateway")
-                    .await?
+                match await_preparation(
+                    scheduling_request.as_ref(),
+                    self.recover_account_after_unauthorized(
+                        &account,
+                        failed_access_token,
+                        "gateway",
+                    ),
+                )
+                .await??
                 {
                     Some(refreshed_token) => {
                         diagnostics::retry_reason("oauth_recovery");
@@ -2545,6 +2680,7 @@ impl GatewayService {
                                 tls_profile,
                                 &account_selection_context,
                                 request_capture_policy,
+                                scheduling_request.as_ref(),
                             )
                             .await?;
                         if resp.status() == StatusCode::UNAUTHORIZED {
@@ -2585,6 +2721,7 @@ impl GatewayService {
                     client_type,
                     &account_selection_context,
                     request_capture_policy,
+                    scheduling_request.as_ref(),
                     resp,
                 )
                 .await?;
@@ -2756,6 +2893,7 @@ impl GatewayService {
         client_type: ClientType,
         account_selection_context: &AccountSelectionContext,
         request_capture_policy: RequestCapturePolicy,
+        scheduling_request: Option<&SchedulingRequest>,
         resp: Response,
     ) -> Result<(Response, Option<SignatureRetryStage>), AppError> {
         if path != "/v1/messages" || resp.status() != StatusCode::BAD_REQUEST {
@@ -2804,10 +2942,17 @@ impl GatewayService {
                     tls_profile,
                     account_selection_context,
                     request_capture_policy,
+                    scheduling_request,
                 )
                 .await
             {
                 Ok(resp) => resp,
+                Err(e @ (AppError::SchedulingConflict | AppError::AdmissionLimited { .. })) => {
+                    return Err(e);
+                }
+                Err(e @ AppError::ServiceUnavailable(_)) if scheduling_request.is_some() => {
+                    return Err(e);
+                }
                 Err(e) => {
                     warn!(
                         "account {} signature retry stage={} failed: {}",
@@ -2867,19 +3012,20 @@ impl GatewayService {
         tls_profile: TlsProfileId,
         account_selection_context: &AccountSelectionContext,
         request_capture_policy: RequestCapturePolicy,
+        scheduling_request: Option<&SchedulingRequest>,
     ) -> Result<Response, AppError> {
         let target_url = upstream_url_with_base(&self.upstream_base, path, query);
 
         debug!("upstream URL: {}", target_url);
 
-        let mut diagnostic = (path == "/v1/messages")
-            .then(|| diagnostics::begin_attempt(account, body))
-            .flatten();
         // 正文和 CCH 在上层已完成；此后只改变传输表示，诊断仍观察逻辑正文。
         let wire_body = match request_encoding.encode(body).await {
             Ok(bytes) => bytes,
             Err(error) => return Ok(request_body_codec_error_response(error)),
         };
+        let mut diagnostic = (path == "/v1/messages")
+            .then(|| diagnostics::prepare_attempt(account, body))
+            .flatten();
         let wire_headers = request_headers_for_encoding(headers, request_encoding);
         let prepared = PreparedRequest {
             tls_profile,
@@ -2896,22 +3042,55 @@ impl GatewayService {
             headers: ordered_anthropic_headers(path, &wire_headers),
             preserve_header_casing: !is_event_logging_path(path) && !path.starts_with("/api/eval/"),
         };
-        let resp = match runtime_transport::send(
-            account,
-            prepared,
-            wire_body.as_ref(),
-            UPSTREAM_TTFB_TIMEOUT,
-        )
-        .await
-        {
+        // v3 在环境准备和发送准入完成后才建立真实 attempt，避免排队制造假发送。
+        let transport = if let Some(request) = scheduling_request {
+            request.phase(RequestPhase::Preparing);
+            let transport = tokio::time::timeout_at(
+                request.deadline(),
+                runtime_transport::prepare(account, request.remaining()?),
+            )
+            .await
+            .map_err(|_| AppError::AdmissionLimited { retry_after: 1 })??;
+            let permit = request.admit(account).await?;
+            Some((transport, permit))
+        } else {
+            None
+        };
+        if let Some(trace) = diagnostic.as_mut() {
+            if let Some(request) = scheduling_request {
+                trace.with_feedback(request.clone());
+            }
+            trace.commit();
+        }
+        let response_result = if let Some((transport, permit)) = transport {
+            permit.submitted();
+            transport
+                .submit(prepared, wire_body.as_ref(), UPSTREAM_TTFB_TIMEOUT)
+                .await
+        } else {
+            runtime_transport::send(account, prepared, wire_body.as_ref(), UPSTREAM_TTFB_TIMEOUT)
+                .await
+        };
+        let resp = match response_result {
             Ok(response) => response,
             Err(error) => {
+                if matches!(error, AppError::BadGateway(_)) {
+                    if let Some(request) = scheduling_request {
+                        request.submission_failed(account.id);
+                    }
+                }
                 if let Some(trace) = diagnostic.as_mut() {
                     trace.transport_error();
                 }
                 return Err(error);
             }
         };
+
+        if diagnostic.is_none() {
+            if let Some(request) = scheduling_request {
+                request.response_headers(account.id, resp.status().as_u16());
+            }
+        }
 
         if let Some(trace) = diagnostic.as_mut() {
             trace.headers(
@@ -3003,6 +3182,14 @@ impl GatewayService {
                     None
                 }
             };
+            if let Some(request) = scheduling_request {
+                if rate_limit_decision
+                    .as_ref()
+                    .is_some_and(|decision| !matches!(decision, RateLimitDecision::PassThrough))
+                {
+                    request.capacity_rejected(account.id);
+                }
+            }
             let (downstream_body, remove_transport_headers) =
                 buffered_error_body_for_downstream(body_bytes.clone(), &headers_429);
 
@@ -3621,6 +3808,12 @@ fn request_headers_for_encoding(
 
 fn count_tokens_app_error_response(err: AppError) -> Response {
     match err {
+        e @ AppError::AdmissionLimited { .. } => e.into_response(),
+        AppError::SchedulingConflict => anthropic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "会话绑定已更新，请重试",
+        ),
         AppError::BadRequest(message) => {
             anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
         }
@@ -7701,6 +7894,7 @@ mod tests {
     use crate::service::session_hello_probe::{SessionHelloProbeConfig, SessionHelloProbeDecision};
     use crate::service::telemetry::MessageTelemetryUsage;
     use crate::service::telemetry::TelemetryService;
+    use crate::service::v3_scheduling::{V3Scheduler, now_ms};
     use crate::service::version_profile::{
         COUNT_TOKENS_BETA_TOKENS, ClaudeCodeProfile, ClaudeCodeProfileSelectionConfig,
         ClaudeCodeProfileSelectionMode, DEFAULT_CLAUDE_CODE_VERSION,
@@ -7718,6 +7912,7 @@ mod tests {
     use crate::store::diagnostics_store::DiagnosticsStore;
     use crate::store::memory::MemoryStore;
     use crate::store::prime_log_store::PrimeLogStore;
+    use crate::store::scheduling_store::SchedulingStore;
     use crate::store::settings_store::{
         DEFAULT_ALLOW_SYSTEM_ROLE_MODELS, DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, SettingsStore,
     };
@@ -7759,6 +7954,7 @@ mod tests {
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
+    use uuid::Uuid;
     use zstd::stream::encode_all as zstd_encode_all;
 
     fn all_warmup_intercepts_enabled() -> WarmupInterceptConfig {
@@ -8953,6 +9149,7 @@ mod tests {
                         TlsProfileId::default(),
                         &AccountSelectionContext::disabled(),
                         RequestCapturePolicy::SummaryOnly,
+                        None,
                     )
                     .await
                     .unwrap()
@@ -9013,6 +9210,21 @@ mod tests {
         upstream_base: String,
         oauth_token_url: String,
     ) -> (GatewayService, Arc<AccountStore>) {
+        test_gateway_service_with_scheduling(cache, upstream_base, oauth_token_url, false).await
+    }
+
+    /// 为真实 HTTP 回归按需装配新调度，旧 helper 保持非 v3 行为。
+    /// @param cache 测试缓存。
+    /// @param upstream_base 本地上游入口。
+    /// @param oauth_token_url 合成认证入口。
+    /// @param enabled 是否使用新调度。
+    /// @return 网关与账号存储。
+    async fn test_gateway_service_with_scheduling(
+        cache: Arc<dyn CacheStore>,
+        upstream_base: String,
+        oauth_token_url: String,
+        enabled: bool,
+    ) -> (GatewayService, Arc<AccountStore>) {
         sqlx::any::install_default_drivers();
         let tmp =
             std::env::temp_dir().join(format!("ccgw_gateway_unit_{}.db", rand::random::<u64>()));
@@ -9024,13 +9236,19 @@ mod tests {
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let usage_store = Arc::new(UsageStore::new(pool.clone()));
         let diagnostics_store = Arc::new(DiagnosticsStore::new(pool.clone()));
-        let settings_store = Arc::new(SettingsStore::new(pool));
-        let account_svc = Arc::new(AccountService::new_with_oauth_token_url(
+        let settings_store = Arc::new(SettingsStore::new(pool.clone()));
+        let mut account_service = AccountService::new_with_oauth_token_url(
             account_store.clone(),
             cache.clone(),
             settings_store.clone(),
             oauth_token_url,
-        ));
+        );
+        if enabled {
+            let scheduler = Arc::new(V3Scheduler::new(Arc::new(SchedulingStore::new(pool))));
+            scheduler.reload(&settings_store).await.unwrap();
+            account_service = account_service.with_scheduler(scheduler);
+        }
+        let account_svc = Arc::new(account_service);
         let telemetry_svc = Arc::new(TelemetryService::new(
             account_store.clone(),
             account_svc.clone(),
@@ -19120,5 +19338,238 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"out
                 "allowed_system_role_models": ["claude-opus-4-8"]
             })
         );
+    }
+    /// 使用真实 HTTP 断开等待中的客户端，确认 Hyper 取消会释放排队和观察租约。
+    #[tokio::test]
+    async fn v3_real_http_disconnect_releases_waiting_request() {
+        use crate::service::v3_scheduling::RequestPhase;
+        use axum::routing::any;
+        use tokio::net::TcpStream;
+        let (service, _) = test_gateway_service_with_scheduling(
+            Arc::new(MemoryStore::new()),
+            "http://127.0.0.1:9".into(),
+            String::new(),
+            true,
+        )
+        .await;
+        let account = create_gateway_account(&service, "disconnect@example.invalid", 1, 0).await;
+        let queue = service.account_svc.get_or_create_queue(account.id, 1).await;
+        let held = queue.acquire(Duration::from_secs(1), 2).await.unwrap();
+        let service = Arc::new(service);
+        let app = Router::new().fallback(any({
+            let service = service.clone();
+            move |request: Request| {
+                let service = service.clone();
+                async move { service.handle_request(request, None).await }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let body=serde_json::to_vec(&json!({"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"synthetic"}]})).unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(format!("POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nUser-Agent: AI-Hub-Monitor/1.0\r\nContent-Length: {}\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+        client.write_all(&body).await.unwrap();
+        let scheduler = service.account_svc.scheduler().unwrap();
+        timeout(Duration::from_secs(3), async {
+            while scheduler
+                .snapshot(account.id)
+                .requests
+                .iter()
+                .all(|r| r.phase != RequestPhase::WaitingConcurrency)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("请求没有进入真实并发等待");
+        drop(client);
+        timeout(Duration::from_secs(3), async {
+            while !scheduler.snapshot(account.id).requests.is_empty() || queue.waiting_count() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("断连后等待资源未释放");
+        assert!(scheduler.snapshot(account.id).events.is_empty());
+        drop(held);
+        assert_eq!(queue.active_request_count(), 0);
+        server.abort();
+    }
+
+    /// 真实下游流断连时，发送许可不退还，但并发和当前会话租约必须释放。
+    #[tokio::test]
+    async fn v3_real_http_stream_disconnect_releases_execution() {
+        use axum::routing::any;
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", upstream_listener.local_addr().unwrap());
+        let upstream_app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                let stream = tokio_stream::iter(vec![Ok::<_, Infallible>(Bytes::from_static(
+                    b"event: ping\ndata: {}\n\n",
+                ))])
+                .chain(tokio_stream::pending());
+                (
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(stream),
+                )
+                    .into_response()
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+        let (service, _) = test_gateway_service_with_scheduling(
+            Arc::new(MemoryStore::new()),
+            upstream,
+            String::new(),
+            true,
+        )
+        .await;
+        let account =
+            create_gateway_account(&service, "stream-disconnect@example.invalid", 1, 50).await;
+        let service = Arc::new(service);
+        let app = Router::new().fallback(any({
+            let service = service.clone();
+            move |request: Request| {
+                let service = service.clone();
+                async move { service.handle_request(request, None).await }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response=reqwest::Client::builder().no_proxy().build().unwrap().post(format!("http://{address}/v1/messages")).header("user-agent","AI-Hub-Monitor/1.0").json(&json!({"model":"claude-opus-4-8","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"synthetic"}]})).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let scheduler = service.account_svc.scheduler().unwrap();
+        assert_eq!(scheduler.snapshot(account.id).events.len(), 1);
+        drop(response);
+        let queue = service.account_svc.get_or_create_queue(account.id, 1).await;
+        timeout(Duration::from_secs(3), async {
+            while queue.active_request_count() != 0
+                || !scheduler.snapshot(account.id).requests.is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("流断连后许可未释放");
+        assert_eq!(scheduler.snapshot(account.id).events.len(), 1);
+        server.abort();
+        upstream_server.abort();
+    }
+    /// 发送许可前超时只能产生根记录，预处理好的诊断草稿不能伪造 attempt。
+    #[tokio::test]
+    async fn v3_pacing_timeout_preserves_binding_and_has_no_attempt() {
+        let (service, _) = test_gateway_service_with_scheduling(
+            Arc::new(MemoryStore::new()),
+            "http://127.0.0.1:9".into(),
+            String::new(),
+            true,
+        )
+        .await;
+        let account =
+            create_gateway_account(&service, "pacing-timeout@example.invalid", 1, 1).await;
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "v3_admission_wait_seconds".into(),
+                "1".into(),
+            )]))
+            .await
+            .unwrap();
+        let scheduler = service.account_svc.scheduler().unwrap();
+        scheduler.reload(&service.settings_store).await.unwrap();
+        let sid = Uuid::new_v4().to_string();
+        let seed = scheduler.begin(0, Some(&sid));
+        seed.selected(&account, None);
+        drop(seed.admit(&account).await.unwrap());
+        let key = seed.key().unwrap().to_owned();
+        drop(seed);
+        let response = service
+            .handle_request(claude_code_messages_request(&sid), None)
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let root = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = body::to_bytes(response.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["type"],
+            "rate_limit_error"
+        );
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let detail = diagnostics.detail(&root).await.unwrap();
+        assert!(detail.attempts.is_empty());
+        assert_eq!(detail.request.attempt_count, 0);
+        assert_eq!(
+            scheduler
+                .store
+                .binding(&key, now_ms())
+                .await
+                .unwrap()
+                .unwrap()
+                .account_id,
+            account.id
+        );
+        assert_eq!(
+            service
+                .account_svc
+                .get_or_create_queue(account.id, 1)
+                .await
+                .active_request_count(),
+            0
+        );
+    }
+
+    /// 已有 SSE 观察器识别到 200 内错误时只反馈一次失败，不奖励快速错误的延迟。
+    #[tokio::test]
+    async fn v3_sse_error_feedback_uses_existing_body_observation() {
+        let wire=b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"synthetic\"}}\n\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                (
+                    [("content-type", "text/event-stream")],
+                    Body::from(wire.as_slice()),
+                )
+                    .into_response()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (service, _) = test_gateway_service_with_scheduling(
+            Arc::new(MemoryStore::new()),
+            base,
+            String::new(),
+            true,
+        )
+        .await;
+        let account = create_gateway_account(&service, "sse-feedback@example.invalid", 1, 0).await;
+        let response = service.handle_request(messages_request(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), 65536).await.unwrap();
+        assert_eq!(body.as_ref(), wire);
+        let score = service.account_svc.get_account_score_info(&account).await;
+        let summary = service
+            .account_svc
+            .v3_summary(&account, &score, 0)
+            .await
+            .unwrap();
+        assert!(summary.factors.health < 0.5);
+        assert_eq!(summary.factors.latency, 0.5);
+        server.abort();
     }
 }

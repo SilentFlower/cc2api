@@ -42,10 +42,12 @@ use crate::service::rewriter::{
 };
 use crate::service::runtime_bridge;
 use crate::service::telemetry::TelemetryService;
+use crate::service::v3_scheduling::{PhaseCounts, SchedulingConfig, now_ms};
 use crate::service::version_profile::{
     ClaudeCodeProfileSelectionMode, all_profiles, profile_for_key,
 };
 use crate::store::prime_log_store::PrimeLogStore;
+use crate::store::settings_store::V3_SCHEDULING_DEFAULTS;
 use crate::store::settings_store::{
     DEFAULT_BOOTSTRAP_ADDITIONAL_MODEL_OPTIONS, DEFAULT_BOOTSTRAP_MODEL_OPTIONS_MODE,
     DEFAULT_CACHE_CONTROL_TTL_REWRITE, DEFAULT_CLAUDE_CODE_CONTEXT_SANITIZER_MODE,
@@ -137,6 +139,11 @@ pub fn build_router(
         )
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
+        .route("/admin/accounts/:id/scheduling", get(account_scheduling))
+        .route(
+            "/admin/accounts/:id/scheduling/sessions",
+            get(account_scheduling_sessions),
+        )
         .route(
             "/admin/accounts/:id/cli-process/import",
             post(import_cli_process),
@@ -327,6 +334,16 @@ async fn list_accounts(
         ClaudeCodeProfileSelectionMode::Account => "account",
     };
 
+    let binding_counts = if let Some(scheduler) = state.account_svc.scheduler() {
+        scheduler
+            .store
+            .counts(&accounts.iter().map(|a| a.id).collect::<Vec<_>>(), now_ms())
+            .await
+            .ok()
+    } else {
+        None
+    };
+
     // 为每个账号附加遥测会话过期时间 + 调度评分信息
     let mut data: Vec<serde_json::Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
@@ -341,6 +358,21 @@ async fn list_accounts(
         }
         // 附加实时调度评分和并发/排队状态
         let si = state.account_svc.get_account_score_info(a).await;
+        if state.account_svc.scheduler().is_some() {
+            match binding_counts.as_ref() {
+                Some(counts) => match state
+                    .account_svc
+                    .v3_summary(a, &si, counts.get(&a.id).copied().unwrap_or(0))
+                    .await
+                {
+                    Ok(summary) => {
+                        obj["v3_scheduling"] = serde_json::to_value(summary).unwrap_or_default()
+                    }
+                    Err(_) => obj["v3_scheduling_error"] = serde_json::json!("调度观测不可用"),
+                },
+                None => obj["v3_scheduling_error"] = serde_json::json!("调度观测不可用"),
+            }
+        }
         obj["scheduling_score"] = serde_json::json!((si.score * 100.0).round() / 100.0);
         obj["scheduling_detail"] = serde_json::json!({
             "eff_7d": (si.eff_7d * 100.0).round() / 100.0,
@@ -1307,11 +1339,96 @@ fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::Utc.timestamp_millis_opt(ts).single()
 }
 
+/// 获取单账号只读调度快照，不续期或触发上游调用。
+/// @param state 已通过管理员认证的状态。
+/// @param id 正式账号 ID。
+/// @return 真实状态、最近事件与完整性信息。
+async fn account_scheduling(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let account = state.account_svc.get_account(id).await?;
+    let scheduler = state
+        .account_svc
+        .scheduler()
+        .ok_or_else(|| AppError::ServiceUnavailable("当前部署未启用 v3 调度".into()))?;
+    let score = state.account_svc.get_account_score_info(&account).await;
+    let counts = scheduler.store.counts(&[id], now_ms()).await?;
+    let summary = state
+        .account_svc
+        .v3_summary(&account, &score, counts.get(&id).copied().unwrap_or(0))
+        .await?;
+    Ok(Json(
+        serde_json::json!({"summary":summary,"snapshot":scheduler.snapshot(id)}),
+    ))
+}
+
+/// 会话查询仅接受有界分页、活跃状态和十六进制匿名摘要前缀。
+#[derive(Deserialize)]
+struct SchedulingSessionQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    state: Option<String>,
+    prefix: Option<String>,
+}
+
+/// 分页读取网关绑定及阶段数，不返回原会话 ID 或凭据。
+/// @param state 管理员状态。
+/// @param id 正式账号 ID。
+/// @param query 已解码查询参数。
+/// @return 绑定列表、总数与观测时间。
+async fn account_scheduling_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<SchedulingSessionQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.account_svc.get_account(id).await?;
+    let scheduler = state
+        .account_svc
+        .scheduler()
+        .ok_or_else(|| AppError::ServiceUnavailable("当前部署未启用 v3 调度".into()))?;
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.unwrap_or(20);
+    let prefix = query.prefix.unwrap_or_default().to_ascii_lowercase();
+    if page < 1
+        || !(1..=100).contains(&page_size)
+        || prefix.len() > 64
+        || !prefix.bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(AppError::BadRequest("会话分页或摘要筛选不合法".into()));
+    }
+    let active = match query.state.as_deref().unwrap_or("all") {
+        "all" => None,
+        "active" => Some(true),
+        "idle" => Some(false),
+        _ => return Err(AppError::BadRequest("会话状态筛选不合法".into())),
+    };
+    let now = now_ms();
+    let snapshot = scheduler.snapshot(id);
+    let active_keys = scheduler.active_keys(id);
+    let (bindings, total) = scheduler
+        .store
+        .sessions(id, now, page, page_size, &prefix, &active_keys, active)
+        .await?;
+    let items=bindings.into_iter().map(|b| {
+        let requests=snapshot.requests.iter().filter(|r|r.bound && r.session_key.as_deref()==Some(b.session_key.as_str()));
+        serde_json::json!({"session_key":b.session_key,"account_id":b.account_id,"created_at_ms":b.created_at_ms,"last_seen_at_ms":b.last_seen_at_ms,"expires_at_ms":b.expires_at_ms,"phases":PhaseCounts::of(requests)})
+    }).collect::<Vec<_>>();
+    Ok(Json(
+        serde_json::json!({"items":items,"total":total,"page":page,"page_size":page_size,"observed_at_ms":now}),
+    ))
+}
+
 // --- Settings Handlers ---
 
 /// 获取所有设置项。
 async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let mut settings = state.settings_store.get_all().await?;
+    for (key, value) in V3_SCHEDULING_DEFAULTS {
+        settings
+            .entry((*key).to_string())
+            .or_insert_with(|| (*value).to_string());
+    }
     for key in OBSOLETE_SETTINGS_KEYS {
         settings.remove(*key);
     }
@@ -1489,6 +1606,11 @@ async fn update_settings(
     for key in OBSOLETE_SETTINGS_KEYS {
         body.remove(*key);
     }
+    let _v3_settings_guard = if body.keys().any(|key| key.starts_with("v3_")) {
+        Some(state.account_svc.lock_v3_settings().await)
+    } else {
+        None
+    };
     // 校验权重值必须是合法的非负数
     for key in &[
         "score_weight_7d",
@@ -1655,10 +1777,21 @@ async fn update_settings(
     if let Some(val) = body.get("bootstrap_additional_model_options") {
         parse_bootstrap_additional_model_options(val)?;
     }
+    let v3_config_update = if body.keys().any(|key| key.starts_with("v3_")) {
+        let mut merged = state.settings_store.get_all().await?;
+        merged.extend(body.clone());
+        Some(SchedulingConfig::parse(&merged)?)
+    } else {
+        None
+    };
     state
         .settings_store
         .upsert_many_with_profile(&body, selected_profile)
         .await?;
+    if let (Some(config), Some(scheduler)) = (v3_config_update, state.account_svc.scheduler()) {
+        scheduler.apply_config(config);
+    }
+
     if selected_profile.is_some()
         || body.contains_key("claude_code_profile_selection_mode")
         || body.contains_key("allowed_claude_code_versions")
@@ -1872,17 +2005,19 @@ mod tests {
     };
     use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
     use crate::model::account::{CanonicalEnvData, CanonicalPromptEnvData};
-    use crate::service::account::AccountService;
+    use crate::service::account::{AccountSelectionContext, AccountService};
     use crate::service::gateway::GatewayService;
     use crate::service::oauth::TokenTester;
     use crate::service::oauth_flow::OAuthFlowService;
     use crate::service::rewriter::Rewriter;
     use crate::service::telemetry::TelemetryService;
+    use crate::service::v3_scheduling::{RequestPhase, SchedulingConfig, V3Scheduler, now_ms};
     use crate::service::version_profile::ClaudeCodeProfileSelectionMode;
     use crate::store::account_store::AccountStore;
     use crate::store::diagnostics_store::DiagnosticsStore;
     use crate::store::memory::MemoryStore;
     use crate::store::prime_log_store::PrimeLogStore;
+    use crate::store::scheduling_store::SchedulingStore;
     use crate::store::settings_store::SettingsStore;
     use crate::store::token_store::TokenStore;
     use crate::store::usage_store::UsageStore;
@@ -1907,6 +2042,22 @@ mod tests {
     /// @return 管理路由、网关、设置存储及隔离内存连接池。
     async fn test_router_with_gateway_and_settings()
     -> (Router, Arc<GatewayService>, Arc<SettingsStore>, AnyPool) {
+        let (router, gateway, settings, pool, _) = test_router_with_scheduling(false).await;
+        (router, gateway, settings, pool)
+    }
+
+    /// 在隔离数据库中按需装配新调度，保留所有旧路由测试的原行为。
+    /// @param enabled 是否启用 v3 调度。
+    /// @return 路由、网关、设置、池与账号服务。
+    async fn test_router_with_scheduling(
+        enabled: bool,
+    ) -> (
+        Router,
+        Arc<GatewayService>,
+        Arc<SettingsStore>,
+        AnyPool,
+        Arc<AccountService>,
+    ) {
         sqlx::any::install_default_drivers();
         let pool = AnyPoolOptions::new()
             .max_connections(1)
@@ -1919,11 +2070,16 @@ mod tests {
         let account_store = Arc::new(AccountStore::new(pool.clone(), "sqlite".into()));
         let settings_store = Arc::new(SettingsStore::new(pool.clone()));
         let cache = Arc::new(MemoryStore::new());
-        let account_svc = Arc::new(AccountService::new(
-            account_store.clone(),
-            cache.clone(),
-            settings_store.clone(),
-        ));
+        let mut account_service =
+            AccountService::new(account_store.clone(), cache.clone(), settings_store.clone());
+        if enabled {
+            let scheduler = Arc::new(V3Scheduler::new(Arc::new(SchedulingStore::new(
+                pool.clone(),
+            ))));
+            scheduler.reload(&settings_store).await.unwrap();
+            account_service = account_service.with_scheduler(scheduler);
+        }
+        let account_svc = Arc::new(account_service);
         let telemetry_svc = Arc::new(TelemetryService::new(account_store, account_svc.clone()));
         let gateway_svc = Arc::new(
             GatewayService::new(
@@ -1963,7 +2119,7 @@ mod tests {
         let router = build_router(
             &cfg,
             gateway_svc.clone(),
-            account_svc,
+            account_svc.clone(),
             Arc::new(TokenTester::new()),
             Arc::new(TokenStore::new(pool.clone(), "sqlite".into())),
             settings_store.clone(),
@@ -1971,7 +2127,7 @@ mod tests {
             Arc::new(OAuthFlowService::new()),
             telemetry_svc,
         );
-        (router, gateway_svc, settings_store, pool)
+        (router, gateway_svc, settings_store, pool, account_svc)
     }
 
     /// 诊断查询只对管理员开放，并支持关联 ID 反查和受控参数错误。
@@ -3115,5 +3271,133 @@ mod tests {
             ))
             .is_err()
         );
+    }
+    /// 会话观察经过真实管理员路由；只读查询不续租，不把请求数当会话数。
+    #[tokio::test]
+    async fn scheduling_routes_are_admin_only_bounded_and_read_only() {
+        use sqlx::Row;
+        let (app, _, _, pool, accounts) = test_router_with_scheduling(true).await;
+        let rows=sqlx::query("INSERT INTO accounts(name,email,token,device_id) VALUES('合成账号','scheduling@example.invalid','synthetic','synthetic-device') RETURNING id").fetch_all(&pool).await.unwrap();
+        let id: i64 = rows[0].get(0);
+        let account = accounts.get_account(id).await.unwrap();
+        let scheduler = accounts.scheduler().unwrap();
+        let first = scheduler.begin(1, Some("synthetic-private-session"));
+        first.selected(&account, None);
+        first.admit(&account).await.unwrap().submitted();
+        let second = scheduler.begin(1, Some("synthetic-private-session"));
+        accounts
+            .select_v3_account(&second, &[], &[], &AccountSelectionContext::disabled(), 2)
+            .await
+            .unwrap();
+        second.phase(RequestPhase::WaitingSend);
+        let before = scheduler
+            .store
+            .binding(first.key().unwrap(), now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        for path in [
+            format!("/admin/accounts/{id}/scheduling"),
+            format!("/admin/accounts/{id}/scheduling/sessions"),
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        let (status, detail) = account_admin_json(
+            &app,
+            Method::GET,
+            &format!("/admin/accounts/{id}/scheduling"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["summary"]["bound_sessions"], 1);
+        assert_eq!(detail["summary"]["active_sessions"], 1);
+        assert_eq!(detail["summary"]["phases"]["running"], 1);
+        assert_eq!(detail["summary"]["phases"]["waiting_send"], 1);
+        assert_eq!(detail["snapshot"]["events"].as_array().unwrap().len(), 1);
+        let (status, sessions) = account_admin_json(
+            &app,
+            Method::GET,
+            &format!("/admin/accounts/{id}/scheduling/sessions?state=active"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sessions["total"], 1);
+        assert!(!sessions.to_string().contains("synthetic-private-session"));
+        let after = scheduler
+            .store
+            .binding(first.key().unwrap(), now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.expires_at_ms, after.expires_at_ms);
+        assert_eq!(before.last_seen_at_ms, after.last_seen_at_ms);
+        for suffix in ["page=0", "page_size=101", "prefix=not-hex", "state=unknown"] {
+            let (status, _) = account_admin_json(
+                &app,
+                Method::GET,
+                &format!("/admin/accounts/{id}/scheduling/sessions?{suffix}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let (status, list) =
+            account_admin_json(&app, Method::GET, "/admin/accounts", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list["data"][0]["v3_scheduling"]["bound_sessions"], 1);
+    }
+
+    /// 并发局部设置更新不能共同持久化出全零权重。
+    #[tokio::test]
+    async fn scheduling_settings_merge_validate_and_apply_atomically() {
+        let (app, _, settings, _, accounts) = test_router_with_scheduling(true).await;
+        let left = account_admin_json(
+            &app,
+            Method::PUT,
+            "/admin/settings",
+            json!({"v3_smart_weight_load":"0","v3_smart_weight_quota":"0"}),
+        );
+        let right = account_admin_json(
+            &app,
+            Method::PUT,
+            "/admin/settings",
+            json!({"v3_smart_weight_health":"0","v3_smart_weight_latency":"0"}),
+        );
+        let (left, right) = tokio::join!(left, right);
+        assert!(
+            (left.0 == StatusCode::OK && right.0 == StatusCode::BAD_REQUEST)
+                || (right.0 == StatusCode::OK && left.0 == StatusCode::BAD_REQUEST)
+        );
+        let stored = settings.get_all().await.unwrap();
+        let config = SchedulingConfig::parse(&stored).unwrap();
+        assert_eq!(
+            config.weights,
+            accounts.scheduler().unwrap().config().weights
+        );
+        let (status, _) = account_admin_json(
+            &app,
+            Method::PUT,
+            "/admin/settings",
+            json!({"v3_scheduling_mode":"legacy_score","v3_admission_wait_seconds":"10"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(accounts.scheduler().unwrap().config().mode, "legacy_score");
+        let (status, _) = account_admin_json(
+            &app,
+            Method::PUT,
+            "/admin/settings",
+            json!({"v3_admission_wait_seconds":"121"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(accounts.scheduler().unwrap().config().wait_seconds, 10);
     }
 }

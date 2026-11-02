@@ -16,4 +16,5 @@ pub mod telemetry;
 pub mod usage;
 pub mod usage_poller;
 pub mod usage_pricing;
+pub mod v3_scheduling;
 pub mod version_profile;

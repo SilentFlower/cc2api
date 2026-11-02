@@ -23,6 +23,7 @@ use crate::model::request_diagnostics::{
 };
 use crate::service::rewriter::extract_session_id_from_body;
 use crate::service::usage::UsageCapture;
+use crate::service::v3_scheduling::SchedulingRequest;
 use crate::service::version_profile::profile_for_version;
 use crate::store::cache::UpstreamSessionPoolResolve;
 use crate::store::diagnostics_store::{DiagnosticEvent, DiagnosticsStore};
@@ -30,6 +31,14 @@ use crate::store::diagnostics_store::{DiagnosticEvent, DiagnosticsStore};
 tokio::task_local! {
     /// 只在当前请求的异步调用链中可见，不向后台遥测任务传播。
     pub(crate) static CURRENT_TRACE: TraceContext;
+}
+
+/// 返回当前消息请求的根标识，不创建新的诊断请求。
+/// @return 无请求作用域时为空。
+pub(crate) fn current_request_id() -> Option<String> {
+    CURRENT_TRACE
+        .try_with(|trace| trace.lock().request.request_id.clone())
+        .ok()
 }
 
 struct TraceState {
@@ -224,19 +233,19 @@ pub(crate) struct AttemptTrace {
     record: Option<AttemptDiagnostic>,
     capture: Option<UsageCapture>,
     start: Instant,
+    committed: bool,
+    feedback: Option<SchedulingRequest>,
 }
 
-/// 在实际发送边界创建独立尝试，记录最终请求参数。
+/// 预处理白名单观察参数；尚不记录 attempt，丢弃也不记取消。
 /// @param account 实际用于协议改写的账号副本。
 /// @param body 最终上游请求字节，只临时解析，不持久化。
-/// @return 有请求作用域时返回观察器。
-pub(crate) fn begin_attempt(account: &Account, body: &[u8]) -> Option<AttemptTrace> {
+/// @return 有请求作用域时返回未提交的观察器。
+pub(crate) fn prepare_attempt(account: &Account, body: &[u8]) -> Option<AttemptTrace> {
     CURRENT_TRACE
         .try_with(|trace| {
             let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let mut state = trace.lock();
-            state.request.attempt_count = state.request.attempt_count.saturating_add(1);
-            state.request.error_stage = None;
+            let state = trace.lock();
             let mut sessions = state.sessions.clone();
             sessions.upstream_session_hash = extract_session_id_from_body(&body)
                 .map(|value| identity_hash(account.id, "session", &value));
@@ -247,7 +256,7 @@ pub(crate) fn begin_attempt(account: &Account, body: &[u8]) -> Option<AttemptTra
             let record = AttemptDiagnostic {
                 attempt_id: Uuid::new_v4().to_string(),
                 request_id: state.request.request_id.clone(),
-                ordinal: state.request.attempt_count,
+                ordinal: 0,
                 account_id: account.id,
                 profile_version: profile_for_version(&device_profile(account).env.version)
                     .key
@@ -269,21 +278,61 @@ pub(crate) fn begin_attempt(account: &Account, body: &[u8]) -> Option<AttemptTra
                 outcome: "in_progress".into(),
                 error_stage: None,
                 error_type: None,
-                retry_reason: state.next_retry.take().map(str::to_owned),
+                retry_reason: None,
             };
             drop(state);
-            trace.emit(Some(record.clone()));
             AttemptTrace {
                 trace: trace.clone(),
                 record: Some(record),
                 capture: Some(UsageCapture::observer(&body)),
                 start: Instant::now(),
+                committed: false,
+                feedback: None,
             }
         })
         .ok()
 }
 
+/// 保留旧观察器测试的即时开始入口。
+/// @param account 合成账号。
+/// @param body 合成请求正文。
+/// @return 已提交的测试观察器。
+#[cfg(test)]
+fn begin_attempt(account: &Account, body: &[u8]) -> Option<AttemptTrace> {
+    let mut attempt = prepare_attempt(account, body)?;
+    attempt.commit();
+    Some(attempt)
+}
+
 impl AttemptTrace {
+    /// 在真正提交边界发布一次 attempt；大正文解析已在准入前完成。
+    /// @return 无，重复调用不重复计数。
+    pub(crate) fn commit(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(record) = self.record.as_mut() else {
+            return;
+        };
+        let mut state = self.trace.lock();
+        state.request.attempt_count = state.request.attempt_count.saturating_add(1);
+        state.request.error_stage = None;
+        record.ordinal = state.request.attempt_count;
+        record.retry_reason = state.next_retry.take().map(str::to_owned);
+        record.started_at = now();
+        self.start = Instant::now();
+        self.committed = true;
+        drop(state);
+        self.trace.emit(Some(record.clone()));
+    }
+
+    /// 让现有响应观察器在完整结束后回灌反馈，不新增 SSE 解析路径。
+    /// @param request 当前调度租约。
+    /// @return 无。
+    pub(crate) fn with_feedback(&mut self, request: SchedulingRequest) {
+        self.feedback = Some(request);
+    }
+
     /// 返回供 sender 证据复用的内部 UUID。
     /// @return 当前尝试 UUID。
     pub(crate) fn id(&self) -> &str {
@@ -352,6 +401,11 @@ impl AttemptTrace {
     }
 
     fn finish(&mut self, end: &'static str) {
+        if !self.committed {
+            self.record.take();
+            self.capture.take();
+            return;
+        }
         let Some(mut record) = self.record.take() else {
             return;
         };
@@ -391,6 +445,15 @@ impl AttemptTrace {
             "upstream_rejected" => Some("upstream_headers".into()),
             _ => Some("upstream_body".into()),
         };
+        if let Some(feedback) = self.feedback.take() {
+            feedback.finish_observed_attempt(
+                record.account_id,
+                record.status_code,
+                &record.outcome,
+                record.error_type.as_deref(),
+                record.ttft_ms,
+            );
+        }
         record.finished_at = Some(now());
         record.duration_ms = Some(self.start.elapsed().as_millis() as u64);
         {
@@ -439,6 +502,7 @@ impl RequestTraceGuard {
     /// @return 无返回值。
     pub(crate) fn error(&self, error: &AppError) {
         let stage = match error {
+            AppError::AdmissionLimited { .. } | AppError::SchedulingConflict => "admission",
             AppError::BadRequest(_) => "request",
             AppError::Unauthorized | AppError::PermanentCredential(_) => "credentials",
             AppError::TooManyRequests(_) => "admission",

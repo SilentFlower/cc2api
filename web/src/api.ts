@@ -6,9 +6,10 @@ export function setAuth(token: string) {
   authToken = token
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(BASE + path, {
     method,
+    signal,
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${authToken}`,
@@ -83,6 +84,8 @@ export interface Account {
   upstream_session_pool_newest_last_seen_ms?: number | null
   telemetry_count: number
   telemetry_expires_at?: string
+  v3_scheduling?: SchedulingSummary
+  v3_scheduling_error?: string
   scheduling_score?: number
   scheduling_detail?: {
     eff_7d: number
@@ -108,6 +111,64 @@ export interface Account {
   request_usage?: RequestUsage | null
   created_at: string
   updated_at: string
+}
+
+/** v3 当前请求阶段计数，独立于绑定会话数与加权槽位。 */
+export interface SchedulingPhases {
+  waiting_concurrency: number
+  preparing: number
+  waiting_send: number
+  running: number
+  backoff: number
+}
+
+/** v3 调度器的真实生效配置和可解释容量摘要。 */
+export interface SchedulingSummary {
+  config: { mode: 'smart' | 'legacy_score'; wait_seconds: number; weights: [number, number, number, number] }
+  factors: { load: number; quota: number; health: number; latency: number; score: number }
+  capacity: { immediate: boolean; can_queue: boolean; reason: string; earliest_submit_at_ms: number }
+  observed_at_ms: number
+  bound_sessions: number
+  active_sessions: number
+  unbound_requests: number
+  phases: SchedulingPhases
+  next_send_at_ms: number | null
+  submissions_last_60s: number
+  history_available_from_ms: number
+  history_truncated: boolean
+}
+
+/** 无正文或原始会话 ID 的管理调度详情。 */
+export interface SchedulingDetail {
+  summary: SchedulingSummary
+  snapshot: {
+    observed_at_ms: number
+    history_available_from_ms: number
+    history_truncated: boolean
+    dropped_events: number
+    submissions_last_60s: number
+    requests: { request_id: string; session_key: string | null; account_id: number; bound: boolean; phase: string; started_at_ms: number; phase_since_ms: number }[]
+    events: { request_id: string; account_id: number; submitted_at_ms: number }[]
+  }
+}
+
+/** 一个按 Token 隔离的匿名网关绑定及当前请求分布。 */
+export interface SchedulingSession {
+  session_key: string
+  account_id: number
+  created_at_ms: number
+  last_seen_at_ms: number
+  expires_at_ms: number
+  phases: SchedulingPhases
+}
+
+/** 有界分页会话结果，不含官方聊天内容。 */
+export interface SchedulingSessions {
+  items: SchedulingSession[]
+  total: number
+  page: number
+  page_size: number
+  observed_at_ms: number
 }
 
 export interface PagedResult<T> {
@@ -247,6 +308,12 @@ export const api = {
       claude_code_profile_selection_mode?: 'client_version' | 'account'
       claude_code_version_profile?: string
     }>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
+  /** 获取只读调度快照。@param id 账号 ID。@param signal 关闭详情时取消读取。@return 当前状态与真实提交点。 */
+  accountScheduling: (id: number, signal?: AbortSignal) =>
+    request<SchedulingDetail>('GET', `/admin/accounts/${id}/scheduling`, undefined, signal),
+  /** 分页读取匿名会话。@param id 账号。@param page 页码。@param state 活跃筛选。@param prefix 摘要前缀。@param signal 取消信号。@return 绑定分页。 */
+  accountSchedulingSessions: (id: number, page: number, state = 'all', prefix = '', signal?: AbortSignal) =>
+    request<SchedulingSessions>('GET', `/admin/accounts/${id}/scheduling/sessions?page=${page}&page_size=20&state=${encodeURIComponent(state)}&prefix=${encodeURIComponent(prefix)}`, undefined, signal),
   createAccount: (a: Partial<Account>) => request<Account>('POST', '/admin/accounts', a),
   updateAccount: (id: number, a: Partial<Account>) => request<Account>('PUT', `/admin/accounts/${id}`, a),
   deleteAccount: (id: number) => request<void>('DELETE', `/admin/accounts/${id}`),

@@ -2,11 +2,11 @@ use chrono::Utc;
 use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -20,6 +20,10 @@ use crate::model::account::{
 };
 use crate::service::rewriter::ClientType;
 use crate::service::runtime_lease::RuntimeGate;
+use crate::service::v3_scheduling::{
+    PhaseCounts, SchedulingAccountSummary, SchedulingCandidate, SchedulingRequest, V3Scheduler,
+    now_ms, send_interval_ms,
+};
 use crate::service::version_profile::{
     apply_identity_to_env_json, default_profile, profile_for_key,
 };
@@ -299,6 +303,7 @@ pub struct AccountQueue {
 pub struct AccountSlotPermit {
     permit: Option<OwnedSemaphorePermit>,
     active_requests: Arc<AtomicI64>,
+    scheduling_request: Option<SchedulingRequest>,
 }
 
 impl AccountSlotPermit {
@@ -306,7 +311,16 @@ impl AccountSlotPermit {
         Self {
             permit: Some(permit),
             active_requests,
+            scheduling_request: None,
         }
+    }
+
+    /// 让调度租约随响应流的并发许可存活。
+    /// @param request 当前 v3 请求租约。
+    /// @return 持有调度状态的许可。
+    pub fn with_scheduling_request(mut self, request: SchedulingRequest) -> Self {
+        self.scheduling_request = Some(request);
+        self
     }
 }
 
@@ -543,7 +557,10 @@ impl AccountQueue {
     }
 }
 
+/// 统一账号硬资格、凭据及并发；v3 按需装配持久调度。
 pub struct AccountService {
+    scheduler: Option<Arc<V3Scheduler>>,
+    v3_settings_lock: AsyncMutex<()>,
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
     oauth_token_url: String,
@@ -648,6 +665,11 @@ fn build_oauth_credential_snapshot(
 }
 
 impl AccountService {
+    /// 创建保持旧行为的账号服务，v3 通过显式 builder 接入。
+    /// @param store 账号存储。
+    /// @param cache 既有缓存。
+    /// @param settings_store 全局设置。
+    /// @return 尚未装配 v3 调度器的服务。
     pub fn new(
         store: Arc<AccountStore>,
         cache: Arc<dyn CacheStore>,
@@ -678,11 +700,33 @@ impl AccountService {
             store,
             cache,
             oauth_token_url,
+            scheduler: None,
+            v3_settings_lock: AsyncMutex::new(()),
             score_weights: RwLock::new((DEFAULT_W7D, DEFAULT_W5H, DEFAULT_WCONC)),
             settings_store,
             queues: RwLock::new(HashMap::new()),
             transient_rate_limit_backoffs: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// 仅在 v3 启动时装配新调度，其他调用保留原行为。
+    /// @param scheduler 共享调度器。
+    /// @return 已装配服务。
+    pub fn with_scheduler(mut self, scheduler: Arc<V3Scheduler>) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// 串行化 v3 设置的合并校验、提交和缓存替换，避免并发局部更新拼出非法组合。
+    /// @return 当前管理员更新的独占锁。
+    pub async fn lock_v3_settings(&self) -> MutexGuard<'_, ()> {
+        self.v3_settings_lock.lock().await
+    }
+
+    /// 返回可选的 v3 调度器。
+    /// @return 非 v3 为 None。
+    pub fn scheduler(&self) -> Option<&Arc<V3Scheduler>> {
+        self.scheduler.as_ref()
     }
 
     /// 从数据库加载评分权重到内存缓存，启动时和更新设置后调用。
@@ -846,7 +890,11 @@ impl AccountService {
         normalize_account_auth(&mut normalized)?;
         normalize_upstream_session_pool_config(&mut normalized)?;
         validate_account_usage_limits(&normalized)?;
-        self.store.update(&normalized).await
+        self.store.update(&normalized).await?;
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.account_updated(a.id);
+        }
+        Ok(())
     }
 
     /// 校验并独立更新账号用量控制线，不写入快照中的凭据或账号状态。
@@ -857,8 +905,17 @@ impl AccountService {
         self.store.update_usage_limits(account).await
     }
 
+    /// 沿原管理门禁删除账号，v3 附属状态在同一事务清理。
+    /// @param id 已获准删除的账号。
+    /// @return 删除成功或存储错误。
     pub async fn delete_account(&self, id: i64) -> Result<(), AppError> {
-        self.store.delete(id).await
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.store.delete_account(id).await?;
+            scheduler.forget_account(id);
+            Ok(())
+        } else {
+            self.store.delete(id).await
+        }
     }
 
     pub async fn get_account(&self, id: i64) -> Result<Account, AppError> {
@@ -1175,6 +1232,76 @@ impl AccountService {
             }
         }
 
+        let mut candidates = self
+            .eligible_accounts(
+                &runtime_exclude_ids,
+                allowed_ids,
+                context,
+                skipped_sticky_for_fable_quota,
+                excluded_for_usage_limit,
+            )
+            .await?;
+
+        // 新会话优先避开当前分钟 RPM 已满账号；若全部已满，保留候选交给后续 admission 等待/拒绝。
+        let rpm_available = self.filter_rpm_available(&candidates).await;
+        if !rpm_available.is_empty() {
+            candidates = rpm_available;
+        }
+
+        if candidates.is_empty() {
+            if skipped_sticky_for_fable_quota {
+                return Err(AppError::TooManyRequests(format!(
+                    "Fable 周用量已达到 {}% 上限,暂无可切换账号",
+                    fable_weekly_usage_limit_percent
+                )));
+            }
+            return Err(AppError::ServiceUnavailable("no available accounts".into()));
+        }
+
+        // 按优先级分组，同优先级内按综合评分选择（5h 用量 + 并发负载）
+        let selected = self.select_by_score(&candidates).await;
+
+        Ok(SelectedAccount {
+            account: selected,
+            sticky: false,
+            should_bind_session: !session_hash.is_empty(),
+        })
+    }
+
+    /// 在请求真正进入所选账号后提交粘性会话绑定。
+    ///
+    /// 新会话选择阶段不能提前写绑定：如果随后 RPM admission 发现账号已满并换号，
+    /// 提前绑定会把下一轮误判成粘性请求，导致本应换号的请求被留在满载账号上等待或拒绝。
+    pub async fn bind_selected_session(
+        &self,
+        session_hash: &str,
+        account_id: i64,
+    ) -> Result<(), AppError> {
+        if session_hash.is_empty() {
+            return Ok(());
+        }
+        self.cache
+            .set_session_account_id(session_hash, account_id, STICKY_SESSION_TTL)
+            .await
+    }
+
+    /// 共用的硬资格过滤，保持旧路径与 v3 的权限、额度规则一致。
+    /// @param runtime_exclude_ids 本轮排除账号。
+    /// @param allowed_ids Token 范围。
+    /// @param context 模型与额度合同。
+    /// @param skipped_sticky_for_fable_quota 原绑定是否因 Fable 门禁排除。
+    /// @param excluded_for_usage_limit 原绑定是否命中普通控制线。
+    /// @return 符合硬资格的候选；容量尚未裁决。
+    async fn eligible_accounts(
+        &self,
+        runtime_exclude_ids: &[i64],
+        allowed_ids: &[i64],
+        context: &AccountSelectionContext,
+        skipped_sticky_for_fable_quota: bool,
+        mut excluded_for_usage_limit: bool,
+    ) -> Result<Vec<Account>, AppError> {
+        let fable_quota_fallback_active = context.is_fable_quota_fallback_active();
+        let fable_weekly_usage_limit_percent = context.fable_weekly_usage_limit_percent;
         // 获取可调度账号
         let accounts = self.store.list_schedulable().await?;
 
@@ -1226,47 +1353,155 @@ impl AccountService {
             }
         }
 
-        // 新会话优先避开当前分钟 RPM 已满账号；若全部已满，保留候选交给后续 admission 等待/拒绝。
-        let rpm_available = self.filter_rpm_available(&candidates).await;
-        if !rpm_available.is_empty() {
-            candidates = rpm_available;
-        }
+        Ok(candidates)
+    }
 
-        if candidates.is_empty() {
-            if skipped_sticky_for_fable_quota {
-                return Err(AppError::TooManyRequests(format!(
-                    "Fable 周用量已达到 {}% 上限,暂无可切换账号",
-                    fable_weekly_usage_limit_percent
-                )));
+    /// v3 严格绑定与新会话容量选择，不读取旧缓存绑定或固定分钟 RPM。
+    /// @param request 本请求的统一期限和匿名会话。
+    /// @param exclude_ids 既有故障／Token 排除。
+    /// @param allowed_ids Token 允许范围。
+    /// @param context 既有模型和硬额度规则。
+    /// @param slot_units 当前请求加权槽位。
+    /// @return 稳定绑定或可接纳的新候选。
+    pub async fn select_v3_account(
+        &self,
+        request: &SchedulingRequest,
+        exclude_ids: &[i64],
+        allowed_ids: &[i64],
+        context: &AccountSelectionContext,
+        slot_units: u32,
+    ) -> Result<SelectedAccount, AppError> {
+        let scheduler = self
+            .scheduler
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("v3 调度未装配".into()))?;
+        request.check_deadline()?;
+        let binding = match request.key() {
+            Some(key) => {
+                let mut binding = scheduler.store.binding(key, now_ms()).await?;
+                if binding.is_none() {
+                    // 活动流在短暂存储故障后仍可能持有旧期限；先 CAS 续租，不能用内存猜权威绑定。
+                    for hint in scheduler.live_bindings(key) {
+                        if scheduler.store.renew(&hint, now_ms(), true).await? {
+                            break;
+                        }
+                    }
+                    binding = scheduler.store.binding(key, now_ms()).await?;
+                }
+                binding
             }
-            return Err(AppError::ServiceUnavailable("no available accounts".into()));
+            None => None,
+        };
+        let candidates = self
+            .eligible_accounts(exclude_ids, allowed_ids, context, false, false)
+            .await
+            .map_err(|error| match error {
+                AppError::Internal(_) => AppError::ServiceUnavailable("调度账号数据不可用".into()),
+                other => other,
+            })?;
+        if let Some(bound) = &binding {
+            if let Some(account) = candidates.iter().find(|a| a.id == bound.account_id) {
+                scheduler.store.renew(bound, now_ms(), true).await?;
+                request.selected(account, binding.clone());
+                return Ok(SelectedAccount {
+                    account: account.clone(),
+                    sticky: true,
+                    should_bind_session: false,
+                });
+            }
         }
-
-        // 按优先级分组，同优先级内按综合评分选择（5h 用量 + 并发负载）
-        let selected = self.select_by_score(&candidates).await;
-
+        let mut snapshots = Vec::with_capacity(candidates.len());
+        for account in candidates {
+            let score = self.get_account_score_info(&account).await;
+            let next_send_ms = scheduler
+                .store
+                .next_send(account.id, send_interval_ms(account.rpm_limit))
+                .await?;
+            snapshots.push(SchedulingCandidate {
+                account,
+                active_units: score.current_concurrency_units,
+                max_units: score.max_concurrency_units,
+                queued: score.queued,
+                queued_units: score.queued_request_units,
+                legacy_score: score.score,
+                next_send_ms,
+            });
+        }
+        let account = scheduler.choose(snapshots, request, slot_units)?;
+        request.selected(&account, binding);
         Ok(SelectedAccount {
-            account: selected,
+            account,
             sticky: false,
-            should_bind_session: !session_hash.is_empty(),
+            should_bind_session: false,
         })
     }
 
-    /// 在请求真正进入所选账号后提交粘性会话绑定。
-    ///
-    /// 新会话选择阶段不能提前写绑定：如果随后 RPM admission 发现账号已满并换号，
-    /// 提前绑定会把下一轮误判成粘性请求，导致本应换号的请求被留在满载账号上等待或拒绝。
-    pub async fn bind_selected_session(
+    /// 从真实选择器的共享计算构成账号管理摘要。
+    /// @param account 当前持久账号。
+    /// @param score 已读取的加权容量和旧评分。
+    /// @param bound_sessions 批量读取的有效绑定数。
+    /// @return v3 管理摘要或观测不可用。
+    pub async fn v3_summary(
         &self,
-        session_hash: &str,
-        account_id: i64,
-    ) -> Result<(), AppError> {
-        if session_hash.is_empty() {
-            return Ok(());
+        account: &Account,
+        score: &AccountScoreInfo,
+        bound_sessions: i64,
+    ) -> Result<SchedulingAccountSummary, AppError> {
+        let scheduler = self
+            .scheduler
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("v3 调度未启用".into()))?;
+        let now = now_ms();
+        let next = scheduler
+            .store
+            .next_send(account.id, send_interval_ms(account.rpm_limit))
+            .await?;
+        let candidate = SchedulingCandidate {
+            account: account.clone(),
+            active_units: score.current_concurrency_units,
+            max_units: score.max_concurrency_units,
+            queued: score.queued,
+            queued_units: score.queued_request_units,
+            legacy_score: score.score,
+            next_send_ms: next,
+        };
+        let config = scheduler.config();
+        let factors = scheduler.factors(&candidate, &config, now);
+        let mut capacity = scheduler.capacity(
+            &candidate,
+            DEFAULT_REQUEST_SLOT_UNITS,
+            config.wait_seconds as i64 * 1000,
+            now,
+        );
+        if !account.is_schedulable() || account_usage_limit_reached(account) {
+            capacity.immediate = false;
+            capacity.can_queue = false;
+            capacity.reason = "account_unavailable".into();
         }
-        self.cache
-            .set_session_account_id(session_hash, account_id, STICKY_SESSION_TTL)
-            .await
+        let snapshot = scheduler.snapshot(account.id);
+        let phases = PhaseCounts::of(snapshot.requests.iter());
+        let active_sessions = snapshot
+            .requests
+            .iter()
+            .filter(|r| r.bound)
+            .filter_map(|r| r.session_key.as_deref())
+            .collect::<HashSet<_>>()
+            .len();
+        let unbound_requests = snapshot.requests.iter().filter(|r| !r.bound).count();
+        Ok(SchedulingAccountSummary {
+            config,
+            factors,
+            capacity,
+            observed_at_ms: now,
+            bound_sessions,
+            active_sessions,
+            unbound_requests,
+            phases,
+            next_send_at_ms: (account.rpm_limit > 0).then_some(next.max(now)),
+            submissions_last_60s: snapshot.submissions_last_60s,
+            history_available_from_ms: snapshot.history_available_from_ms,
+            history_truncated: snapshot.history_truncated,
+        })
     }
 
     async fn filter_rpm_available(&self, accounts: &[Account]) -> Vec<Account> {
