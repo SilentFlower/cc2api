@@ -782,6 +782,7 @@ impl AccountService {
         }
 
         normalize_account_auth(a)?;
+        normalize_account_subscription(a)?;
         normalize_upstream_session_pool_config(a)?;
         validate_account_usage_limits(a)?;
 
@@ -815,9 +816,36 @@ impl AccountService {
             return Err(AppError::BadRequest("unconfirmed CLI identity".into()));
         }
         normalize_account_auth(account)?;
+        normalize_account_subscription(account)?;
         normalize_upstream_session_pool_config(account)?;
         validate_account_usage_limits(account)?;
         self.store.create(account).await
+    }
+
+    /// 在刷新锁内只更新套餐元数据，不写回旧凭据副本。
+    /// @param id 账号 ID。
+    /// @param subscription_type 未提交或明确的新类型/空值。
+    /// @param rate_limit_tier 未提交或明确的真实分级/空值。
+    /// @return 保存结果。
+    pub async fn update_subscription_metadata(
+        &self,
+        id: i64,
+        subscription_type: Option<Option<String>>,
+        rate_limit_tier: Option<Option<String>>,
+    ) -> Result<(), AppError> {
+        validate_subscription_metadata(
+            subscription_type
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+            rate_limit_tier.as_ref().and_then(|value| value.as_deref()),
+        )?;
+        let (key, owner) = self.acquire_oauth_credential_lock(id).await?;
+        let result = self
+            .store
+            .update_subscription_metadata(id, subscription_type, rate_limit_tier)
+            .await;
+        self.cache.release_lock(&key, &owner).await;
+        result
     }
 
     /// 将当前 settings 中选定的 Claude Code 版本画像应用到新账号 env。
@@ -888,6 +916,7 @@ impl AccountService {
     pub async fn update_account(&self, a: &Account) -> Result<(), AppError> {
         let mut normalized = a.clone();
         normalize_account_auth(&mut normalized)?;
+        normalize_account_subscription(&mut normalized)?;
         normalize_upstream_session_pool_config(&mut normalized)?;
         validate_account_usage_limits(&normalized)?;
         self.store.update(&normalized).await?;
@@ -1929,6 +1958,10 @@ impl AccountService {
         {
             return Err(AppError::BadRequest("重授权凭据格式不合法".into()));
         }
+        validate_subscription_metadata(
+            input.subscription_type.as_deref(),
+            input.rate_limit_tier.as_deref(),
+        )?;
         let encoded = serde_json::to_vec(input)
             .map_err(|_| AppError::BadRequest("凭据提交格式不合法".into()))?;
         let request_hash = hex::encode(Sha256::digest(encoded));
@@ -2811,6 +2844,40 @@ fn check_usage_window(
     Some(dt)
 }
 
+/// 校验套餐元数据，防止将控制字符或无界文本带入协议。
+fn validate_subscription_metadata(
+    subscription_type: Option<&str>,
+    rate_limit_tier: Option<&str>,
+) -> Result<(), AppError> {
+    for (key, value) in [
+        ("subscription_type", subscription_type),
+        ("rate_limit_tier", rate_limit_tier),
+    ] {
+        if value.is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control)) {
+            return Err(AppError::BadRequest(format!(
+                "{key} 必须为不含控制字符的短文本"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 规整已校验的官方元数据，不从套餐名补造分级。
+fn normalize_account_subscription(account: &mut Account) -> Result<(), AppError> {
+    validate_subscription_metadata(
+        account.subscription_type.as_deref(),
+        account.rate_limit_tier.as_deref(),
+    )?;
+    for value in [&mut account.subscription_type, &mut account.rate_limit_tier] {
+        *value = value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+    }
+    Ok(())
+}
+
 /// 校验账号控制线，避免内部创建或更新绕过管理接口的值域校验。
 fn validate_account_usage_limits(account: &Account) -> Result<(), AppError> {
     for (key, value) in [
@@ -3339,6 +3406,7 @@ mod tests {
             account_uuid: None,
             organization_uuid: None,
             subscription_type: None,
+            rate_limit_tier: None,
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,
@@ -3385,6 +3453,7 @@ mod tests {
             account_uuid: None,
             organization_uuid: None,
             subscription_type: None,
+            rate_limit_tier: None,
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,
@@ -4451,6 +4520,8 @@ mod tests {
             access_token: "synthetic-new-access".into(),
             refresh_token: "synthetic-new-refresh".into(),
             expires_at: (Utc::now() + ChronoDuration::hours(1)).timestamp_millis(),
+            subscription_type: None,
+            rate_limit_tier: None,
         }
     }
 
@@ -4662,5 +4733,43 @@ mod tests {
     fn tiered_decay_mid_range() {
         assert_eq!(tiered_decay(0.4), 0.8);
         assert_eq!(tiered_decay(0.21), 0.8);
+    }
+    /// 新元数据与凭据原子导入，旧字段缺省不改变原有回执序列化合同。
+    /// @return 无；元数据丢失、旧摘要变化或重复导入不幂等时失败。
+    #[tokio::test]
+    async fn login_import_subscription_metadata_and_legacy_payload_contract() {
+        let (_, svc) = setup_account_service().await;
+        let mut account = new_account_request("tier@example.invalid");
+        svc.create_account(&mut account).await.unwrap();
+        let mut input = login_import_input(&svc, &account).await;
+        let legacy = serde_json::to_value(&input).unwrap();
+        assert!(legacy.get("subscription_type").is_none());
+        assert!(legacy.get("rate_limit_tier").is_none());
+        let decoded: OAuthCredentialImport = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&input).unwrap(),
+            serde_json::to_vec(&decoded).unwrap()
+        );
+        input.subscription_type = Some("max".into());
+        input.rate_limit_tier = Some("default_claude_max_20x".into());
+        svc.import_oauth_credentials(account.id, &input)
+            .await
+            .unwrap();
+        svc.import_oauth_credentials(account.id, &input)
+            .await
+            .unwrap();
+        let saved = svc.get_account(account.id).await.unwrap();
+        assert_eq!(saved.subscription_type.as_deref(), Some("max"));
+        assert_eq!(
+            saved.rate_limit_tier.as_deref(),
+            Some("default_claude_max_20x")
+        );
+        assert_eq!(saved.refresh_token, input.refresh_token);
+        input.rate_limit_tier = Some("default_claude_max_5x".into());
+        assert!(
+            svc.import_oauth_credentials(account.id, &input)
+                .await
+                .is_err()
+        );
     }
 }

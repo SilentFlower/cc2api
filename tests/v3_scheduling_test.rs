@@ -128,6 +128,7 @@ impl Fixture {
             account_uuid: None,
             organization_uuid: None,
             subscription_type: None,
+            rate_limit_tier: None,
             concurrency: 1,
             priority: 50,
             rpm_limit: 0,

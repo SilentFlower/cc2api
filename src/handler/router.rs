@@ -458,6 +458,7 @@ struct CreateAccountRequest {
     account_uuid: Option<String>,
     organization_uuid: Option<String>,
     subscription_type: Option<String>,
+    rate_limit_tier: Option<String>,
     concurrency: Option<i32>,
     priority: Option<i32>,
     rpm_limit: Option<i32>,
@@ -711,6 +712,7 @@ async fn create_account(
         account_uuid: req.account_uuid,
         organization_uuid: req.organization_uuid,
         subscription_type: req.subscription_type,
+        rate_limit_tier: req.rate_limit_tier,
         concurrency: req.concurrency.unwrap_or(3),
         priority: req.priority.unwrap_or(50),
         rpm_limit: req.rpm_limit.unwrap_or(0).max(0),
@@ -869,12 +871,64 @@ async fn config_permit(
     Ok(Some(permit))
 }
 
+/// 解码可选套餐字段，区分未提交与明确清除。
+/// @param updates 原始增量载荷。
+/// @param key 受控字段名。
+/// @return 外层为空表示保持原值，内层为空表示清除。
+fn subscription_update(
+    updates: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Option<String>>, AppError> {
+    let Some(value) = updates.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let raw = value
+        .as_str()
+        .ok_or_else(|| AppError::BadRequest(format!("{key} 必须为文本或空值")))?;
+    if raw.len() > 256 || raw.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(format!(
+            "{key} 必须为不含控制字符的短文本"
+        )));
+    }
+    Ok(Some(
+        (!raw.trim().is_empty()).then(|| raw.trim().to_string()),
+    ))
+}
+
 async fn update_account(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Account>, AppError> {
     let mut existing = state.account_svc.get_account(id).await?;
+    let subscription = subscription_update(&updates, "subscription_type")?;
+    let tier = subscription_update(&updates, "rate_limit_tier")?;
+    if (subscription.is_some() || tier.is_some())
+        && updates.as_object().is_some_and(|fields| {
+            fields
+                .keys()
+                .all(|key| matches!(key.as_str(), "subscription_type" | "rate_limit_tier"))
+        })
+    {
+        // 同步套餐不能顺便写回旧 AT/RT；元数据使用独立 SQL 和刷新锁。
+        state
+            .account_svc
+            .update_subscription_metadata(id, subscription, tier)
+            .await?;
+        return Ok(Json(state.account_svc.get_account(id).await?));
+    }
+    if let Some(value) = &subscription {
+        if value != &existing.subscription_type && tier.is_none() {
+            existing.rate_limit_tier = None;
+        }
+        existing.subscription_type = value.clone();
+    }
+    if let Some(value) = &tier {
+        existing.rate_limit_tier = value.clone();
+    }
     // 先校验新字段，避免状态快捷操作或其它配置先写入后才发现限额无效。
     for (key, limit) in [
         (
@@ -995,6 +1049,12 @@ async fn update_account(
                         .update_account_usage_limits(&existing)
                         .await?;
                 }
+                if subscription.is_some() || tier.is_some() {
+                    state
+                        .account_svc
+                        .update_subscription_metadata(id, subscription.clone(), tier.clone())
+                        .await?;
+                }
                 existing = state.account_svc.get_account(id).await?;
                 return Ok(Json(existing));
             }
@@ -1014,12 +1074,6 @@ async fn update_account(
     if updates.get("organization_uuid").is_some() {
         existing.organization_uuid = updates
             .get("organization_uuid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-    }
-    if updates.get("subscription_type").is_some() {
-        existing.subscription_type = updates
-            .get("subscription_type")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
     }
@@ -3399,5 +3453,60 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(accounts.scheduler().unwrap().config().wait_seconds, 10);
+    }
+    /// 管理接口元数据更新保留最新凭据，非法元数据不能先改变账号状态。
+    /// @return 无；创建、局部更新、清除或拒绝顺序异常时失败。
+    #[tokio::test]
+    async fn subscription_metadata_admin_roundtrip_and_atomic_validation() {
+        let (app, _, _, pool, _) = test_router_with_scheduling(false).await;
+        let (status, account) = account_admin_json(
+            &app,
+            Method::POST,
+            "/admin/accounts",
+            json!({
+                "name":"synthetic-tier", "email":"tier-admin@example.invalid", "auth_type":"oauth",
+                "access_token":"synthetic-old-access", "refresh_token":"synthetic-old-refresh",
+                "subscription_type":"max", "rate_limit_tier":"default_claude_max_20x"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(account["rate_limit_tier"], "default_claude_max_20x");
+        let id = account["id"].as_i64().unwrap();
+        let path = format!("/admin/accounts/{id}");
+        sqlx::query("UPDATE accounts SET access_token='synthetic-rotated-access',refresh_token='synthetic-rotated-refresh' WHERE id=$1")
+            .bind(id).execute(&pool).await.unwrap();
+        let (status, updated) = account_admin_json(
+            &app,
+            Method::PUT,
+            &path,
+            json!({"rate_limit_tier":"default_claude_max_5x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["refresh_token"], "synthetic-rotated-refresh");
+        assert_eq!(updated["subscription_type"], "max");
+        assert_eq!(updated["rate_limit_tier"], "default_claude_max_5x");
+        for value in [json!(7), json!("bad\nvalue"), json!("x".repeat(257))] {
+            let (status, _) = account_admin_json(
+                &app,
+                Method::PUT,
+                &path,
+                json!({"status":"disabled","rate_limit_tier":value}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let (_, list) = account_admin_json(&app, Method::GET, "/admin/accounts", Value::Null).await;
+        assert_eq!(list["data"][0]["status"], "active");
+        let (_, updated) = account_admin_json(
+            &app,
+            Method::PUT,
+            &path,
+            json!({"subscription_type":"ultra"}),
+        )
+        .await;
+        assert!(updated.get("rate_limit_tier").is_none());
+        assert_eq!(updated["refresh_token"], "synthetic-rotated-refresh");
     }
 }

@@ -61,6 +61,7 @@ export interface Account {
   account_uuid?: string | null
   organization_uuid?: string | null
   subscription_type?: string | null
+  rate_limit_tier?: string | null
   concurrency: number
   priority: number
   rpm_limit: number
@@ -219,7 +220,7 @@ export interface UsageLimit {
 }
 
 export interface UsageData {
-  five_hour?: UsageWindow
+  five_hour?: UsageWindow | null
   seven_day?: UsageWindow
   seven_day_sonnet?: UsageWindow
   seven_day_fable?: UsageWindow

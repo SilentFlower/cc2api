@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { api, type Account, type OAuthExchangeResult, type UsageWindow } from '../api';
 import UsageWindowStats from './UsageWindowStats.vue';
 import SchedulingDetails from './SchedulingDetails.vue';
+import { subscriptionLabel, fiveHourLabel } from '../lib/subscription';
 import { schedulingReasonLabel } from '../lib/scheduling';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -99,6 +100,7 @@ const form = ref({
   account_uuid: '',
   organization_uuid: '',
   subscription_type: '',
+  rate_limit_tier: '',
   concurrency: 3,
   priority: 50,
   rpm_limit: 0,
@@ -120,6 +122,12 @@ const testResult = ref<{ status: string; message?: string } | null>(null);
 /** 正在刷新用量的账号 ID */
 const refreshingUsage = ref<number | null>(null);
 type UsageWindowKey = 'five_hour' | 'seven_day' | 'seven_day_sonnet' | 'seven_day_fable';
+
+/** 修改原始类型时清除旧分级，防止把上个套餐的真实分级带入新类型。@param value 原始类型。@return 无。 */
+function selectSubscription(value: string) {
+  if (form.value.subscription_type !== value) form.value.rate_limit_tier = '';
+  form.value.subscription_type = value;
+}
 
 /** 加载账号列表 */
 async function load() {
@@ -210,6 +218,7 @@ function openCreate() {
     account_uuid: '',
     organization_uuid: '',
     subscription_type: '',
+    rate_limit_tier: '',
     concurrency: 3,
     priority: 50,
     rpm_limit: 0,
@@ -246,6 +255,7 @@ function openEdit(a: Account) {
     account_uuid: a.account_uuid || '',
     organization_uuid: a.organization_uuid || '',
     subscription_type: a.subscription_type || '',
+    rate_limit_tier: a.rate_limit_tier || '',
     concurrency: a.concurrency,
     priority: a.priority,
     rpm_limit: a.rpm_limit ?? 0,
@@ -317,6 +327,7 @@ async function save() {
       updates.account_uuid = form.value.account_uuid || null;
       updates.organization_uuid = form.value.organization_uuid || null;
       updates.subscription_type = form.value.subscription_type || null;
+      updates.rate_limit_tier = form.value.rate_limit_tier || null;
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       updates.rpm_limit = form.value.rpm_limit;
@@ -350,6 +361,7 @@ async function save() {
         account_uuid: form.value.account_uuid || null,
         organization_uuid: form.value.organization_uuid || null,
         subscription_type: form.value.subscription_type || null,
+        rate_limit_tier: form.value.rate_limit_tier || null,
         concurrency: form.value.concurrency,
         priority: form.value.priority,
         rpm_limit: form.value.rpm_limit,
@@ -829,6 +841,7 @@ function applyOAuthResult() {
     account_uuid: r.account_uuid || '',
     organization_uuid: r.organization_uuid || '',
     subscription_type: '',
+    rate_limit_tier: '',
     concurrency: 3,
     priority: 50,
     rpm_limit: 0,
@@ -924,6 +937,7 @@ async function copyText(text: string) {
               </div>
               <div class="min-w-0">
                 <p class="text-sm font-medium text-[#29261e] truncate">{{ a.name || a.email }}</p>
+                <span class="text-xs text-[#8c8475]">{{ subscriptionLabel(a.subscription_type, a.rate_limit_tier) }}</span>
                 <p v-if="a.name" class="text-xs text-[#8c8475] truncate">{{ a.email }}</p>
               </div>
             </div>
@@ -1099,7 +1113,7 @@ async function copyText(text: string) {
               <UsageWindowStats :stats="a.request_usage?.five_hour" label="5h" />
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">5 小时 · {{ a.five_hour_usage_limit_percent > 0 ? `上限 ${a.five_hour_usage_limit_percent}%` : '未限制' }}</span>
-                <span class="text-[#5c5647] font-medium">{{ usagePercentLabel(usageWindow(a.usage_data, 'five_hour')) }}
+                <span class="text-[#5c5647] font-medium">{{ fiveHourLabel(a.usage_data, usagePercentLabel(usageWindow(a.usage_data, 'five_hour'))) }}
                   <span v-if="hasFutureReset(usageWindow(a.usage_data, 'five_hour'))" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(usageWindow(a.usage_data, 'five_hour')?.resets_at) }}</span>
                 </span>
               </div>
@@ -1424,13 +1438,14 @@ async function copyText(text: string) {
                 v-for="opt in [
                   { value: '', label: '未设置' },
                   { value: 'max', label: 'Max' },
+                  { value: 'ultra', label: 'Ultra' },
                   { value: 'pro', label: 'Pro' },
                   { value: 'team', label: 'Team' },
                   { value: 'enterprise', label: 'Enterprise' },
                 ]"
                 :key="opt.value"
                 type="button"
-                @click="form.subscription_type = opt.value"
+                @click="selectSubscription(opt.value)"
                 class="px-3 py-1.5 rounded-lg text-xs font-medium border transition-all duration-200"
                 :class="form.subscription_type === opt.value
                   ? 'bg-[#c4704f]/10 border-[#c4704f] text-[#c4704f]'
@@ -1439,6 +1454,10 @@ async function copyText(text: string) {
                 {{ opt.label }}
               </button>
             </div>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">官方分级（选填）</Label>
+            <Input v-model="form.rate_limit_tier" placeholder="填写官方 profile 中的 rateLimitTier" class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] font-mono text-sm" />
           </div>
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">

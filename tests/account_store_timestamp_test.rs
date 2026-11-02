@@ -39,6 +39,7 @@ async fn usage_limits_storage_contract(pool: &AnyPool, driver: &str) {
     for column in [
         "five_hour_usage_limit_percent",
         "seven_day_usage_limit_percent",
+        "rate_limit_tier",
     ] {
         sqlx::query(&format!("ALTER TABLE accounts DROP COLUMN {column}"))
             .execute(pool)
@@ -49,6 +50,9 @@ async fn usage_limits_storage_contract(pool: &AnyPool, driver: &str) {
     let upgraded = store.get_by_id(account.id).await.unwrap();
     assert_eq!(upgraded.five_hour_usage_limit_percent, 0);
     assert_eq!(upgraded.seven_day_usage_limit_percent, 0);
+    assert_eq!(upgraded.rate_limit_tier, None);
+    account.subscription_type = Some("max".into());
+    account.rate_limit_tier = Some("default_claude_max_20x".into());
     account.five_hour_usage_limit_percent = 80;
     account.seven_day_usage_limit_percent = 60;
     store.update(&account).await.unwrap();
@@ -77,6 +81,30 @@ async fn usage_limits_storage_contract(pool: &AnyPool, driver: &str) {
     let process = json!({"constrained_memory": 1024});
     store.update_cli_process(&account, &process).await.unwrap();
     let refreshed = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(
+        refreshed.rate_limit_tier.as_deref(),
+        Some("default_claude_max_20x")
+    );
+    // 元数据写入只能触及套餐列，不能把旧快照中的 RT 写回去。
+    store
+        .update_subscription_metadata(account.id, None, Some(Some("default_claude_max_5x".into())))
+        .await
+        .unwrap();
+    let metadata = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(metadata.refresh_token, "synthetic-next-refresh");
+    assert_eq!(
+        metadata.rate_limit_tier.as_deref(),
+        Some("default_claude_max_5x")
+    );
+    store
+        .update_subscription_metadata(account.id, Some(Some("ultra".into())), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_by_id(account.id).await.unwrap().rate_limit_tier,
+        None
+    );
+
     assert_eq!(
         refreshed.expires_at.unwrap().timestamp(),
         refreshed_until.timestamp()
@@ -179,6 +207,7 @@ fn new_account(email: &str) -> Account {
         account_uuid: None,
         organization_uuid: None,
         subscription_type: None,
+        rate_limit_tier: None,
         concurrency: 3,
         priority: 50,
         rpm_limit: 0,

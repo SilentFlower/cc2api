@@ -3765,10 +3765,11 @@ fn apply_growthbook_attributes(
         "userType".into(),
         serde_json::Value::String("external".into()),
     );
-    map.insert(
-        "rateLimitTier".into(),
-        serde_json::Value::String(rate_limit_tier(&profile.subscription_type)),
-    );
+    if let Some(tier) = profile.effective_rate_limit_tier() {
+        map.insert("rateLimitTier".into(), serde_json::Value::String(tier));
+    } else {
+        map.remove("rateLimitTier");
+    }
     map.insert("entrypoint".into(), serde_json::Value::String("cli".into()));
     map.remove("apiBaseUrlHost");
 
@@ -3801,16 +3802,6 @@ fn rewrite_growthbook_payload_shape(body: &mut serde_json::Value, shape: Telemet
             map.insert("forcedFeatures".into(), serde_json::json!([]));
             map.insert("url".into(), serde_json::Value::String(String::new()));
         }
-    }
-}
-
-/// 根据订阅类型生成 GrowthBook rateLimitTier。
-fn rate_limit_tier(subscription_type: &Option<String>) -> String {
-    match subscription_type.as_deref() {
-        Some("max") => "default_claude_max_20x".to_string(),
-        Some("pro") => "default_claude_pro".to_string(),
-        Some(other) if !other.is_empty() => format!("default_claude_{}", other),
-        _ => "default".to_string(),
     }
 }
 
@@ -6911,6 +6902,7 @@ mod tests {
             account_uuid: Some("account-uuid".into()),
             organization_uuid: Some("org-uuid".into()),
             subscription_type: Some("max".into()),
+            rate_limit_tier: None,
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,

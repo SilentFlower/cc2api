@@ -2036,9 +2036,11 @@ fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_j
         "appVersion": profile.env.version,
         "accountUUID": profile.account_uuid,
         "userType": "external",
-        "rateLimitTier": rate_limit_tier(&profile.subscription_type),
         "entrypoint": "cli",
     });
+    if let Some(tier) = profile.effective_rate_limit_tier() {
+        attrs["rateLimitTier"] = json!(tier);
+    }
     if shape == TelemetryShape::ClaudeCode2173 {
         attrs["email"] = json!(profile.email);
     }
@@ -2061,16 +2063,6 @@ fn build_growthbook_eval(account: &Account, run_profile: &RunProfile) -> serde_j
             "forcedFeatures": [],
             "url": "",
         }),
-    }
-}
-
-/// 根据订阅类型生成 GrowthBook rateLimitTier。
-fn rate_limit_tier(subscription_type: &Option<String>) -> String {
-    match subscription_type.as_deref() {
-        Some("max") => "default_claude_max_20x".to_string(),
-        Some("pro") => "default_claude_pro".to_string(),
-        Some(other) if !other.is_empty() => format!("default_claude_{}", other),
-        _ => "default".to_string(),
     }
 }
 
@@ -2328,6 +2320,7 @@ mod tests {
             account_uuid: Some("account-uuid".into()),
             organization_uuid: Some("org-uuid".into()),
             subscription_type: Some("max".into()),
+            rate_limit_tier: None,
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,

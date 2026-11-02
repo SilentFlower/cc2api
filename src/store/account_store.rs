@@ -130,6 +130,9 @@ impl AccountStore {
             subscription_type: row
                 .try_get::<Option<String>, _>("subscription_type")
                 .unwrap_or(None),
+            rate_limit_tier: row
+                .try_get::<Option<String>, _>("rate_limit_tier")
+                .unwrap_or(None),
             concurrency: row.try_get::<i32, _>("concurrency").unwrap_or(3),
             priority: row.try_get::<i32, _>("priority").unwrap_or(50),
             rpm_limit: row.try_get::<i32, _>("rpm_limit").unwrap_or(0),
@@ -210,8 +213,8 @@ impl AccountStore {
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models,
                 allow_fast_mode, upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
-                upstream_session_refresh_policy, five_hour_usage_limit_percent, seven_day_usage_limit_percent)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+                upstream_session_refresh_policy, five_hour_usage_limit_percent, seven_day_usage_limit_percent, rate_limit_tier)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
             RETURNING id, CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at"#,
             self.ts(9),
             self.ts(10),
@@ -254,6 +257,7 @@ impl AccountStore {
             .bind(&a.upstream_session_refresh_policy)
             .bind(a.five_hour_usage_limit_percent)
             .bind(a.seven_day_usage_limit_percent)
+            .bind(&a.rate_limit_tier)
             .fetch_all(&self.pool)
             .await?;
         let row = rows.first().ok_or(AppError::NotFound)?;
@@ -287,8 +291,8 @@ impl AccountStore {
                 allow_1m_models=$21, allow_fast_mode=$22, upstream_session_pool_enabled=$23,
                 upstream_session_pool_size=$24, upstream_session_ttl_minutes=$25,
                 upstream_session_refresh_policy=$26, five_hour_usage_limit_percent=$27,
-                seven_day_usage_limit_percent=$28, updated_at={}
-            WHERE id=$29"#,
+                seven_day_usage_limit_percent=$28, rate_limit_tier=$29, updated_at={}
+            WHERE id=$30"#,
             self.ts(8),
             self.ts(9),
             self.now_expr()
@@ -322,6 +326,7 @@ impl AccountStore {
             .bind(&a.upstream_session_refresh_policy)
             .bind(a.five_hour_usage_limit_percent)
             .bind(a.seven_day_usage_limit_percent)
+            .bind(&a.rate_limit_tier)
             .bind(a.id)
             .execute(&self.pool)
             .await?;
@@ -592,7 +597,10 @@ impl AccountStore {
         }
         let query = format!("UPDATE accounts SET access_token=$1,refresh_token=$2,oauth_expires_at={},
             auth_error='',status=CASE WHEN $4=1 THEN 'active' ELSE status END,
-            disable_reason=CASE WHEN $4=1 THEN '' ELSE disable_reason END,oauth_refreshed_at={},updated_at={}
+            disable_reason=CASE WHEN $4=1 THEN '' ELSE disable_reason END,oauth_refreshed_at={},updated_at={},
+            rate_limit_tier=CASE WHEN $16=1 THEN CAST($17 AS TEXT)
+                WHEN $14=1 AND COALESCE(subscription_type,'')<>COALESCE(CAST($15 AS TEXT),'') THEN NULL ELSE rate_limit_tier END,
+            subscription_type=CASE WHEN $14=1 THEN CAST($15 AS TEXT) ELSE subscription_type END
             WHERE id=$6 AND auth_type='oauth' AND access_token=$7 AND refresh_token=$8
                 AND status=$9 AND disable_reason=$10 AND email=$11
                 AND COALESCE(account_uuid,'')=$12 AND COALESCE(organization_uuid,'')=$13",
@@ -611,6 +619,22 @@ impl AccountStore {
             .bind(&expected.email)
             .bind(expected.account_uuid.as_deref().unwrap_or_default())
             .bind(expected.organization_uuid.as_deref().unwrap_or_default())
+            .bind(i32::from(input.subscription_type.is_some()))
+            .bind(
+                input
+                    .subscription_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            )
+            .bind(i32::from(input.rate_limit_tier.is_some()))
+            .bind(
+                input
+                    .rate_limit_tier
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            )
             .execute(&mut *transaction)
             .await?
             .rows_affected();
@@ -620,6 +644,38 @@ impl AccountStore {
             ));
         }
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// 局部更新原始套餐元数据，避免旧账号快照覆盖轮换后的凭据。
+    /// @param id 目标账号。
+    /// @param subscription_type 外层为空表示未提交，内层为空表示清除。
+    /// @param rate_limit_tier 外层为空表示未提交，内层为空表示清除。
+    /// @return 保存结果；套餐改变而未提供真实分级时清除旧分级。
+    pub async fn update_subscription_metadata(
+        &self,
+        id: i64,
+        subscription_type: Option<Option<String>>,
+        rate_limit_tier: Option<Option<String>>,
+    ) -> Result<(), AppError> {
+        // SQLx Any 的空参数可能携带整数类型，显式转 TEXT 避免 PostgreSQL 对空字符串作整数解析。
+        let query = format!("UPDATE accounts SET
+            rate_limit_tier=CASE WHEN $1=1 THEN CAST($2 AS TEXT)
+                WHEN $3=1 AND COALESCE(subscription_type,'')<>COALESCE(CAST($4 AS TEXT),'') THEN NULL ELSE rate_limit_tier END,
+            subscription_type=CASE WHEN $3=1 THEN CAST($4 AS TEXT) ELSE subscription_type END,updated_at={}
+            WHERE id=$5", self.now_expr());
+        let changed = sqlx::query(&query)
+            .bind(i32::from(rate_limit_tier.is_some()))
+            .bind(rate_limit_tier.flatten())
+            .bind(i32::from(subscription_type.is_some()))
+            .bind(subscription_type.flatten())
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if changed != 1 {
+            return Err(AppError::NotFound);
+        }
         Ok(())
     }
 
@@ -843,7 +899,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     CAST(canonical_env AS TEXT) AS canonical_env,
     CAST(canonical_prompt_env AS TEXT) AS canonical_prompt_env,
     CAST(canonical_process AS TEXT) AS canonical_process,
-    billing_mode, account_uuid, organization_uuid, subscription_type,
+    billing_mode, account_uuid, organization_uuid, subscription_type, rate_limit_tier,
     concurrency, priority, rpm_limit, five_hour_usage_limit_percent, seven_day_usage_limit_percent,
     CAST(rate_limited_at AS TEXT) AS rate_limited_at,
     CAST(rate_limit_reset_at AS TEXT) AS rate_limit_reset_at,

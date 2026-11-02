@@ -54,6 +54,7 @@ async fn create_test_account(svc: &AccountService, email: &str, priority: i32) -
         account_uuid: None,
         organization_uuid: None,
         subscription_type: None,
+        rate_limit_tier: None,
         concurrency: 3,
         priority,
         rpm_limit: 0,

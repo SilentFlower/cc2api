@@ -443,6 +443,7 @@ pub struct DeviceProfile {
     pub account_uuid: String,
     pub organization_uuid: Option<String>,
     pub subscription_type: Option<String>,
+    pub rate_limit_tier: Option<String>,
     pub env: CanonicalEnvData,
     pub prompt: CanonicalPromptEnvData,
     pub process: CanonicalProcessData,
@@ -461,6 +462,27 @@ pub struct RunProfile {
 pub struct RequestProfile {
     pub session_id: String,
     pub client_request_id: String,
+}
+
+impl DeviceProfile {
+    /// 选择真实官方分级，缺失时仅保留原有旧套餐协议兼容。
+    /// @return 可发送的分级；未知 Ultra 分级为空，避免拼造未经观察的新协议值。
+    pub fn effective_rate_limit_tier(&self) -> Option<String> {
+        if let Some(tier) = self
+            .rate_limit_tier
+            .as_deref()
+            .filter(|tier| !tier.is_empty())
+        {
+            return Some(tier.to_string());
+        }
+        match self.subscription_type.as_deref() {
+            Some("max") => Some("default_claude_max_20x".into()),
+            Some("pro") => Some("default_claude_pro".into()),
+            Some(value) if value.eq_ignore_ascii_case("ultra") => None,
+            Some(other) if !other.is_empty() => Some(format!("default_claude_{other}")),
+            _ => Some("default".into()),
+        }
+    }
 }
 
 /// 进程指标快照。
@@ -497,6 +519,7 @@ pub fn device_profile(account: &Account) -> DeviceProfile {
         account_uuid: derive_account_uuid(account),
         organization_uuid: account.organization_uuid.clone(),
         subscription_type: account.subscription_type.clone(),
+        rate_limit_tier: account.rate_limit_tier.clone(),
         env,
         prompt,
         process,
@@ -829,6 +852,7 @@ fn stable_hash_bytes(seed: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::device_profile;
     use super::{
         derive_account_uuid, derive_device_id, generate_canonical_identity, normalize_env,
         normalize_process, process_snapshot, process_snapshot_json, profile_presets, run_profile,
@@ -867,6 +891,7 @@ mod tests {
             account_uuid: None,
             organization_uuid: None,
             subscription_type: None,
+            rate_limit_tier: None,
             concurrency: 3,
             priority: 50,
             rpm_limit: 0,
@@ -1033,5 +1058,40 @@ mod tests {
         assert_ne!(old_run.growthbook_session_id, new_run.growthbook_session_id);
         assert_eq!(derive_device_id(&old), derive_device_id(&new));
         assert_eq!(derive_account_uuid(&old), derive_account_uuid(&new));
+    }
+    /// 真实分级优先，Ultra 未知分级不拼造协议值，旧账号回退保持兼容。
+    /// @return 无；与真实字段或旧协议兼容合同不一致时失败。
+    #[test]
+    fn subscription_tier_uses_actual_metadata_without_inventing_ultra() {
+        let mut account = legacy_account();
+        for (kind, actual, expected) in [
+            (
+                "max",
+                Some("default_claude_max_5x"),
+                Some("default_claude_max_5x"),
+            ),
+            (
+                "max",
+                Some("default_claude_max_20x"),
+                Some("default_claude_max_20x"),
+            ),
+            (
+                "ultra",
+                Some("official_future_tier"),
+                Some("official_future_tier"),
+            ),
+            ("ultra", None, None),
+            ("max", None, Some("default_claude_max_20x")),
+            ("pro", None, Some("default_claude_pro")),
+        ] {
+            account.subscription_type = Some(kind.into());
+            account.rate_limit_tier = actual.map(str::to_owned);
+            assert_eq!(
+                device_profile(&account)
+                    .effective_rate_limit_tier()
+                    .as_deref(),
+                expected
+            );
+        }
     }
 }

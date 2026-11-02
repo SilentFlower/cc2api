@@ -127,6 +127,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN rate_limit_tier TEXT")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("ALTER TABLE accounts ADD COLUMN disable_reason TEXT NOT NULL DEFAULT ''")
         .execute(pool)
         .await

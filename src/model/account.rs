@@ -133,6 +133,12 @@ pub struct OAuthCredentialImport {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+    /// 真实登录产物中的套餐类型；缺失时保留原元数据及旧回执摘要。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    /// 真实登录产物中的分级，不能从商业套餐名称推断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_tier: Option<String>,
 }
 
 impl Default for AccountAuthType {
@@ -194,9 +200,12 @@ pub struct Account {
     /// OAuth organization UUID（强烈推荐填写，用于遥测改写）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization_uuid: Option<String>,
-    /// 订阅类型：max / pro / team / enterprise（强烈推荐填写，用于遥测改写）。
+    /// 官方原始订阅类型：ultra / max / pro / team / enterprise。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_type: Option<String>,
+    /// 官方登录产物明确提供的分级；缺失时不能把协议兼容值当成套餐事实。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_tier: Option<String>,
     #[serde(default = "default_concurrency")]
     pub concurrency: i32,
     #[serde(default = "default_priority")]
