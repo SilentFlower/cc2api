@@ -431,8 +431,9 @@ impl TelemetryService {
         let sessions_ref = self.sessions.clone();
         let store_ref = self.account_store.clone();
         let proxy_url = account.proxy_url.clone();
+        let account_svc = self.account_svc.clone();
         tokio::spawn(async move {
-            telemetry_loop(sessions_ref, store_ref, key, proxy_url).await;
+            telemetry_loop(sessions_ref, store_ref, key, proxy_url, account_svc).await;
         });
     }
 
@@ -544,6 +545,7 @@ async fn telemetry_loop(
     store: Arc<AccountStore>,
     key: TelemetrySessionKey,
     proxy_url: String,
+    account_svc: Arc<AccountService>,
 ) {
     let account_id = key.0;
     let mut tls_profile = {
@@ -568,6 +570,15 @@ async fn telemetry_loop(
 
     loop {
         tokio::time::sleep(TICK_INTERVAL).await;
+
+        // 会话缓存的 AT 不能绕过后来发生的解绑或重授权；活动许可覆盖真实发送。
+        let _credential_activity = match account_svc.upstream_activity(account_id).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                sessions.lock().await.remove(&key);
+                break;
+            }
+        };
 
         let mut map = sessions.lock().await;
         let session = match map.get_mut(&key) {
@@ -631,7 +642,6 @@ async fn telemetry_loop(
             let mut payload =
                 build_event_batch(&session.account, &session.run_profile, uptime_secs, &events);
             let scan_summary = sanitize_telemetry_payload(&mut payload);
-            let token = session.token.clone();
             let user_agent = session_ua(&session.account);
             let c = client.clone();
             session.last_event_batch_at = now;
@@ -641,6 +651,13 @@ async fn telemetry_loop(
             drop(map);
 
             log_simulated_batch_pre_send(account_id, &scan_summary);
+            let token = match account_svc.resolve_upstream_token(account_id).await {
+                Ok(token) => token,
+                Err(_) => {
+                    sessions.lock().await.remove(&key);
+                    break;
+                }
+            };
             send_telemetry(
                 &c,
                 &format!("{}{}", UPSTREAM_BASE, EVENT_LOGGING_V2_PATH),
@@ -670,12 +687,18 @@ async fn telemetry_loop(
         if should_gb {
             let payload = build_growthbook_eval(&session.account, &session.run_profile);
             let user_agent = growthbook_user_agent_for_account(&session.account);
-            let token = session.token.clone();
             let c = client.clone();
             session.last_growthbook_at = Some(now);
             session.send_count += 1;
             drop(map);
 
+            let token = match account_svc.resolve_upstream_token(account_id).await {
+                Ok(token) => token,
+                Err(_) => {
+                    sessions.lock().await.remove(&key);
+                    break;
+                }
+            };
             send_telemetry(
                 &c,
                 &format!("{}/api/eval/{}", UPSTREAM_BASE, GROWTHBOOK_CLIENT_KEY),
@@ -2268,6 +2291,7 @@ mod tests {
                 service.account_store.clone(),
                 telemetry_session_key(&old),
                 String::new(),
+                service.account_svc.clone(),
             ),
         )
         .await

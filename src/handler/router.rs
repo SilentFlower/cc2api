@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use chrono::TimeZone;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::warn;
@@ -24,6 +25,7 @@ use crate::model::account::{
     DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
 };
 use crate::model::api_token::{self, ApiToken};
+use crate::model::credential_ownership::CredentialOwnershipInput;
 use crate::model::request_diagnostics::{DiagnosticDetail, DiagnosticPage, DiagnosticQuery};
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -159,6 +161,14 @@ pub fn build_router(
         .route(
             "/admin/accounts/:id/oauth-credentials/resolve",
             post(resolve_oauth_credentials),
+        )
+        .route(
+            "/admin/runtime/credential-capabilities",
+            get(credential_capabilities),
+        )
+        .route(
+            "/admin/accounts/:id/oauth-ownership",
+            get(credential_ownership).post(credential_handoff),
         )
         .route(
             "/admin/accounts/:id/oauth-credentials/import",
@@ -344,10 +354,15 @@ async fn list_accounts(
         None
     };
 
+    let credential_ownerships = state.account_svc.credential_ownerships().await?;
     // 为每个账号附加遥测会话过期时间 + 调度评分信息
     let mut data: Vec<serde_json::Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
         let mut obj = serde_json::to_value(a).unwrap_or_default();
+        obj["credential_ownership"] = credential_ownerships
+            .get(&a.id)
+            .map(|value| json!({"owner":value.owner,"phase":value.phase,"protocol":value.protocol}))
+            .unwrap_or(Value::Null);
         obj["request_usage"] = request_usage
             .as_ref()
             .and_then(|stats| stats.get(&a.id))
@@ -445,6 +460,7 @@ async fn list_accounts(
 #[derive(Deserialize)]
 struct CreateAccountRequest {
     cli_identity: Option<CliIdentityImport>,
+    credential_ownership: Option<CredentialOwnershipInput>,
     name: Option<String>,
     email: String,
     token: Option<String>,
@@ -607,7 +623,9 @@ async fn runtime_account_config(
     Ok(Json(
         serde_json::json!({"account_id": account.id, "proxy_url": account.proxy_url,
         "auth_type": account.auth_type, "status": account.status, "email": account.email,
-        "account_uuid": account.account_uuid, "organization_uuid": account.organization_uuid}),
+        "account_uuid": account.account_uuid, "organization_uuid": account.organization_uuid,
+        "credential_ownership_protocol":1,
+        "credential_ownership":state.account_svc.credential_ownership(id).await?}),
     ))
 }
 
@@ -628,6 +646,21 @@ async fn runtime_lease_update(
         return Err(AppError::BadRequest("v3 runtime is not configured".into()));
     }
     let account = state.account_svc.get_account(id).await?;
+    if matches!(
+        input.operation.as_str(),
+        "prepare" | "prepare-cli" | "prepare-cli-shared" | "claim"
+    ) {
+        if let Some(ownership) = state.account_svc.credential_ownership(id).await? {
+            let controlled = input.owner.starts_with("binding:")
+                || (ownership.phase == "reauth"
+                    && ownership.lease_owner.as_deref() == Some(input.owner.as_str()));
+            if !ownership.gateway_ready() && !controlled {
+                return Err(AppError::ServiceUnavailable(
+                    "账号凭据正在交接或需要核对，不能启动普通 CLI 作业".into(),
+                ));
+            }
+        }
+    }
     let queue = state
         .account_svc
         .get_or_create_queue(id, account.concurrency)
@@ -777,7 +810,17 @@ async fn create_account(
             account.canonical_process = serde_json::to_value(process)
                 .map_err(|_| AppError::BadRequest("invalid CLI process observation".into()))?;
         }
-        state.account_svc.create_cli_account(&mut account).await?;
+        let ownership = req
+            .credential_ownership
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("CLI 账号创建需要凭据交接协议 1".into()))?;
+        if ownership.identity.environment_id != identity.environment_id {
+            return Err(AppError::BadRequest("创建归属与 CLI 环境不一致".into()));
+        }
+        state
+            .account_svc
+            .create_cli_account_owned(&mut account, Some(ownership))
+            .await?;
     } else {
         state.account_svc.create_account(&mut account).await?;
     }
@@ -971,6 +1014,25 @@ async fn update_account(
     ]
     .iter()
     .any(|key| updates.get(key).is_some());
+    // 普通限额、优先级等仍可热改；受管凭据只能在已确认的网关归属下修改。
+    let credential_update = [
+        "email",
+        "auth_type",
+        "access_token",
+        "refresh_token",
+        "token",
+        "setup_token",
+        "account_uuid",
+        "organization_uuid",
+        "expires_at",
+    ]
+    .iter()
+    .any(|key| updates.get(key).is_some());
+    let _credential_activity = if credential_update {
+        Some(state.account_svc.upstream_activity(existing.id).await?)
+    } else {
+        None
+    };
     let _runtime_permit = if runtime_update {
         config_permit(&state, &existing).await?
     } else {
@@ -1172,10 +1234,46 @@ async fn delete_account(
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
 
+/// 返回受信任交接能力，不接触账号令牌。
+/// @param headers 管理及服务证明。@return 当前协议版本。
+async fn credential_capabilities(headers: HeaderMap) -> Result<Json<Value>, AppError> {
+    require_v3_credential_service(&headers)?;
+    Ok(Json(json!({"credential_ownership_protocol":1})))
+}
+
+/// 查询原账号凭据归属，不触发刷新。
+/// @param state 服务。@param id 原账号。@param headers 服务证明。@return 脱敏归属。
+async fn credential_ownership(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_v3_credential_service(&headers)?;
+    Ok(Json(
+        json!({"protocol":1,"ownership":state.account_svc.credential_ownership(id).await?}),
+    ))
+}
+
+/// 推进同代交接或查询回执；完整凭据只返回内部受信任调用方。
+/// @param state 服务。@param id 原账号。@param headers 服务证明。@param input 操作。
+/// @return 同操作回执与允许的凭据快照。
+async fn credential_handoff(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(input): Json<CredentialOwnershipInput>,
+) -> Result<Json<Value>, AppError> {
+    require_v3_credential_service(&headers)?;
+    Ok(Json(
+        state.account_svc.credential_handoff(id, &input).await?,
+    ))
+}
+
 async fn test_account(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _credential_activity = state.account_svc.upstream_activity(id).await?;
     let account = state.account_svc.get_account(id).await?;
     let token = match state.account_svc.resolve_upstream_token(id).await {
         Ok(token) => token,

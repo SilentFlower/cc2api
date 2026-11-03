@@ -382,6 +382,8 @@ impl SchedulingStore {
         for sql in [
             "DELETE FROM gateway_session_bindings WHERE account_id=$1",
             "DELETE FROM gateway_account_send_state WHERE account_id=$1",
+            "DELETE FROM oauth_handoff_operations WHERE account_id=$1",
+            "DELETE FROM oauth_account_ownerships WHERE account_id=$1",
             "DELETE FROM accounts WHERE id=$1",
         ] {
             sqlx::query(sql)

@@ -1758,6 +1758,7 @@ impl GatewayService {
                 }
             };
             let account = selected.account;
+            let _credential_activity = self.account_svc.upstream_activity(account.id).await?;
             let request_account = account_for_request_profile(&account, request_profile);
             let tls_profile = tls_profile_for_account(&request_account, default_tls_profile);
             let filtered_body_map =
@@ -2293,7 +2294,9 @@ impl GatewayService {
             } else {
                 info!("[耗时] 槽位获取: {:.0}ms", slot_ms);
             }
-            let mut slot_guard = SlotReleaseGuard::new(admission.permit);
+            let activity = self.account_svc.upstream_activity(account.id).await?;
+            let mut slot_guard =
+                SlotReleaseGuard::new(admission.permit.with_credential_activity(activity));
             let request_account = account_for_request_profile(&account, request_profile);
             let tls_profile = tls_profile_for_account(&request_account, default_tls_profile);
 

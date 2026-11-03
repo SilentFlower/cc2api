@@ -926,6 +926,11 @@ async function copyText(text: string) {
 
           <!-- 信息 -->
           <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
+            <p v-if="a.credential_ownership" class="text-xs text-[#8c8475]" role="status">
+              {{ a.credential_ownership.phase === 'ready'
+                ? (a.credential_ownership.owner === 'local' ? '本地管理凭据 · 网关已暂停' : '网关管理凭据')
+                : (a.credential_ownership.phase === 'reauth' ? '重新授权中 · 上游活动暂停' : '凭据交接待确认 · 请在账号环境页对账') }}
+            </p>
             <div class="grid grid-cols-5 gap-2">
               <div class="text-center relative"
                    @mouseenter="showScoreTooltip($event, a)"

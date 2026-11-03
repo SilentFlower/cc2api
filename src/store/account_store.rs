@@ -10,7 +10,11 @@ use crate::model::account::{
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     OAuthCredentialImport,
 };
+use crate::model::credential_ownership::CredentialOwnershipChange;
 use crate::service::version_profile::IdentityProfile;
+
+#[path = "credential_ownership.rs"]
+mod credential_ownership;
 
 /// 统一保存和读取 SQLite/PostgreSQL 账号配置与凭据。
 pub struct AccountStore {
@@ -178,6 +182,16 @@ impl AccountStore {
     /// @param a 待创建账号；成功后回填 ID 和数据库时间。
     /// @return 持久化结果；失败不报告创建成功。
     pub async fn create(&self, a: &mut Account) -> Result<(), AppError> {
+        self.create_with_ownership(a, None).await
+    }
+
+    /// 同事务创建账号及初始交接状态，避免半创建账号提前刷新。
+    /// @param a 已校验账号。@param ownership 初始归属。@return 创建并提交的结果。
+    pub(crate) async fn create_with_ownership(
+        &self,
+        a: &mut Account,
+        ownership: Option<CredentialOwnershipChange>,
+    ) -> Result<(), AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) as cnt FROM accounts WHERE email=$1")
             .bind(&a.email)
             .fetch_one(&self.pool)
@@ -224,6 +238,7 @@ impl AccountStore {
             self.json(15)
         );
         // SQLite WAL 下只取 RETURNING 首行会在语句完成前返回，必须消费到结束才确认提交。
+        let mut transaction = self.pool.begin().await?;
         let rows: Vec<AnyRow> = sqlx::query(&q)
             .bind(&a.name)
             .bind(&a.email)
@@ -258,13 +273,19 @@ impl AccountStore {
             .bind(a.five_hour_usage_limit_percent)
             .bind(a.seven_day_usage_limit_percent)
             .bind(&a.rate_limit_tier)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *transaction)
             .await?;
         let row = rows.first().ok_or(AppError::NotFound)?;
 
         a.id = row.try_get::<i64, _>("id").unwrap_or_default();
         a.created_at = Self::parse_time(row, "created_at");
         a.updated_at = Self::parse_time(row, "updated_at");
+        if let Some(mut change) = ownership {
+            change.next.account_id = a.id;
+            change.receipt.account_id = a.id;
+            credential_ownership::apply_ownership_change(&mut transaction, &change).await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -631,6 +652,21 @@ impl AccountStore {
         request_hash: &str,
         restore_auth: bool,
     ) -> Result<(), AppError> {
+        self.import_oauth_credentials_owned(expected, input, request_hash, restore_auth, None)
+            .await
+    }
+
+    /// 将登录/回交凭据与归属阶段原子提交，复用原导入回执和身份条件。
+    /// @param expected 原账号。@param input 凭据。@param request_hash 摘要。
+    /// @param restore_auth 是否恢复认证停用。@param ownership 同批归属变更。@return 提交结果。
+    pub(crate) async fn import_oauth_credentials_owned(
+        &self,
+        expected: &Account,
+        input: &OAuthCredentialImport,
+        request_hash: &str,
+        restore_auth: bool,
+        ownership: Option<&CredentialOwnershipChange>,
+    ) -> Result<(), AppError> {
         let expires_at = DateTime::from_timestamp_millis(input.expires_at)
             .ok_or_else(|| AppError::BadRequest("凭据有效期不合法".into()))?;
         let mut transaction = self.pool.begin().await?;
@@ -704,6 +740,9 @@ impl AccountStore {
             return Err(AppError::ServiceUnavailable(
                 "账号状态或凭据已改变，请重试提交".into(),
             ));
+        }
+        if let Some(change) = ownership {
+            credential_ownership::apply_ownership_change(&mut transaction, change).await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -862,10 +901,20 @@ impl AccountStore {
     }
 
     pub async fn delete(&self, id: i64) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM oauth_handoff_operations WHERE account_id=$1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM oauth_account_ownerships WHERE account_id=$1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("DELETE FROM accounts WHERE id=$1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         Ok(())
     }
 

@@ -75,6 +75,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    for statement in [
+        "CREATE TABLE IF NOT EXISTS oauth_account_ownerships (
+            account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            record_json TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS oauth_handoff_operations (
+            operation_id TEXT PRIMARY KEY,
+            account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            record_json TEXT NOT NULL)",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
     UsageStore::migrate(pool).await?;
     DiagnosticsStore::migrate(pool).await?;
     SchedulingStore::migrate(pool).await?;

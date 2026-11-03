@@ -428,6 +428,20 @@ impl PrimePollerService {
         message_body_order_fingerprint_enabled: bool,
     ) -> PrimeOutcome {
         let started = Instant::now();
+        let _credential_activity = match self.account_svc.upstream_activity(account.id).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return PrimeOutcome {
+                    success: false,
+                    error_message: "skipped: credential ownership unavailable".into(),
+                    duration_ms: 0,
+                    passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
+                    status: None,
+                    failed_access_token: None,
+                };
+            }
+        };
 
         // 取账号凭证(OAuth 会自动刷新,SetupToken 直接返回)。
         let mut token = match self.account_svc.resolve_upstream_token(account.id).await {

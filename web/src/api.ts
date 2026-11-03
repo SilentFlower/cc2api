@@ -36,6 +36,7 @@ export interface Account {
   expires_at?: number | null
   oauth_refreshed_at?: string
   auth_error?: string
+  credential_ownership?: { protocol: number; owner: string; phase: string } | null
   proxy_url: string
   device_id: string
   canonical_env?: Record<string, unknown>

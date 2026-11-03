@@ -18,6 +18,7 @@ use crate::model::account::{
     DEFAULT_UPSTREAM_SESSION_TTL_MINUTES, MAX_UPSTREAM_SESSION_POOL_SIZE,
     MAX_UPSTREAM_SESSION_TTL_MINUTES, MIN_UPSTREAM_SESSION_TTL_MINUTES, OAuthCredentialImport,
 };
+use crate::model::credential_ownership::CredentialOwnershipInput;
 use crate::service::rewriter::ClientType;
 use crate::service::runtime_lease::RuntimeGate;
 use crate::service::v3_scheduling::{
@@ -28,9 +29,14 @@ use crate::service::version_profile::{
     apply_identity_to_env_json, default_profile, profile_for_key,
 };
 use crate::store::account_store::AccountStore;
+
+#[path = "credential_ownership.rs"]
+mod credential_ownership;
 use crate::store::cache::{
     CacheStore, UpstreamSessionPoolResolve, UpstreamSessionPoolStatus, UpstreamSessionRefreshPolicy,
 };
+pub use credential_ownership::CredentialActivity;
+use credential_ownership::CredentialGate;
 
 const STICKY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
@@ -303,6 +309,7 @@ pub struct AccountSlotPermit {
     permit: Option<CapacityPermit>,
     active_requests: Arc<AtomicI64>,
     scheduling_request: Option<SchedulingRequest>,
+    credential_activity: Option<CredentialActivity>,
 }
 
 /// 槽位归还前先偿还缩容差额，涵盖等待门禁时取消或超时的路径。
@@ -319,6 +326,7 @@ impl AccountSlotPermit {
             permit: Some(permit),
             active_requests: queue.active_requests.clone(),
             scheduling_request: None,
+            credential_activity: None,
         }
     }
 
@@ -327,6 +335,12 @@ impl AccountSlotPermit {
     /// @return 持有调度状态的许可。
     pub fn with_scheduling_request(mut self, request: SchedulingRequest) -> Self {
         self.scheduling_request = Some(request);
+        self
+    }
+
+    /// 将凭据活动许可绑定到响应生命周期。@param activity 许可。@return 当前并发许可。
+    pub fn with_credential_activity(mut self, activity: CredentialActivity) -> Self {
+        self.credential_activity = Some(activity);
         self
     }
 }
@@ -605,6 +619,7 @@ impl AccountQueue {
 
 /// 统一账号硬资格、凭据及并发；v3 按需装配持久调度。
 pub struct AccountService {
+    credential_gates: Mutex<HashMap<i64, Arc<CredentialGate>>>,
     scheduler: Option<Arc<V3Scheduler>>,
     v3_settings_lock: AsyncMutex<()>,
     store: Arc<AccountStore>,
@@ -746,6 +761,7 @@ impl AccountService {
             store,
             cache,
             oauth_token_url,
+            credential_gates: Mutex::new(HashMap::new()),
             scheduler: None,
             v3_settings_lock: AsyncMutex::new(()),
             score_weights: RwLock::new((DEFAULT_W7D, DEFAULT_W5H, DEFAULT_WCONC)),
@@ -839,6 +855,16 @@ impl AccountService {
     /// @param account 已由受信任导入接口校验的新账号。
     /// @return 创建结果；已有账号由独立绑定流程处理。
     pub async fn create_cli_account(&self, account: &mut Account) -> Result<(), AppError> {
+        self.create_cli_account_owned(account, None).await
+    }
+
+    /// 创建时同事务关闭新账号准入，等待本地绑定与 AT-only 发布确认。
+    /// @param account 已确认 CLI 账号。@param input 新协议证明。@return 创建结果。
+    pub async fn create_cli_account_owned(
+        &self,
+        account: &mut Account,
+        input: Option<&CredentialOwnershipInput>,
+    ) -> Result<(), AppError> {
         let environment: CanonicalEnvData =
             serde_json::from_value(account.canonical_env.clone())
                 .map_err(|_| AppError::BadRequest("invalid CLI environment".into()))?;
@@ -865,7 +891,26 @@ impl AccountService {
         normalize_account_subscription(account)?;
         normalize_upstream_session_pool_config(account)?;
         validate_account_usage_limits(account)?;
-        self.store.create(account).await
+        let ownership = input
+            .map(|value| credential_ownership::creation_change(account, value))
+            .transpose()?;
+        if let Some(change) = &ownership {
+            if let Some(receipt) = self
+                .store
+                .credential_handoff_receipt(&change.receipt.operation_id)
+                .await?
+            {
+                if receipt.identity != change.receipt.identity
+                    || receipt.request_hash != change.receipt.request_hash
+                    || receipt.direction != "create"
+                {
+                    return Err(AppError::BadRequest("创建交接操作 ID 冲突".into()));
+                }
+                *account = self.store.get_by_id(receipt.account_id).await?;
+                return Ok(());
+            }
+        }
+        self.store.create_with_ownership(account, ownership).await
     }
 
     /// 在刷新锁内只更新套餐元数据，不写回旧凭据副本。
@@ -1283,6 +1328,17 @@ impl AccountService {
         if !session_hash.is_empty() {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
                 if account_id > 0 {
+                    if (allowed_ids.is_empty() || allowed_ids.contains(&account_id))
+                        && self
+                            .store
+                            .credential_ownership(account_id)
+                            .await?
+                            .is_some_and(|value| !value.gateway_ready())
+                    {
+                        return Err(AppError::ServiceUnavailable(
+                            "原会话账号正在交接或由本地管理，保持会话绑定".into(),
+                        ));
+                    }
                     if let Ok(account) = self.store.get_by_id(account_id).await {
                         let id_allowed =
                             allowed_ids.is_empty() || allowed_ids.contains(&account_id);
@@ -1411,6 +1467,7 @@ impl AccountService {
         let fable_weekly_usage_limit_percent = context.fable_weekly_usage_limit_percent;
         // 获取可调度账号
         let accounts = self.store.list_schedulable().await?;
+        let ownerships = self.store.credential_ownerships().await?;
 
         // 过滤：排除项 + 可用账号限制
         let mut candidates: Vec<Account> = accounts
@@ -1418,6 +1475,9 @@ impl AccountService {
             .filter(|a| {
                 !runtime_exclude_ids.contains(&a.id)
                     && (allowed_ids.is_empty() || allowed_ids.contains(&a.id))
+                    && ownerships
+                        .get(&a.id)
+                        .is_none_or(|value| value.gateway_ready())
             })
             .collect();
 
@@ -1499,6 +1559,19 @@ impl AccountService {
             }
             None => None,
         };
+        if let Some(bound) = &binding {
+            if (allowed_ids.is_empty() || allowed_ids.contains(&bound.account_id))
+                && self
+                    .store
+                    .credential_ownership(bound.account_id)
+                    .await?
+                    .is_some_and(|value| !value.gateway_ready())
+            {
+                return Err(AppError::ServiceUnavailable(
+                    "原会话账号正在交接或由本地管理，保持会话绑定".into(),
+                ));
+            }
+        }
         let candidates = self
             .eligible_accounts(exclude_ids, allowed_ids, context, false, false)
             .await
@@ -1826,6 +1899,7 @@ impl AccountService {
     /// @param id 账号 ID，仅支持 OAuth 账号。
     /// @return 返回最终持久化的完整用量对象。
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
+        let _credential_activity = self.upstream_activity(id).await?;
         let account = self.store.get_by_id(id).await?;
         if account.auth_type != crate::model::account::AccountAuthType::Oauth {
             return Err(AppError::BadRequest(
@@ -1870,6 +1944,7 @@ impl AccountService {
     }
 
     pub async fn resolve_upstream_token(&self, id: i64) -> Result<String, AppError> {
+        let _credential_activity = self.upstream_activity(id).await?;
         let account = self.store.get_by_id(id).await?;
         match account.auth_type {
             AccountAuthType::SetupToken => {
@@ -1879,6 +1954,7 @@ impl AccountService {
                 Ok(account.setup_token)
             }
             AccountAuthType::Oauth => {
+                validate_managed_oauth_account(&account)?;
                 let resolved = self
                     .resolve_oauth_account(
                         &account,
@@ -1907,6 +1983,7 @@ impl AccountService {
         id: i64,
         failed_access_token: &str,
     ) -> Result<String, AppError> {
+        let _credential_activity = self.upstream_activity(id).await?;
         if failed_access_token.is_empty() {
             return Err(AppError::BadRequest(
                 "失败的 OAuth access token 为空".into(),
@@ -1980,6 +2057,7 @@ impl AccountService {
         min_validity_seconds: i64,
         force_refresh: bool,
     ) -> Result<OAuthCredentialSnapshot, AppError> {
+        let _credential_activity = self.upstream_activity(id).await?;
         if min_validity_seconds < 0 {
             return Err(AppError::BadRequest(
                 "min_validity_seconds 不能小于 0".into(),
@@ -2082,6 +2160,17 @@ impl AccountService {
         input: &OAuthCredentialImport,
         request_hash: &str,
     ) -> Result<OAuthCredentialSnapshot, AppError> {
+        if let Some(ownership) = self.store.credential_ownership(id).await? {
+            if ownership.direction != "reauth"
+                || ownership.owner != "gateway"
+                || !matches!(ownership.phase.as_str(), "ready" | "reauth")
+                || ownership.lease_owner.as_deref() != Some(input.owner.as_str())
+            {
+                return Err(AppError::ServiceUnavailable(
+                    "原重新授权已被后续凭据交接替代，请核对当前归属".into(),
+                ));
+            }
+        }
         if let Some((account_id, original_hash)) =
             self.store.oauth_import_receipt(&input.operation_id).await?
         {
@@ -2126,32 +2215,46 @@ impl AccountService {
         let _permit = queue
             .runtime_gate
             .begin_oauth_import(&input.owner, &input.generation)?;
-        let reason = account.disable_reason.as_str();
-        let auth_reason = reason
-            .strip_prefix("permanent credential failure: ")
-            .unwrap_or(reason);
-        let permanent_grant = auth_reason.starts_with("OAuth refresh rejected: status ")
-            && auth_reason.ends_with("error=invalid_grant")
-            && auth_reason
-                .split_whitespace()
-                .nth(4)
-                .and_then(|value| value.parse::<u16>().ok())
-                .is_some_and(|status| (400..500).contains(&status) && status != 429);
-        let restore_auth = account.status == AccountStatus::Disabled
-            && account.auth_error == reason
-            && (matches!(
-                auth_reason,
-                "401 OAuth 认证恢复失败"
-                    | "401 OAuth 认证失败"
-                    | "401 OAuth 刷新后仍认证失败"
-                    | OAUTH_MISSING_REFRESH_TOKEN_REASON
-            ) || permanent_grant);
+        let restore_auth = oauth_import_restores_auth(&account);
+        let ownership = self.reauth_ownership_change(id, input).await?;
         self.store
-            .import_oauth_credentials(&account, input, request_hash, restore_auth)
+            .import_oauth_credentials_owned(
+                &account,
+                input,
+                request_hash,
+                restore_auth,
+                ownership.as_ref(),
+            )
             .await?;
         oauth_import_snapshot(self.store.get_by_id(id).await?)
     }
+}
 
+/// 仅新授权可恢复明确的认证失效；人工停用、封禁与限流保持原状。
+fn oauth_import_restores_auth(account: &Account) -> bool {
+    let reason = account.disable_reason.as_str();
+    let auth_reason = reason
+        .strip_prefix("permanent credential failure: ")
+        .unwrap_or(reason);
+    let permanent_grant = auth_reason.starts_with("OAuth refresh rejected: status ")
+        && auth_reason.ends_with("error=invalid_grant")
+        && auth_reason
+            .split_whitespace()
+            .nth(4)
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|status| (400..500).contains(&status) && status != 429);
+    account.status == AccountStatus::Disabled
+        && account.auth_error == reason
+        && (matches!(
+            auth_reason,
+            "401 OAuth 认证恢复失败"
+                | "401 OAuth 认证失败"
+                | "401 OAuth 刷新后仍认证失败"
+                | OAUTH_MISSING_REFRESH_TOKEN_REASON
+        ) || permanent_grant)
+}
+
+impl AccountService {
     /// 串行读取回执和当前凭据，区分未提交与尚不能确认。
     /// @param id 原关联账号 ID。
     /// @param operation_id 唯一操作 ID。
@@ -2174,7 +2277,27 @@ impl AccountService {
                     "凭据提交结果尚不能确认".into(),
                 ));
             }
-            match self.store.oauth_import_receipt(operation_id).await? {
+            let receipt = self.store.oauth_import_receipt(operation_id).await?;
+            if receipt.is_some() {
+                if let Some(ownership) = self.store.credential_ownership(id).await? {
+                    let current = self
+                        .store
+                        .credential_handoff_receipt(&ownership.operation_id)
+                        .await?;
+                    if ownership.owner != "gateway"
+                        || ownership.direction != "reauth"
+                        || !matches!(ownership.phase.as_str(), "ready" | "reauth")
+                        || !current.is_some_and(|value| {
+                            value.import_operation_id.as_deref() == Some(operation_id)
+                        })
+                    {
+                        return Err(AppError::ServiceUnavailable(
+                            "历史登录回执已被后续凭据交接替代，不能发布旧凭据".into(),
+                        ));
+                    }
+                }
+            }
+            match receipt {
                 Some((account_id, _)) if account_id == id => Ok(Some(oauth_import_snapshot(
                     self.store.get_by_id(id).await?,
                 )?)),
@@ -2304,6 +2427,8 @@ impl AccountService {
             .map(|expires_at| expires_at > Utc::now())
             .unwrap_or(false);
 
+        let ownership_restore = self.begin_owned_refresh(id).await?;
+
         match crate::service::oauth::refresh_oauth_token_at(
             &latest.refresh_token,
             &latest.proxy_url,
@@ -2320,9 +2445,21 @@ impl AccountService {
                         tokens.expires_at,
                     )
                     .await?;
+                if let Some(change) = &ownership_restore {
+                    self.finish_owned_refresh(change).await?;
+                }
                 self.store.get_by_id(id).await
             }
             Err(err) => {
+                if let Some(change) = &ownership_restore {
+                    if matches!(&err, AppError::Internal(_)) {
+                        // 请求或响应结果未知：保留持久维护，不以旧 AT 降级成功或重试旧 RT。
+                        return Err(AppError::ServiceUnavailable(
+                            "OAuth 刷新结果未知，请核对或重新授权原账号".into(),
+                        ));
+                    }
+                    self.finish_owned_refresh(change).await?;
+                }
                 let msg = err.to_string();
                 if !self
                     .store
@@ -2409,6 +2546,12 @@ impl AccountService {
         failed_access_token: &str,
         reason: &str,
     ) -> Result<bool, AppError> {
+        // 维护阻止了 401 恢复时，不能把本地门禁误记为凭据永久失效。
+        let _credential_activity = match self.upstream_activity(id).await {
+            Ok(permit) => permit,
+            Err(AppError::ServiceUnavailable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let current = self.store.get_by_id(id).await?;
         if current.access_token != failed_access_token {
             return Ok(false);
@@ -3161,6 +3304,9 @@ pub fn generate_session_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::credential_ownership::{
+        CredentialIdentity, CredentialMaterial, CredentialOwnershipInput,
+    };
 
     #[tokio::test]
     async fn closed_runtime_gate_preserves_queue_capacity_and_waiting_load() {
@@ -4441,6 +4587,473 @@ mod tests {
         let (waiting, remaining_ms) = svc.transient_rate_limit_backoff_status(account.id).await;
         assert_eq!(waiting, 0);
         assert_eq!(remaining_ms, 0);
+    }
+
+    /// 创建真实 SQLite 及同身份凭据，用于交接和重启边界测试。
+    async fn ownership_fixture() -> (
+        Arc<AccountStore>,
+        Arc<SettingsStore>,
+        Arc<AccountService>,
+        Account,
+        CredentialOwnershipInput,
+    ) {
+        let (store, settings, service) = setup_account_service_with_settings().await;
+        let mut account = test_account_with_usage(json!({}));
+        account.id = 0;
+        account.email = "ownership@example.invalid".into();
+        account.device_id = "1".repeat(64);
+        account.account_uuid = Some("synthetic-ownership-uuid".into());
+        account.expires_at = Some(Utc::now() + ChronoDuration::hours(1));
+        account.rpm_limit = 17;
+        account.priority = 63;
+        account.concurrency = 2;
+        store.create(&mut account).await.unwrap();
+        let input = CredentialOwnershipInput {
+            protocol: 1,
+            operation_id: Uuid::new_v4().simple().to_string(),
+            action: "prepare".into(),
+            direction: "detach".into(),
+            identity: CredentialIdentity {
+                deployment_id: "ownership-fixture".into(),
+                environment_id: "2".repeat(32),
+                bench_account_id: 1,
+                device_id: account.device_id.clone(),
+                email: account.email.clone(),
+                account_uuid: account.account_uuid.clone().unwrap(),
+                organization_uuid: None,
+            },
+            expected_generation: None,
+            source_refresh_sha256: None,
+            lease_owner: None,
+            credentials: None,
+        };
+        (store, settings, service, account, input)
+    }
+
+    #[tokio::test]
+    async fn ownership_detach_drains_activities_and_restart_stays_closed() {
+        let (store, settings, service, account, mut input) = ownership_fixture().await;
+        let activity = service.upstream_activity(account.id).await.unwrap();
+        let pending_service = service.clone();
+        let pending_input = input.clone();
+        let id = account.id;
+        let pending =
+            tokio::spawn(
+                async move { pending_service.credential_handoff(id, &pending_input).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.credential_ownership(id).await.unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.upstream_activity(id).await.is_err());
+        assert!(
+            !service
+                .disable_oauth_for_failed_token(id, &account.access_token, "401 OAuth 认证恢复失败")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_by_id(id).await.unwrap().status,
+            AccountStatus::Active
+        );
+        assert!(!pending.is_finished(), "旧活动结束前不能导出最终凭据");
+        drop(activity);
+        let prepared = pending.await.unwrap().unwrap();
+        assert_eq!(prepared["receipt"]["stage"], "prepared");
+        input.action = "commit".into();
+        let committed = service.credential_handoff(id, &input).await.unwrap();
+        assert_eq!(committed["ownership"]["owner"], "local");
+        assert!(
+            committed["credentials"].is_null(),
+            "已交给本地后不能再返回远端旧凭据"
+        );
+        let restarted = AccountService::new(store, Arc::new(MemoryStore::new()), settings);
+        assert!(restarted.resolve_upstream_token(id).await.is_err());
+        assert!(restarted.refresh_usage(id).await.is_err());
+        assert!(
+            restarted
+                .resolve_oauth_credentials(id, 600, false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_return_is_atomic_idempotent_and_old_reply_cannot_reopen() {
+        let (store, _settings, service, account, mut input) = ownership_fixture().await;
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "commit".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        let detach = input.clone();
+        input.expected_generation = Some(input.operation_id.clone());
+        input.operation_id = Uuid::new_v4().simple().to_string();
+        input.direction = "return".into();
+        input.action = "prepare".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "commit".into();
+        input.credentials = Some(CredentialMaterial {
+            access_token: "local-latest-at".into(),
+            refresh_token: "local-latest-rt".into(),
+            expires_at: (Utc::now() + ChronoDuration::hours(1)).timestamp_millis(),
+        });
+        let imported = service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert_eq!(imported["receipt"]["stage"], "imported");
+        assert_eq!(
+            store.get_by_id(account.id).await.unwrap().refresh_token,
+            "local-latest-rt"
+        );
+        assert!(service.upstream_activity(account.id).await.is_err());
+        input.action = "finish".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        drop(service.upstream_activity(account.id).await.unwrap());
+        let current = store.get_by_id(account.id).await.unwrap();
+        store
+            .update_oauth_tokens_if_current(
+                &current,
+                "later-at",
+                "later-rt",
+                Utc::now() + ChronoDuration::hours(1),
+            )
+            .await
+            .unwrap();
+        input.action = "commit".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_by_id(account.id).await.unwrap().refresh_token,
+            "later-rt"
+        );
+        let old = service
+            .credential_handoff(account.id, &detach)
+            .await
+            .unwrap();
+        assert_eq!(old["ownership"]["owner"], "gateway");
+        let stored = store.get_by_id(account.id).await.unwrap();
+        assert_eq!(
+            (stored.rpm_limit, stored.priority, stored.concurrency),
+            (17, 63, 2)
+        );
+        input.credentials.as_mut().unwrap().refresh_token = "conflicting-rt".into();
+        assert!(
+            service
+                .credential_handoff(account.id, &input)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_unknown_attach_is_rejected_without_disabling_account() {
+        let (store, _settings, service, account, mut input) = ownership_fixture().await;
+        input.direction = "attach".into();
+        input.source_refresh_sha256 = Some("0".repeat(64));
+        assert!(
+            service
+                .credential_handoff(account.id, &input)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .credential_ownership(account.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.get_by_id(account.id).await.unwrap().status,
+            AccountStatus::Active
+        );
+        drop(service.upstream_activity(account.id).await.unwrap());
+    }
+
+    /// 暂停仅保护本调用范围内的原绑定，不阻塞只能使用其他账号的请求。
+    #[tokio::test]
+    async fn ownership_paused_sticky_keeps_binding_and_other_account_scope_works() {
+        let (store, _settings, service, account, mut input) = ownership_fixture().await;
+        let mut other = test_account_with_usage(json!({}));
+        other.id = 0;
+        other.email = "other-ownership@example.invalid".into();
+        store.create(&mut other).await.unwrap();
+        service
+            .cache
+            .set_session_account_id("ownership-sticky", account.id, STICKY_SESSION_TTL)
+            .await
+            .unwrap();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "commit".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .select_account_with_context("ownership-sticky", &[], &[account.id, other.id])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .cache
+                .get_session_account_id("ownership-sticky")
+                .await
+                .unwrap(),
+            Some(account.id)
+        );
+        let selected = service
+            .select_account_with_context("ownership-sticky", &[], &[other.id])
+            .await
+            .unwrap();
+        assert_eq!(selected.account.id, other.id);
+    }
+
+    /// 未知刷新保留持久关闭，明确重授权的导入与交接回执原子推进。
+    #[tokio::test]
+    async fn ownership_refresh_uncertainty_requires_original_account_reauthorization() {
+        let (store, settings, service, account, mut input) = ownership_fixture().await;
+        input.direction = "attach".into();
+        input.source_refresh_sha256 = Some(hex::encode(Sha256::digest(
+            account.refresh_token.as_bytes(),
+        )));
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "commit".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "finish".into();
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        let restore = service
+            .begin_owned_refresh(account.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(service.upstream_activity(account.id).await.is_err());
+        service.finish_owned_refresh(&restore).await.unwrap();
+        drop(service.upstream_activity(account.id).await.unwrap());
+        service.begin_owned_refresh(account.id).await.unwrap();
+        let restarted = AccountService::new(store.clone(), Arc::new(MemoryStore::new()), settings);
+        assert!(restarted.resolve_upstream_token(account.id).await.is_err());
+        let login = login_import_input(&restarted, &account).await;
+        input.expected_generation = Some(input.operation_id.clone());
+        input.operation_id = Uuid::new_v4().simple().to_string();
+        input.direction = "reauth".into();
+        input.action = "prepare".into();
+        input.source_refresh_sha256 = None;
+        input.lease_owner = Some(login.owner.clone());
+        restarted
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "cancel".into();
+        let cancelled = restarted
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled["ownership"]["phase"], "reconcile",
+            "取消登录不能解除原刷新结果未知的维护"
+        );
+        assert!(restarted.upstream_activity(account.id).await.is_err());
+        input.expected_generation = Some(input.operation_id.clone());
+        input.operation_id = Uuid::new_v4().simple().to_string();
+        input.action = "prepare".into();
+        restarted
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        restarted
+            .import_oauth_credentials(account.id, &login)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .credential_handoff_receipt(&input.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .stage,
+            "imported"
+        );
+        input.action = "finish".into();
+        restarted
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .credential_ownership(account.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .gateway_ready()
+        );
+        assert_eq!(
+            store.get_by_id(account.id).await.unwrap().refresh_token,
+            login.refresh_token
+        );
+        assert!(
+            restarted
+                .oauth_import_status(account.id, &login.operation_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let refreshing = restarted
+            .begin_owned_refresh(account.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            restarted
+                .oauth_import_status(account.id, &login.operation_id)
+                .await
+                .is_err()
+        );
+        restarted.finish_owned_refresh(&refreshing).await.unwrap();
+        let queue = restarted
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        queue
+            .runtime_gate
+            .update(&login.owner, &login.generation, "release")
+            .unwrap();
+        input.expected_generation = Some(input.operation_id.clone());
+        input.operation_id = Uuid::new_v4().simple().to_string();
+        input.direction = "detach".into();
+        input.action = "prepare".into();
+        input.lease_owner = None;
+        restarted
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        input.action = "commit".into();
+        restarted
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert!(
+            restarted
+                .oauth_import_status(account.id, &login.operation_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            restarted
+                .import_oauth_credentials(account.id, &login)
+                .await
+                .is_err()
+        );
+    }
+
+    /// 退休只切换归属，不以 RT 完整性限制本地删除。
+    #[tokio::test]
+    async fn ownership_retire_works_without_usable_tokens_and_cleans_records_on_delete() {
+        let (store, _settings, service, account, mut input) = ownership_fixture().await;
+        store
+            .update_oauth_tokens(account.id, "", "", Utc::now())
+            .await
+            .unwrap();
+        input.direction = "retire".into();
+        let prepared = service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert!(prepared["credentials"].is_null());
+        input.action = "commit".into();
+        let retired = service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert_eq!(retired["ownership"]["owner"], "local");
+        assert!(service.upstream_activity(account.id).await.is_err());
+        store.delete(account.id).await.unwrap();
+        assert!(
+            store
+                .credential_ownership(account.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .credential_handoff_receipt(&input.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// 来源不明的旧目标只接受受信任新授权，保留人工停用和原限额。
+    #[tokio::test]
+    async fn ownership_authorize_restores_only_auth_failure_and_preserves_manual_disable() {
+        for (reason, active) in [
+            ("401 OAuth 认证失败", true),
+            ("手动停用", false),
+            ("403 认证失败", false),
+        ] {
+            let (store, _settings, service, account, mut input) = ownership_fixture().await;
+            service
+                .disable_for_auth_failure(account.id, reason)
+                .await
+                .unwrap();
+            input.direction = "authorize".into();
+            input.source_refresh_sha256 = Some(hex::encode(Sha256::digest(b"new-auth-refresh")));
+            service
+                .credential_handoff(account.id, &input)
+                .await
+                .unwrap();
+            input.action = "commit".into();
+            input.credentials = Some(CredentialMaterial {
+                access_token: "new-auth-access".into(),
+                refresh_token: "new-auth-refresh".into(),
+                expires_at: (Utc::now() + ChronoDuration::hours(1)).timestamp_millis(),
+            });
+            service
+                .credential_handoff(account.id, &input)
+                .await
+                .unwrap();
+            input.action = "finish".into();
+            service
+                .credential_handoff(account.id, &input)
+                .await
+                .unwrap();
+            let stored = store.get_by_id(account.id).await.unwrap();
+            assert_eq!(stored.status == AccountStatus::Active, active);
+            assert_eq!(
+                (stored.rpm_limit, stored.concurrency, stored.priority),
+                (17, 2, 63)
+            );
+        }
     }
 
     #[tokio::test]

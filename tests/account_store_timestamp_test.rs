@@ -10,8 +10,139 @@ use claude_code_gateway::model::account::{
     Account, AccountAuthType, AccountStatus, BillingMode, DEFAULT_UPSTREAM_SESSION_POOL_SIZE,
     DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY, DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
 };
+use claude_code_gateway::model::credential_ownership::{
+    CredentialIdentity, CredentialMaterial, CredentialOwnershipInput,
+};
+use claude_code_gateway::service::account::AccountService;
 use claude_code_gateway::store::account_store::AccountStore;
 use claude_code_gateway::store::db::{init_db, migrate};
+use claude_code_gateway::store::memory::MemoryStore;
+use claude_code_gateway::store::settings_store::SettingsStore;
+
+/// 两种数据库共用归属迁移、导入原子性、回执和删除合同。
+/// @param pool 独立测试数据库。@param driver 数据库类型。@return 无；合同不一致时失败。
+async fn credential_ownership_storage_contract(pool: &AnyPool, driver: &str) {
+    migrate(pool, driver).await.unwrap();
+    migrate(pool, driver).await.unwrap();
+    let store = Arc::new(AccountStore::new(pool.clone(), driver.into()));
+    let settings = Arc::new(SettingsStore::new_with_driver(pool.clone(), driver.into()));
+    let service = AccountService::new(store.clone(), Arc::new(MemoryStore::new()), settings);
+    let mut account = new_account("ownership-storage@example.invalid");
+    account.device_id = "a".repeat(64);
+    account.account_uuid = Some("ownership-storage-uuid".into());
+    store.create(&mut account).await.unwrap();
+    let mut input = CredentialOwnershipInput {
+        protocol: 1,
+        operation_id: "b".repeat(32),
+        action: "prepare".into(),
+        direction: "detach".into(),
+        identity: CredentialIdentity {
+            deployment_id: "ownership-storage".into(),
+            environment_id: "c".repeat(32),
+            bench_account_id: 1,
+            device_id: account.device_id.clone(),
+            email: account.email.clone(),
+            account_uuid: account.account_uuid.clone().unwrap(),
+            organization_uuid: None,
+        },
+        expected_generation: None,
+        source_refresh_sha256: None,
+        lease_owner: None,
+        credentials: None,
+    };
+    service
+        .credential_handoff(account.id, &input)
+        .await
+        .unwrap();
+    input.action = "commit".into();
+    service
+        .credential_handoff(account.id, &input)
+        .await
+        .unwrap();
+    assert!(service.upstream_activity(account.id).await.is_err());
+    input.expected_generation = Some(input.operation_id.clone());
+    input.operation_id = "d".repeat(32);
+    input.direction = "return".into();
+    input.action = "prepare".into();
+    service
+        .credential_handoff(account.id, &input)
+        .await
+        .unwrap();
+    input.action = "commit".into();
+    input.credentials = Some(CredentialMaterial {
+        access_token: "storage-current-at".into(),
+        refresh_token: "storage-current-rt".into(),
+        expires_at: (Utc::now() + Duration::hours(1)).timestamp_millis(),
+    });
+    service
+        .credential_handoff(account.id, &input)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_by_id(account.id).await.unwrap().refresh_token,
+        "storage-current-rt"
+    );
+    assert_eq!(
+        store
+            .credential_handoff_receipt(&input.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stage,
+        "imported"
+    );
+    assert!(service.upstream_activity(account.id).await.is_err());
+    input.action = "finish".into();
+    service
+        .credential_handoff(account.id, &input)
+        .await
+        .unwrap();
+    service
+        .credential_handoff(account.id, &input)
+        .await
+        .unwrap();
+    drop(service.upstream_activity(account.id).await.unwrap());
+    sqlx::query("UPDATE oauth_account_ownerships SET record_json='{}' WHERE account_id=$1")
+        .bind(account.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(store.credential_ownership(account.id).await.is_err());
+    assert!(!store.credential_ownerships().await.unwrap()[&account.id].gateway_ready());
+    store.delete(account.id).await.unwrap();
+    assert!(
+        store
+            .credential_handoff_receipt(&input.operation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// SQLite 的实际事务和幂等迁移合同。@return 无。
+#[tokio::test]
+async fn sqlite_credential_ownership_storage() {
+    sqlx::any::install_default_drivers();
+    let path = temp_dir().join(format!(
+        "ownership-storage-{}.sqlite",
+        rand::random::<u64>()
+    ));
+    let pool = init_db("sqlite", path.to_str().unwrap()).await.unwrap();
+    credential_ownership_storage_contract(&pool, "sqlite").await;
+    pool.close().await;
+    remove_file(path).unwrap();
+}
+
+/// PostgreSQL 的同一真实事务合同，仅允许专用临时库。@return 无。
+#[tokio::test]
+#[ignore = "需要 CC2API_OWNERSHIP_TEST_POSTGRES_DSN 指向独立临时数据库"]
+async fn postgres_credential_ownership_storage() {
+    sqlx::any::install_default_drivers();
+    let dsn = std::env::var("CC2API_OWNERSHIP_TEST_POSTGRES_DSN").expect("须提供专用临时库");
+    let pool = AnyPool::connect(&dsn).await.unwrap();
+    credential_ownership_storage_contract(&pool, "postgres").await;
+    pool.close().await;
+}
 
 async fn setup() -> Arc<AccountStore> {
     sqlx::any::install_default_drivers();
