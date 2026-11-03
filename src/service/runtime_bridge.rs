@@ -9,6 +9,8 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::redirect::Policy;
+use reqwest::{Client, Error as ReqwestError};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
@@ -17,6 +19,17 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use crate::error::AppError;
 use crate::handler::router::AppState;
 use crate::service::runtime_lease::RuntimeLease;
+
+const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// 只共享连接池，认证材料始终在单次请求上设置，不进入默认头或缓存。
+static MANAGEMENT_CLIENT: LazyLock<Result<Client, ReqwestError>> = LazyLock::new(|| {
+    Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .connect_timeout(SESSION_TIMEOUT)
+        .build()
+});
 
 /// 配置事务持有门禁时收口对应账号实例，阻止已解析的旧请求跨过修改。
 /// @param account_id 修改的账号 ID。
@@ -48,11 +61,10 @@ fn config() -> Result<(String, String, reqwest::Client), AppError> {
             "v3 management is not configured".into(),
         ));
     }
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .build()
-        .map_err(|_| AppError::ServiceUnavailable("v3 management unavailable".into()))?;
+    let client = MANAGEMENT_CLIENT
+        .as_ref()
+        .map_err(|_| AppError::ServiceUnavailable("v3 management unavailable".into()))?
+        .clone();
     Ok((base.trim_end_matches('/').into(), token, client))
 }
 
@@ -89,12 +101,18 @@ async fn authenticated(headers: &HeaderMap) -> Result<(), AppError> {
         .get(format!("{base}/internal/v3/session/verify"))
         .bearer_auth(token)
         .header(header::COOKIE, cookie(headers))
+        .timeout(SESSION_TIMEOUT)
         .send()
         .await
         .map_err(|_| AppError::ServiceUnavailable("v3 session unavailable".into()))?;
     if !response.status().is_success() {
         return Err(AppError::Unauthorized);
     }
+    // 校验端只返回小型 {ok:true}；读完响应体后，认证连接才能归还共享池复用。
+    response
+        .bytes()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("v3 session unavailable".into()))?;
     Ok(())
 }
 
@@ -117,6 +135,7 @@ pub async fn grant_session() -> Result<Response, AppError> {
     let upstream = client
         .post(format!("{base}/internal/v3/session"))
         .bearer_auth(token)
+        .timeout(SESSION_TIMEOUT)
         .send()
         .await
         .map_err(|_| AppError::ServiceUnavailable("v3 session unavailable".into()))?;
@@ -204,6 +223,19 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
     )
 }
 
+/// 只有明确有限的 JSON 状态读取使用总期限，不能误截断 SSE 或后台长操作。
+/// @param method 已通过白名单的 HTTP 方法。
+/// @param path 不含查询字符串的管理路径。
+/// @return 普通状态读取的期限，其它请求沿用既有生命周期。
+fn status_timeout(method: &Method, path: &str) -> Option<Duration> {
+    (*method == Method::GET
+        && matches!(
+            path,
+            "/api/projects" | "/api/projects/catalog" | "/api/accounts/warmup/pi" | "/api/accounts"
+        ))
+    .then_some(STATUS_TIMEOUT)
+}
+
 async fn http_bridge(
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -219,6 +251,7 @@ async fn http_bridge(
     }
     authenticated(&headers).await?;
     let (base, token, client) = config()?;
+    let timeout = status_timeout(&method, browser_path);
     let path = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -236,6 +269,9 @@ async fn http_bridge(
         if let Some(value) = headers.get(&key) {
             request = request.header(key, value);
         }
+    }
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
     }
     let upstream = request
         .body(body)
@@ -357,8 +393,74 @@ pub fn routes() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::browser_path_allowed;
+    use super::{MANAGEMENT_CLIENT, STATUS_TIMEOUT, browser_path_allowed, status_timeout};
     use axum::http::Method;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    /// 有限状态 GET 设置期限，流式读取、长写操作及相似路径保持原生命周期。
+    #[test]
+    fn management_status_timeouts_preserve_streams_and_long_operations() {
+        for path in [
+            "/api/projects",
+            "/api/projects/catalog",
+            "/api/accounts/warmup/pi",
+            "/api/accounts",
+        ] {
+            assert_eq!(status_timeout(&Method::GET, path), Some(STATUS_TIMEOUT));
+            assert_eq!(status_timeout(&Method::POST, path), None);
+        }
+        for path in [
+            "/api/runs-stream",
+            "/api/project-iterations-stream",
+            "/api/projects/stream",
+            "/api/projects/agents/1/events",
+            "/api/projects/catalogue",
+        ] {
+            assert_eq!(status_timeout(&Method::GET, path), None);
+        }
+    }
+
+    /// 两次借用的管理客户端复用同一 TCP 连接，避免每次认证和转发重新建池。
+    #[tokio::test]
+    async fn management_client_reuses_connection_without_default_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 1);
+                    request.push(byte[0]);
+                    assert!(request.len() < 4096);
+                }
+                let headers = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(!headers.contains("authorization:") && !headers.contains("cookie:"));
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let client = MANAGEMENT_CLIENT.as_ref().unwrap().clone();
+            let response = client
+                .get(format!("http://{address}/status"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+        }
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn management_bridge_rejects_internal_and_encoded_paths() {
