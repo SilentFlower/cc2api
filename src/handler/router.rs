@@ -845,9 +845,10 @@ async fn config_permit(
     state: &AppState,
     account: &Account,
 ) -> Result<Option<RuntimeConfigPermit>, AppError> {
-    if std::env::var("V3_RUNTIME_URL")
-        .unwrap_or_default()
-        .is_empty()
+    if state.account_svc.scheduler().is_none()
+        && std::env::var("V3_RUNTIME_URL")
+            .unwrap_or_default()
+            .is_empty()
     {
         return Ok(None);
     }
@@ -904,6 +905,12 @@ async fn update_account(
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Account>, AppError> {
     let mut existing = state.account_svc.get_account(id).await?;
+    let mut option_fields: Vec<&str> = updates
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("账号更新必须是对象".into()))?
+        .keys()
+        .map(String::as_str)
+        .collect();
     let subscription = subscription_update(&updates, "subscription_type")?;
     let tier = subscription_update(&updates, "rate_limit_tier")?;
     if (subscription.is_some() || tier.is_some())
@@ -923,6 +930,7 @@ async fn update_account(
     if let Some(value) = &subscription {
         if value != &existing.subscription_type && tier.is_none() {
             existing.rate_limit_tier = None;
+            option_fields.push("rate_limit_tier");
         }
         existing.subscription_type = value.clone();
     }
@@ -948,7 +956,8 @@ async fn update_account(
             *limit = number as i32;
         }
     }
-    let _runtime_permit = if [
+    let runtime_update = [
+        "email",
         "proxy_url",
         "auth_type",
         "access_token",
@@ -961,8 +970,8 @@ async fn update_account(
         "expires_at",
     ]
     .iter()
-    .any(|key| updates.get(key).is_some())
-    {
+    .any(|key| updates.get(key).is_some());
+    let _runtime_permit = if runtime_update {
         config_permit(&state, &existing).await?
     } else {
         None
@@ -1014,18 +1023,20 @@ async fn update_account(
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
         existing.proxy_url = proxy_url.to_string();
     }
-    if let Some(concurrency) = updates.get("concurrency").and_then(|v| v.as_i64()) {
-        if concurrency > 0 {
-            existing.concurrency = concurrency as i32;
+    for (key, target, minimum) in [
+        ("concurrency", &mut existing.concurrency, 1),
+        ("priority", &mut existing.priority, 1),
+        ("rpm_limit", &mut existing.rpm_limit, 0),
+    ] {
+        if let Some(value) = updates.get(key) {
+            *target = value
+                .as_i64()
+                .and_then(|number| i32::try_from(number).ok())
+                .filter(|number| *number >= minimum)
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!("{key} 必须是 {minimum}～{} 的整数", i32::MAX))
+                })?;
         }
-    }
-    if let Some(priority) = updates.get("priority").and_then(|v| v.as_i64()) {
-        if priority > 0 {
-            existing.priority = priority as i32;
-        }
-    }
-    if let Some(rpm_limit) = updates.get("rpm_limit").and_then(|v| v.as_i64()) {
-        existing.rpm_limit = rpm_limit.max(0) as i32;
     }
     if let Some(status) = updates.get("status").and_then(|v| v.as_str()) {
         if !status.is_empty() {
@@ -1114,7 +1125,14 @@ async fn update_account(
         existing.upstream_session_refresh_policy = policy.to_string();
     }
 
-    state.account_svc.update_account(&existing).await?;
+    if runtime_update {
+        state.account_svc.update_account(&existing).await?;
+    } else {
+        state
+            .account_svc
+            .update_account_options(&existing, &option_fields)
+            .await?;
+    }
     existing = state.account_svc.get_account(id).await?;
     Ok(Json(existing))
 }
@@ -2385,6 +2403,87 @@ mod tests {
             assert_eq!(updated["seven_day_usage_limit_percent"], expected.1);
             assert_eq!(updated["rpm_limit"], 50);
         }
+    }
+
+    /// 活动 API 与 CLI 不妨碍普通配置保存，真正身份修改仍须排空且不能覆盖轮换凭据。
+    #[tokio::test]
+    async fn account_options_hot_update_preserves_active_api_cli_and_credentials() {
+        let (app, _, _, pool, accounts) = test_router_with_scheduling(true).await;
+        let (status, created) = account_admin_json(&app, Method::POST, "/admin/accounts", json!({
+            "name":"hot-options", "email":"hot-options@example.invalid", "auth_type":"oauth",
+            "access_token":"synthetic-old-access", "refresh_token":"synthetic-old-refresh",
+            "expires_at":(Utc::now() + ChronoDuration::hours(2)).timestamp_millis(), "concurrency":3
+        })).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_i64().unwrap();
+        let path = format!("/admin/accounts/{id}");
+        let queue = accounts.get_or_create_queue(id, 3).await;
+        let active = queue.acquire(Duration::from_secs(1), 2).await.unwrap();
+        let cli = queue
+            .runtime_gate
+            .prepare_shared_cli("run:synthetic-hot-edit")
+            .unwrap();
+        sqlx::query("UPDATE accounts SET access_token='synthetic-new-access', refresh_token='synthetic-new-refresh', status='error' WHERE id=$1")
+            .bind(id).execute(&pool).await.unwrap();
+        let (code, updated) = account_admin_json(
+            &app,
+            Method::PUT,
+            &path,
+            json!({
+                "concurrency":1,"rpm_limit":17,"priority":23,"name":"hot-updated",
+                "five_hour_usage_limit_percent":81,"auto_telemetry":true,
+                "subscription_type":"ultra", "rate_limit_tier":null
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{updated}");
+        assert_eq!(updated["rpm_limit"], 17);
+        assert_eq!(updated["priority"], 23);
+        assert_eq!(updated["concurrency"], 1);
+        assert_eq!(queue.active_request_count(), 1);
+        assert_eq!(queue.max_units(), 2);
+        assert_eq!(accounts.get_or_create_queue(id, 3).await.max_units(), 2);
+        let saved = accounts.get_account(id).await.unwrap();
+        assert_eq!(saved.access_token, "synthetic-new-access");
+        assert_eq!(saved.refresh_token, "synthetic-new-refresh");
+        assert_eq!(saved.status.to_string(), "error");
+        assert_eq!(saved.subscription_type.as_deref(), Some("ultra"));
+        assert!(saved.rate_limit_tier.is_none());
+        for protected in [
+            json!({"proxy_url":"http://synthetic.invalid:1"}),
+            json!({"access_token":"must-not-write"}),
+        ] {
+            let (code, _) = account_admin_json(&app, Method::PUT, &path, protected).await;
+            assert!(!code.is_success());
+        }
+        // 维护尝试失败不能释放已有 CLI 租约，也不能取消 API。
+        assert_eq!(queue.active_request_count(), 1);
+        queue
+            .runtime_gate
+            .update(&cli.owner, &cli.generation, "release")
+            .unwrap();
+        let (code, _) = account_admin_json(
+            &app,
+            Method::PUT,
+            &path,
+            json!({"proxy_url":"http://synthetic.invalid:1"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        drop(active);
+        for (key, value) in [
+            ("rpm_limit", json!(-1)),
+            ("priority", json!(0)),
+            ("concurrency", json!(i64::MAX)),
+        ] {
+            let mut update = json!({"name":"must-not-write"});
+            update[key] = value;
+            assert_eq!(
+                account_admin_json(&app, Method::PUT, &path, update).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(accounts.get_account(id).await.unwrap().name, "hot-updated");
     }
 
     /// 管理接口严格拒绝错误类型和范围，不能静默忽略或部分写入。

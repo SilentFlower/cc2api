@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::Account;
+use crate::model::request_diagnostics::DiagnosticParameters;
 use crate::service::diagnostics;
 pub use crate::store::scheduling_store::send_interval_ms;
 use crate::store::scheduling_store::{SchedulingStore, SendClaim, SessionBinding};
@@ -20,6 +21,7 @@ const HISTORY_MS: i64 = 5 * 60 * 1000;
 const PER_ACCOUNT_EVENTS: usize = 500;
 const GLOBAL_EVENTS: usize = 10000;
 const MAX_OBSERVED_ACCOUNTS: usize = 10000;
+const MAX_LATENCY_CLASSES: usize = 64;
 
 /// 一次请求冻结的 v3 调度设置，不包含账号或凭据。
 #[derive(Clone, Debug, Serialize)]
@@ -214,12 +216,44 @@ pub struct SchedulingSnapshot {
     pub events: Vec<SubmissionEvent>,
 }
 
-/// 进程内软反馈；未知保持中性，失败惩罚随时间衰减。
+/// 同模型、思考配置和流式方式才能比较首输出，不保存任意请求内容。
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+struct LatencyClass {
+    model: Option<String>,
+    thinking_type: Option<String>,
+    thinking_budget: Option<u64>,
+    effort: Option<String>,
+    stream: Option<bool>,
+}
+
+impl From<&DiagnosticParameters> for LatencyClass {
+    /// 冻结已经过白名单过滤的请求事实，缺失参数不猜默认值。
+    /// @param parameters 既有诊断参数摘要。
+    /// @return 本请求使用的延迟分组。
+    fn from(parameters: &DiagnosticParameters) -> Self {
+        Self {
+            model: parameters.model.clone(),
+            thinking_type: parameters.thinking_type.clone(),
+            thinking_budget: parameters.thinking_budget,
+            effort: parameters.effort.clone(),
+            stream: parameters.stream,
+        }
+    }
+}
+
+/// 一个分组的首输出平滑值和最近成功采样时间。
+struct LatencySample {
+    ewma_ms: f64,
+    sampled_at_ms: i64,
+}
+
+/// 进程内软反馈；健康按账号共享，首输出按请求参数隔离。
 #[derive(Default)]
 struct Feedback {
     failure: f64,
     sampled_at_ms: i64,
     latency_ms: Option<f64>,
+    latencies: HashMap<LatencyClass, LatencySample>,
     observed: bool,
 }
 
@@ -291,6 +325,7 @@ struct RequestLease {
     id: String,
     key: Option<String>,
     config: SchedulingConfig,
+    latency_class: LatencyClass,
     deadline: Instant,
     binding: Mutex<Option<SessionBinding>>,
     attempt_started: Mutex<Option<Instant>>,
@@ -361,6 +396,20 @@ impl V3Scheduler {
     /// @param session_id 改写前解析的显式会话 ID。
     /// @return 会随流结束释放的租约。
     pub fn begin(self: &Arc<Self>, token_id: i64, session_id: Option<&str>) -> SchedulingRequest {
+        self.begin_with_parameters(token_id, session_id, &DiagnosticParameters::default())
+    }
+
+    /// 创建请求租约并冻结延迟比较分组，不改变绑定键或准入期限。
+    /// @param token_id 已鉴权的 Token 命名空间。
+    /// @param session_id 改写前显式会话 ID。
+    /// @param parameters 已通过白名单过滤的模型和思考参数。
+    /// @return 流结束时释放的请求租约。
+    pub fn begin_with_parameters(
+        self: &Arc<Self>,
+        token_id: i64,
+        session_id: Option<&str>,
+        parameters: &DiagnosticParameters,
+    ) -> SchedulingRequest {
         let config = self.config();
         let key = session_id.filter(|s| !s.is_empty()).map(|sid| {
             let mut hash = Sha256::new();
@@ -390,6 +439,7 @@ impl V3Scheduler {
             key,
             deadline: Instant::now() + Duration::from_secs(config.wait_seconds),
             config,
+            latency_class: LatencyClass::from(parameters),
             binding: Mutex::new(None),
             attempt_started: Mutex::new(None),
         }));
@@ -483,7 +533,7 @@ impl V3Scheduler {
         Ok(())
     }
 
-    /// 计算智能因素，管理展示和实际选号共用此方法。
+    /// 计算管理汇总智能因素，实际选号复用同一公式并限定请求分组。
     /// @param candidate 已经过硬资格过滤的容量快照。
     /// @param config 本请求冻结的设置。
     /// @param now_ms 当前 UTC 毫秒。
@@ -494,29 +544,41 @@ impl V3Scheduler {
         config: &SchedulingConfig,
         now_ms: i64,
     ) -> SmartFactors {
+        self.factors_for_class(candidate, config, now_ms, None)
+    }
+
+    fn factors_for_class(
+        &self,
+        candidate: &SchedulingCandidate,
+        config: &SchedulingConfig,
+        now_ms: i64,
+        class: Option<&LatencyClass>,
+    ) -> SmartFactors {
         let pressure = (candidate.active_units + candidate.queued_units).max(0) as f64
             / candidate.max_units.max(1) as f64;
         let wait = (candidate.next_send_ms - now_ms).max(0) as f64;
         let load = 1.0 / (1.0 + pressure + wait / 1000.0);
         let quota = remaining_quota(&candidate.account, now_ms);
         let state = self.runtime();
-        let (health, latency) = state
-            .feedback
-            .get(&candidate.account.id)
+        let feedback = state.feedback.get(&candidate.account.id);
+        let health = feedback
             .map(|f| {
                 let decay = 0.5_f64.powf((now_ms - f.sampled_at_ms).max(0) as f64 / 900000.0);
-                (
-                    if f.observed {
-                        1.0 - f.failure * decay
-                    } else {
-                        0.5
-                    },
-                    f.latency_ms
-                        .map(|ms| 1.0 / (1.0 + ms / 10000.0))
-                        .unwrap_or(0.5),
-                )
+                if f.observed {
+                    1.0 - f.failure * decay
+                } else {
+                    0.5
+                }
             })
-            .unwrap_or((0.5, 0.5));
+            .unwrap_or(0.5);
+        // 只有管理页使用账号汇总；实际选号缺少同类样本时保持中性，不能借用其它模型。
+        let latency_ms = feedback.and_then(|f| match class {
+            Some(class) => f.latencies.get(class).map(|sample| sample.ewma_ms),
+            None => f.latency_ms,
+        });
+        let latency = latency_ms
+            .map(|ms| 1.0 / (1.0 + ms / 10000.0))
+            .unwrap_or(0.5);
         let values = [load, quota, health, latency];
         let score = values
             .iter()
@@ -624,7 +686,13 @@ impl V3Scheduler {
                 let score = if request.0.config.mode == "legacy_score" {
                     -c.legacy_score
                 } else {
-                    self.factors(&c, &request.0.config, now).score
+                    self.factors_for_class(
+                        &c,
+                        &request.0.config,
+                        now,
+                        Some(&request.0.latency_class),
+                    )
+                    .score
                 };
                 (c.account, score)
             })
@@ -750,7 +818,14 @@ impl V3Scheduler {
             });
     }
 
-    fn feedback(&self, account_id: i64, failure: bool, capacity: bool, latency_ms: Option<f64>) {
+    fn feedback(
+        &self,
+        account_id: i64,
+        failure: bool,
+        capacity: bool,
+        latency_ms: Option<f64>,
+        class: &LatencyClass,
+    ) {
         let now = now_ms();
         let mut state = self.runtime();
         let f = state.feedback.entry(account_id).or_default();
@@ -763,8 +838,25 @@ impl V3Scheduler {
         f.failure = decayed * (1.0 - alpha) + if failure { alpha } else { 0.0 };
         f.sampled_at_ms = now;
         f.observed = true;
-        if let Some(ms) = latency_ms {
+        if let Some(ms) = latency_ms.filter(|ms| ms.is_finite() && *ms >= 0.0) {
             f.latency_ms = Some(f.latency_ms.map(|old| old * 0.8 + ms * 0.2).unwrap_or(ms));
+            // 参数组合可能持续增长；淘汰最旧统计只使该组恢复中性，不限制业务准入。
+            if !f.latencies.contains_key(class) && f.latencies.len() >= MAX_LATENCY_CLASSES {
+                if let Some(oldest) = f
+                    .latencies
+                    .iter()
+                    .min_by_key(|(_, sample)| sample.sampled_at_ms)
+                    .map(|(key, _)| key.clone())
+                {
+                    f.latencies.remove(&oldest);
+                }
+            }
+            let sample = f.latencies.entry(class.clone()).or_insert(LatencySample {
+                ewma_ms: ms,
+                sampled_at_ms: now,
+            });
+            sample.ewma_ms = sample.ewma_ms * 0.8 + ms * 0.2;
+            sample.sampled_at_ms = now;
         }
         if state.feedback.len() > MAX_OBSERVED_ACCOUNTS {
             if let Some(oldest) = state
@@ -960,7 +1052,7 @@ impl SchedulingRequest {
         });
     }
 
-    /// 依据真实响应头更新健康与延迟；用户错误和 429 在分类后处理。
+    /// 无诊断观察器时仅按响应头分类健康，不能把头部耗时当作有效输出。
     /// @param account_id 当前账号。
     /// @param status 实际上游 HTTP 状态。
     /// @return 无。
@@ -971,13 +1063,14 @@ impl SchedulingRequest {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        if let Some(started) = started {
+        if started.is_some() {
             if (200..300).contains(&status) || status >= 500 {
                 self.0.scheduler.feedback(
                     account_id,
                     status >= 500,
                     false,
-                    (status < 300).then(|| started.elapsed().as_millis() as f64),
+                    None,
+                    &self.0.latency_class,
                 );
             }
         }
@@ -988,7 +1081,7 @@ impl SchedulingRequest {
     /// @param status 实际上游状态，未知不造状态码。
     /// @param outcome 已有观察器判定的终态。
     /// @param error_type 白名单错误类型。
-    /// @param latency_ms 响应头耗时，非首 token。
+    /// @param latency_ms 已观察到的首个有效输出耗时；未采到时为空。
     /// @return 无；本地取消、采样失败和用户输入错误不惩罚账号。
     pub(crate) fn finish_observed_attempt(
         &self,
@@ -999,9 +1092,13 @@ impl SchedulingRequest {
         latency_ms: Option<u64>,
     ) {
         if outcome == "success" {
-            self.0
-                .scheduler
-                .feedback(account_id, false, false, latency_ms.map(|ms| ms as f64));
+            self.0.scheduler.feedback(
+                account_id,
+                false,
+                false,
+                latency_ms.map(|ms| ms as f64),
+                &self.0.latency_class,
+            );
         } else if !matches!(outcome, "cancelled" | "transport_error")
             && (status.is_some_and(|s| s >= 500)
                 || (matches!(outcome, "upstream_error" | "body_error")
@@ -1015,7 +1112,9 @@ impl SchedulingRequest {
                         )
                     })))
         {
-            self.0.scheduler.feedback(account_id, true, false, None);
+            self.0
+                .scheduler
+                .feedback(account_id, true, false, None, &self.0.latency_class);
         }
     }
 
@@ -1031,7 +1130,9 @@ impl SchedulingRequest {
             .take()
             .is_some()
         {
-            self.0.scheduler.feedback(account_id, true, false, None);
+            self.0
+                .scheduler
+                .feedback(account_id, true, false, None, &self.0.latency_class);
         }
     }
 
@@ -1039,7 +1140,9 @@ impl SchedulingRequest {
     /// @param account_id 当前账号。
     /// @return 无。
     pub fn capacity_rejected(&self, account_id: i64) {
-        self.0.scheduler.feedback(account_id, true, true, None);
+        self.0
+            .scheduler
+            .feedback(account_id, true, true, None, &self.0.latency_class);
     }
 }
 
@@ -1067,4 +1170,171 @@ fn remaining_quota(account: &Account, now: i64) -> f64 {
         })
         .collect::<Vec<_>>();
     windows.into_iter().reduce(f64::min).unwrap_or(0.5)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use sqlx::any::AnyPoolOptions;
+
+    fn scheduler() -> Arc<V3Scheduler> {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let scheduler = Arc::new(V3Scheduler::new(Arc::new(SchedulingStore::new(pool))));
+        scheduler.apply_config(SchedulingConfig {
+            weights: [0.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        });
+        scheduler
+    }
+
+    fn candidate(id: i64) -> SchedulingCandidate {
+        let account = serde_json::from_value(json!({
+            "id":id,"name":"合成延迟样本","email":format!("latency-{id}@example.invalid"),"status":"active",
+            "device_id":"synthetic-device","canonical_env":{},"canonical_prompt_env":{},"canonical_process":{},
+            "billing_mode":"strip","concurrency":4,"priority":50,"created_at":Utc::now(),"updated_at":Utc::now()
+        })).unwrap();
+        SchedulingCandidate {
+            account,
+            active_units: 0,
+            max_units: 8,
+            queued: 0,
+            queued_units: 0,
+            legacy_score: 0.0,
+            next_send_ms: 0,
+        }
+    }
+
+    /// 同类成功样本更新 EWMA，其他模型、思考与流式分组保持未知，健康仍按账号共享。
+    #[tokio::test]
+    async fn first_output_latency_is_scoped_and_only_successful_output_updates_ewma() {
+        let scheduler = scheduler();
+        let params = json!({"model":"claude-sonnet-5","thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"high"},"stream":true});
+        let request =
+            scheduler.begin_with_parameters(0, None, &DiagnosticParameters::from_request(&params));
+        let candidate = candidate(7);
+        request.finish_observed_attempt(7, Some(200), "success", None, Some(2000));
+        let factors = || {
+            scheduler.factors_for_class(
+                &candidate,
+                &scheduler.config(),
+                now_ms(),
+                Some(&request.0.latency_class),
+            )
+        };
+        assert!((factors().latency - 1.0 / 1.2).abs() < 1e-9);
+        for (outcome, status, error) in [
+            ("cancelled", Some(200), None),
+            ("incomplete", Some(200), Some("sampling_limit")),
+            ("body_error", Some(200), Some("decode_error")),
+            ("upstream_error", Some(200), Some("overloaded_error")),
+            ("upstream_rejected", Some(500), None),
+        ] {
+            request.finish_observed_attempt(7, status, outcome, error, Some(1));
+            assert!((factors().latency - 1.0 / 1.2).abs() < 1e-9);
+        }
+        request.finish_observed_attempt(7, Some(200), "success", None, None);
+        request.submitted(7);
+        request.response_headers(7, 200);
+        assert!((factors().latency - 1.0 / 1.2).abs() < 1e-9);
+        for (pointer, value) in [
+            ("/model", json!("claude-opus-5")),
+            ("/thinking/type", json!("adaptive")),
+            ("/thinking/budget_tokens", json!(2048)),
+            ("/output_config/effort", json!("low")),
+            ("/stream", json!(false)),
+        ] {
+            let mut different = params.clone();
+            *different.pointer_mut(pointer).unwrap() = value;
+            let class = LatencyClass::from(&DiagnosticParameters::from_request(&different));
+            let other = scheduler.factors_for_class(
+                &candidate,
+                &scheduler.config(),
+                now_ms(),
+                Some(&class),
+            );
+            assert_eq!(other.latency, 0.5);
+            assert!(other.health > 0.0);
+        }
+        request.finish_observed_attempt(7, Some(200), "success", None, Some(4000));
+        assert!((factors().latency - 1.0 / 1.24).abs() < 1e-9);
+        assert!(
+            (scheduler
+                .factors(&candidate, &scheduler.config(), now_ms())
+                .latency
+                - factors().latency)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// 不同模型的快慢顺序相反时，实际选号必须跟随该请求的分组。
+    #[tokio::test]
+    async fn first_output_scoped_latency_changes_actual_selection_without_header_fallback() {
+        let scheduler = scheduler();
+        let fast_sonnet = scheduler.begin_with_parameters(
+            0,
+            None,
+            &DiagnosticParameters::from_request(&json!({"model":"claude-sonnet-5"})),
+        );
+        let fast_opus = scheduler.begin_with_parameters(
+            0,
+            None,
+            &DiagnosticParameters::from_request(&json!({"model":"claude-opus-5"})),
+        );
+        fast_sonnet.finish_observed_attempt(7, Some(200), "success", None, Some(100));
+        fast_sonnet.finish_observed_attempt(8, Some(200), "success", None, Some(30000));
+        fast_opus.finish_observed_attempt(7, Some(200), "success", None, Some(30000));
+        fast_opus.finish_observed_attempt(8, Some(200), "success", None, Some(100));
+        assert_eq!(
+            scheduler
+                .choose(vec![candidate(7), candidate(8)], &fast_sonnet, 2)
+                .unwrap()
+                .id,
+            7
+        );
+        assert_eq!(
+            scheduler
+                .choose(vec![candidate(7), candidate(8)], &fast_opus, 2)
+                .unwrap()
+                .id,
+            8
+        );
+        let unknown = scheduler.begin(0, None);
+        unknown.submitted(9);
+        unknown.response_headers(9, 200);
+        assert_eq!(
+            scheduler
+                .factors(&candidate(9), &scheduler.config(), now_ms())
+                .latency,
+            0.5
+        );
+    }
+
+    /// 分组数量有界，淘汰只恢复未知，不改变业务可用性。
+    #[tokio::test]
+    async fn first_output_latency_classes_are_bounded() {
+        let scheduler = scheduler();
+        for budget in 1..=65 {
+            let request = scheduler.begin_with_parameters(
+                0,
+                None,
+                &DiagnosticParameters::from_request(&json!({
+                    "model":"claude-sonnet-5","thinking":{"type":"enabled","budget_tokens":budget}
+                })),
+            );
+            request.finish_observed_attempt(7, Some(200), "success", None, Some(20000));
+        }
+        let state = scheduler.runtime();
+        let feedback = state.feedback.get(&7).unwrap();
+        assert_eq!(feedback.latencies.len(), MAX_LATENCY_CLASSES);
+        assert!(feedback.latencies.contains_key(&LatencyClass::from(
+            &DiagnosticParameters::from_request(&json!({
+                "model":"claude-sonnet-5","thinking":{"type":"enabled","budget_tokens":65}
+            }))
+        )));
+    }
 }

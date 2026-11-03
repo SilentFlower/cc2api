@@ -39,7 +39,7 @@ const chartEnd = computed(() => (detail.value?.snapshot.observed_at_ms ?? 0) + 6
 const events = computed(() => detail.value?.snapshot.events.filter(event => event.submitted_at_ms >= chartStart.value) ?? []);
 const factors = computed(() => summary.value ? [
   ['负载', summary.value.factors.load], ['额度', summary.value.factors.quota],
-  ['健康', summary.value.factors.health], ['响应头延迟', summary.value.factors.latency],
+  ['健康', summary.value.factors.health], ['首输出延迟（汇总）', summary.value.factors.latency],
 ] as const : []);
 
 /** 将绝对提交时间映射到同一时间轴。@param time UTC 毫秒。@return SVG 横坐标。 */
@@ -196,7 +196,7 @@ onUnmounted(() => { stop(); document.removeEventListener('visibilitychange', syn
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div v-for="factor in factors" :key="factor[0]" class="text-xs"><div class="flex justify-between mb-1"><span>{{ factor[0] }}</span><span>{{ (factor[1] * 100).toFixed(0) }}</span></div><div class="h-1.5 rounded bg-[#eee7dc]"><div class="h-full rounded bg-[#c4704f]" :style="{ width: Math.max(0, Math.min(100, factor[1] * 100)) + '%' }" /></div></div>
         </div>
-        <p class="text-[11px] text-[#8c8475]">归一化偏好越高越优，仅影响新会话；延迟是上游响应头耗时。未知额度或反馈保持中性。</p>
+        <p class="text-[11px] text-[#8c8475]">归一化偏好越高越优，仅影响新会话。延迟取成功请求的首个有效文字、思考或工具输出；图中为账号汇总，实际选号按模型、思考参数和流式方式分别比较。未知额度或反馈保持中性。</p>
         <div class="space-y-3 border-t border-[#e8e2d9] pt-4">
           <h3 class="text-sm font-semibold">网关绑定会话</h3>
           <div class="flex flex-wrap gap-2">

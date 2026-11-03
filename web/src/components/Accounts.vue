@@ -5,6 +5,7 @@ import UsageWindowStats from './UsageWindowStats.vue';
 import SchedulingDetails from './SchedulingDetails.vue';
 import { subscriptionLabel, fiveHourLabel } from '../lib/subscription';
 import { schedulingReasonLabel } from '../lib/scheduling';
+import { accountUpdateDelta } from '../lib/accountUpdate';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -43,6 +44,8 @@ let accountLoading = false;
 
 /** 表单弹窗是否可见 */
 const showForm = ref(false);
+/** 编辑开始时的标量快照，用于增量提交。 */
+const editBaseline = ref<Record<string, unknown>>({});
 /** 删除确认弹窗是否可见 */
 const showDeleteConfirm = ref(false);
 /** 待删除账号 ID */
@@ -270,6 +273,7 @@ function openEdit(a: Account) {
     upstream_session_ttl_minutes: a.upstream_session_ttl_minutes ?? DEFAULT_UPSTREAM_SESSION_TTL_MINUTES,
     upstream_session_refresh_policy: a.upstream_session_refresh_policy ?? DEFAULT_UPSTREAM_SESSION_REFRESH_POLICY,
   };
+  editBaseline.value = { ...form.value };
   showForm.value = true;
 }
 
@@ -314,33 +318,7 @@ async function save() {
         && editing.value.auth_type !== 'oauth') {
         throw new Error('切换到 OAuth 模式时必须填写 Refresh Token');
       }
-      const updates: Record<string, unknown> = {};
-      if (form.value.name) updates.name = form.value.name;
-      if (form.value.email) updates.email = form.value.email;
-      updates.auth_type = form.value.auth_type;
-      if (form.value.setup_token) updates.setup_token = form.value.setup_token;
-      if (form.value.access_token) updates.access_token = form.value.access_token;
-      if (form.value.refresh_token) updates.refresh_token = form.value.refresh_token;
-      if (expiresAt) updates.expires_at = Number(expiresAt);
-      updates.proxy_url = form.value.proxy_url;
-      updates.billing_mode = form.value.billing_mode;
-      updates.account_uuid = form.value.account_uuid || null;
-      updates.organization_uuid = form.value.organization_uuid || null;
-      updates.subscription_type = form.value.subscription_type || null;
-      updates.rate_limit_tier = form.value.rate_limit_tier || null;
-      updates.concurrency = form.value.concurrency;
-      updates.priority = form.value.priority;
-      updates.rpm_limit = form.value.rpm_limit;
-      updates.five_hour_usage_limit_percent = form.value.five_hour_usage_limit_percent;
-      updates.seven_day_usage_limit_percent = form.value.seven_day_usage_limit_percent;
-      updates.auto_telemetry = form.value.auto_telemetry;
-      updates.auto_poll_usage = form.value.auto_poll_usage;
-      updates.allow_1m_models = form.value.allow_1m_models;
-      updates.allow_fast_mode = form.value.allow_fast_mode;
-      updates.upstream_session_pool_enabled = form.value.upstream_session_pool_enabled;
-      updates.upstream_session_pool_size = form.value.upstream_session_pool_size;
-      updates.upstream_session_ttl_minutes = form.value.upstream_session_ttl_minutes;
-      updates.upstream_session_refresh_policy = form.value.upstream_session_refresh_policy;
+      const updates = accountUpdateDelta(form.value, editBaseline.value);
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {

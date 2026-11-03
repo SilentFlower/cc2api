@@ -123,6 +123,61 @@ async fn usage_limits_storage_contract(pool: &AnyPool, driver: &str) {
     assert_eq!(updated.access_token, "synthetic-next-access");
     assert_eq!(updated.canonical_process, process);
     assert_eq!(updated.five_hour_usage_limit_percent, 81);
+    // 普通配置也只能写提交列，必须保留旧快照之后产生的凭据、状态、套餐与指标。
+    account.concurrency = 2;
+    account.priority = 31;
+    account.rpm_limit = 19;
+    account.name = "hot-options".into();
+    store
+        .update_options(&account, &["concurrency", "priority", "rpm_limit", "name"])
+        .await
+        .unwrap();
+    let options = store.get_by_id(account.id).await.unwrap();
+    assert_eq!(
+        (options.concurrency, options.priority, options.rpm_limit),
+        (2, 31, 19)
+    );
+    assert_eq!(options.refresh_token, "synthetic-next-refresh");
+    assert_eq!(options.status, AccountStatus::Disabled);
+    assert_eq!(options.subscription_type.as_deref(), Some("ultra"));
+    assert_eq!(options.canonical_process, process);
+    assert_eq!(options.five_hour_usage_limit_percent, 81);
+    assert!(
+        store
+            .update_options(&account, &["name", "refresh_token"])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_by_id(account.id).await.unwrap().refresh_token,
+        "synthetic-next-refresh"
+    );
+    account.rate_limit_tier = None;
+    account.subscription_type = None;
+    store
+        .update_options(&account, &["subscription_type", "rate_limit_tier"])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_by_id(account.id)
+            .await
+            .unwrap()
+            .subscription_type
+            .is_none()
+    );
+    // 同一 SQL 在同连接上反复切换文本与清除，验证 PostgreSQL 预编译缓存参数类型稳定。
+    for value in [Some("ultra"), None, Some("max"), None] {
+        account.subscription_type = value.map(str::to_owned);
+        account.rate_limit_tier = value.map(|_| "synthetic-tier".into());
+        store
+            .update_options(&account, &["subscription_type", "rate_limit_tier"])
+            .await
+            .unwrap();
+        let read = store.get_by_id(account.id).await.unwrap();
+        assert_eq!(read.subscription_type, account.subscription_type);
+        assert_eq!(read.rate_limit_tier, account.rate_limit_tier);
+    }
     account.five_hour_usage_limit_percent = 80;
     store.update_usage_limits(&account).await.unwrap();
     store

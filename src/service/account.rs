@@ -3,8 +3,8 @@ use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{Instant, sleep};
@@ -259,14 +259,12 @@ fn waiting_queue_capacity(concurrency: i32) -> i32 {
 /// # 运行时修改 concurrency
 /// 不重建 queue 实例，而是通过 [`AccountQueue::adjust_capacity`] 原地调整两把信号量：
 /// - 扩容：直接 `add_permits(delta)`，立即生效；
-/// - 缩容：先 `forget_permits(delta)` 扣减可用 permit；若槽位被占满无法立即扣完，
-///   spawn 一个后台吞 permit 任务循环读取 `slot_max`（共享 target），只要实际 cap 仍超过 target
-///   就继续 acquire+forget，反之立即把 permit 归还并退出。
-///   期间如果又被扩容，旧吞任务会在下次循环发现 cap 已达标直接退出——**不会遗留过期吞任务**。
+/// - 缩容：先扣减空闲 permit，剩余槽位差额在已持有许可归还之前销毁；
+///   等待位仍延迟回收，已有排队请求不取消。重新扩容时按最新目标计算差额。
 ///
 /// # 单账号系统内最多请求数
 /// `active_units ≤ concurrency × 2` + `waiting_requests ≤ 2 × concurrency`。缩容时
-/// 短暂可能超过 new 直到已有 waiter 耗尽（被 honor）——这是可接受的过渡态。
+/// 已有在途请求和等待人数可能暂时超过新上限，后续槽位准入使用新容量。
 ///
 /// # 客户端中断 / 超时安全
 /// `acquire` 返回的 `Future` 在被 drop 时：`queue_permit` 自动归还到 `queue_cap`；
@@ -279,14 +277,15 @@ pub struct AccountQueue {
     slots: Arc<Semaphore>,
     /// 等待位信号量，实际通过槽位和 CLI 门禁后归还。
     queue_cap: Arc<Semaphore>,
-    /// 槽位容量目标（== 账号当前 `concurrency × 2` 内部单位）。shrinker 循环读这个值作为裁决依据,
-    /// 扩容时自动撤销旧的 shrink 意图。
+    /// 槽位容量目标（== 账号当前 `concurrency × 2` 内部单位），归还许可时读取最新目标。
     slot_max: Arc<AtomicI32>,
     /// 等待位容量目标（== `2 × concurrency`）。单独存一个 atomic 供 queue_cap 的 shrinker 读取。
     queue_max: Arc<AtomicI32>,
     /// `slots` 信号量当前实际总 permit 数（累计 add_permits - 累计 forget）。用于
-    /// `adjust_capacity` 计算 delta 和 shrinker 判断是否继续吞 permit。
+    /// `adjust_capacity` 与许可归还时据此计算容量差额。
     slots_cap: Arc<AtomicI32>,
+    /// 序列化槽位缩扩容与归还，归还前先偿还缩容差额，防止已排队请求抢跑。
+    slot_capacity_lock: Arc<Mutex<()>>,
     /// `queue_cap` 信号量当前实际总 permit 数。同 `slots_cap`。
     qc_cap: Arc<AtomicI32>,
     /// 正在等待槽位的请求数（仅供 UI 展示用）。包 Arc 是为了 scopeguard 的 move 闭包能引用。
@@ -301,16 +300,24 @@ pub struct AccountQueue {
 
 /// 账号槽位 permit 包装器，Drop 时自动归还底层信号量 permit，并同步减少活跃请求计数。
 pub struct AccountSlotPermit {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<CapacityPermit>,
     active_requests: Arc<AtomicI64>,
     scheduling_request: Option<SchedulingRequest>,
 }
 
+/// 槽位归还前先偿还缩容差额，涵盖等待门禁时取消或超时的路径。
+struct CapacityPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    slots_cap: Arc<AtomicI32>,
+    slot_max: Arc<AtomicI32>,
+    slot_capacity_lock: Arc<Mutex<()>>,
+}
+
 impl AccountSlotPermit {
-    fn new(permit: OwnedSemaphorePermit, active_requests: Arc<AtomicI64>) -> Self {
+    fn new(permit: CapacityPermit, queue: &AccountQueue) -> Self {
         Self {
             permit: Some(permit),
-            active_requests,
+            active_requests: queue.active_requests.clone(),
             scheduling_request: None,
         }
     }
@@ -326,8 +333,30 @@ impl AccountSlotPermit {
 
 impl Drop for AccountSlotPermit {
     fn drop(&mut self) {
-        let _ = self.permit.take();
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        let _ = self.permit.take();
+    }
+}
+
+impl Drop for CapacityPermit {
+    fn drop(&mut self) {
+        let _lock = self
+            .slot_capacity_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(mut permit) = self.permit.take() {
+            let debt = (self.slots_cap.load(Ordering::Acquire)
+                - self.slot_max.load(Ordering::Acquire))
+            .max(0) as usize;
+            let retired = debt.min(permit.num_permits());
+            if retired > 0 {
+                // 先销毁超出新上限的单位，再归还余量；FIFO 等待者不能先于缩容拿到它们。
+                if let Some(excess) = permit.split(retired) {
+                    excess.forget();
+                    self.slots_cap.fetch_sub(retired as i32, Ordering::AcqRel);
+                }
+            }
+        }
     }
 }
 
@@ -355,6 +384,7 @@ impl AccountQueue {
             slot_max: Arc::new(AtomicI32::new(cap)),
             queue_max: Arc::new(AtomicI32::new(qc)),
             slots_cap: Arc::new(AtomicI32::new(cap)),
+            slot_capacity_lock: Arc::new(Mutex::new(())),
             qc_cap: Arc::new(AtomicI32::new(qc)),
             waiting: Arc::new(AtomicI64::new(0)),
             waiting_units: Arc::new(AtomicI64::new(0)),
@@ -367,17 +397,30 @@ impl AccountQueue {
     ///
     /// @param new 新的标准并发槽位数，内部会换算成 `new × 2` 个信号量单位。
     ///
-    /// # 关键设计
-    /// `slot_max` / `queue_max` 是共享的 target，所有后台 shrinker 任务每次循环都读取最新值。因此：
-    /// - 扩容 10→1→10：第二次调用 store(10)，旧的 shrinker（从 10→1 留下）下次循环看到
-    ///   `cap(10) <= target(10)` 后把 permit 归还并退出，不会继续悄悄吞；
-    /// - 缩容 10→5→1：两次调整合并到同一个 target=1，新旧 shrinker 共同工作至 `cap=1`。
+    /// 槽位先销毁空闲许可，其余差额由在途许可归还前偿还，避免后台任务排在旧等待者后面。
+    /// 等待位继续沿用共享目标的延迟缩容，已有排队请求不被取消。
     fn adjust_capacity(&self, new: i32) {
         let new_slot_units = standard_concurrency_to_slot_units(new);
         let new_queue_cap = waiting_queue_capacity(new);
-        self.slot_max.store(new_slot_units, Ordering::Release);
+        {
+            let _lock = self
+                .slot_capacity_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.slot_max.store(new_slot_units, Ordering::Release);
+            let current = self.slots_cap.load(Ordering::Acquire);
+            if new_slot_units > current {
+                let added = new_slot_units - current;
+                self.slots_cap.fetch_add(added, Ordering::AcqRel);
+                self.slots.add_permits(added as usize);
+            } else {
+                let retired = self
+                    .slots
+                    .forget_permits((current - new_slot_units) as usize);
+                self.slots_cap.fetch_sub(retired as i32, Ordering::AcqRel);
+            }
+        }
         self.queue_max.store(new_queue_cap, Ordering::Release);
-        Self::adjust_semaphore(&self.slots, &self.slots_cap, &self.slot_max);
         Self::adjust_semaphore(&self.queue_cap, &self.qc_cap, &self.queue_max);
     }
 
@@ -500,6 +543,12 @@ impl AccountQueue {
                 Ok(Err(_)) => return Err(QueueWaitError::Closed),
                 Err(_) => return Err(QueueWaitError::Timeout),
             };
+        let slot_permit = CapacityPermit {
+            permit: Some(slot_permit),
+            slots_cap: self.slots_cap.clone(),
+            slot_max: self.slot_max.clone(),
+            slot_capacity_lock: self.slot_capacity_lock.clone(),
+        };
 
         // 持有槽位不代表已准入；CLI 占用期间仍须占等待位且只计等待负载。
         self.gate_waiting_units
@@ -516,10 +565,7 @@ impl AccountQueue {
             return Err(QueueWaitError::Timeout);
         }
         drop(queue_permit);
-        Ok(AccountSlotPermit::new(
-            slot_permit,
-            self.active_requests.clone(),
-        ))
+        Ok(AccountSlotPermit::new(slot_permit, self))
     }
 
     /// 当前活跃内部单位数 = `slots` 当前总 permit - 可用 permit - 尚在等门禁的单位。
@@ -922,6 +968,38 @@ impl AccountService {
         self.store.update(&normalized).await?;
         if let Some(scheduler) = &self.scheduler {
             scheduler.account_updated(a.id);
+        }
+        Ok(())
+    }
+
+    /// 校验并热更新普通配置，按列保存且保留现有队列、流和运行租约。
+    /// @param account 本次编辑的配置快照。
+    /// @param fields 明确需要写入的普通配置列。
+    /// @return 校验或写入结果；成功后当前并发和 RPM 等待者立即使用新配置。
+    pub async fn update_account_options(
+        &self,
+        account: &Account,
+        fields: &[&str],
+    ) -> Result<(), AppError> {
+        let mut normalized = account.clone();
+        normalize_account_subscription(&mut normalized)?;
+        normalize_upstream_session_pool_config(&mut normalized)?;
+        validate_account_usage_limits(&normalized)?;
+        // 与队列创建/调整共用写锁，避免保存后旧请求又用过期快照恢复上限。
+        let mut queues = self.queues.write().await;
+        self.store.update_options(&normalized, fields).await?;
+        if fields.contains(&"concurrency") {
+            if let Some(queue) = queues.get(&account.id) {
+                queue.adjust_capacity(normalized.concurrency);
+            } else {
+                let queue = Arc::new(AccountQueue::new(normalized.concurrency));
+                queue.runtime_gate.recover(account.id);
+                queues.insert(account.id, queue);
+            }
+        }
+        drop(queues);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.account_updated(account.id);
         }
         Ok(())
     }
@@ -1726,7 +1804,14 @@ impl AccountService {
         let mut map = self.queues.write().await;
         if let Some(q) = map.get(&account_id) {
             if q.slot_max.load(Ordering::Relaxed) != slot_units {
-                q.adjust_capacity(concurrency);
+                // 请求中的 Account 可能早于管理更新；以持久配置为准，读失败保留当前容量。
+                if let Ok(current) = self.store.get_by_id(account_id).await {
+                    if q.slot_max.load(Ordering::Relaxed)
+                        != standard_concurrency_to_slot_units(current.concurrency)
+                    {
+                        q.adjust_capacity(current.concurrency);
+                    }
+                }
             }
             return q.clone();
         }
@@ -3707,6 +3792,68 @@ mod tests {
             .await
             .expect("regular permit after shrink settled");
         drop(next);
+    }
+
+    /// 缩容前已排队的请求不能抢到退还中的旧容量，重新扩容后也不能留下延迟吞槽任务。
+    #[tokio::test]
+    async fn account_queue_hot_shrink_blocks_existing_waiters_and_reexpands() {
+        let queue = Arc::new(AccountQueue::new(2));
+        let first = queue.acquire(Duration::from_secs(1), 2).await.unwrap();
+        let second = queue.acquire(Duration::from_secs(1), 2).await.unwrap();
+        let waiting_queue = queue.clone();
+        let mut waiter =
+            tokio::spawn(async move { waiting_queue.acquire(Duration::from_secs(2), 2).await });
+        wait_until_queue_waiting(&queue, 1, 2).await;
+        queue.adjust_capacity(1);
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.active_request_count(), 1);
+        drop(second);
+        let next = waiter.await.unwrap().unwrap();
+        assert_eq!(queue.active_request_count(), 1);
+        queue.adjust_capacity(3);
+        let added = queue.acquire(Duration::from_secs(1), 4).await.unwrap();
+        assert_eq!(queue.active_units(), 6);
+        queue.adjust_capacity(1);
+        queue.adjust_capacity(3);
+        drop(next);
+        drop(added);
+        assert_eq!(queue.active_units(), 0);
+        assert_eq!(queue.slots.available_permits(), 6);
+    }
+
+    /// 门禁等待期间取消也须偿还缩容差额，不能漏还或暴露旧容量。
+    #[tokio::test]
+    async fn account_queue_hot_shrink_cancellation_at_runtime_gate_retires_capacity() {
+        let queue = Arc::new(AccountQueue::new(2));
+        let lease = queue
+            .runtime_gate
+            .prepare("login:synthetic-shrink")
+            .unwrap();
+        let waiting_queue = queue.clone();
+        let pending =
+            tokio::spawn(async move { waiting_queue.acquire(Duration::from_secs(30), 4).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.gate_waiting_units.load(Ordering::Relaxed) != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        queue.adjust_capacity(1);
+        pending.abort();
+        let _ = pending.await;
+        assert_eq!(queue.slots_cap.load(Ordering::Relaxed), 2);
+        assert_eq!(queue.slots.available_permits(), 2);
+        assert_eq!(queue.active_units(), 0);
+        queue
+            .runtime_gate
+            .update(&lease.owner, &lease.generation, "release")
+            .unwrap();
     }
 
     #[tokio::test]

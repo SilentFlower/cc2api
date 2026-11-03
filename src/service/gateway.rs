@@ -24,6 +24,7 @@ use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::model::identity::device_profile;
+use crate::model::request_diagnostics::DiagnosticParameters;
 use crate::model::request_usage::RequestUsage;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -2022,9 +2023,10 @@ impl GatewayService {
             .filter(|_| path == "/v1/messages")
             .map(|scheduler| {
                 let explicit_sid = extract_session_id_from_body(&body_map);
-                scheduler.begin(
+                scheduler.begin_with_parameters(
                     api_token.map(|t| t.id).unwrap_or(0),
                     explicit_sid.as_deref(),
+                    &DiagnosticParameters::from_request(&body_map),
                 )
             });
 

@@ -28,7 +28,7 @@ const wconc = ref('0.2');
 const v3Mode = ref('smart');
 const v3WaitSeconds = ref<string | number>('120');
 const v3Weights = ref<Array<string | number>>(['1', '0.8', '1', '0.5']);
-const v3WeightLabels = ['可用负载', '有效额度', '真实健康', '响应头延迟'];
+const v3WeightLabels = ['可用负载', '有效额度', '真实健康', '首输出延迟'];
 const isValidV3 = computed(() => {
   const wait = String(v3WaitSeconds.value).trim();
   const weights = v3Weights.value.map(value => Number(String(value).trim()));

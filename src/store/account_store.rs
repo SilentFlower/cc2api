@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::AnyPool;
 use sqlx::Row;
-use sqlx::any::AnyRow;
+use sqlx::any::{AnyArguments, AnyRow};
+use sqlx::{AnyPool, Arguments};
 
 use crate::error::AppError;
 use crate::model::account::{
@@ -333,6 +333,68 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 仅写入白名单内明确提交的普通配置，避免旧快照覆盖并行变化的凭据和状态。
+    /// @param account 已校验的配置快照。
+    /// @param fields 本次需要更新的字段名，未知或受保护字段会被拒绝。
+    /// @return 数据库写入结果；空字段列表不执行写入。
+    pub async fn update_options(&self, account: &Account, fields: &[&str]) -> Result<(), AppError> {
+        let mut args = AnyArguments::default();
+        let mut assignments = Vec::new();
+        for field in fields {
+            let text = match *field {
+                "name" => Some(Some(account.name.clone())),
+                "billing_mode" => Some(Some(account.billing_mode.to_string())),
+                "subscription_type" => Some(account.subscription_type.clone()),
+                "rate_limit_tier" => Some(account.rate_limit_tier.clone()),
+                "allow_1m_models" => Some(Some(account.allow_1m_models.clone())),
+                "upstream_session_refresh_policy" => {
+                    Some(Some(account.upstream_session_refresh_policy.clone()))
+                }
+                _ => None,
+            };
+            let index = assignments.len() + 1;
+            if let Some(value) = text {
+                // 固定绑定文本类型，避免 Any 的 NULL 在预编译缓存中先被记成整数类型。
+                args.add(value.unwrap_or_default());
+                let expression = if matches!(*field, "subscription_type" | "rate_limit_tier") {
+                    format!("NULLIF(${index},'')")
+                } else {
+                    format!("${index}")
+                };
+                assignments.push(format!("{field}={expression}"));
+                continue;
+            }
+            let value = match *field {
+                "concurrency" => account.concurrency,
+                "priority" => account.priority,
+                "rpm_limit" => account.rpm_limit,
+                "auto_telemetry" => i32::from(account.auto_telemetry),
+                "auto_poll_usage" => i32::from(account.auto_poll_usage),
+                "allow_fast_mode" => i32::from(account.allow_fast_mode),
+                "upstream_session_pool_enabled" => i32::from(account.upstream_session_pool_enabled),
+                "upstream_session_pool_size" => account.upstream_session_pool_size,
+                "upstream_session_ttl_minutes" => account.upstream_session_ttl_minutes,
+                "five_hour_usage_limit_percent" => account.five_hour_usage_limit_percent,
+                "seven_day_usage_limit_percent" => account.seven_day_usage_limit_percent,
+                _ => return Err(AppError::BadRequest("字段不支持运行中更新".into())),
+            };
+            args.add(value);
+            assignments.push(format!("{field}=${index}"));
+        }
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        args.add(account.id);
+        let query = format!(
+            "UPDATE accounts SET {}, updated_at={} WHERE id=${}",
+            assignments.join(", "),
+            self.now_expr(),
+            assignments.len() + 1
+        );
+        sqlx::query_with(&query, args).execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// 只更新账号的两个用量控制线，避免状态快捷操作覆盖其它配置或凭据。
     /// @param account 已通过值域校验的账号控制线快照。
     /// @return 数据库写入结果。
@@ -658,17 +720,17 @@ impl AccountStore {
         subscription_type: Option<Option<String>>,
         rate_limit_tier: Option<Option<String>>,
     ) -> Result<(), AppError> {
-        // SQLx Any 的空参数可能携带整数类型，显式转 TEXT 避免 PostgreSQL 对空字符串作整数解析。
+        // 始终绑定文本，清除用 NULLIF 表达，避免 NULL/文本交替时缓存的参数类型冲突。
         let query = format!("UPDATE accounts SET
-            rate_limit_tier=CASE WHEN $1=1 THEN CAST($2 AS TEXT)
-                WHEN $3=1 AND COALESCE(subscription_type,'')<>COALESCE(CAST($4 AS TEXT),'') THEN NULL ELSE rate_limit_tier END,
-            subscription_type=CASE WHEN $3=1 THEN CAST($4 AS TEXT) ELSE subscription_type END,updated_at={}
+            rate_limit_tier=CASE WHEN $1=1 THEN NULLIF($2,'')
+                WHEN $3=1 AND COALESCE(subscription_type,'')<>$4 THEN NULL ELSE rate_limit_tier END,
+            subscription_type=CASE WHEN $3=1 THEN NULLIF($4,'') ELSE subscription_type END,updated_at={}
             WHERE id=$5", self.now_expr());
         let changed = sqlx::query(&query)
             .bind(i32::from(rate_limit_tier.is_some()))
-            .bind(rate_limit_tier.flatten())
+            .bind(rate_limit_tier.flatten().unwrap_or_default())
             .bind(i32::from(subscription_type.is_some()))
-            .bind(subscription_type.flatten())
+            .bind(subscription_type.flatten().unwrap_or_default())
             .bind(id)
             .execute(&self.pool)
             .await?

@@ -361,6 +361,7 @@ mod tests {
             started_at: request.started_at.clone(),
             finished_at: request.finished_at.clone(),
             ttft_ms: Some(10),
+            first_output_ms: Some(15),
             duration_ms: Some(20),
             status_code: Some(200),
             upstream_request_id: Some("req_synthetic0".into()),

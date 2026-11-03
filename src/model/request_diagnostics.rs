@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -26,6 +27,51 @@ pub struct DiagnosticParameters {
     pub effort: Option<String>,
     pub stream: Option<bool>,
     pub tools_count: Option<usize>,
+}
+
+impl DiagnosticParameters {
+    /// 从请求中提取可用于诊断和延迟分组的既有白名单参数。
+    /// @param body 已解析的请求，不保留正文或任意扩展字段。
+    /// @return 缺失或非法字段保持未知的参数摘要。
+    pub fn from_request(body: &Value) -> Self {
+        Self {
+            model: body
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(safe_model),
+            max_tokens: body.get("max_tokens").and_then(Value::as_u64),
+            thinking_type: body
+                .pointer("/thinking/type")
+                .and_then(Value::as_str)
+                .filter(|value| ["enabled", "disabled", "adaptive"].contains(value))
+                .map(str::to_owned),
+            thinking_budget: body
+                .pointer("/thinking/budget_tokens")
+                .and_then(Value::as_u64),
+            effort: body
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    ["low", "medium", "high", "xhigh", "max", "default", "none"].contains(value)
+                })
+                .map(str::to_owned),
+            stream: body.get("stream").and_then(Value::as_bool),
+            tools_count: body.get("tools").and_then(Value::as_array).map(Vec::len),
+        }
+    }
+}
+
+/// 只保留安全模型标识，不能把请求正文或凭据片段带入诊断和统计键。
+/// @param value 外部模型值。
+/// @return 符合既有白名单时的模型名。
+pub(crate) fn safe_model(value: &str) -> Option<String> {
+    (value.len() <= 128
+        && value.starts_with("claude-")
+        && !value.contains("sk-ant-")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)))
+    .then(|| value.to_owned())
 }
 
 /// 同一账号内可关联的会话和线程摘要，所有身份均为散列。
@@ -85,7 +131,11 @@ pub struct AttemptDiagnostic {
     pub sessions: DiagnosticSessions,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// 历史字段保留响应头耗时语义，不作为首输出延迟回填。
     pub ttft_ms: Option<u64>,
+    /// 首次有效内容被观察到的耗时；旧记录和未观察到内容时为空。
+    #[serde(default)]
+    pub first_output_ms: Option<u64>,
     pub duration_ms: Option<u64>,
     pub status_code: Option<u16>,
     pub upstream_request_id: Option<String>,

@@ -19,7 +19,7 @@ use crate::model::account::Account;
 use crate::model::identity::device_profile;
 use crate::model::request_diagnostics::{
     AttemptDiagnostic, DiagnosticParameters, DiagnosticSessions, DiagnosticTokens,
-    RequestDiagnostic, normalize_correlation_id,
+    RequestDiagnostic, normalize_correlation_id, safe_model,
 };
 use crate::service::rewriter::extract_session_id_from_body;
 use crate::service::usage::UsageCapture;
@@ -262,11 +262,12 @@ pub(crate) fn prepare_attempt(account: &Account, body: &[u8]) -> Option<AttemptT
                     .key
                     .into(),
                 profile_selection: state.profile_selection.clone(),
-                parameters: parameters(&body),
+                parameters: DiagnosticParameters::from_request(&body),
                 sessions,
                 started_at: now(),
                 finished_at: None,
                 ttft_ms: None,
+                first_output_ms: None,
                 duration_ms: None,
                 status_code: None,
                 upstream_request_id: None,
@@ -411,6 +412,11 @@ impl AttemptTrace {
         };
         if let Some(capture) = self.capture.take() {
             let observed = capture.observation(end == "complete");
+            record.first_output_ms = observed.first_output_at.map(|at| {
+                at.saturating_duration_since(self.start)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            });
             record.tokens = observed.tokens.into();
             record.partial = observed.partial;
             record.response_model = observed.response_model.as_deref().and_then(safe_model);
@@ -451,7 +457,7 @@ impl AttemptTrace {
                 record.status_code,
                 &record.outcome,
                 record.error_type.as_deref(),
-                record.ttft_ms,
+                record.first_output_ms,
             );
         }
         record.finished_at = Some(now());
@@ -633,41 +639,6 @@ fn identity_hash(account: i64, kind: &str, value: &str) -> String {
     hex::encode(&digest[..16])
 }
 
-fn safe_model(value: &str) -> Option<String> {
-    (value.len() <= 128
-        && value.starts_with("claude-")
-        && !value.contains("sk-ant-")
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
-    .then(|| value.to_owned())
-}
-
-fn parameters(body: &Value) -> DiagnosticParameters {
-    DiagnosticParameters {
-        model: body
-            .get("model")
-            .and_then(Value::as_str)
-            .and_then(safe_model),
-        max_tokens: body.get("max_tokens").and_then(Value::as_u64),
-        thinking_type: body
-            .pointer("/thinking/type")
-            .and_then(Value::as_str)
-            .filter(|v| ["enabled", "disabled", "adaptive"].contains(v))
-            .map(str::to_owned),
-        thinking_budget: body
-            .pointer("/thinking/budget_tokens")
-            .and_then(Value::as_u64),
-        effort: body
-            .pointer("/output_config/effort")
-            .and_then(Value::as_str)
-            .filter(|v| ["low", "medium", "high", "xhigh", "max", "default", "none"].contains(v))
-            .map(str::to_owned),
-        stream: body.get("stream").and_then(Value::as_bool),
-        tools_count: body.get("tools").and_then(Value::as_array).map(Vec::len),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -675,10 +646,12 @@ mod tests {
         selected_account, session_context,
     };
     use crate::model::account::Account;
-    use crate::model::request_diagnostics::DiagnosticQuery;
+    use crate::model::request_diagnostics::{AttemptDiagnostic, DiagnosticQuery};
     use crate::service::usage::USAGE_BUFFER_LIMIT;
+    use crate::service::v3_scheduling::{SchedulingCandidate, V3Scheduler, now_ms};
     use crate::store::cache::{UpstreamSessionPoolAction, UpstreamSessionPoolResolve};
     use crate::store::diagnostics_store::DiagnosticsStore;
+    use crate::store::scheduling_store::SchedulingStore;
     use axum::body::{Body, Bytes, to_bytes};
     use axum::response::Response;
     use flate2::Compression;
@@ -689,6 +662,7 @@ mod tests {
     use std::convert::Infallible;
     use std::io::Write;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio_stream::StreamExt;
 
     async fn store() -> Arc<DiagnosticsStore> {
@@ -708,6 +682,73 @@ mod tests {
             "canonical_env":{"version":"2.1.293"},"canonical_prompt_env":{},"canonical_process":{},"billing_mode":"strip",
             "created_at":now(),"updated_at":now()
         })).unwrap()
+    }
+
+    /// 头部立即到达但首内容延迟时，两项时间分开记录，响应字节保持不变且旧记录可读。
+    #[tokio::test]
+    async fn first_output_diagnostics_measure_content_after_headers_and_read_old_records() {
+        let store = store().await;
+        let trace = TraceContext::new(store.clone());
+        let guard = RequestTraceGuard::new(trace.clone());
+        let scheduler = Arc::new(V3Scheduler::new(Arc::new(SchedulingStore::new(
+            AnyPoolOptions::new()
+                .connect_lazy("sqlite::memory:")
+                .unwrap(),
+        ))));
+        let first = b"data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+        let output = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"synthetic\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let response = CURRENT_TRACE
+            .scope(trace, async {
+                let mut attempt = begin_attempt(&account(), br#"{"stream":true}"#).unwrap();
+                attempt.with_feedback(scheduler.begin(0, None));
+                let stream = tokio_stream::once(Ok::<_, Infallible>(Bytes::from_static(first)))
+                    .chain(tokio_stream::once(Ok(Bytes::from_static(output))).then(
+                        |part| async move {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            part
+                        },
+                    ));
+                let response = Response::new(Body::from_stream(stream));
+                attempt.headers(200, response.headers(), vec![]);
+                guard.wrap(attempt.wrap(response))
+            })
+            .await;
+        let id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+                .as_ref(),
+            [first.as_slice(), output.as_slice()].concat()
+        );
+        store.flush().await.unwrap();
+        let detail = store.detail(&id).await.unwrap();
+        let record = &detail.attempts[0];
+        assert_eq!(record.outcome, "success");
+        assert!(record.first_output_ms.unwrap() >= record.ttft_ms.unwrap() + 20);
+        let candidate = SchedulingCandidate {
+            account: account(),
+            active_units: 0,
+            max_units: 8,
+            queued: 0,
+            queued_units: 0,
+            legacy_score: 0.0,
+            next_send_ms: 0,
+        };
+        let factor = scheduler
+            .factors(&candidate, &scheduler.config(), now_ms())
+            .latency;
+        assert!(
+            (factor - 1.0 / (1.0 + record.first_output_ms.unwrap() as f64 / 10000.0)).abs() < 1e-9
+        );
+        let mut old = serde_json::to_value(record).unwrap();
+        old.as_object_mut().unwrap().remove("first_output_ms");
+        let old: AttemptDiagnostic = serde_json::from_value(old).unwrap();
+        assert_eq!(old.first_output_ms, None);
+        assert_eq!(old.ttft_ms, record.ttft_ms);
     }
 
     /// 响应包装在请求作用域外仍可收口，原始字节与头值保持不变，记录仅含白名单。

@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::mem::take;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -47,10 +48,12 @@ struct UsageParser {
     error_type: Option<String>,
     observation_error: Option<&'static str>,
     tokens: [Option<u64>; 6],
+    first_output_at: Option<Instant>,
 }
 
 /// 与计费无关的响应观察结果，只保留白名单元信息。
 pub(crate) struct MessageObservation {
+    pub first_output_at: Option<Instant>,
     pub response_model: Option<String>,
     pub message_id: Option<String>,
     pub stop_reason: Option<String>,
@@ -160,6 +163,7 @@ impl UsageCapture {
     pub(crate) fn observation(self, complete: bool) -> MessageObservation {
         let parser = self.completed_parser(complete);
         MessageObservation {
+            first_output_at: parser.first_output_at,
             response_model: parser.response_model,
             message_id: parser.message_id,
             stop_reason: parser.stop_reason,
@@ -231,6 +235,7 @@ impl UsageParser {
             error_type: None,
             observation_error: None,
             tokens: [None; 6],
+            first_output_at: None,
         }
     }
 
@@ -378,6 +383,10 @@ impl UsageParser {
     }
 
     fn observe_value(&mut self, value: &Value) {
+        // 只在原有解码和事件派发成功后记点，响应头、心跳与空块不能奖励低延迟。
+        if self.first_output_at.is_none() && has_effective_output(value) {
+            self.first_output_at = Some(Instant::now());
+        }
         if let Some(model) = value
             .get("model")
             .or_else(|| value.pointer("/message/model"))
@@ -542,6 +551,40 @@ impl UsageParser {
     }
 }
 
+fn has_effective_output(value: &Value) -> bool {
+    let nonempty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    let block_output = |block: &Value| match block["type"].as_str() {
+        Some("text") => nonempty(block.get("text")),
+        Some("thinking") => nonempty(block.get("thinking")),
+        // 具名调用本身已是有效工具输出，不必等到参数全部拼接完成。
+        Some("tool_use" | "server_tool_use") => {
+            nonempty(block.get("id")) && nonempty(block.get("name"))
+        }
+        _ => false,
+    };
+    match value["type"].as_str() {
+        Some("content_block_delta") => {
+            let delta = &value["delta"];
+            match delta["type"].as_str() {
+                Some("text_delta") => nonempty(delta.get("text")),
+                Some("thinking_delta") => nonempty(delta.get("thinking")),
+                Some("input_json_delta") => nonempty(delta.get("partial_json")),
+                _ => false,
+            }
+        }
+        Some("content_block_start") => block_output(&value["content_block"]),
+        Some("message") => value
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| blocks.iter().any(block_output)),
+        _ => false,
+    }
+}
+
 impl Write for UsageParser {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.observe(bytes);
@@ -589,6 +632,60 @@ mod tests {
             &json!({"model":"claude-sonnet-5"}),
             Utc::now(),
         )
+    }
+
+    /// 首输出只识别有效内容，元数据、心跳、空块和签名都不能提前记点。
+    #[test]
+    fn first_output_ignores_metadata_and_records_effective_content_once() {
+        for value in [
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"合成"}}),
+            json!({"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"合成"}}),
+            json!({"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}),
+            json!({"type":"content_block_start","content_block":{"type":"tool_use","id":"synthetic","name":"test","input":{}}}),
+            json!({"type":"content_block_start","content_block":{"type":"server_tool_use","id":"synthetic","name":"test"}}),
+        ] {
+            let mut parser = UsageParser::build(None, 0, &json!({}), Utc::now());
+            for ignored in [
+                json!({"type":"message_start","message":{"id":"synthetic"}}),
+                json!({"type":"ping"}),
+                json!({"type":"content_block_start","content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","delta":{"type":"text_delta","text":" \n"}}),
+                json!({"type":"content_block_delta","delta":{"type":"signature_delta","signature":"synthetic"}}),
+                json!({"type":"content_block_start","content_block":{"type":"tool_use","name":"test"}}),
+            ] {
+                parser.observe_value(&ignored);
+                assert!(parser.first_output_at.is_none());
+            }
+            parser.observe_value(&value);
+            let first = parser.first_output_at.expect("有效输出必须记点");
+            parser.observe_value(&value);
+            assert_eq!(parser.first_output_at, Some(first));
+        }
+    }
+
+    /// 非流式 JSON 在完整解析后才记首输出，空内容保持未知。
+    #[test]
+    fn first_output_buffered_json_requires_effective_content() {
+        for (content, expected) in [
+            (json!([]), false),
+            (json!([{"type":"text","text":" "}]), false),
+            (json!([{"type":"text","text":"合成"}]), true),
+            (json!([{"type":"thinking","thinking":"合成"}]), true),
+            (
+                json!([{"type":"tool_use","id":"synthetic","name":"test","input":{}}]),
+                true,
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&json!({"type":"message","content":content,"usage":{"input_tokens":1,"output_tokens":1}})).unwrap();
+            let mut capture = UsageCapture::observer(&json!({}));
+            for chunk in bytes.chunks(1) {
+                capture.observe(chunk);
+            }
+            assert_eq!(
+                capture.observation(true).first_output_at.is_some(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -746,7 +843,7 @@ mod tests {
                     ""
                 };
                 let data = format!(
-                    "{prefix}data: {{\"usage\":{{\"input_tokens\":100,\"output_tokens\":2}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                    "{prefix}data: {{\"usage\":{{\"input_tokens\":100,\"output_tokens\":2}}}}\n\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"synthetic\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
                 )
                 .replace('\n', newline);
                 source.extend_from_slice(data.as_bytes());
@@ -772,6 +869,7 @@ mod tests {
                         );
                         assert!(!observed.partial, "{coding}/{chunk}");
                         assert_eq!(observed.observation_error, None);
+                        assert!(observed.first_output_at.is_some(), "{coding}/{chunk}");
                     }
                 }
             }
