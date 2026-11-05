@@ -9065,13 +9065,15 @@ mod tests {
 
     #[tokio::test]
     async fn business_forwarding_preserves_actual_http1_casing_and_telemetry_default() {
-        for path in [
-            "/v1/messages",
-            COUNT_TOKENS_PATH,
-            "/api/frame/contract/latest",
-            "/v1/mcp/synthetic",
-            "/api/event_logging/v2/batch",
-            "/api/eval/synthetic",
+        for (path, version, request_class) in [
+            ("/v1/messages", "2.1.280", "main"),
+            (COUNT_TOKENS_PATH, "2.1.280", "main"),
+            ("/api/frame/contract/latest", "2.1.280", "main"),
+            ("/v1/mcp/synthetic", "2.1.280", "main"),
+            ("/api/event_logging/v2/batch", "2.1.280", "main"),
+            ("/api/eval/synthetic", "2.1.280", "main"),
+            ("/v1/messages", "2.1.293", "subagent"),
+            (COUNT_TOKENS_PATH, "2.1.293", "subagent"),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -9112,17 +9114,33 @@ mod tests {
             let service = test_gateway_service_with_urls(base, String::new()).await;
             let account = account_for_request_profile(
                 &test_account(),
-                Some(profile_for_key("2.1.280").unwrap()),
+                Some(profile_for_key(version).unwrap()),
             );
-            let incoming = HashMap::from([
+            let mut incoming = HashMap::from([
                 (
                     "User-Agent".into(),
-                    "claude-cli/2.1.280 (external, cli)".into(),
+                    format!("claude-cli/{version} (external, cli)"),
                 ),
-                ("x-claude-code-request-class".into(), "main".into()),
+                ("x-claude-code-request-class".into(), request_class.into()),
                 ("x-frame-session-id".into(), "synthetic-frame".into()),
                 ("x-mcp-client-session-id".into(), "synthetic-mcp".into()),
             ]);
+            let agent_context = [
+                ("x-claude-code-agent-id", "synthetic-child"),
+                ("x-claude-code-parent-agent-id", "synthetic-parent"),
+                ("x-claude-code-agent-type", "Explore"),
+                (
+                    "x-claude-code-prompt-id",
+                    "11111111-1111-4111-8111-111111111111",
+                ),
+            ];
+            if request_class == "subagent" {
+                incoming.extend(
+                    agent_context
+                        .iter()
+                        .map(|(name, value)| (name.to_ascii_uppercase(), value.to_string())),
+                );
+            }
             let headers = service.rewriter.rewrite_headers(
                 &incoming,
                 path,
@@ -9174,7 +9192,9 @@ mod tests {
             }
             match path {
                 "/v1/messages" => {
-                    assert!(raw.contains("\r\nx-claude-code-request-class: main\r\n"))
+                    assert!(raw.contains(&format!(
+                        "\r\nx-claude-code-request-class: {request_class}\r\n"
+                    )))
                 }
                 "/api/frame/contract/latest" => {
                     assert!(raw.contains("\r\nX-Frame-Session-Id: synthetic-frame\r\n"))
@@ -9185,6 +9205,18 @@ mod tests {
                     assert!(!raw.contains("anthropic-beta:"));
                 }
                 _ => {}
+            }
+            for (name, value) in agent_context {
+                let marker = format!("\r\n{name}:");
+                if path == "/v1/messages" && request_class == "subagent" {
+                    assert!(raw.contains(&format!("{marker} {value}\r\n")), "{name}");
+                    assert_eq!(raw.to_ascii_lowercase().matches(&marker).count(), 1);
+                } else {
+                    assert!(
+                        !raw.to_ascii_lowercase().contains(&marker),
+                        "{path}: {name}"
+                    );
+                }
             }
         }
     }

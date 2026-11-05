@@ -119,6 +119,13 @@ static HEADER_WIRE_CASING: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     m.insert("authorization", "authorization");
     m.insert("x-claude-code-session-id", "X-Claude-Code-Session-Id");
     m.insert("x-client-request-id", "x-client-request-id");
+    m.insert("x-claude-code-agent-id", "x-claude-code-agent-id");
+    m.insert(
+        "x-claude-code-parent-agent-id",
+        "x-claude-code-parent-agent-id",
+    );
+    m.insert("x-claude-code-agent-type", "x-claude-code-agent-type");
+    m.insert("x-claude-code-prompt-id", "x-claude-code-prompt-id");
     m.insert("x-claude-code-request-class", "x-claude-code-request-class");
     m.insert(
         "x-claude-code-prev-tool-durations",
@@ -1631,9 +1638,13 @@ impl Rewriter {
             for (k, v) in headers {
                 let lower = k.to_lowercase();
                 let endpoint_header = match lower.as_str() {
-                    "x-claude-code-request-class" | "x-claude-code-prev-tool-durations" => {
-                        path == "/v1/messages"
-                    }
+                    // 分类和关联字段来自同一原生调用，不能只保留 subagent 标记却丢失其身份。
+                    "x-claude-code-request-class"
+                    | "x-claude-code-prev-tool-durations"
+                    | "x-claude-code-agent-id"
+                    | "x-claude-code-parent-agent-id"
+                    | "x-claude-code-agent-type"
+                    | "x-claude-code-prompt-id" => path == "/v1/messages",
                     "x-frame-cp"
                     | "x-frame-surface"
                     | "x-frame-platform"
@@ -11359,6 +11370,100 @@ mod tests {
             &json!({}),
         );
         assert!(!generated.contains_key("x-claude-code-prev-tool-durations"));
+    }
+
+    #[test]
+    fn messages_agent_context_headers_are_preserved_only_for_native_messages() {
+        let rewriter = Rewriter::new();
+        let context = [
+            ("x-claude-code-agent-id", "synthetic-child"),
+            ("x-claude-code-parent-agent-id", "synthetic-parent"),
+            ("x-claude-code-agent-type", "Explore"),
+            (
+                "x-claude-code-prompt-id",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+        ];
+        for version in ["2.1.280", "2.1.293"] {
+            let account = test_account_with_profile(version);
+            let mut incoming =
+                HashMap::from([("X-Claude-Code-Request-Class".into(), "subagent".into())]);
+            incoming.extend(
+                context
+                    .iter()
+                    .map(|(name, value)| (name.to_ascii_uppercase(), value.to_string())),
+            );
+            for client in [ClientType::ClaudeCode, ClientType::API] {
+                for path in [
+                    "/v1/messages",
+                    "/v1/messages/count_tokens",
+                    "/api/oauth/account/settings",
+                    "/api/hello",
+                ] {
+                    let headers = rewriter.rewrite_headers(
+                        &incoming,
+                        path,
+                        &account,
+                        client,
+                        "claude-sonnet-4-5",
+                        &json!({}),
+                    );
+                    for (name, value) in context {
+                        if client == ClientType::ClaudeCode && path == "/v1/messages" {
+                            assert_eq!(
+                                headers.get(name).map(String::as_str),
+                                Some(value),
+                                "{version} {client:?} {path}: {name}"
+                            );
+                            let ordered = ordered_anthropic_headers(path, &headers);
+                            assert!(ordered.iter().any(|(key, val)| key == name && val == value));
+                            assert_eq!(
+                                headers
+                                    .keys()
+                                    .filter(|key| key.eq_ignore_ascii_case(name))
+                                    .count(),
+                                1
+                            );
+                        } else {
+                            assert!(!headers.keys().any(|key| key.eq_ignore_ascii_case(name)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_main_prompt_id_is_preserved_without_inventing_agent_identity() {
+        let rewriter = Rewriter::new();
+        let account = test_account_with_profile("2.1.293");
+        for prompt in [None, Some("22222222-2222-4222-8222-222222222222")] {
+            let mut incoming =
+                HashMap::from([("x-claude-code-request-class".into(), "main".into())]);
+            if let Some(prompt) = prompt {
+                incoming.insert("x-claude-code-prompt-id".into(), prompt.into());
+            }
+            let headers = rewriter.rewrite_headers(
+                &incoming,
+                "/v1/messages",
+                &account,
+                ClientType::ClaudeCode,
+                "claude-sonnet-4-5",
+                &json!({"messages": [{"role": "user", "content": "synthetic subagent Explore"}]}),
+            );
+            assert_eq!(headers["x-claude-code-request-class"], "main");
+            assert_eq!(
+                headers.get("x-claude-code-prompt-id").map(String::as_str),
+                prompt
+            );
+            for name in [
+                "x-claude-code-agent-id",
+                "x-claude-code-parent-agent-id",
+                "x-claude-code-agent-type",
+            ] {
+                assert!(!headers.contains_key(name));
+            }
+        }
     }
 
     #[test]
