@@ -1,7 +1,7 @@
 use crate::service::account::AccountQueue;
 use crate::service::runtime_lease::RuntimeLease;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -205,6 +205,10 @@ pub fn build_router(
         .route("/admin/settings", get(get_settings).put(update_settings))
         .route("/admin/prime-logs", get(get_prime_logs))
         .route("/admin/request-diagnostics", get(list_request_diagnostics))
+        .route(
+            "/admin/request-diagnostics/:request_id/captures/:attempt_id",
+            get(request_native_capture),
+        )
         .route(
             "/admin/request-diagnostics/:request_id",
             get(request_diagnostic_detail),
@@ -2193,6 +2197,37 @@ async fn request_diagnostic_detail(
     Ok(Json(store.detail(&request_id).await?))
 }
 
+/// 读取属于指定请求的私有组装快照。
+/// @param state 管理共享状态。
+/// @param request_id 已保存的请求 UUID。
+/// @param attempt_id 属于本请求的尝试 UUID。
+/// @return 禁止缓存的管理员快照。
+async fn request_native_capture(
+    State(state): State<AppState>,
+    Path((request_id, attempt_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let store = state
+        .gateway_svc
+        .diagnostics_store()
+        .ok_or_else(|| AppError::ServiceUnavailable("请求诊断尚未装配".into()))?;
+    let detail = store.detail(&request_id).await?;
+    let attempt = detail
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == attempt_id)
+        .ok_or(AppError::NotFound)?;
+    let value = if attempt.profile_selection == "native293_cc_prepared" {
+        runtime_bridge::native_capture(attempt.account_id, &attempt.attempt_id).await?
+    } else {
+        serde_json::json!({"state":"unsupported", "message":"此尝试使用其他转发方式"})
+    };
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 /// 获取最近 50 条峰值预热调用记录,按时间倒序。
 async fn get_prime_logs(
     State(state): State<AppState>,
@@ -2238,6 +2273,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     async fn test_router_with_gateway() -> (Router, Arc<GatewayService>) {
         let (router, gateway, _, _) = test_router_with_gateway_and_settings().await;
@@ -2389,7 +2425,23 @@ mod tests {
                 assert_eq!(value["total"], 1);
             }
         }
+        let capture_path = format!(
+            "/admin/request-diagnostics/{id}/captures/{}",
+            Uuid::new_v4()
+        );
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&capture_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         for (path, expected) in [
+            (capture_path, StatusCode::NOT_FOUND),
             (
                 format!("/admin/request-diagnostics?correlation_id={id}"),
                 StatusCode::OK,

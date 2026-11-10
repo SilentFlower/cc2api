@@ -295,7 +295,50 @@ function normalizeSettingsMap(data: RawSettingsMap): SettingsMap {
   )
 }
 
+/** 管理端请求诊断列表行。 */
+export interface DiagnosticRequest {
+  request_id: string
+  started_at: string
+  status_code: number | null
+  account_id: number | null
+  outcome: string
+  attempt_count: number
+}
+
+/** 单次实际提交及私有采集状态。 */
+export interface DiagnosticAttempt {
+  attempt_id: string
+  account_id: number
+  ordinal: number
+  profile_selection: string
+  capture_status?: string | null
+  status_code: number | null
+  outcome: string
+}
+
+/** 已脱敏的 CC 组装后快照。 */
+export interface NativeCapture {
+  state: string
+  message?: string
+  snapshot?: {
+    stage: 'cc_prepared'
+    headers: [string, string][]
+    body: string
+    body_truncated: boolean
+    headers_truncated: boolean
+    original_body_bytes: number
+    original_body_sha256: string
+  }
+}
+
 export const api = {
+  /** 分页读取请求诊断。@param query 已编码筛选。@return 请求列表与采集健康。 */
+  requestDiagnostics: (query: string, signal?: AbortSignal) => request<{ items: DiagnosticRequest[]; total: number; health: Record<string, number> }>('GET', `/admin/request-diagnostics?${query}`, undefined, signal),
+  /** 读取请求尝试详情。@param id 请求 UUID。@return 摘要与尝试列表。 */
+  requestDiagnosticDetail: (id: string, signal?: AbortSignal) => request<{ request: DiagnosticRequest; attempts: DiagnosticAttempt[] }>('GET', `/admin/request-diagnostics/${encodeURIComponent(id)}`, undefined, signal),
+  /** 读取归属本请求的私有快照。@param requestId 请求 UUID。@param attemptId 尝试 UUID。@return 脱敏组装内容。 */
+  nativeCapture: (requestId: string, attemptId: string, signal?: AbortSignal) => request<NativeCapture>('GET', `/admin/request-diagnostics/${encodeURIComponent(requestId)}/captures/${encodeURIComponent(attemptId)}`, undefined, signal),
+
   /** 换取 v3 的独立浏览器会话。@return 会话签发结果。 */
   openRuntime: () => request<{ ok: boolean }>('POST', '/admin/runtime/session'),
   /** 撤销当前 v3 会话。@return 撤销成功结果，未启用 v3 时兼容旧部署。 */

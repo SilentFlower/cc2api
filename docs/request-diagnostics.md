@@ -67,4 +67,14 @@ SQLite/PostgreSQL 使用独立请求与尝试表，启动幂等建表；后台�
 
 `health.dropped_records` 是丢弃的写入事件数（不是独立请求数），`write_failures` 是写入/清理失败次数，`observation_failures` 是采样超限、解码或解析失败的尝试数。三者都是当前进程计数，重启清零；相应日志仅包含固定文案、计数和内部请求 UUID。查询本身失败时，应查服务日志确认数据库状态。
 
-不保存正文、工具参数、完整 headers、凭据、Cookie、邮箱、设备 ID、账号 UUID 或完整 session ID。标准 UUID 和 `req_` 字母数字响应 ID 可原样关联，其它头值只保存 SHA256；按原头值筛选时执行相同规范化。此功能从启用后采集，历史缺失字段不回填。
+默认诊断摘要不保存正文、工具参数、完整 headers、凭据、Cookie、邮箱、设备 ID、账号 UUID 或完整 session ID。按账号显式开启的私有组装快照遵循下方独立合同。标准 UUID 和 `req_` 字母数字响应 ID 可原样关联，其它头值只保存 SHA256；按原头值筛选时执行相同规范化。此功能从启用后采集，历史缺失字段不回填。
+
+## 查看 CC 组装后请求
+
+管理员打开「请求记录」，按账号 ID 或请求关联 ID 查询，进入「详情 → 查看 CC 组装后内容」。有序头名称、值与正文来自固定二进制已有的 `cc_prepared` 私有事件。此阶段位于原生最终发送前；页面标记为「CC 组装后」。原正文 SHA256 与长度单独列出，展示正文已经脱敏。
+
+采集按账号显式开启，默认关闭。调度器从账号固化配置 `native_capture_enabled=true` 生成私有 sender 目录配置，角色重建后生效。每账号最多保留 50 份、100 MiB，正文最多 2 MiB，请求头最多 128 KiB。落盘使用 0700 目录和 0600 文件。完整内容通过管理员鉴权和调度器服务鉴权读取；读取保持环境休眠状态。Authorization、Cookie、API Key、已知 bearer 和正文秘密字段先脱敏，普通服务日志保留摘要。
+
+`attempts[].capture_status` 为 `disabled`、`saved`、`dropped`、`failed` 或 `timeout`；旧记录为空。`timeout` 表示保存结果待核对，后台写入仍受并发上限约束。单份超限时保留前缀并标记截断。轮转后读取显示文件缺失。采集从开启后生效，历史记录保持原有摘要。
+
+`GET /admin/request-diagnostics/:request_id/captures/:attempt_id` 只读取属于该请求的尝试，响应使用 `Cache-Control: no-store`。正文以转义文本显示。

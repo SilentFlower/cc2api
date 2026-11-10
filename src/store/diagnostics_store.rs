@@ -350,6 +350,7 @@ mod tests {
 
     fn attempt(request: &RequestDiagnostic) -> AttemptDiagnostic {
         AttemptDiagnostic {
+            capture_status: None,
             attempt_id: Uuid::new_v4().to_string(),
             request_id: request.request_id.clone(),
             ordinal: 1,

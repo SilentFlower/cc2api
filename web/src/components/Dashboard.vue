@@ -71,6 +71,8 @@ onMounted(loadDashboard);
             >
               账号
             </router-link>
+            <router-link :to="{ name: 'requests' }" class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'requests' ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium' : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'">请求记录</router-link>
             <router-link
               :to="{ name: 'tokens' }"
               class="px-3 py-1.5 text-sm rounded-lg transition-colors"

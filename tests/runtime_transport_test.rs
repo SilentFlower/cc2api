@@ -55,6 +55,7 @@ async fn sender(origin: &str) -> (String, SenderConfig, String, tokio::task::Joi
         proxy_url: String::new(),
         allowed_origin: origin.into(),
         evidence_file: None,
+        native_capture_dir: None,
         quota_identity: String::new(),
     };
     let path = format!("/tmp/v3-sender-test-{}.json", Uuid::new_v4());

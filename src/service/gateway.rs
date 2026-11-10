@@ -9647,10 +9647,12 @@ mod tests {
     async fn native_real_gateway() {
         use crate::model::request_diagnostics::DiagnosticQuery;
         use crate::service::native_runtime::NativeSenderConfig;
+        use crate::service::runtime_bridge;
         use crate::service::runtime_transport::{SenderConfig, TransportBinding, sender_router};
         use std::env::{temp_dir, var};
         use std::fs;
 
+        let unlimited = var("CCRB_TEST_UNLIMITED").as_deref() == Ok("1");
         let root = temp_dir().join(format!("cc2api-native-gateway-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let (service, store) = test_gateway_service_with_cache_store_and_urls(
@@ -9678,15 +9680,20 @@ mod tests {
             native: Some(NativeSenderConfig {
                 binary_path: var("CCRB_TEST_BINARY").unwrap(),
                 work_root: root.join("workers").to_string_lossy().into_owned(),
-                memory_mib: 1536,
+                memory_mib: if unlimited { 0 } else { 1536 },
                 max_workers: 6,
             }),
             binding,
             proxy_url: var("CCRB_TEST_PROXY").unwrap(),
             allowed_origin: "https://api.anthropic.com".into(),
             evidence_file: Some(root.join("evidence.jsonl").to_string_lossy().into_owned()),
+            native_capture_dir: Some(
+                var("CCRB_TEST_CAPTURE_DIR")
+                    .unwrap_or_else(|_| root.join("captures").to_string_lossy().into_owned()),
+            ),
             quota_identity: "synthetic".into(),
         };
+        let capture_directory = config.native_capture_dir.clone().unwrap();
         let path = root.join("sender.json");
         fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let listener = tokio::net::TcpListener::bind("0.0.0.0:8091").await.unwrap();
@@ -9700,6 +9707,7 @@ mod tests {
                 .method("POST")
                 .uri("/v1/messages")
                 .header("user-agent", "claude-cli/2.1.293 (external, cli)")
+                .header("authorization", "Bearer synthetic-client-gateway")
                 .header("cf-ray", "synthetic-cdn")
                 .header(
                     "x-native-obs-text",
@@ -9711,7 +9719,7 @@ mod tests {
                 .unwrap()
         };
         for (label, expected) in [("gateway-normal", 200), ("gateway-error", 401)] {
-            let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":label}]})), None).await;
+            let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":label},{"type":"text","text":"synthetic-client-gateway"}]}]})), None).await;
             assert!(response.headers().get("x-v3-native-observation").is_none());
             let status = response.status().as_u16();
             let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
@@ -9793,6 +9801,31 @@ mod tests {
                     .iter()
                     .any(|record| record["request_id"] == detail.attempts[0].attempt_id)
             );
+            assert_eq!(detail.attempts[0].capture_status.as_deref(), Some("saved"));
+            let snapshot: serde_json::Value = serde_json::from_slice(
+                &fs::read(format!(
+                    "{capture_directory}/{}.json",
+                    detail.attempts[0].attempt_id
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot["stage"], "cc_prepared");
+            assert_eq!(snapshot["account_id"], account.id);
+            let viewed = runtime_bridge::native_capture(account.id, &detail.attempts[0].attempt_id)
+                .await
+                .unwrap();
+            assert_eq!(viewed["state"], "saved");
+            assert_eq!(viewed["snapshot"]["headers"], snapshot["headers"]);
+            assert!(
+                snapshot["headers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|header| header[0] == "authorization" && header[1] == "[REDACTED]")
+            );
+            assert!(!snapshot.to_string().contains("synthetic-bearer-a"));
+            assert!(!snapshot.to_string().contains("synthetic-client-gateway"));
             assert_eq!(detail.attempts[0].profile_version, "2.1.293");
             assert_eq!(
                 detail.attempts[0].profile_selection,

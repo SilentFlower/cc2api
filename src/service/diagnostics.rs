@@ -260,6 +260,7 @@ fn prepare_observation(account: &Account, body: Value) -> Option<AttemptTrace> {
                 .and_then(Value::as_str)
                 .map(|value| identity_hash(account.id, "message", value));
             let record = AttemptDiagnostic {
+                capture_status: None,
                 attempt_id: Uuid::new_v4().to_string(),
                 request_id: state.request.request_id.clone(),
                 ordinal: 0,
@@ -337,6 +338,7 @@ pub(crate) fn prepare_native_attempt(
     record.profile_version = "2.1.293".into();
     record.profile_selection = "native293_cc_prepared".into();
     record.parameters = observation.parameters;
+    record.capture_status = observation.capture_status;
     Some(attempt)
 }
 

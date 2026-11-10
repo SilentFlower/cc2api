@@ -128,6 +128,54 @@ fn response(upstream: reqwest::Response) -> Response {
     output
 }
 
+/// 使用服务鉴权读取指定尝试的组装快照。
+/// @param account_id 已由诊断记录确认的账号。
+/// @param attempt_id 已由诊断记录确认的尝试 UUID。
+/// @return 有界 JSON 内容；缺失和读取失败保持明确状态。
+pub async fn native_capture(
+    account_id: i64,
+    attempt_id: &str,
+) -> Result<serde_json::Value, AppError> {
+    let (base, token, client) = config()?;
+    let mut response = client
+        .get(format!(
+            "{base}/internal/v3/native-captures/{account_id}/{attempt_id}"
+        ))
+        .bearer_auth(token)
+        .timeout(STATUS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("采集服务读取失败".into()))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(
+            serde_json::json!({"state":"missing", "message":"采集文件缺失、尚未生成或已清理"}),
+        );
+    }
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable("采集文件读取失败".into()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("采集文件读取失败".into()))?
+    {
+        if bytes.len() + chunk.len() > 6 * 1024 * 1024 {
+            return Err(AppError::ServiceUnavailable("采集文件超出读取上限".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let snapshot: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::ServiceUnavailable("采集文件格式无效".into()))?;
+    if snapshot["account_id"] != account_id
+        || snapshot["attempt_id"] != attempt_id
+        || snapshot["stage"] != "cc_prepared"
+    {
+        return Err(AppError::ServiceUnavailable("采集文件归属无效".into()));
+    }
+    Ok(serde_json::json!({"state":"saved", "snapshot":snapshot}))
+}
+
 /// 已经通过 admin_auth 的管理员换取独立 v3 浏览器会话。
 /// @return HttpOnly cookie；响应不包含管理密码或服务秘密。
 pub async fn grant_session() -> Result<Response, AppError> {

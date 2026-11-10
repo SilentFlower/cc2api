@@ -17,6 +17,7 @@ pub const WORKER_MEMORY_MIB: u64 = 192;
 pub struct NativeSenderConfig {
     pub binary_path: String,
     pub work_root: String,
+    /// 显式零表示账号无限内存，正数沿用加权容量公式。
     pub memory_mib: u64,
     pub max_workers: usize,
 }
@@ -36,7 +37,7 @@ pub struct NativeSubmission {
 }
 
 impl NativeSenderConfig {
-    /// 校验当前平台、有限预算及已登记分发体。
+    /// 校验当前平台、资源模式及已登记分发体。
     /// @return 保持打开的精确执行文件，或明确的准备错误。
     pub fn verify(&self) -> Result<File, AppError> {
         super::native_runtime::verify_distribution(self)

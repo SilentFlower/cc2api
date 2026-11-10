@@ -71,8 +71,9 @@ fn digest_file(file: &mut File) -> io::Result<String> {
 /// 核验已登记的 Linux x64 分发文件。@param config 冻结部署配置。@return 只读执行句柄。
 pub(crate) fn verify_distribution(config: &NativeSenderConfig) -> Result<File, AppError> {
     if config.max_workers == 0
-        || config.max_workers as u64
-            > config.memory_mib.saturating_sub(POOL_MEMORY_MIB) / WORKER_MEMORY_MIB
+        || (config.memory_mib != 0
+            && config.max_workers as u64
+                > config.memory_mib.saturating_sub(POOL_MEMORY_MIB) / WORKER_MEMORY_MIB)
         || !Path::new(&config.binary_path).is_absolute()
         || !Path::new(&config.work_root).is_absolute()
     {
@@ -509,6 +510,7 @@ impl Worker {
     async fn execute(
         &mut self,
         submission: &NativeSubmission,
+        capture_dir: Option<&str>,
         response: &mut Option<oneshot::Sender<Result<Response, AppError>>>,
         chunks: &mpsc::Sender<Result<Bytes, io::Error>>,
         deadline: Instant,
@@ -590,7 +592,10 @@ impl Worker {
                     }
                     prepared = true;
                     let value: Value = serde_json::from_str(body).map_err(|_| protocol_error())?;
+                    let capture_status =
+                        super::native_capture::record(capture_dir, submission, payload).await;
                     observation = Some(NativeRequestObservation {
+                        capture_status: Some(capture_status),
                         schema_version: 1,
                         parameters: DiagnosticParameters::from_request(&value),
                         session_id: extract_session_id_from_body(&value)
@@ -904,7 +909,7 @@ impl NativePool {
                         .await
                         .map_err(|_| unavailable())??;
                 let result = tokio::select! {
-                    result = worker.execute(&submission, &mut reply, &chunks, deadline) => result,
+                    result = worker.execute(&submission, config.native_capture_dir.as_deref(), &mut reply, &chunks, deadline) => result,
                     _ = chunks.closed() => {
                         let _ = timeout(Duration::from_millis(200), worker.send("request_cancel", Some(&submission.request.request_id), None)).await;
                         Err(protocol_error())
@@ -1020,13 +1025,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "需要 CCRB_TEST_BINARY、CCRB_TEST_PROXY、CCRB_TEST_CA_FILE 和独立网络夹具"]
     async fn native_real_binary() {
+        let unlimited = var("CCRB_TEST_UNLIMITED").as_deref() == Ok("1");
+        let normal = if unlimited { 2 } else { 3 };
         let root = temp_dir().join(format!("cc2api-native-{}", Uuid::new_v4()));
         let config = SenderConfig {
             native: Some(NativeSenderConfig {
                 binary_path: var("CCRB_TEST_BINARY").unwrap(),
                 work_root: root.to_string_lossy().into_owned(),
-                memory_mib: 1536,
-                max_workers: 6,
+                memory_mib: if unlimited { 0 } else { 1536 },
+                max_workers: normal * 2,
             }),
             binding: TransportBinding {
                 account_id: 7,
@@ -1039,6 +1046,7 @@ mod tests {
             proxy_url: var("CCRB_TEST_PROXY").unwrap(),
             allowed_origin: "https://api.anthropic.com".into(),
             evidence_file: None,
+            native_capture_dir: Some(root.join("captures").to_string_lossy().into_owned()),
             quota_identity: String::new(),
         };
         let make = |label: &str, bearer: &str| {
@@ -1062,7 +1070,7 @@ mod tests {
                 account_uuid: Some("11111111-1111-4111-8111-111111111111".into()),
                 organization_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
                 email: "fixture@example.test".into(),
-                concurrency: 3,
+                concurrency: normal as i32,
             }
         };
         let pool = Arc::new(NativePool {
@@ -1070,7 +1078,8 @@ mod tests {
             ..Default::default()
         });
         let mut insufficient = config.clone();
-        insufficient.native.as_mut().unwrap().memory_mib = 1407;
+        insufficient.native.as_mut().unwrap().memory_mib =
+            (POOL_MEMORY_MIB + (normal * 2) as u64 * WORKER_MEMORY_MIB) - 1;
         assert!(matches!(
             pool.submit(
                 insufficient,
@@ -1102,6 +1111,7 @@ mod tests {
             worker
                 .execute(
                     &expired,
+                    None,
                     &mut reply,
                     &chunks,
                     Instant::now() - Duration::from_millis(1)
@@ -1112,12 +1122,13 @@ mod tests {
         assert!(reply.is_some());
         worker.retire().await;
         assert_eq!(pool.state.lock().unwrap().live, 0);
-        for (label, count) in [("parallel-3", 3), ("parallel-6", 6)] {
+        for count in [normal, normal * 2] {
+            let label = format!("parallel-{count}");
             let operations = (0..count).map(|_| {
                 let pool = pool.clone();
                 let config = config.clone();
-                let mut submission = make(label, "synthetic-bearer-a");
-                if count == 6 {
+                let mut submission = make(&label, "synthetic-bearer-a");
+                if count == normal * 2 {
                     submission.input["body"]["model"] = json!("claude-haiku-4-5");
                 }
                 async move {
@@ -1129,7 +1140,7 @@ mod tests {
                 }
             });
             join_all(operations).await;
-            assert_eq!(pool.state.lock().unwrap().live, count.max(3));
+            assert_eq!(pool.state.lock().unwrap().live, count.max(normal));
         }
         let shared_inode = {
             let state = pool.state.lock().unwrap();
@@ -1231,8 +1242,11 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(evidence["messages"].as_array().unwrap().len(), 13);
-        assert_eq!(evidence["parallel_peak"], 6);
+        assert_eq!(
+            evidence["messages"].as_array().unwrap().len(),
+            normal * 3 + 4
+        );
+        assert_eq!(evidence["parallel_peak"], normal * 2);
         let idle = std::mem::take(&mut pool.state.lock().unwrap().idle);
         for worker in idle {
             worker.retire().await;

@@ -38,6 +38,8 @@ pub(crate) struct NativeRequestObservation {
     pub session_id: Option<String>,
     pub previous_message_id: Option<String>,
     pub body_sha256: String,
+    #[serde(default)]
+    pub capture_status: Option<String>,
 }
 
 /// 仅在网关与 sender 之间传递的原生观察头，消费后移除。
@@ -135,6 +137,9 @@ impl From<[Option<u64>; 6]> for DiagnosticTokens {
 /// 一次真实发送尝试，包括重试和未完整返回的流。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttemptDiagnostic {
+    /// 私有正文采集状态；旧记录为空。
+    #[serde(default)]
+    pub capture_status: Option<String>,
     pub attempt_id: String,
     pub request_id: String,
     pub ordinal: u32,

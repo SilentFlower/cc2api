@@ -41,6 +41,7 @@ const router = createRouter({
       meta: { requiresAuth: true },
       children: [
         { path: '', name: 'accounts', component: () => import('./components/Accounts.vue') },
+        { path: 'requests', name: 'requests', component: () => import('./components/RequestDiagnostics.vue') },
         { path: 'tokens', name: 'tokens', component: () => import('./components/Tokens.vue') },
         { path: 'settings', name: 'settings', component: () => import('./components/Settings.vue') },
         { path: 'environments', name: 'environments', component: () => import('./components/Environments.vue') },
