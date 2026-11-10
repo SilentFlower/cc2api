@@ -7,9 +7,12 @@ use axum::http::{
     response::Parts,
 };
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::LengthLimitError;
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -17,14 +20,18 @@ use std::error::Error;
 use std::future::Future;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::model::identity::device_profile;
-use crate::model::request_diagnostics::DiagnosticParameters;
+use crate::model::request_diagnostics::{
+    DiagnosticParameters, NATIVE_OBSERVATION_HEADER, NativeRequestObservation,
+};
 use crate::model::request_usage::RequestUsage;
 use crate::service::access_policy::{
     AccessPolicy, DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
@@ -35,6 +42,7 @@ use crate::service::account::{
     HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, UsageObservationKind,
 };
 use crate::service::diagnostics::{self, CURRENT_TRACE, RequestTraceGuard, TraceContext};
+use crate::service::native_runtime::NativeSubmission;
 use crate::service::request_body_codec::{
     REQUEST_BODY_LIMIT, RequestBodyCodecError, RequestBodyEncoding,
 };
@@ -1879,6 +1887,7 @@ impl GatewayService {
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
 
+        let native_header_map = req.headers().clone();
         // 提取 header
         let headers = extract_headers(req.headers());
         let ua = headers
@@ -2297,6 +2306,62 @@ impl GatewayService {
             let activity = self.account_svc.upstream_activity(account.id).await?;
             let mut slot_guard =
                 SlotReleaseGuard::new(admission.permit.with_credential_activity(activity));
+            if account.request_backend == "native293" && method == "POST" && path == "/v1/messages"
+            {
+                // HTTP 头按 Latin-1 字节串交给统一白名单，合法 obs-text 也能先被过滤。
+                let native_headers: Vec<(String, String)> = native_header_map
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            value.as_bytes().iter().copied().map(char::from).collect(),
+                        )
+                    })
+                    .collect();
+                let usage_started_at = Utc::now();
+                let started = std::time::Instant::now();
+                let response = self
+                    .forward_native_messages(
+                        &account,
+                        &native_headers,
+                        &body_bytes,
+                        &body_map,
+                        &session_hash,
+                        &account_selection_context,
+                        scheduling_request.as_ref(),
+                        should_bind_session,
+                    )
+                    .await?;
+                let status = response.status().as_u16();
+                let usage = response.status().is_success().then(|| {
+                    UsageCapture::new(
+                        self.usage_store.clone(),
+                        account.id,
+                        &body_map,
+                        usage_started_at,
+                    )
+                });
+                let codings = response_content_codings(response.headers());
+                let (parts, body) = response.into_parts();
+                let guarded = SlotGuardBody::new(
+                    body,
+                    slot_guard.defuse(),
+                    req_start,
+                    account.name.clone(),
+                    self.rewriter.clone(),
+                    None,
+                    codings,
+                    None,
+                    None,
+                    self.telemetry_svc.clone(),
+                    account.clone(),
+                    status,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                )
+                .with_usage_capture(usage);
+                return Ok(Response::from_parts(parts, Body::new(guarded)));
+            }
             let request_account = account_for_request_profile(&account, request_profile);
             let tls_profile = tls_profile_for_account(&request_account, default_tls_profile);
 
@@ -3091,6 +3156,46 @@ impl GatewayService {
             }
         };
 
+        self.finish_forward_response(
+            resp,
+            diagnostic,
+            path,
+            query,
+            headers,
+            body,
+            account,
+            account_selection_context,
+            request_capture_policy,
+            scheduling_request,
+        )
+        .await
+    }
+
+    /// 共用被动额度观察与响应字节处理，业务重试由各自调用方决定。
+    /// @param resp 实际提交取得的原始 HTTP 响应。
+    /// @param diagnostic 当前真实构造的诊断观察器。
+    /// @param path 上游路径。
+    /// @param query 上游查询串。
+    /// @param headers 当前观察来源的请求头。
+    /// @param body 当前观察来源的逻辑正文。
+    /// @param account 承载账号。
+    /// @param account_selection_context 限额决策上下文。
+    /// @param request_capture_policy 全文采集策略。
+    /// @param scheduling_request 当前准入上下文。
+    /// @return 保持状态、用量和流生命周期的响应。
+    async fn finish_forward_response(
+        &self,
+        resp: reqwest::Response,
+        mut diagnostic: Option<diagnostics::AttemptTrace>,
+        path: &str,
+        query: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        account: &Account,
+        account_selection_context: &AccountSelectionContext,
+        request_capture_policy: RequestCapturePolicy,
+        scheduling_request: Option<&SchedulingRequest>,
+    ) -> Result<Response, AppError> {
         if diagnostic.is_none() {
             if let Some(request) = scheduling_request {
                 request.response_headers(account.id, resp.status().as_u16());
@@ -3392,6 +3497,148 @@ impl GatewayService {
         })
     }
 
+    /// 原始 Messages 在任何 Rust 协议改写之前交给固定 293，单次提交后直接返回。
+    /// @param account 准入已冻结的账号。
+    /// @param headers 保留重复值的调用方请求头。
+    /// @param body 原始逻辑正文。
+    /// @param body_map 原始 JSON，用于会话及用量观察。
+    /// @param session_hash 现有网关稳定会话标识。
+    /// @param selection 账号限额决策上下文。
+    /// @param scheduling 当前调度准入。
+    /// @param bind_session 是否提交新会话绑定。
+    /// @return 单次原生模型提交的响应。
+    async fn forward_native_messages(
+        &self,
+        account: &Account,
+        headers: &[(String, String)],
+        body: &[u8],
+        body_map: &serde_json::Value,
+        session_hash: &str,
+        selection: &AccountSelectionContext,
+        scheduling: Option<&SchedulingRequest>,
+        bind_session: bool,
+    ) -> Result<Response, AppError> {
+        validate_native_account_features(account, headers, body_map)?;
+        let bearer = await_preparation(
+            scheduling,
+            self.account_svc.resolve_upstream_token(account.id),
+        )
+        .await??;
+        let transport = await_preparation(
+            scheduling,
+            runtime_transport::prepare(
+                account,
+                scheduling
+                    .map(|request| request.remaining())
+                    .transpose()?
+                    .unwrap_or(std::time::Duration::from_secs(120)),
+            ),
+        )
+        .await??;
+        await_preparation(scheduling, transport.native_ready()).await??;
+        let mut context = serde_json::json!({});
+        if extract_session_id_from_body(body_map).is_none()
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-claude-code-session-id"))
+        {
+            // 普通 API 沿用网关稳定会话；完整原生上下文由二进制按同次正文解析。
+            let digest = Sha256::digest(session_hash.as_bytes());
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            context["sessionId"] = serde_json::json!(Uuid::from_bytes(bytes).to_string());
+        }
+        let id = Uuid::new_v4().to_string();
+        let submission = NativeSubmission {
+            request: PreparedRequest {
+                account_id: account.id,
+                environment_id: String::new(),
+                generation: 0,
+                request_id: id.clone(),
+                deadline_unix_ms: 0,
+                method: "POST".into(),
+                target_url: format!("{}/v1/messages", self.upstream_base.trim_end_matches('/')),
+                headers: Vec::new(),
+                preserve_header_casing: false,
+                tls_profile: TlsProfileId::default(),
+            },
+            input: serde_json::json!({"schema_version":1,"request_id":id,"body":body_map,"headers":headers,"context":context}),
+            bearer,
+            device_id: account.device_id.clone(),
+            account_uuid: account.account_uuid.clone(),
+            organization_uuid: account.organization_uuid.clone(),
+            email: account.email.clone(),
+            concurrency: account.concurrency,
+        };
+        let permit = if let Some(request) = scheduling {
+            Some(request.admit(account).await?)
+        } else {
+            None
+        };
+        if bind_session {
+            let _ = self
+                .account_svc
+                .bind_selected_session(session_hash, account.id)
+                .await;
+        }
+        if let Some(permit) = permit {
+            permit.submitted();
+        }
+        let native_started = Instant::now();
+        let mut response = match transport
+            .submit_native(submission, UPSTREAM_TTFB_TIMEOUT)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if matches!(error, AppError::BadGateway(_)) {
+                    if let Some(request) = scheduling {
+                        request.submission_failed(account.id);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let observation = response
+            .headers_mut()
+            .remove(NATIVE_OBSERVATION_HEADER)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|value| value.len() <= 8192)
+                    .and_then(|value| STANDARD.decode(value).ok())
+            })
+            .and_then(|bytes| serde_json::from_slice::<NativeRequestObservation>(&bytes).ok());
+        let mut diagnostic = observation
+            .and_then(|observation| diagnostics::prepare_native_attempt(account, observation, &id));
+        if let Some(trace) = diagnostic.as_mut() {
+            if let Some(request) = scheduling {
+                trace.with_feedback(request.clone());
+            }
+            trace.commit_native(native_started);
+        } else if response.status().is_success() || response.status().is_server_error() {
+            diagnostics::local_outcome("native293_unobserved");
+            diagnostics::error_stage("native_observation");
+        } else {
+            diagnostics::error_stage("native_prepare");
+        }
+        // 此处分流尚无最终出站正文；禁止把调用方快照写成最终构造的全文证据。
+        self.finish_forward_response(
+            response,
+            diagnostic,
+            "/v1/messages",
+            "",
+            &HashMap::new(),
+            body,
+            account,
+            selection,
+            RequestCapturePolicy::SummaryOnly,
+            scheduling,
+        )
+        .await
+    }
+
     /// 发送独立 count_tokens 请求，在传输边界恢复入站编码。
     /// @param headers 已完成计数请求业务改写的请求头。
     /// @param body 计数请求的最终逻辑正文。
@@ -3589,6 +3836,49 @@ fn requires_upstream_beta_query(path: &str) -> bool {
 
 fn upstream_url(path: &str, query: &str) -> String {
     upstream_url_with_base(UPSTREAM_BASE, path, query)
+}
+
+/// 原生构造前保留账号的计费能力授权，拒绝超范围申请并保持原始输入。
+/// @param account 当前账号功能授权。
+/// @param headers 保留多值的入站头。
+/// @param body 原始逻辑正文。
+/// @return 授权有效时继续构造，超范围申请返回本地 400。
+fn validate_native_account_features(
+    account: &Account,
+    headers: &[(String, String)],
+    body: &JsonValue,
+) -> Result<(), AppError> {
+    let model = body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let allowed_beta = |beta: &str| {
+        let allowed = filter_account_beta_tokens(beta, account, model);
+        beta.split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .all(|token| allowed.split(',').any(|value| value.trim() == token))
+    };
+    let denied = Rewriter::filter_account_fast_mode_body(body, account).is_some()
+        || headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("anthropic-beta") && !allowed_beta(value)
+        })
+        || body
+            .get("betas")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|betas| {
+                betas
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .any(|beta| !allowed_beta(beta))
+            })
+        || (model.contains("[1m]") && !allowed_beta("context-1m-2025-08-07"));
+    if denied {
+        return Err(AppError::BadRequest(
+            "当前账号未授权请求中的 Fast 或 1M 能力".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn upstream_url_with_base(upstream_base: &str, path: &str, query: &str) -> String {
@@ -7838,6 +8128,7 @@ impl Drop for SlotGuardBody {
 
 #[cfg(test)]
 mod tests {
+    use super::validate_native_account_features;
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, AutoModeClassifierProtocol,
         BootstrapModelOptionsMode, BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse,
@@ -7942,7 +8233,6 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
-    use sqlx::AnyPool;
     use sqlx::any::AnyPoolOptions;
     use std::collections::HashMap;
     use std::convert::Infallible;
@@ -8144,6 +8434,7 @@ mod tests {
             canonical_env: json!({}),
             canonical_prompt: json!({}),
             canonical_process: json!({}),
+            request_backend: "legacy".into(),
             billing_mode: BillingMode::Strip,
             account_uuid: None,
             organization_uuid: None,
@@ -9266,8 +9557,10 @@ mod tests {
         sqlx::any::install_default_drivers();
         let tmp =
             std::env::temp_dir().join(format!("ccgw_gateway_unit_{}.db", rand::random::<u64>()));
-        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
-        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        // 沿生产初始化启用WAL，让后台诊断写入与真实请求读取共用相同锁语义。
+        let pool = crate::store::db::init_db("sqlite", tmp.to_str().expect("fixture path"))
+            .await
+            .expect("pool");
         crate::store::db::migrate(&pool, "sqlite")
             .await
             .expect("migrate");
@@ -9323,6 +9616,196 @@ mod tests {
             .await
             .expect("create account");
         account
+    }
+
+    #[test]
+    fn native_backend_preserves_account_feature_authorization_without_rewriting() {
+        let mut account = test_account();
+        account.allow_fast_mode = false;
+        account.allow_1m_models.clear();
+        let body =
+            json!({"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"synthetic"}]});
+        assert!(validate_native_account_features(&account, &[], &body).is_ok());
+        let mut fast = body.clone();
+        fast["speed"] = json!("fast");
+        assert!(validate_native_account_features(&account, &[], &fast).is_err());
+        let betas = vec![(
+            "Anthropic-Beta".into(),
+            "oauth-2025-04-20,context-1m-2025-08-07".into(),
+        )];
+        assert!(validate_native_account_features(&account, &betas, &body).is_err());
+        account.allow_fast_mode = true;
+        account.allow_1m_models = "sonnet".into();
+        assert!(validate_native_account_features(&account, &betas, &fast).is_ok());
+        assert_eq!(fast["speed"], "fast");
+        assert_eq!(betas[0].1, "oauth-2025-04-20,context-1m-2025-08-07");
+    }
+
+    /// 独立网络夹具通过真实 Gateway、私有 HTTP sender 和实际二进制执行单次模型提交。
+    #[tokio::test]
+    #[ignore = "由 cc2api-native 隔离夹具提供二进制、V3 归属及 TLS 上游"]
+    async fn native_real_gateway() {
+        use crate::model::request_diagnostics::DiagnosticQuery;
+        use crate::service::native_runtime::NativeSenderConfig;
+        use crate::service::runtime_transport::{SenderConfig, TransportBinding, sender_router};
+        use std::env::{temp_dir, var};
+        use std::fs;
+
+        let root = temp_dir().join(format!("cc2api-native-gateway-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let (service, store) = test_gateway_service_with_cache_store_and_urls(
+            Arc::new(MemoryStore::new()),
+            "https://api.anthropic.com".into(),
+            "http://127.0.0.1:1".into(),
+        )
+        .await;
+        let mut account = create_gateway_account(&service, "gateway@example.test", 3, 0).await;
+        account.account_uuid = Some("11111111-1111-4111-8111-111111111111".into());
+        account.request_backend = "native293".into();
+        account.setup_token = "synthetic-bearer-a".into();
+        store.update(&account).await.unwrap();
+        reqwest::Client::builder().no_proxy().build().unwrap().post(format!("{}/identity", var("CCRB_TEST_CONTROL").unwrap().trim_end_matches('/')))
+            .json(&serde_json::json!({"device_id":account.device_id,"account_uuid":account.account_uuid})).send().await.unwrap().error_for_status().unwrap();
+        let binding = TransportBinding {
+            account_id: account.id,
+            environment_id: "a".repeat(32),
+            generation: 1,
+            endpoint: format!("http://{}:8091", var("CCRB_TEST_SENDER_HOST").unwrap()),
+            secret: "synthetic-private-key".repeat(3),
+            release_id: "native-offline".into(),
+        };
+        let config = SenderConfig {
+            native: Some(NativeSenderConfig {
+                binary_path: var("CCRB_TEST_BINARY").unwrap(),
+                work_root: root.join("workers").to_string_lossy().into_owned(),
+                memory_mib: 1536,
+                max_workers: 6,
+            }),
+            binding,
+            proxy_url: var("CCRB_TEST_PROXY").unwrap(),
+            allowed_origin: "https://api.anthropic.com".into(),
+            evidence_file: Some(root.join("evidence.jsonl").to_string_lossy().into_owned()),
+            quota_identity: "synthetic".into(),
+        };
+        let path = root.join("sender.json");
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8091").await.unwrap();
+        let sender = tokio::spawn(async move {
+            axum::serve(listener, sender_router(path.to_string_lossy().into_owned()))
+                .await
+                .unwrap();
+        });
+        let request = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("user-agent", "claude-cli/2.1.293 (external, cli)")
+                .header("cf-ray", "synthetic-cdn")
+                .header(
+                    "x-native-obs-text",
+                    HeaderValue::from_bytes(&[0xff]).unwrap(),
+                )
+                .header("x-unregistered", "synthetic-client")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (label, expected) in [("gateway-normal", 200), ("gateway-error", 401)] {
+            let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":label}]})), None).await;
+            assert!(response.headers().get("x-v3-native-observation").is_none());
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&bytes));
+        }
+        let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,
+            "messages":[{"role":"user","content":"gateway-native"}],
+            "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=12345; cc_prompt_id=11111111-1111-4111-8111-111111111111; cc_turn_origin=human;"}],
+            "metadata":{"user_id":"{\"device_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"account_uuid\":\"44444444-4444-4444-8444-444444444444\",\"session_id\":\"22222222-2222-4222-8222-222222222222\"}"}})), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let mut agent = request(
+            serde_json::json!({"model":"claude-sonnet-4-6","stream":true,"max_tokens":64,
+            "messages":[{"role":"user","content":"gateway-agent"},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"准备调用工具","signature":"synthetic-history-signature"},
+                    {"type":"tool_use","id":"toolu_history","name":"lookup_status","input":{"project":"alpha"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_history","content":"ready"}]}],
+            "tools":[{"name":"lookup_status","description":"查询状态","input_schema":{"type":"object","properties":{"project":{"type":"string"}}}}]}),
+        );
+        for (name, value) in [
+            ("x-claude-code-request-class", "subagent"),
+            ("x-claude-code-agent-id", "child-fixture"),
+            ("x-claude-code-parent-agent-id", "parent-fixture"),
+            ("x-claude-code-agent-type", "Explore"),
+            (
+                "x-claude-code-session-id",
+                "33333333-3333-4333-8333-333333333333",
+            ),
+            (
+                "x-claude-code-prompt-id",
+                "44444444-4444-4444-8444-444444444444",
+            ),
+        ] {
+            agent.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static(value),
+            );
+        }
+        let response = service.handle_request(agent, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("toolu_returned"));
+        assert!(String::from_utf8_lossy(&bytes).contains("message_stop"));
+        let queue = service.account_svc.get_or_create_queue(account.id, 3).await;
+        assert_eq!(queue.runtime_gate.snapshot()["active"], 0);
+        assert_eq!(
+            fs::read_to_string(root.join("evidence.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let page = diagnostics
+            .list(DiagnosticQuery {
+                account_id: Some(account.id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 4);
+        let records: Vec<serde_json::Value> = fs::read_to_string(root.join("evidence.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for request in page.items {
+            assert_eq!(request.attempt_count, 1);
+            let detail = diagnostics.detail(&request.request_id).await.unwrap();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["request_id"] == detail.attempts[0].attempt_id)
+            );
+            assert_eq!(detail.attempts[0].profile_version, "2.1.293");
+            assert_eq!(
+                detail.attempts[0].profile_selection,
+                "native293_cc_prepared"
+            );
+            assert_eq!(
+                detail.attempts[0].parameters.model.as_deref(),
+                Some("claude-sonnet-4-6")
+            );
+        }
+        sender.abort();
+        let _ = sender.await;
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// 实际消息和 count_tokens 出站遵守账号 Fast 开关，并保持客户端入口及画像差异。

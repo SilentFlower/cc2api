@@ -49,6 +49,8 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 rand = "0.8"
 hex = "0.4"
 base64 = "0.22"
+percent-encoding = "2"
+libc = "0.2"
 subtle = "2"
 
 # Logging

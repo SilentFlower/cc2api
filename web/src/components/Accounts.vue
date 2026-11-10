@@ -100,6 +100,7 @@ const form = ref({
   expires_at: '',
   proxy_url: '',
   billing_mode: 'strip',
+  request_backend: 'legacy' as 'legacy' | 'native293',
   account_uuid: '',
   organization_uuid: '',
   subscription_type: '',
@@ -218,6 +219,7 @@ function openCreate() {
     expires_at: '',
     proxy_url: '',
     billing_mode: 'strip',
+    request_backend: 'legacy' as 'legacy' | 'native293',
     account_uuid: '',
     organization_uuid: '',
     subscription_type: '',
@@ -255,6 +257,7 @@ function openEdit(a: Account) {
     expires_at: a.expires_at ? String(a.expires_at) : '',
     proxy_url: a.proxy_url,
     billing_mode: a.billing_mode || 'strip',
+    request_backend: a.request_backend ?? 'legacy',
     account_uuid: a.account_uuid || '',
     organization_uuid: a.organization_uuid || '',
     subscription_type: a.subscription_type || '',
@@ -336,6 +339,7 @@ async function save() {
         refresh_token: form.value.refresh_token,
         proxy_url: form.value.proxy_url,
         billing_mode: form.value.billing_mode,
+        request_backend: form.value.request_backend,
         account_uuid: form.value.account_uuid || null,
         organization_uuid: form.value.organization_uuid || null,
         subscription_type: form.value.subscription_type || null,
@@ -816,6 +820,7 @@ function applyOAuthResult() {
     expires_at: (!isSetupToken && r.expires_at) ? String(r.expires_at * 1000) : '',
     proxy_url: oauthProxyUrl.value || '',
     billing_mode: 'strip',
+    request_backend: 'legacy' as 'legacy' | 'native293',
     account_uuid: r.account_uuid || '',
     organization_uuid: r.organization_uuid || '',
     subscription_type: '',
@@ -974,6 +979,7 @@ async function copyText(text: string) {
               <div class="flex justify-between items-center"><span class="text-[10px] text-[#b5b0a6]">{{ a.v3_scheduling.config.mode === 'smart' ? '智能偏好 ' + (a.v3_scheduling.factors.score * 100).toFixed(1) + '（高优）' : '旧评分低分优先' }}</span><Button variant="outline" size="sm" class="text-xs h-7" @click="openScheduling(a)">调度详情</Button></div>
             </div>
             <div v-else-if="a.v3_scheduling_error" class="rounded-lg bg-amber-50 p-3 text-xs text-amber-700">{{ a.v3_scheduling_error }}，不代表零负载。<button class="underline ml-2" @click="openScheduling(a)">查看详情</button></div>
+            <p class="text-xs text-[#8c8578]">转发方式：{{ a.request_backend === 'native293' ? '原生运行时 2.1.293' : '原有转发' }}</p>
             <div class="grid grid-cols-3 gap-3">
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">优先级</p>
@@ -1379,6 +1385,14 @@ async function copyText(text: string) {
           </div>
           <div v-if="editing && editing.auth_type === 'oauth' && editing.auth_error" class="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-500">
             最近认证错误：{{ editing.auth_error }}
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">请求转发方式</Label>
+            <select v-model="form.request_backend" class="w-full rounded-md border border-[#e8e2d9] bg-[#f9f6f1] px-3 py-2 text-sm text-[#29261e]">
+              <option value="legacy">原有转发</option>
+              <option value="native293">原生运行时 2.1.293</option>
+            </select>
+            <p class="text-xs text-[#b5b0a6]">原生方式由账号 sender 运行独立进程池，使用显式部署资源预算。请在账号空闲时切换。</p>
           </div>
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">代理地址（选填）</Label>

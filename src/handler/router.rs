@@ -471,6 +471,7 @@ struct CreateAccountRequest {
     expires_at: Option<i64>,
     proxy_url: Option<String>,
     billing_mode: Option<String>,
+    request_backend: Option<String>,
     account_uuid: Option<String>,
     organization_uuid: Option<String>,
     subscription_type: Option<String>,
@@ -623,6 +624,7 @@ async fn runtime_account_config(
     Ok(Json(
         serde_json::json!({"account_id": account.id, "proxy_url": account.proxy_url,
         "auth_type": account.auth_type, "status": account.status, "email": account.email,
+        "request_backend": account.request_backend, "concurrency": account.concurrency,
         "account_uuid": account.account_uuid, "organization_uuid": account.organization_uuid,
         "credential_ownership_protocol":1,
         "credential_ownership":state.account_svc.credential_ownership(id).await?}),
@@ -714,11 +716,22 @@ fn normalize_oauth_credential_validity_seconds(value: Option<i64>) -> Result<i64
     Ok(value)
 }
 
+/// 校验账号选择的请求构造方式，未知值不得降级成旧后端。
+fn validate_request_backend(value: &str) -> Result<String, AppError> {
+    match value {
+        "legacy" | "native293" => Ok(value.into()),
+        _ => Err(AppError::BadRequest(
+            "request_backend 只支持 legacy 或 native293".into(),
+        )),
+    }
+}
+
 async fn create_account(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<Account>), AppError> {
+    let backend = validate_request_backend(req.request_backend.as_deref().unwrap_or("legacy"))?;
     if req.email.is_empty() {
         return Err(AppError::BadRequest("email is required".into()));
     }
@@ -741,6 +754,7 @@ async fn create_account(
         canonical_env: serde_json::json!({}),
         canonical_prompt: serde_json::json!({}),
         canonical_process: serde_json::json!({}),
+        request_backend: backend,
         billing_mode: req.billing_mode.unwrap_or_else(|| "strip".into()).into(),
         account_uuid: req.account_uuid,
         organization_uuid: req.organization_uuid,
@@ -887,8 +901,10 @@ impl Drop for RuntimeConfigPermit {
 async fn config_permit(
     state: &AppState,
     account: &Account,
+    force: bool,
 ) -> Result<Option<RuntimeConfigPermit>, AppError> {
-    if state.account_svc.scheduler().is_none()
+    if !force
+        && state.account_svc.scheduler().is_none()
         && std::env::var("V3_RUNTIME_URL")
             .unwrap_or_default()
             .is_empty()
@@ -911,7 +927,13 @@ async fn config_permit(
     {
         return Err(AppError::BadRequest("account runtime is busy".into()));
     }
-    runtime_bridge::quiesce(account.id, &permit.lease).await?;
+    if !force
+        || !std::env::var("V3_RUNTIME_URL")
+            .unwrap_or_default()
+            .is_empty()
+    {
+        runtime_bridge::quiesce(account.id, &permit.lease).await?;
+    }
     Ok(Some(permit))
 }
 
@@ -954,6 +976,13 @@ async fn update_account(
         .keys()
         .map(String::as_str)
         .collect();
+    if let Some(value) = updates.get("request_backend") {
+        existing.request_backend = validate_request_backend(
+            value
+                .as_str()
+                .ok_or_else(|| AppError::BadRequest("request_backend 必须为文本".into()))?,
+        )?;
+    }
     let subscription = subscription_update(&updates, "subscription_type")?;
     let tier = subscription_update(&updates, "rate_limit_tier")?;
     if (subscription.is_some() || tier.is_some())
@@ -1000,6 +1029,7 @@ async fn update_account(
         }
     }
     let runtime_update = [
+        "request_backend",
         "email",
         "proxy_url",
         "auth_type",
@@ -1034,7 +1064,7 @@ async fn update_account(
         None
     };
     let _runtime_permit = if runtime_update {
-        config_permit(&state, &existing).await?
+        config_permit(&state, &existing, updates.get("request_backend").is_some()).await?
     } else {
         None
     };
@@ -1126,6 +1156,12 @@ async fn update_account(
                     state
                         .account_svc
                         .update_subscription_metadata(id, subscription.clone(), tier.clone())
+                        .await?;
+                }
+                if updates.get("request_backend").is_some() {
+                    state
+                        .account_svc
+                        .update_account_options(&existing, &["request_backend"])
                         .await?;
                 }
                 existing = state.account_svc.get_account(id).await?;
@@ -1229,7 +1265,7 @@ async fn delete_account(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let account = state.account_svc.get_account(id).await?;
-    let _runtime_permit = config_permit(&state, &account).await?;
+    let _runtime_permit = config_permit(&state, &account, false).await?;
     state.account_svc.delete_account(id).await?;
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
@@ -2174,7 +2210,7 @@ mod tests {
         normalize_oauth_credential_validity_seconds, validate_model_id_list,
     };
     use crate::config::{AdminConfig, Config, DatabaseConfig, ServerConfig};
-    use crate::model::account::{CanonicalEnvData, CanonicalPromptEnvData};
+    use crate::model::account::{Account, CanonicalEnvData, CanonicalPromptEnvData};
     use crate::service::account::{AccountSelectionContext, AccountService};
     use crate::service::gateway::GatewayService;
     use crate::service::oauth::TokenTester;
@@ -2846,6 +2882,99 @@ mod tests {
 
     async fn test_router() -> Router {
         test_router_with_gateway().await.0
+    }
+
+    #[tokio::test]
+    async fn account_backend_defaults_validate_and_obey_busy_gate() {
+        let (app, _, _, _, accounts) = test_router_with_scheduling(false).await;
+        let request = |method: Method, path: &str, value: serde_json::Value| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, "Bearer admin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request(Method::POST, "/admin/accounts", json!({"email":"native-a@example.test","setup_token":"synthetic","auto_telemetry":false}))).await.unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first: Account =
+            serde_json::from_slice(&body::to_bytes(first.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(first.request_backend, "legacy");
+        let second = app.clone().oneshot(request(Method::POST, "/admin/accounts", json!({"email":"native-b@example.test","setup_token":"synthetic","request_backend":"native293","auto_telemetry":false}))).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second: Account = serde_json::from_slice(
+            &body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second.request_backend, "native293");
+        let path = format!("/admin/accounts/{}", first.id);
+        for backend in [json!("invalid"), json!(true)] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    Method::PUT,
+                    &path,
+                    json!({"request_backend":backend}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let queue = accounts
+            .get_or_create_queue(first.id, first.concurrency)
+            .await;
+        let permit = queue.acquire(Duration::from_secs(1), 2).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::PUT,
+                &path,
+                json!({"request_backend":"native293"}),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_eq!(
+            accounts
+                .get_account(first.id)
+                .await
+                .unwrap()
+                .request_backend,
+            "legacy"
+        );
+        drop(permit);
+        for backend in ["native293", "legacy"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    Method::PUT,
+                    &path,
+                    json!({"request_backend":backend}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                accounts
+                    .get_account(first.id)
+                    .await
+                    .unwrap()
+                    .request_backend,
+                backend
+            );
+            assert_eq!(
+                accounts
+                    .get_account(second.id)
+                    .await
+                    .unwrap()
+                    .request_backend,
+                "native293"
+            );
+        }
     }
 
     #[tokio::test]

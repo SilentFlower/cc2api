@@ -2,6 +2,16 @@ pub mod access_policy;
 pub mod account;
 pub mod diagnostics;
 pub mod gateway;
+mod native_contract;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod native_runtime;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[path = "native_runtime_unsupported.rs"]
+pub mod native_runtime;
+#[cfg(test)]
+#[path = "native_runtime_unsupported.rs"]
+#[allow(dead_code, unused_imports)]
+mod native_unsupported_smoke;
 pub mod oauth;
 pub mod oauth_flow;
 pub mod prime_poller;

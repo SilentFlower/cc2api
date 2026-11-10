@@ -124,6 +124,7 @@ impl Fixture {
             canonical_env: serde_json::json!({}),
             canonical_prompt: serde_json::json!({}),
             canonical_process: serde_json::json!({}),
+            request_backend: "legacy".into(),
             billing_mode: BillingMode::Strip,
             account_uuid: None,
             organization_uuid: None,

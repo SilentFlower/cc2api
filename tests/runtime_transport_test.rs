@@ -43,6 +43,7 @@ async fn sender(origin: &str) -> (String, SenderConfig, String, tokio::task::Joi
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let config = SenderConfig {
+        native: None,
         binding: TransportBinding {
             account_id: 7,
             environment_id: Uuid::new_v4().to_string(),

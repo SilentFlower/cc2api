@@ -194,6 +194,9 @@ pub struct Account {
     pub canonical_prompt: Value,
     pub canonical_process: Value,
     pub billing_mode: BillingMode,
+    /// 账号请求构造后端；历史默认沿用原有 Rust 转发。
+    #[serde(default = "default_request_backend")]
+    pub request_backend: String,
     /// OAuth account UUID（强烈推荐填写，用于遥测改写）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_uuid: Option<String>,
@@ -261,6 +264,10 @@ pub struct Account {
     pub usage_fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_request_backend() -> String {
+    "legacy".into()
 }
 
 fn default_concurrency() -> i32 {

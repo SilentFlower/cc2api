@@ -892,6 +892,7 @@ mod tests {
             canonical_env: json!({}),
             canonical_prompt: json!({}),
             canonical_process: json!({}),
+            request_backend: "legacy".into(),
             billing_mode: BillingMode::Strip,
             account_uuid: None,
             organization_uuid: None,

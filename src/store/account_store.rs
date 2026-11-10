@@ -50,10 +50,42 @@ impl AccountStore {
     /// 为 PostgreSQL 显式转换文本时间参数，SQLite 保留原占位符。
     fn ts(&self, n: u32) -> String {
         if self.is_pg() {
-            format!("${}::TIMESTAMPTZ", n)
+            // SQLx Any 将无类型 NULL 编成 i32，先转 TEXT 让 NULL 与实际时间字符串共用转换。
+            format!("${}::TEXT::TIMESTAMPTZ", n)
         } else {
             format!("${}", n)
         }
+    }
+
+    /// 按可空参数的实际编码类型划分PG预编译缓存，原始绑定值保持不变。
+    /// @param query 已参数化的SQL。
+    /// @param present 各可空参数是否具有实际值，顺序与调用点固定。
+    /// @return PG附加有限布尔缓存键，SQLite返回原SQL。
+    fn nullable_query(&self, mut query: String, present: &[bool]) -> String {
+        if self.is_pg() {
+            // SQLx Any把NULL编码为i32，PG缓存仅以SQL为键；同一缓存项必须保持参数类型。
+            query.push_str(" /* any-null:");
+            for value in present {
+                query.push(if *value { '1' } else { '0' });
+            }
+            query.push_str(" */");
+        }
+        query
+    }
+
+    /// 固定账号创建和全量更新中的六个可空参数。@param query 参数化SQL。@param account 待写账号。@return 类型稳定的缓存SQL。
+    fn account_query(&self, query: String, account: &Account) -> String {
+        self.nullable_query(
+            query,
+            &[
+                account.expires_at.is_some(),
+                account.oauth_refreshed_at.is_some(),
+                account.account_uuid.is_some(),
+                account.organization_uuid.is_some(),
+                account.subscription_type.is_some(),
+                account.rate_limit_tier.is_some(),
+            ],
+        )
     }
 
     /// SQLx Any 不直接支持 JSONB，写入 PostgreSQL 原生 JSON 列时需要显式转换。
@@ -121,6 +153,9 @@ impl AccountStore {
             canonical_env: Self::parse_json(row, "canonical_env"),
             canonical_prompt: Self::parse_json(row, "canonical_prompt_env"),
             canonical_process: Self::parse_json(row, "canonical_process"),
+            request_backend: row
+                .try_get::<String, _>("request_backend")
+                .unwrap_or_else(|_| "legacy".into()),
             billing_mode: row
                 .try_get::<String, _>("billing_mode")
                 .unwrap_or_else(|_| "strip".into())
@@ -227,8 +262,8 @@ impl AccountStore {
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, rpm_limit, auto_telemetry, auto_poll_usage, allow_1m_models,
                 allow_fast_mode, upstream_session_pool_enabled, upstream_session_pool_size, upstream_session_ttl_minutes,
-                upstream_session_refresh_policy, five_hour_usage_limit_percent, seven_day_usage_limit_percent, rate_limit_tier)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
+                upstream_session_refresh_policy, five_hour_usage_limit_percent, seven_day_usage_limit_percent, rate_limit_tier, request_backend)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
             RETURNING id, CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at"#,
             self.ts(9),
             self.ts(10),
@@ -237,6 +272,7 @@ impl AccountStore {
             self.json(14),
             self.json(15)
         );
+        let q = self.account_query(q, a);
         // SQLite WAL 下只取 RETURNING 首行会在语句完成前返回，必须消费到结束才确认提交。
         let mut transaction = self.pool.begin().await?;
         let rows: Vec<AnyRow> = sqlx::query(&q)
@@ -273,6 +309,7 @@ impl AccountStore {
             .bind(a.five_hour_usage_limit_percent)
             .bind(a.seven_day_usage_limit_percent)
             .bind(&a.rate_limit_tier)
+            .bind(&a.request_backend)
             .fetch_all(&mut *transaction)
             .await?;
         let row = rows.first().ok_or(AppError::NotFound)?;
@@ -312,12 +349,13 @@ impl AccountStore {
                 allow_1m_models=$21, allow_fast_mode=$22, upstream_session_pool_enabled=$23,
                 upstream_session_pool_size=$24, upstream_session_ttl_minutes=$25,
                 upstream_session_refresh_policy=$26, five_hour_usage_limit_percent=$27,
-                seven_day_usage_limit_percent=$28, rate_limit_tier=$29, updated_at={}
-            WHERE id=$30"#,
+                seven_day_usage_limit_percent=$28, rate_limit_tier=$29, request_backend=$30, updated_at={}
+            WHERE id=$31"#,
             self.ts(8),
             self.ts(9),
             self.now_expr()
         );
+        let q = self.account_query(q, a);
         sqlx::query(&q)
             .bind(&a.name)
             .bind(&a.email)
@@ -348,6 +386,7 @@ impl AccountStore {
             .bind(a.five_hour_usage_limit_percent)
             .bind(a.seven_day_usage_limit_percent)
             .bind(&a.rate_limit_tier)
+            .bind(&a.request_backend)
             .bind(a.id)
             .execute(&self.pool)
             .await?;
@@ -365,6 +404,7 @@ impl AccountStore {
             let text = match *field {
                 "name" => Some(Some(account.name.clone())),
                 "billing_mode" => Some(Some(account.billing_mode.to_string())),
+                "request_backend" => Some(Some(account.request_backend.clone())),
                 "subscription_type" => Some(account.subscription_type.clone()),
                 "rate_limit_tier" => Some(account.rate_limit_tier.clone()),
                 "allow_1m_models" => Some(Some(account.allow_1m_models.clone())),
@@ -809,6 +849,12 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 保存账号停用状态及可选限流时间。
+    /// @param id 目标账号ID。
+    /// @param status 调用方决定的账号状态。
+    /// @param reason 已脱敏的停用原因。
+    /// @param rate_limit_reset_at 可选恢复时间，省略时清除原限流时间。
+    /// @return 数据库写入结果。
     pub async fn disable_account(
         &self,
         id: i64,
@@ -826,6 +872,7 @@ impl AccountStore {
         );
         let limited_str = rate_limit_reset_at.map(|_| self.fmt_time(Utc::now()));
         let reset_str = rate_limit_reset_at.map(|t| self.fmt_time(t));
+        let q = self.nullable_query(q, &[rate_limit_reset_at.is_some()]);
         sqlx::query(&q)
             .bind(status.to_string())
             .bind(reason)
@@ -1010,7 +1057,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     CAST(canonical_env AS TEXT) AS canonical_env,
     CAST(canonical_prompt_env AS TEXT) AS canonical_prompt_env,
     CAST(canonical_process AS TEXT) AS canonical_process,
-    billing_mode, account_uuid, organization_uuid, subscription_type, rate_limit_tier,
+    billing_mode, request_backend, account_uuid, organization_uuid, subscription_type, rate_limit_tier,
     concurrency, priority, rpm_limit, five_hour_usage_limit_percent, seven_day_usage_limit_percent,
     CAST(rate_limited_at AS TEXT) AS rate_limited_at,
     CAST(rate_limit_reset_at AS TEXT) AS rate_limit_reset_at,
@@ -1024,6 +1071,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::any::AnyPoolOptions;
 
     async fn make_store(driver: &str) -> AccountStore {
         sqlx::any::install_default_drivers();
@@ -1037,6 +1085,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_backend_migration_and_account_updates_are_independent() {
+        let store = make_store("sqlite").await;
+        crate::store::db::migrate(&store.pool, "sqlite")
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE accounts DROP COLUMN request_backend")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        for email in ["a@example.test", "b@example.test"] {
+            sqlx::query("INSERT INTO accounts(email,token,device_id,canonical_env,canonical_prompt_env,canonical_process) VALUES($1,'synthetic','device','{}','{}','{}')").bind(email).execute(&store.pool).await.unwrap();
+        }
+        crate::store::db::migrate(&store.pool, "sqlite")
+            .await
+            .unwrap();
+        let mut accounts = store.list().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(
+            accounts
+                .iter()
+                .all(|account| account.request_backend == "legacy")
+        );
+        accounts[0].request_backend = "native293".into();
+        store
+            .update_options(&accounts[0], &["request_backend"])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_by_id(accounts[0].id)
+                .await
+                .unwrap()
+                .request_backend,
+            "native293"
+        );
+        assert_eq!(
+            store
+                .get_by_id(accounts[1].id)
+                .await
+                .unwrap()
+                .request_backend,
+            "legacy"
+        );
+        accounts[0].request_backend = "legacy".into();
+        store.update(&accounts[0]).await.unwrap();
+        assert_eq!(
+            store
+                .get_by_id(accounts[0].id)
+                .await
+                .unwrap()
+                .request_backend,
+            "legacy"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要独立、全新的合成 PostgreSQL 测试库 CCRB_TEST_POSTGRES_URL"]
+    async fn postgres_native_backend_migration_create_update_and_rollback() {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect(&std::env::var("CCRB_TEST_POSTGRES_URL").unwrap())
+            .await
+            .unwrap();
+        crate::store::db::migrate(&pool, "postgres").await.unwrap();
+        sqlx::query("ALTER TABLE accounts DROP COLUMN request_backend")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts(email,token,device_id,canonical_env,canonical_prompt_env,canonical_process) VALUES('historical@example.test','synthetic','device','{}','{}','{}')").execute(&pool).await.unwrap();
+        crate::store::db::migrate(&pool, "postgres").await.unwrap();
+        let store = AccountStore::new(pool, "postgres".into());
+        let old = store.list().await.unwrap().remove(0);
+        assert_eq!(old.request_backend, "legacy");
+        let mut native = old.clone();
+        native.id = 0;
+        native.email = "native@example.test".into();
+        native.request_backend = "native293".into();
+        store.create(&mut native).await.unwrap();
+        // 同一连接的同一SQL必须覆盖NULL和实际时间交替，防止参数类型缓存漂移。
+        let timestamp = DateTime::parse_from_rfc3339("2030-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut dated = old.clone();
+        dated.id = 0;
+        dated.email = "dated@example.test".into();
+        dated.expires_at = Some(timestamp);
+        dated.oauth_refreshed_at = Some(timestamp);
+        dated.account_uuid = Some("11111111-1111-4111-8111-111111111111".into());
+        dated.organization_uuid = Some("22222222-2222-4222-8222-222222222222".into());
+        dated.subscription_type = Some("pro".into());
+        dated.rate_limit_tier = Some("synthetic-tier".into());
+        store.create(&mut dated).await.unwrap();
+        assert_eq!(
+            store.get_by_id(dated.id).await.unwrap().expires_at,
+            Some(timestamp)
+        );
+        assert_eq!(
+            store.get_by_id(native.id).await.unwrap().request_backend,
+            "native293"
+        );
+        native.request_backend = "legacy".into();
+        store.update(&native).await.unwrap();
+        assert_eq!(
+            store.get_by_id(native.id).await.unwrap().request_backend,
+            "legacy"
+        );
+        native.request_backend = "native293".into();
+        native.expires_at = Some(timestamp);
+        native.oauth_refreshed_at = Some(timestamp);
+        native.account_uuid = dated.account_uuid.clone();
+        native.organization_uuid = dated.organization_uuid.clone();
+        native.subscription_type = dated.subscription_type.clone();
+        native.rate_limit_tier = dated.rate_limit_tier.clone();
+        store.update(&native).await.unwrap();
+        assert_eq!(
+            store.get_by_id(native.id).await.unwrap().expires_at,
+            Some(timestamp)
+        );
+        native.expires_at = None;
+        native.oauth_refreshed_at = None;
+        native.account_uuid = None;
+        native.organization_uuid = None;
+        native.subscription_type = None;
+        native.rate_limit_tier = None;
+        store.update(&native).await.unwrap();
+        assert!(
+            store
+                .get_by_id(native.id)
+                .await
+                .unwrap()
+                .expires_at
+                .is_none()
+        );
+        native.account_uuid = Some(String::new());
+        store.update(&native).await.unwrap();
+        assert_eq!(
+            store.get_by_id(native.id).await.unwrap().account_uuid,
+            Some(String::new())
+        );
+        for reset in [None, Some(timestamp), None] {
+            store
+                .disable_account(
+                    native.id,
+                    AccountStatus::Disabled,
+                    "synthetic-disable",
+                    reset,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_by_id(native.id)
+                    .await
+                    .unwrap()
+                    .rate_limit_reset_at,
+                reset
+            );
+        }
+        store
+            .update_options(&native, &["request_backend"])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_by_id(native.id).await.unwrap().request_backend,
+            "native293"
+        );
+        assert_eq!(
+            store.get_by_id(old.id).await.unwrap().request_backend,
+            "legacy"
+        );
+    }
+
+    #[tokio::test]
     async fn test_ts_sqlite_plain_placeholder() {
         let store = make_store("sqlite").await;
         assert_eq!(store.ts(1), "$1");
@@ -1047,9 +1269,9 @@ mod tests {
     #[tokio::test]
     async fn test_ts_postgres_casts_to_timestamptz() {
         let store = make_store("postgres").await;
-        assert_eq!(store.ts(1), "$1::TIMESTAMPTZ");
-        assert_eq!(store.ts(5), "$5::TIMESTAMPTZ");
-        assert_eq!(store.ts(10), "$10::TIMESTAMPTZ");
+        assert_eq!(store.ts(1), "$1::TEXT::TIMESTAMPTZ");
+        assert_eq!(store.ts(5), "$5::TEXT::TIMESTAMPTZ");
+        assert_eq!(store.ts(10), "$10::TEXT::TIMESTAMPTZ");
     }
 
     #[tokio::test]

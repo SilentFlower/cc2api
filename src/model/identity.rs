@@ -887,6 +887,7 @@ mod tests {
             canonical_env: json!({}),
             canonical_prompt: serde_json::to_value(CanonicalPromptEnvData::default()).unwrap(),
             canonical_process: serde_json::to_value(CanonicalProcessData::default()).unwrap(),
+            request_backend: "legacy".into(),
             billing_mode: BillingMode::Strip,
             account_uuid: None,
             organization_uuid: None,

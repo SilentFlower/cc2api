@@ -32,6 +32,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 use crate::model::account::Account;
+use crate::service::native_runtime::{NativePool, NativeSenderConfig, NativeSubmission};
 use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
 
 const META_HEADER: &str = "x-v3-request";
@@ -69,6 +70,8 @@ pub struct PreparedRequest {
 /// 账号进程的受限配置；由管理进程原子写入，CLI 用户不可读取。
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SenderConfig {
+    #[serde(default)]
+    pub native: Option<NativeSenderConfig>,
     pub binding: TransportBinding,
     pub proxy_url: String,
     pub allowed_origin: String,
@@ -83,11 +86,24 @@ fn record_headers(
     prepared: &PreparedRequest,
     upstream: &reqwest::Response,
 ) -> Result<(), AppError> {
+    record_response_headers(
+        config,
+        prepared,
+        upstream.status().as_u16(),
+        upstream.headers(),
+    )
+}
+
+fn record_response_headers(
+    config: &SenderConfig,
+    prepared: &PreparedRequest,
+    status: u16,
+    response_headers: &HeaderMap,
+) -> Result<(), AppError> {
     let Some(path) = &config.evidence_file else {
         return Ok(());
     };
-    let headers: serde_json::Map<String, serde_json::Value> = upstream
-        .headers()
+    let headers: serde_json::Map<String, serde_json::Value> = response_headers
         .iter()
         .filter(|(name, _)| {
             name.as_str().starts_with("anthropic-ratelimit-unified-")
@@ -104,7 +120,7 @@ fn record_headers(
         "identity": config.quota_identity, "origin": "api", "environment_id": config.binding.environment_id,
         "account_id": config.binding.account_id, "generation": config.binding.generation,
         "request_id": prepared.request_id, "ts": now_ms() as f64 / 1000.0,
-        "status": upstream.status().as_u16(), "headers": headers});
+        "status": status, "headers": headers});
     let path = Path::new(path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -282,6 +298,85 @@ async fn prepare_from_runtime(
 }
 
 impl PreparedTransport {
+    /// 在发送准入之前校验账号原生能力，准备失败不记录模型提交。
+    /// @return 已验证原始输入协议和环境代次，或明确准备错误。
+    pub async fn native_ready(&self) -> Result<(), AppError> {
+        let PreparedRoute::V3 { client, binding } = &self.route else {
+            return Err(AppError::ServiceUnavailable(
+                "原生方式需要 V3 账号 sender".into(),
+            ));
+        };
+        let capability = client
+            .get(format!(
+                "{}/internal/native/status",
+                binding.endpoint.trim_end_matches('/')
+            ))
+            .bearer_auth(&binding.secret)
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生 sender 能力不可用".into()))?;
+        if !capability.status().is_success() {
+            return Err(AppError::ServiceUnavailable("原生 sender 准备失败".into()));
+        }
+        let capability: serde_json::Value = capability
+            .json()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生 sender 能力无效".into()))?;
+        if capability["raw_input_protocol"] != 1
+            || capability["environment_id"] != binding.environment_id
+            || capability["generation"] != binding.generation
+        {
+            return Err(AppError::ServiceUnavailable(
+                "原生 sender 能力或代次不匹配".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 向具备原始输入能力的 V3 sender 提交一次请求。
+    /// @param submission 已冻结的调用方信封与当前账号授权。
+    /// @param ttfb_timeout 包括能力检查及首次响应的预算。
+    /// @return 上游响应；缺能力或提交失败时返回明确错误。
+    pub async fn submit_native(
+        self,
+        mut submission: NativeSubmission,
+        ttfb_timeout: Duration,
+    ) -> Result<reqwest::Response, AppError> {
+        let PreparedRoute::V3 { client, binding } = self.route else {
+            return Err(AppError::ServiceUnavailable(
+                "原生方式需要 V3 账号 sender".into(),
+            ));
+        };
+        let operation = async {
+            submission.request.account_id = self.account_id;
+            submission.request.environment_id = binding.environment_id;
+            submission.request.generation = binding.generation;
+            submission.request.deadline_unix_ms =
+                now_ms() + ttfb_timeout.as_millis().min(120_000) as u64;
+            let response = client
+                .post(format!(
+                    "{}/internal/native/messages",
+                    binding.endpoint.trim_end_matches('/')
+                ))
+                .bearer_auth(binding.secret)
+                .json(&submission)
+                .send()
+                .await
+                .map_err(|_| AppError::BadGateway("原生请求提交状态未知".into()))?;
+            if let Some(error) = response.headers().get(ERROR_HEADER) {
+                return Err(if error == "before-send" {
+                    AppError::ServiceUnavailable("原生请求准备失败".into())
+                } else {
+                    AppError::BadGateway("原生请求提交状态未知".into())
+                });
+            }
+            Ok(response)
+        };
+        timeout(ttfb_timeout, operation)
+            .await
+            .map_err(|_| AppError::BadGateway("原生请求响应超时，提交状态未知".into()))?
+    }
+
     /// 提交冻结请求；调用者必须已经完成本次准入。
     /// @param prepared 不再改写的协议元信息。
     /// @param body 不再修改的原始传输字节。
@@ -409,6 +504,7 @@ fn validate_binding(
 #[derive(Clone)]
 struct SenderState {
     config_path: String,
+    native_pool: Arc<NativePool>,
     active: Arc<AtomicU64>,
     evidence_error: Arc<AtomicBool>,
     evidence_lock: Arc<Mutex<()>>,
@@ -443,14 +539,19 @@ fn authenticate(headers: &HeaderMap, config: &SenderConfig) -> Result<(), AppErr
     Ok(())
 }
 
-fn now_ms() -> u64 {
+/// 返回当前 Unix 毫秒，用于私有请求的同一时钟截止。@return UTC 毫秒。
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-fn validate_request(prepared: &PreparedRequest, config: &SenderConfig) -> Result<(), AppError> {
+/// 核对私有请求归属、时限和允许目标。@param prepared 冻结元信息。@param config 当前账号绑定。@return 校验结果。
+pub(crate) fn validate_request(
+    prepared: &PreparedRequest,
+    config: &SenderConfig,
+) -> Result<(), AppError> {
     let url = reqwest::Url::parse(&prepared.target_url)
         .map_err(|_| AppError::BadRequest("invalid upstream URL".into()))?;
     let allowed = reqwest::Url::parse(&config.allowed_origin)
@@ -558,6 +659,101 @@ async fn forward(State(state): State<SenderState>, headers: HeaderMap, body: Byt
     })
 }
 
+async fn native_status(
+    State(state): State<SenderState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let config = read_config(&state.config_path)?;
+    authenticate(&headers, &config)?;
+    config
+        .native
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?
+        .verify()?;
+    if state.evidence_error.load(Ordering::SeqCst) {
+        return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
+    }
+    Ok(Json(
+        serde_json::json!({"raw_input_protocol":1,"version":"2.1.293","environment_id":config.binding.environment_id,"generation":config.binding.generation}),
+    ))
+}
+
+async fn native_forward(
+    State(state): State<SenderState>,
+    headers: HeaderMap,
+    Json(submission): Json<NativeSubmission>,
+) -> Response {
+    let mut submitted = false;
+    let operation = async {
+        let config = read_config(&state.config_path)?;
+        authenticate(&headers, &config)?;
+        validate_request(&submission.request, &config)?;
+        let target = reqwest::Url::parse(&submission.request.target_url)
+            .map_err(|_| AppError::BadRequest("原生目标无效".into()))?;
+        if submission.request.method != "POST"
+            || target.path() != "/v1/messages"
+            || target.query().is_some()
+        {
+            return Err(AppError::BadRequest("原生方式只支持 Messages".into()));
+        }
+        if state.evidence_error.load(Ordering::SeqCst) {
+            return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
+        }
+        config
+            .native
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?
+            .verify()?;
+        state.active.fetch_add(1, Ordering::SeqCst);
+        let guard = ActiveRequest(state.active.clone());
+        submitted = true;
+        let response = state
+            .native_pool
+            .submit(config.clone(), submission.clone())
+            .await?;
+        // 共用额度证据格式，进程池和响应流由同一活动许可覆盖。
+        {
+            let _lock = state.evidence_lock.lock().unwrap();
+            if record_response_headers(
+                &config,
+                &submission.request,
+                response.status().as_u16(),
+                response.headers(),
+            )
+            .is_err()
+            {
+                state.evidence_error.store(true, Ordering::SeqCst);
+            }
+        }
+        let (parts, body) = response.into_parts();
+        let stream = unfold(
+            (body.into_data_stream(), guard),
+            |(mut stream, guard)| async move { stream.next().await.map(|item| (item, (stream, guard))) },
+        );
+        Ok::<Response, AppError>(Response::from_parts(parts, Body::from_stream(stream)))
+    };
+    operation.await.unwrap_or_else(|error| {
+        // 准备类错误在写入业务指令前产生；活动计数已经覆盖启动阶段。
+        let before_send = !submitted
+            || matches!(
+                &error,
+                AppError::ServiceUnavailable(_) | AppError::BadRequest(_) | AppError::Unauthorized
+            );
+        let mut response = error.into_response();
+        response.headers_mut().insert(
+            ERROR_HEADER,
+            if before_send {
+                "before-send"
+            } else {
+                "uncertain"
+            }
+            .parse()
+            .unwrap(),
+        );
+        response
+    })
+}
+
 /// 构建只服务单个账号环境的内部发送器路由。
 ///
 /// @param config_path root 所有的账号配置文件路径。
@@ -565,10 +761,13 @@ async fn forward(State(state): State<SenderState>, headers: HeaderMap, body: Byt
 pub fn sender_router(config_path: String) -> Router {
     Router::new()
         .route("/internal/send", post(forward))
+        .route("/internal/native/status", get(native_status))
+        .route("/internal/native/messages", post(native_forward))
         .route("/internal/status", get(status))
         .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .with_state(SenderState {
             config_path,
+            native_pool: Arc::new(NativePool::default()),
             active: Arc::new(AtomicU64::new(0)),
             evidence_error: Arc::new(AtomicBool::new(false)),
             evidence_lock: Arc::new(Mutex::new(())),
@@ -624,6 +823,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let config = SenderConfig {
+            native: None,
             binding: TransportBinding {
                 account_id: 7,
                 environment_id: "synthetic-tls".into(),
@@ -959,6 +1159,7 @@ mod tests {
             release_id: "test".into(),
         };
         let config = SenderConfig {
+            native: None,
             binding,
             proxy_url: String::new(),
             allowed_origin: "https://api.anthropic.com".into(),

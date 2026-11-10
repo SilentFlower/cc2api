@@ -29,6 +29,20 @@ pub struct DiagnosticParameters {
     pub tools_count: Option<usize>,
 }
 
+/// 受信任 sender 从原生组装快照提取的白名单观察；不包含业务正文或凭据。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRequestObservation {
+    pub schema_version: u8,
+    pub parameters: DiagnosticParameters,
+    pub session_id: Option<String>,
+    pub previous_message_id: Option<String>,
+    pub body_sha256: String,
+}
+
+/// 仅在网关与 sender 之间传递的原生观察头，消费后移除。
+pub(crate) const NATIVE_OBSERVATION_HEADER: &str = "x-v3-native-observation";
+
 impl DiagnosticParameters {
     /// 从请求中提取可用于诊断和延迟分组的既有白名单参数。
     /// @param body 已解析的请求，不保留正文或任意扩展字段。

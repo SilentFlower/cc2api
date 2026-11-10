@@ -54,6 +54,7 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
         canonical_env: serde_json::json!({}),
         canonical_prompt: serde_json::json!({}),
         canonical_process: serde_json::json!({}),
+        request_backend: "legacy".into(),
         billing_mode: claude_code_gateway::model::account::BillingMode::Strip,
         account_uuid: None,
         organization_uuid: None,

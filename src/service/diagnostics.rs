@@ -8,7 +8,7 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -19,7 +19,7 @@ use crate::model::account::Account;
 use crate::model::identity::device_profile;
 use crate::model::request_diagnostics::{
     AttemptDiagnostic, DiagnosticParameters, DiagnosticSessions, DiagnosticTokens,
-    RequestDiagnostic, normalize_correlation_id, safe_model,
+    NativeRequestObservation, RequestDiagnostic, normalize_correlation_id, safe_model,
 };
 use crate::service::rewriter::extract_session_id_from_body;
 use crate::service::usage::UsageCapture;
@@ -242,9 +242,15 @@ pub(crate) struct AttemptTrace {
 /// @param body 最终上游请求字节，只临时解析，不持久化。
 /// @return 有请求作用域时返回未提交的观察器。
 pub(crate) fn prepare_attempt(account: &Account, body: &[u8]) -> Option<AttemptTrace> {
+    CURRENT_TRACE.try_with(|_| ()).ok()?;
+    let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    prepare_observation(account, body)
+}
+
+// 观察器只读取明确来源的临时参数，完整业务正文不进入诊断存储。
+fn prepare_observation(account: &Account, body: Value) -> Option<AttemptTrace> {
     CURRENT_TRACE
         .try_with(|trace| {
-            let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             let state = trace.lock();
             let mut sessions = state.sessions.clone();
             sessions.upstream_session_hash = extract_session_id_from_body(&body)
@@ -294,6 +300,46 @@ pub(crate) fn prepare_attempt(account: &Account, body: &[u8]) -> Option<AttemptT
         .ok()
 }
 
+/// 从固定运行时组装阶段的实际白名单摘要建立诊断，来源不冒充最终写出。
+/// @param account 实际承载账号。
+/// @param observation sender 从 cc_prepared 提取的有界摘要。
+/// @param attempt_id 私有作业及 sender 证据共用的 UUID。
+/// @return 未提交的原生观察器，摘要损坏时保持缺口可见。
+pub(crate) fn prepare_native_attempt(
+    account: &Account,
+    observation: NativeRequestObservation,
+    attempt_id: &str,
+) -> Option<AttemptTrace> {
+    if Uuid::parse_str(attempt_id).is_err()
+        || observation.schema_version != 1
+        || observation.body_sha256.len() != 64
+        || !observation
+            .body_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || observation
+            .session_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 512)
+        || observation
+            .previous_message_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 512)
+    {
+        return None;
+    }
+    let context = serde_json::json!({"model":observation.parameters.model,"stream":observation.parameters.stream,
+        "metadata":{"user_id":serde_json::json!({"session_id":observation.session_id}).to_string()},
+        "thread":{"previous_message_id":observation.previous_message_id}});
+    let mut attempt = prepare_observation(account, context)?;
+    let record = attempt.record.as_mut()?;
+    record.attempt_id = attempt_id.to_owned();
+    record.profile_version = "2.1.293".into();
+    record.profile_selection = "native293_cc_prepared".into();
+    record.parameters = observation.parameters;
+    Some(attempt)
+}
+
 /// 保留旧观察器测试的即时开始入口。
 /// @param account 合成账号。
 /// @param body 合成请求正文。
@@ -309,6 +355,20 @@ impl AttemptTrace {
     /// 在真正提交边界发布一次 attempt；大正文解析已在准入前完成。
     /// @return 无，重复调用不重复计数。
     pub(crate) fn commit(&mut self) {
+        self.commit_started(Instant::now(), now());
+    }
+
+    /// 原生摘要在响应头时回传，保留实际提交起点并只增加一次尝试。
+    /// @param started 网关开始该次原生提交的单调时间。
+    /// @return 无。
+    pub(crate) fn commit_native(&mut self, started: Instant) {
+        let timestamp = (Utc::now()
+            - ChronoDuration::from_std(started.elapsed()).unwrap_or_default())
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+        self.commit_started(started, timestamp);
+    }
+
+    fn commit_started(&mut self, started: Instant, timestamp: String) {
         if self.committed {
             return;
         }
@@ -320,8 +380,8 @@ impl AttemptTrace {
         state.request.error_stage = None;
         record.ordinal = state.request.attempt_count;
         record.retry_reason = state.next_retry.take().map(str::to_owned);
-        record.started_at = now();
-        self.start = Instant::now();
+        record.started_at = timestamp;
+        self.start = started;
         self.committed = true;
         drop(state);
         self.trace.emit(Some(record.clone()));

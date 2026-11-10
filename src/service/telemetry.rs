@@ -2340,6 +2340,7 @@ mod tests {
             canonical_env: serde_json::to_value(env).unwrap(),
             canonical_prompt: serde_json::to_value(prompt).unwrap(),
             canonical_process: serde_json::to_value(CanonicalProcessData::default()).unwrap(),
+            request_backend: "legacy".into(),
             billing_mode: BillingMode::Strip,
             account_uuid: Some("account-uuid".into()),
             organization_uuid: Some("org-uuid".into()),

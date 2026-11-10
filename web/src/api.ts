@@ -59,6 +59,7 @@ export interface Account {
     }
   }
   billing_mode: string
+  request_backend?: 'legacy' | 'native293'
   account_uuid?: string | null
   organization_uuid?: string | null
   subscription_type?: string | null

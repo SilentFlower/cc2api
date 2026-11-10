@@ -90,6 +90,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     DiagnosticsStore::migrate(pool).await?;
     SchedulingStore::migrate(pool).await?;
     // 增量迁移
+    sqlx::query("ALTER TABLE accounts ADD COLUMN request_backend TEXT NOT NULL DEFAULT 'legacy'")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'")
         .execute(pool)
         .await
@@ -720,6 +724,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     canonical_prompt_env TEXT NOT NULL DEFAULT '{}',
     canonical_process    TEXT NOT NULL DEFAULT '{}',
     billing_mode    TEXT NOT NULL DEFAULT 'strip',
+    request_backend TEXT NOT NULL DEFAULT 'legacy',
     concurrency     INTEGER NOT NULL DEFAULT 3,
     priority        INTEGER NOT NULL DEFAULT 50,
     rpm_limit       INTEGER NOT NULL DEFAULT 0,
@@ -757,6 +762,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     canonical_prompt_env JSONB NOT NULL DEFAULT '{}',
     canonical_process    JSONB NOT NULL DEFAULT '{}',
     billing_mode    TEXT NOT NULL DEFAULT 'strip',
+    request_backend TEXT NOT NULL DEFAULT 'legacy',
     concurrency     INT NOT NULL DEFAULT 3,
     priority        INT NOT NULL DEFAULT 50,
     rpm_limit       INT NOT NULL DEFAULT 0,
