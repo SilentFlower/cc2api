@@ -297,6 +297,7 @@ function normalizeSettingsMap(data: RawSettingsMap): SettingsMap {
 
 /** 管理端请求诊断列表行。 */
 export interface DiagnosticRequest {
+  log_mode?: 'info' | 'debug' | null
   request_id: string
   started_at: string
   status_code: number | null
@@ -307,6 +308,7 @@ export interface DiagnosticRequest {
 
 /** 单次实际提交及私有采集状态。 */
 export interface DiagnosticAttempt {
+  log_mode?: 'info' | 'debug' | null
   attempt_id: string
   account_id: number
   ordinal: number
@@ -382,7 +384,7 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
 
   // 设置
-  getSettings: () => request<RawSettingsMap>('GET', '/admin/settings').then(normalizeSettingsMap),
+  getSettings: (signal?: AbortSignal) => request<RawSettingsMap>('GET', '/admin/settings', undefined, signal).then(normalizeSettingsMap),
   updateSettings: (data: SettingsMap) => request<{ ok: boolean }>('PUT', '/admin/settings', data),
 
   // 峰值预热日志

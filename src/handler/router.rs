@@ -26,7 +26,9 @@ use crate::model::account::{
 };
 use crate::model::api_token::{self, ApiToken};
 use crate::model::credential_ownership::CredentialOwnershipInput;
-use crate::model::request_diagnostics::{DiagnosticDetail, DiagnosticPage, DiagnosticQuery};
+use crate::model::request_diagnostics::{
+    DiagnosticDetail, DiagnosticPage, DiagnosticQuery, RequestLogMode,
+};
 use crate::service::access_policy::{
     DEFAULT_ALLOWED_CLAUDE_CODE_VERSIONS, DEFAULT_ALLOWED_USER_AGENTS,
     DEFAULT_BLOCKED_CLAUDE_CODE_VERSIONS, validate_blocked_claude_code_versions,
@@ -142,6 +144,10 @@ pub fn build_router(
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
         .route("/admin/accounts/:id/scheduling", get(account_scheduling))
+        .route(
+            "/admin/accounts/:id/native-preparation",
+            get(native_preparation_status).post(request_native_preparation),
+        )
         .route(
             "/admin/accounts/:id/scheduling/sessions",
             get(account_scheduling_sessions),
@@ -1743,6 +1749,10 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::
     settings
         .entry("intercept_assistant_prefill_models".into())
         .or_insert_with(|| DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS.to_string());
+    settings.insert(
+        "request_diagnostics_log_mode".into(),
+        state.gateway_svc.request_log_mode().await.as_str().into(),
+    );
     settings
         .entry("log_429_request_enabled".into())
         .or_insert_with(|| DEFAULT_LOG_429_REQUEST_ENABLED.to_string());
@@ -1902,6 +1912,13 @@ async fn update_settings(
     }
     if let Some(val) = body.get("cache_control_ttl_rewrite") {
         CacheControlTtlRewrite::parse(val)?;
+    }
+    if let Some(val) = body.get("request_diagnostics_log_mode") {
+        if RequestLogMode::parse(val).is_none() {
+            return Err(AppError::BadRequest(
+                "request_diagnostics_log_mode 必须是 info 或 debug".into(),
+            ));
+        }
     }
     if let Some(val) = body.get("message_cache_control_rewrite") {
         MessageCacheControlRewrite::parse(val)?;
@@ -2088,6 +2105,9 @@ async fn update_settings(
             .reload_assistant_prefill_intercept_config()
             .await?;
     }
+    if body.contains_key("request_diagnostics_log_mode") {
+        state.gateway_svc.reload_request_log_mode().await?;
+    }
     if body.contains_key("log_429_request_enabled")
         || body.contains_key("log_non_stream_request_enabled")
         || body.contains_key("log_429_request_body_limit")
@@ -2165,6 +2185,33 @@ fn validate_usize_range(key: &str, raw: &str, min: usize, max: usize) -> Result<
             key, min, max
         ))),
     }
+}
+
+/// 将账号原生准备入队，调用方不等待本地加载。
+/// @param state 已通过管理鉴权的共享服务。
+/// @param id 唯一账号 ID。
+/// @return 入队确认及当前准备状态。
+async fn request_native_preparation(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.account_svc.get_account(id).await?;
+    state.account_svc.notify_native_change(id, false);
+    Ok(Json(
+        serde_json::json!({"queued":true,"preparation":state.gateway_svc.native_preparation_status(id)}),
+    ))
+}
+
+/// 查询独立的原生进程准备状态。
+/// @param state 已通过管理鉴权的共享服务。
+/// @param id 当前账号 ID。
+/// @return 真实准备阶段的受控摘要。
+async fn native_preparation_status(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.account_svc.get_account(id).await?;
+    Ok(Json(state.gateway_svc.native_preparation_status(id)))
 }
 
 /// 分页查询已鉴权业务请求的白名单诊断。
@@ -3233,6 +3280,51 @@ mod tests {
         assert_eq!(value["session_hello_probe_timeout_secs"], "5");
         assert_eq!(value["session_hello_probe_success_ttl_secs"], "3600");
         assert_eq!(value["session_hello_probe_failure_cooldown_secs"], "300");
+    }
+
+    /// 日志模式默认摘要，非法值在批量写入前拒绝，合法模式可热保存。
+    #[tokio::test]
+    async fn log_mode_setting_validates_atomically_and_defaults_to_info() {
+        let app = test_router().await;
+        let update = |mode: &str| {
+            Request::builder().method(Method::PUT).uri("/admin/settings")
+            .header(header::AUTHORIZATION, "Bearer admin").header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({"request_diagnostics_log_mode":mode,"log_429_request_enabled":"true"}).to_string())).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(update("trace")).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        for expected in ["info", "debug"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/settings")
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["request_diagnostics_log_mode"], expected);
+            if expected == "info" {
+                assert_eq!(
+                    value["log_429_request_enabled"], "false",
+                    "无效模式不能部分写入同批设置"
+                );
+                assert_eq!(
+                    app.clone().oneshot(update("debug")).await.unwrap().status(),
+                    StatusCode::OK
+                );
+            }
+        }
     }
 
     #[tokio::test]

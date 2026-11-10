@@ -241,6 +241,27 @@ impl RuntimeGate {
         .is_ok()
     }
 
+    /// 等待排他维护关闭门禁，让后台准备先取消。
+    /// @return 当前存在排他租约时立即返回。
+    pub(crate) async fn wait_exclusive(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .unwrap()
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.exclusive)
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// 认领排他维护门禁，随后等待既有 API 排空。
     /// @param owner 环境维护来源。
     /// @return 新建或同来源的既有维护租约。
@@ -320,6 +341,7 @@ impl RuntimeGate {
         }
         self.persist(&next)?;
         *state = next;
+        self.changed.notify_waiters();
         Ok(lease)
     }
 

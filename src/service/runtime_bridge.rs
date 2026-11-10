@@ -151,6 +151,9 @@ pub async fn native_capture(
             serde_json::json!({"state":"missing", "message":"采集文件缺失、尚未生成或已清理"}),
         );
     }
+    if response.status() == reqwest::StatusCode::GONE {
+        return Ok(serde_json::json!({"state":"expired", "message":"采集内容已超过七天保留期"}));
+    }
     if !response.status().is_success() {
         return Err(AppError::ServiceUnavailable("采集文件读取失败".into()));
     }

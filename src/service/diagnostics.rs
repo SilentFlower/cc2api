@@ -19,18 +19,27 @@ use crate::model::account::Account;
 use crate::model::identity::device_profile;
 use crate::model::request_diagnostics::{
     AttemptDiagnostic, DiagnosticParameters, DiagnosticSessions, DiagnosticTokens,
-    NativeRequestObservation, RequestDiagnostic, normalize_correlation_id, safe_model,
+    NativeRequestObservation, RequestDiagnostic, RequestLogMode, normalize_correlation_id,
+    safe_model,
 };
 use crate::service::rewriter::extract_session_id_from_body;
 use crate::service::usage::UsageCapture;
 use crate::service::v3_scheduling::SchedulingRequest;
 use crate::service::version_profile::profile_for_version;
 use crate::store::cache::UpstreamSessionPoolResolve;
-use crate::store::diagnostics_store::{DiagnosticEvent, DiagnosticsStore};
+use crate::store::diagnostics_store::{ActiveDiagnostic, DiagnosticEvent, DiagnosticsStore};
 
 tokio::task_local! {
+    /// 独立于诊断存储的请求模式，保证旁路故障时内容策略仍生效。
+    pub(crate) static CURRENT_LOG_MODE: RequestLogMode;
     /// 只在当前请求的异步调用链中可见，不向后台遥测任务传播。
     pub(crate) static CURRENT_TRACE: TraceContext;
+}
+
+/// 获取入口冻结模式；独立后台任务默认沿摘要策略。
+/// @return 当前请求模式。
+pub(crate) fn current_log_mode() -> RequestLogMode {
+    CURRENT_LOG_MODE.try_with(|mode| *mode).unwrap_or_default()
 }
 
 /// 返回当前消息请求的根标识，不创建新的诊断请求。
@@ -42,6 +51,7 @@ pub(crate) fn current_request_id() -> Option<String> {
 }
 
 struct TraceState {
+    retention: Option<ActiveDiagnostic>,
     request: RequestDiagnostic,
     profile_selection: String,
     sessions: DiagnosticSessions,
@@ -62,11 +72,15 @@ impl TraceContext {
     /// @param store 独立诊断存储。
     /// @return 当前请求的观测上下文。
     pub(crate) fn new(store: Arc<DiagnosticsStore>) -> Self {
+        let request_id = Uuid::new_v4().to_string();
+        let retention = store.track_request(&request_id);
         let trace = Self {
             store,
             state: Arc::new(Mutex::new(TraceState {
+                retention: Some(retention),
                 request: RequestDiagnostic {
-                    request_id: Uuid::new_v4().to_string(),
+                    log_mode: Some(current_log_mode()),
+                    request_id,
                     started_at: now(),
                     finished_at: None,
                     status_code: None,
@@ -152,6 +166,7 @@ impl TraceContext {
                 state.request.error_stage = Some("admission".into());
             }
             state.request.finished_at = Some(now());
+            state.retention.take();
         }
         self.emit(None);
     }
@@ -260,6 +275,7 @@ fn prepare_observation(account: &Account, body: Value) -> Option<AttemptTrace> {
                 .and_then(Value::as_str)
                 .map(|value| identity_hash(account.id, "message", value));
             let record = AttemptDiagnostic {
+                log_mode: state.request.log_mode,
                 capture_status: None,
                 attempt_id: Uuid::new_v4().to_string(),
                 request_id: state.request.request_id.clone(),
@@ -327,6 +343,20 @@ pub(crate) fn prepare_native_attempt(
             .as_ref()
             .is_some_and(|id| id.len() > 512)
     {
+        return None;
+    }
+    let session_mismatch = CURRENT_TRACE
+        .try_with(|trace| {
+            let expected = trace.lock().sessions.upstream_session_hash.clone();
+            let actual = observation
+                .session_id
+                .as_deref()
+                .map(|session| identity_hash(account.id, "session", session));
+            expected.is_some() && expected != actual
+        })
+        .unwrap_or(false);
+    if session_mismatch {
+        error_stage("native_session_observation");
         return None;
     }
     let context = serde_json::json!({"model":observation.parameters.model,"stream":observation.parameters.stream,

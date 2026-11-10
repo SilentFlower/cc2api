@@ -39,6 +39,7 @@ impl CredentialGate {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .0 = closed;
+        self.changed.notify_waiters();
     }
 
     fn enter(self: &Arc<Self>) -> Result<CredentialActivity, AppError> {
@@ -76,6 +77,28 @@ impl CredentialGate {
 /// 覆盖到实际发送结束的活动许可；丢弃时自动归还排空计数。
 pub struct CredentialActivity {
     gate: Arc<CredentialGate>,
+}
+
+impl CredentialActivity {
+    /// 等待凭据进入排空，供零模型准备优先收口。
+    /// @return 门禁关闭后结束等待。
+    pub(crate) async fn closed(&self) {
+        loop {
+            let changed = self.gate.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .0
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 impl Drop for CredentialActivity {
@@ -288,6 +311,7 @@ impl AccountService {
     ) -> Result<(), AppError> {
         self.store.change_credential_ownership(change).await?;
         self.credential_gate(change.next.account_id).close(false);
+        self.notify_native_change(change.next.account_id, true);
         Ok(())
     }
     fn credential_gate(&self, id: i64) -> Arc<CredentialGate> {
@@ -404,6 +428,9 @@ impl AccountService {
         {
             if current.operation_id == input.operation_id {
                 gate.close(!current.gateway_ready());
+                if current.gateway_ready() {
+                    self.notify_native_change(id, true);
+                }
             }
             let snapshot = if current.operation_id == input.operation_id
                 && current.gateway_ready()
@@ -463,6 +490,7 @@ impl AccountService {
                 .await?;
             ownership = Some(next.clone());
             gate.close(false);
+            self.notify_native_change(id, true);
         } else if input.action == "cancel"
             && record.stage == "prepared"
             && matches!(input.direction.as_str(), "return" | "reauth")
@@ -479,6 +507,9 @@ impl AccountService {
                 .await?;
             ownership = Some(next.clone());
             gate.close(!next.gateway_ready());
+            if next.gateway_ready() {
+                self.notify_native_change(id, true);
+            }
         }
         let snapshot = if matches!(record.stage.as_str(), "prepared" | "imported")
             && input.direction != "retire"

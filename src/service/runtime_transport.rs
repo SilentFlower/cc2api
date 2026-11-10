@@ -32,13 +32,19 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 use crate::model::account::Account;
+use crate::model::request_diagnostics::RequestLogMode;
+use crate::service::native_contract::{
+    NativePreparation, NativePreparationControl, NativePreparationStatus,
+};
 use crate::service::native_runtime::{NativePool, NativeSenderConfig, NativeSubmission};
 use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
 
 const META_HEADER: &str = "x-v3-request";
 const ERROR_HEADER: &str = "x-v3-transport-error";
-const REQUEST_BUDGET_MS: u64 = 120_000;
-const CLOCK_SKEW_MS: u64 = 5_000;
+/// 私有请求最多持有的单调执行预算。
+pub(crate) const REQUEST_BUDGET_MS: u64 = 120_000;
+/// 绑定校验允许的跨进程墙钟偏差。
+pub(crate) const CLOCK_SKEW_MS: u64 = 5_000;
 
 /// 由调度器登记的单账号传输实例；秘密仅用于服务间鉴权。
 #[derive(Clone, Deserialize, Serialize)]
@@ -260,6 +266,59 @@ pub async fn prepare(
     .await
 }
 
+/// 只解析已经运行的账号环境，后台准备不会唤醒休眠环境。
+/// @param account 当前账号快照。
+/// @return 已验证绑定；环境停止或未配置 V3 时为空。
+pub(crate) async fn prepare_existing(
+    account: &Account,
+) -> Result<Option<PreparedTransport>, AppError> {
+    let base = std::env::var("V3_RUNTIME_URL").unwrap_or_default();
+    if base.is_empty() {
+        return Ok(None);
+    }
+    let secret = std::env::var("V3_INTERNAL_TOKEN").map_err(|_| {
+        AppError::ServiceUnavailable("v3 runtime authentication unavailable".into())
+    })?;
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| AppError::ServiceUnavailable("v3 bridge unavailable".into()))?;
+    let binding: Option<TransportBinding> = client
+        .get(format!(
+            "{}/internal/v3/transport/{}?wake=false",
+            base.trim_end_matches('/'),
+            account.id
+        ))
+        .bearer_auth(secret)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("运行绑定读取失败".into()))?
+        .error_for_status()
+        .map_err(|_| AppError::ServiceUnavailable("运行绑定未就绪".into()))?
+        .json()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("运行绑定无效".into()))?;
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    validate_binding(
+        &binding,
+        account.id,
+        &std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default(),
+        &std::env::var("V3_RELEASE").unwrap_or_default(),
+    )?;
+    Ok(Some(PreparedTransport {
+        account_id: account.id,
+        route: PreparedRoute::V3 { client, binding },
+    }))
+}
+
 /// 分离配置来源与传输，测试可注入仅解析到回环地址的客户端。
 /// @param account 当前账号。
 /// @param client 不继承代理的内部客户端。
@@ -302,6 +361,100 @@ async fn prepare_from_runtime(
 }
 
 impl PreparedTransport {
+    /// 核对两次只读解析是否仍指向同一受信任 sender。
+    /// @param other 当前重新读取的传输绑定。
+    /// @return 账号、代次、服务与鉴权配置完全一致时为 true。
+    pub(crate) fn same_binding(&self, other: &Self) -> bool {
+        match (&self.route, &other.route) {
+            (PreparedRoute::V3 { binding: left, .. }, PreparedRoute::V3 { binding: right, .. }) => {
+                self.account_id == other.account_id
+                    && left.account_id == right.account_id
+                    && left.environment_id == right.environment_id
+                    && left.generation == right.generation
+                    && left.endpoint == right.endpoint
+                    && left.secret == right.secret
+                    && left.release_id == right.release_id
+            }
+            _ => false,
+        }
+    }
+
+    /// 使用已绑定环境准备一个原生进程，不提交模型作业。
+    /// @param preparation 网关冻结的账号身份与准备标识。
+    /// @return 真实握手后的准备状态。
+    pub(crate) async fn prepare_native(
+        &self,
+        mut preparation: NativePreparation,
+    ) -> Result<NativePreparationStatus, AppError> {
+        let PreparedRoute::V3 { client, binding } = &self.route else {
+            return Err(AppError::ServiceUnavailable(
+                "原生准备需要 V3 sender".into(),
+            ));
+        };
+        preparation.account_id = self.account_id;
+        preparation.environment_id = binding.environment_id.clone();
+        preparation.generation = binding.generation;
+        let response = client
+            .post(format!(
+                "{}/internal/native/prepare",
+                binding.endpoint.trim_end_matches('/')
+            ))
+            .bearer_auth(&binding.secret)
+            .json(&preparation)
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生准备通道不可用".into()))?
+            .error_for_status()
+            .map_err(|_| AppError::ServiceUnavailable("原生准备失败".into()))?;
+        let status: NativePreparationStatus = response
+            .json()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生准备回执无效".into()))?;
+        if status.account_id != self.account_id
+            || status.environment_id != binding.environment_id
+            || status.generation != binding.generation
+            || status.preparation_id != preparation.preparation_id
+            || status.version != "2.1.293"
+            || status.raw_input_protocol != 1
+            || !matches!(status.state.as_str(), "ready" | "busy")
+            || (status.state == "ready" && (status.pid.is_none() || status.idle_workers == 0))
+        {
+            return Err(AppError::ServiceUnavailable("原生准备回执归属不符".into()));
+        }
+        Ok(status)
+    }
+
+    /// 取消当前绑定中指定的准备，保留在途业务。
+    /// @param preparation_id 本次准备 UUID。
+    /// @return 已提交取消控制或明确通道错误。
+    pub(crate) async fn cancel_native_preparation(
+        &self,
+        preparation_id: &str,
+    ) -> Result<(), AppError> {
+        let PreparedRoute::V3 { client, binding } = &self.route else {
+            return Ok(());
+        };
+        client
+            .post(format!(
+                "{}/internal/native/prepare/cancel",
+                binding.endpoint.trim_end_matches('/')
+            ))
+            .bearer_auth(&binding.secret)
+            .json(&NativePreparationControl {
+                account_id: self.account_id,
+                environment_id: binding.environment_id.clone(),
+                generation: binding.generation,
+                preparation_id: preparation_id.into(),
+            })
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生准备取消失败".into()))?
+            .error_for_status()
+            .map_err(|_| AppError::ServiceUnavailable("原生准备取消被拒绝".into()))?;
+        Ok(())
+    }
+
     /// 在发送准入之前校验账号原生能力，准备失败不记录模型提交。
     /// @return 已验证原始输入协议和环境代次，或明确准备错误。
     pub async fn native_ready(&self) -> Result<(), AppError> {
@@ -687,17 +840,101 @@ async fn native_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let config = read_config(&state.config_path)?;
     authenticate(&headers, &config)?;
-    config
-        .native
-        .as_ref()
-        .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?
-        .verify()?;
+    state.native_pool.verify(
+        config
+            .native
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?,
+    )?;
     if state.evidence_error.load(Ordering::SeqCst) {
         return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
     }
     Ok(Json(
         serde_json::json!({"raw_input_protocol":1,"version":"2.1.293","environment_id":config.binding.environment_id,"generation":config.binding.generation}),
     ))
+}
+
+/// 在现有服务鉴权与绑定边界内执行零模型准备。
+/// @param state sender 状态。
+/// @param headers 服务鉴权头。
+/// @param preparation 账号身份和准备截止。
+/// @return 实际进程握手结果。
+async fn native_prepare(
+    State(state): State<SenderState>,
+    headers: HeaderMap,
+    Json(preparation): Json<NativePreparation>,
+) -> Result<Json<NativePreparationStatus>, AppError> {
+    let config = read_config(&state.config_path)?;
+    authenticate(&headers, &config)?;
+    if state.evidence_error.load(Ordering::SeqCst) {
+        return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
+    }
+    state.native_pool.verify(
+        config
+            .native
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?,
+    )?;
+    // 这里只借用既有绑定与截止校验结构；input 没有业务正文，也不会进入 execute。
+    let identity = NativeSubmission {
+        log_mode: RequestLogMode::Info,
+        request: PreparedRequest {
+            account_id: preparation.account_id,
+            environment_id: preparation.environment_id,
+            generation: preparation.generation,
+            request_id: preparation.preparation_id.clone(),
+            deadline_unix_ms: preparation.deadline_unix_ms,
+            method: "POST".into(),
+            target_url: format!("{}/v1/messages", config.allowed_origin),
+            headers: Vec::new(),
+            preserve_header_casing: false,
+            tls_profile: TlsProfileId::default(),
+        },
+        input: serde_json::json!({"schema_version":1,"request_id":preparation.preparation_id}),
+        bearer: preparation.bearer,
+        device_id: preparation.device_id,
+        account_uuid: preparation.account_uuid,
+        organization_uuid: preparation.organization_uuid,
+        email: preparation.email,
+        concurrency: preparation.concurrency,
+    };
+    let deadline = validate_request(&identity.request, &config)?;
+    let status = state
+        .native_pool
+        .prepare(config.clone(), identity, deadline)
+        .await?;
+    let current = read_config(&state.config_path)?;
+    if serde_json::to_vec(&current).ok() != serde_json::to_vec(&config).ok() {
+        return Err(AppError::ServiceUnavailable(
+            "原生准备期间环境配置已变化".into(),
+        ));
+    }
+    Ok(Json(status))
+}
+
+/// 只取消本账号及当前环境代次的准备。
+/// @param state sender 状态。
+/// @param headers 服务鉴权头。
+/// @param control 准备归属和 UUID。
+/// @return 已登记撤销，覆盖准备尚未到达的情况。
+async fn native_prepare_cancel(
+    State(state): State<SenderState>,
+    headers: HeaderMap,
+    Json(control): Json<NativePreparationControl>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let config = read_config(&state.config_path)?;
+    authenticate(&headers, &config)?;
+    if control.account_id != config.binding.account_id
+        || control.environment_id != config.binding.environment_id
+        || control.generation != config.binding.generation
+        || Uuid::parse_str(&control.preparation_id).is_err()
+    {
+        return Err(AppError::BadRequest("准备取消归属不匹配".into()));
+    }
+    if !state.native_pool.cancel_preparation(&control) {
+        return Err(AppError::ServiceUnavailable("原生准备撤销登记已满".into()));
+    }
+    Ok(Json(serde_json::json!({"cancelled":true})))
 }
 
 async fn native_forward(
@@ -721,11 +958,12 @@ async fn native_forward(
         if state.evidence_error.load(Ordering::SeqCst) {
             return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
         }
-        config
-            .native
-            .as_ref()
-            .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?
-            .verify()?;
+        state.native_pool.verify(
+            config
+                .native
+                .as_ref()
+                .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?,
+        )?;
         state.active.fetch_add(1, Ordering::SeqCst);
         let guard = ActiveRequest(state.active.clone());
         submitted = true;
@@ -784,6 +1022,11 @@ pub fn sender_router(config_path: String) -> Router {
     Router::new()
         .route("/internal/send", post(forward))
         .route("/internal/native/status", get(native_status))
+        .route("/internal/native/prepare", post(native_prepare))
+        .route(
+            "/internal/native/prepare/cancel",
+            post(native_prepare_cancel),
+        )
         .route("/internal/native/messages", post(native_forward))
         .route("/internal/status", get(status))
         .layer(DefaultBodyLimit::max(128 * 1024 * 1024))

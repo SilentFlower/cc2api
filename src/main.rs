@@ -9,7 +9,7 @@ use claude_code_gateway::tlsfp;
 
 use std::env;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -137,6 +137,7 @@ async fn main() {
         )
         .with_diagnostics(diagnostics_store),
     );
+    gateway_svc.start_native_prewarm();
     gateway_svc
         .reload_system_role_models()
         .await
@@ -189,6 +190,9 @@ async fn main() {
         .reload_assistant_prefill_intercept_config()
         .await
         .expect("load assistant prefill intercept config failed");
+    if gateway_svc.reload_request_log_mode().await.is_err() {
+        warn!("请求日志模式读取失败，沿用当前摘要策略");
+    }
     gateway_svc
         .reload_rate_limit_request_log_config()
         .await

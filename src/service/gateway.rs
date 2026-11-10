@@ -30,7 +30,7 @@ use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::model::identity::device_profile;
 use crate::model::request_diagnostics::{
-    DiagnosticParameters, NATIVE_OBSERVATION_HEADER, NativeRequestObservation,
+    DiagnosticParameters, NATIVE_OBSERVATION_HEADER, NativeRequestObservation, RequestLogMode,
 };
 use crate::model::request_usage::RequestUsage;
 use crate::service::access_policy::{
@@ -42,6 +42,7 @@ use crate::service::account::{
     HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, RateLimitDecision, UsageObservationKind,
 };
 use crate::service::diagnostics::{self, CURRENT_TRACE, RequestTraceGuard, TraceContext};
+use crate::service::native_prewarm::NativePrewarmer;
 use crate::service::native_runtime::NativeSubmission;
 use crate::service::request_body_codec::{
     REQUEST_BODY_LIMIT, RequestBodyCodecError, RequestBodyEncoding,
@@ -90,12 +91,13 @@ use crate::store::settings_store::{
     DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, DEFAULT_MESSAGE_CACHE_CONTROL_REWRITE,
     DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED, DEFAULT_NON_STREAM_PROBE_CACHE_ENABLED,
     DEFAULT_PASSTHROUGH_OS_VERSION, DEFAULT_PASSTHROUGH_SHELL, DEFAULT_PASSTHROUGH_WORKING_DIR,
-    DEFAULT_REWRITE_DISABLED_THINKING_ENABLED, DEFAULT_REWRITE_DISABLED_THINKING_MODELS,
-    DEFAULT_SESSION_HELLO_PROBE_ENABLED, DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS,
-    DEFAULT_SESSION_HELLO_PROBE_STRICT, DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS,
-    DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS, DEFAULT_STREAM_KEEPALIVE_ENABLED,
-    DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS,
-    SettingsStore, normalize_message_top_field_filter_enabled,
+    DEFAULT_REQUEST_DIAGNOSTICS_LOG_MODE, DEFAULT_REWRITE_DISABLED_THINKING_ENABLED,
+    DEFAULT_REWRITE_DISABLED_THINKING_MODELS, DEFAULT_SESSION_HELLO_PROBE_ENABLED,
+    DEFAULT_SESSION_HELLO_PROBE_FAILURE_COOLDOWN_SECS, DEFAULT_SESSION_HELLO_PROBE_STRICT,
+    DEFAULT_SESSION_HELLO_PROBE_SUCCESS_TTL_SECS, DEFAULT_SESSION_HELLO_PROBE_TIMEOUT_SECS,
+    DEFAULT_STREAM_KEEPALIVE_ENABLED, DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+    DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT_SECS, SettingsStore,
+    normalize_message_top_field_filter_enabled,
 };
 use crate::store::usage_store::UsageStore;
 use crate::tlsfp::{
@@ -316,7 +318,7 @@ enum RequestCapturePolicy {
 
 impl RequestCapturePolicy {
     fn allows_full_capture(self) -> bool {
-        matches!(self, Self::Configured)
+        matches!(self, Self::Configured) && diagnostics::current_log_mode() == RequestLogMode::Debug
     }
 }
 
@@ -582,6 +584,7 @@ struct AccessProfileConfig {
 }
 
 pub struct GatewayService {
+    native_prewarmer: NativePrewarmer,
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
@@ -603,6 +606,7 @@ pub struct GatewayService {
     disabled_thinking_rewrite: RwLock<DisabledThinkingRewrite>,
     assistant_prefill_intercept_config: RwLock<AssistantPrefillInterceptConfig>,
     rate_limit_request_log_config: RwLock<RateLimitRequestLogConfig>,
+    request_log_mode: RwLock<RequestLogMode>,
     non_stream_probe_cache_config: RwLock<NonStreamProbeCacheConfig>,
     non_stream_probe_cache: RwLock<HashMap<String, CachedProbeResponse>>,
     stream_stability_config: RwLock<StreamStabilityConfig>,
@@ -631,6 +635,7 @@ impl GatewayService {
         usage_store: Arc<UsageStore>,
     ) -> Self {
         Self {
+            native_prewarmer: NativePrewarmer::new(account_svc.clone()),
             account_svc,
             rewriter,
             telemetry_svc,
@@ -672,6 +677,7 @@ impl GatewayService {
                 default_assistant_prefill_intercept_config(),
             ),
             rate_limit_request_log_config: RwLock::new(default_rate_limit_request_log_config()),
+            request_log_mode: RwLock::new(RequestLogMode::Info),
             non_stream_probe_cache_config: RwLock::new(default_non_stream_probe_cache_config()),
             non_stream_probe_cache: RwLock::new(HashMap::new()),
             stream_stability_config: RwLock::new(default_stream_stability_config()),
@@ -696,6 +702,19 @@ impl GatewayService {
         self.diagnostics_store.as_ref()
     }
 
+    /// 启动账号原生准备协调器，保持环境基础 ready 的原语义。
+    /// @return 无返回值。
+    pub fn start_native_prewarm(&self) {
+        self.native_prewarmer.start();
+    }
+
+    /// 查询指定账号的独立准备摘要。
+    /// @param account_id 已授权账号 ID。
+    /// @return 原生准备状态。
+    pub fn native_preparation_status(&self, account_id: i64) -> JsonValue {
+        self.native_prewarmer.status(account_id)
+    }
+
     /// 读取当前账号页的两个用量窗口，不触发上游请求。
     /// @param accounts 当前页账号及额度缓存。
     /// @return 按账号 ID 索引的本地用量统计。
@@ -712,6 +731,7 @@ impl GatewayService {
     /// @param path 当前请求路径。
     /// @param body_map 原始下游请求体。
     /// @param client_type 当前客户端类型。
+    /// @param explicit_session 原生入口已校验的头部会话；legacy 传空。
     /// @return 返回主请求 override 和 telemetry 只读映射表。
     async fn build_upstream_session_rewrite(
         &self,
@@ -719,11 +739,13 @@ impl GatewayService {
         path: &str,
         body_map: &serde_json::Value,
         client_type: ClientType,
+        explicit_session: Option<&str>,
     ) -> UpstreamSessionRewrite {
         let mut rewrite = UpstreamSessionRewrite::default();
         if path == "/v1/messages" && client_type == ClientType::ClaudeCode {
-            if let Some(real_session_id) =
-                crate::service::rewriter::extract_session_id_from_body(body_map)
+            if let Some(real_session_id) = explicit_session
+                .map(str::to_string)
+                .or_else(|| extract_session_id_from_body(body_map))
             {
                 match self
                     .account_svc
@@ -1158,6 +1180,26 @@ impl GatewayService {
         Ok(())
     }
 
+    /// 热加载后续请求的日志模式，读取错误保留已生效缓存。
+    /// @return 成功刷新或设置读取错误。
+    pub async fn reload_request_log_mode(&self) -> Result<(), AppError> {
+        let value = self
+            .settings_store
+            .get_value(
+                "request_diagnostics_log_mode",
+                DEFAULT_REQUEST_DIAGNOSTICS_LOG_MODE,
+            )
+            .await?;
+        *self.request_log_mode.write().await = RequestLogMode::parse(&value).unwrap_or_default();
+        Ok(())
+    }
+
+    /// 返回当前实际生效的日志模式，管理页不从数据库值猜测缓存状态。
+    /// @return 下一个请求入口将冻结的模式。
+    pub async fn request_log_mode(&self) -> RequestLogMode {
+        *self.request_log_mode.read().await
+    }
+
     /// 从全局设置刷新 429 请求观测日志配置。
     ///
     /// 配置缓存到内存,只在上游返回 429 时读取,默认关闭以避免记录用户请求内容。
@@ -1573,6 +1615,21 @@ impl GatewayService {
     /// @param api_token 已校验的账号访问范围。
     /// @return 原有业务响应及可用的诊断关联头。
     pub async fn handle_request(&self, req: Request, api_token: Option<&ApiToken>) -> Response {
+        let mode = *self.request_log_mode.read().await;
+        diagnostics::CURRENT_LOG_MODE
+            .scope(mode, self.handle_request_with_diagnostics(req, api_token))
+            .await
+    }
+
+    /// 在已冻结内容策略的作用域中装配诊断，保持独立存储的旁路性质。
+    /// @param req 已鉴权请求。
+    /// @param api_token 当前访问范围。
+    /// @return 包含关联标识的响应。
+    async fn handle_request_with_diagnostics(
+        &self,
+        req: Request,
+        api_token: Option<&ApiToken>,
+    ) -> Response {
         let Some(store) = self
             .diagnostics_store
             .as_ref()
@@ -2326,6 +2383,7 @@ impl GatewayService {
                         &native_headers,
                         &body_bytes,
                         &body_map,
+                        client_type,
                         &session_hash,
                         &account_selection_context,
                         scheduling_request.as_ref(),
@@ -2369,7 +2427,7 @@ impl GatewayService {
             // 但 sticky、RPM 与本地缓存仍继续使用未经改写的真实下游 session。
             let upstream_session_rewrite = await_preparation(
                 scheduling_request.as_ref(),
-                self.build_upstream_session_rewrite(&account, &path, &body_map, client_type),
+                self.build_upstream_session_rewrite(&account, &path, &body_map, client_type, None),
             )
             .await?;
             diagnostics::session_context(
@@ -3502,6 +3560,7 @@ impl GatewayService {
     /// @param headers 保留重复值的调用方请求头。
     /// @param body 原始逻辑正文。
     /// @param body_map 原始 JSON，用于会话及用量观察。
+    /// @param client_type 原始客户端类别，只对已识别 CC 会话应用既有池。
     /// @param session_hash 现有网关稳定会话标识。
     /// @param selection 账号限额决策上下文。
     /// @param scheduling 当前调度准入。
@@ -3513,12 +3572,53 @@ impl GatewayService {
         headers: &[(String, String)],
         body: &[u8],
         body_map: &serde_json::Value,
+        client_type: ClientType,
         session_hash: &str,
         selection: &AccountSelectionContext,
         scheduling: Option<&SchedulingRequest>,
         bind_session: bool,
     ) -> Result<Response, AppError> {
         validate_native_account_features(account, headers, body_map)?;
+        let pool_session = native_pool_session(headers, body_map);
+        let original_session =
+            extract_session_id_from_body(body_map).or_else(|| pool_session.clone());
+        // 冲突或重复 session 头交给原二进制拒绝，不能先映射而抹去错误证据。
+        let mut rewrite = if client_type == ClientType::ClaudeCode && pool_session.is_some() {
+            await_preparation(
+                scheduling,
+                self.build_upstream_session_rewrite(
+                    account,
+                    "/v1/messages",
+                    body_map,
+                    client_type,
+                    pool_session.as_deref(),
+                ),
+            )
+            .await?
+        } else {
+            UpstreamSessionRewrite::default()
+        };
+        if rewrite
+            .message
+            .as_ref()
+            .and_then(|resolved| resolved.upstream_session_id.as_deref())
+            .is_some_and(|session| session.len() != 36 || Uuid::parse_str(session).is_err())
+        {
+            warn!(
+                "原生会话池映射失败开放: account={} reason=invalid_target",
+                account.id
+            );
+            rewrite.message = None;
+        }
+        diagnostics::session_context(
+            account.id,
+            original_session.as_deref(),
+            rewrite.message.as_ref(),
+        );
+        let (native_body, native_headers, mut context) =
+            map_native_session(body_map, headers, &rewrite)?;
+        let body_map = native_body.as_ref();
+        let headers = native_headers.as_ref();
         let bearer = await_preparation(
             scheduling,
             self.account_svc.resolve_upstream_token(account.id),
@@ -3536,7 +3636,6 @@ impl GatewayService {
         )
         .await??;
         await_preparation(scheduling, transport.native_ready()).await??;
-        let mut context = serde_json::json!({});
         if extract_session_id_from_body(body_map).is_none()
             && !headers
                 .iter()
@@ -3549,7 +3648,11 @@ impl GatewayService {
             context["sessionId"] = serde_json::json!(Uuid::from_bytes(bytes).to_string());
         }
         let id = Uuid::new_v4().to_string();
+        let mut input = serde_json::json!({"schema_version":1,"request_id":id,"headers":headers,"context":context});
+        // 映射副本直接移入信封，大正文无需在 json! 中再次完整序列化和复制。
+        input["body"] = native_body.into_owned();
         let submission = NativeSubmission {
+            log_mode: diagnostics::current_log_mode(),
             request: PreparedRequest {
                 account_id: account.id,
                 environment_id: String::new(),
@@ -3562,7 +3665,7 @@ impl GatewayService {
                 preserve_header_casing: false,
                 tls_profile: TlsProfileId::default(),
             },
-            input: serde_json::json!({"schema_version":1,"request_id":id,"body":body_map,"headers":headers,"context":context}),
+            input,
             bearer,
             device_id: account.device_id.clone(),
             account_uuid: account.account_uuid.clone(),
@@ -3836,6 +3939,102 @@ fn requires_upstream_beta_query(path: &str) -> bool {
 
 fn upstream_url(path: &str, query: &str) -> String {
     upstream_url_with_base(UPSTREAM_BASE, path, query)
+}
+
+// 只改变可由固定二进制无歧义表达的 session；其余输入仍走原来的校验与错误路径。
+fn native_pool_session(headers: &[(String, String)], body: &JsonValue) -> Option<String> {
+    let values: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-claude-code-session-id"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if values.len() > 1 {
+        return None;
+    }
+    let session = if let Some(value) = body.pointer("/metadata/user_id") {
+        let user: JsonValue = serde_json::from_str(value.as_str()?).ok()?;
+        let session = user.get("session_id")?.as_str()?;
+        if values.first().is_some_and(|header| *header != session) {
+            return None;
+        }
+        session.to_string()
+    } else {
+        values.first()?.to_string()
+    };
+    (session.len() == 36 && Uuid::parse_str(&session).is_ok()).then_some(session)
+}
+
+fn map_native_session<'a>(
+    body: &'a JsonValue,
+    headers: &'a [(String, String)],
+    rewrite: &UpstreamSessionRewrite,
+) -> Result<(Cow<'a, JsonValue>, Cow<'a, [(String, String)]>, JsonValue), AppError> {
+    let Some(resolved) = rewrite.message.as_ref() else {
+        return Ok((
+            Cow::Borrowed(body),
+            Cow::Borrowed(headers),
+            serde_json::json!({}),
+        ));
+    };
+    let Some(target) = resolved
+        .upstream_session_id
+        .as_deref()
+        .filter(|target| *target != resolved.real_session_id)
+    else {
+        return Ok((
+            Cow::Borrowed(body),
+            Cow::Borrowed(headers),
+            serde_json::json!({}),
+        ));
+    };
+    if native_pool_session(headers, body).as_deref() != Some(resolved.real_session_id.as_str())
+        || target.len() != 36
+        || Uuid::parse_str(target).is_err()
+    {
+        return Err(AppError::BadRequest("原生会话映射上下文不一致".into()));
+    }
+    let mut mapped_body = Cow::Borrowed(body);
+    if let Some(value) = body
+        .pointer("/metadata/user_id")
+        .and_then(JsonValue::as_str)
+    {
+        let mut user: JsonValue = serde_json::from_str(value)
+            .map_err(|_| AppError::BadRequest("原生会话归属结构无效".into()))?;
+        user["session_id"] = JsonValue::String(target.into());
+        mapped_body.to_mut()["metadata"]["user_id"] = JsonValue::String(
+            serde_json::to_string(&user)
+                .map_err(|_| AppError::Internal("原生会话编码失败".into()))?,
+        );
+    }
+    let mut context = serde_json::json!({});
+    let request_classes: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-claude-code-request-class"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("x-claude-code-agent-id"))
+        && request_classes.len() <= 1
+        && request_classes
+            .iter()
+            .all(|class| matches!(*class, "main" | "compaction" | "auxiliary" | "side_reply"))
+    {
+        // 原运行时以真实 session 派生隐式主代理 ID；单改 session 会断开孩子的 parentAgentId。
+        // 显式保留这份身份，原生 billing 中的子代理冲突仍由原校验拒绝。
+        context["agentKind"] = JsonValue::String("main".into());
+        context["agentId"] = JsonValue::String(resolved.real_session_id.clone());
+    }
+    let mut headers = headers.to_vec();
+    if let Some((_, value)) = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-claude-code-session-id"))
+    {
+        *value = target.into();
+    } else {
+        headers.push(("x-claude-code-session-id".into(), target.into()));
+    }
+    Ok((mapped_body, Cow::Owned(headers), context))
 }
 
 /// 原生构造前保留账号的计费能力授权，拒绝超范围申请并保持原始输入。
@@ -4182,6 +4381,9 @@ fn safe_body_summary(b: &[u8]) -> String {
 }
 
 fn safe_upstream_error_log_body(body: &[u8], headers: &HeaderMap) -> String {
+    if diagnostics::current_log_mode() != RequestLogMode::Debug {
+        return format!("省略错误正文，原始长度{}字节", body.len());
+    }
     let decoded = decode_upstream_error_body(body, headers);
     let raw = if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded) {
         serde_json::to_string(&value)
@@ -8128,7 +8330,8 @@ impl Drop for SlotGuardBody {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_native_account_features;
+    use super::{map_native_session, native_pool_session, validate_native_account_features};
+
     use super::{
         AssistantPrefillInterceptConfig, AutoModeClassifierMode, AutoModeClassifierProtocol,
         BootstrapModelOptionsMode, BootstrapProfileConfig, COUNT_TOKENS_PATH, CachedProbeResponse,
@@ -8175,11 +8378,12 @@ mod tests {
     };
     use crate::model::api_token::{ApiToken, ApiTokenStatus};
     use crate::model::identity::device_profile;
-    use crate::model::request_diagnostics::DiagnosticQuery;
+    use crate::model::request_diagnostics::{DiagnosticQuery, RequestLogMode};
     use crate::service::account::{
         AccountSelectionContext, AccountService, DEFAULT_REQUEST_SLOT_UNITS,
         HAIKU_REQUEST_SLOT_UNITS, QueueWaitError, UsageObservationKind,
     };
+    use crate::service::diagnostics;
     use crate::service::oauth::TokenTester;
     use crate::service::oauth_flow::OAuthFlowService;
     use crate::service::request_body_codec::{REQUEST_BODY_LIMIT, RequestBodyEncoding};
@@ -8307,6 +8511,93 @@ mod tests {
             "thinking": {"type": "adaptive", "display": "updates"},
             "fallbacks": "default"
         })
+    }
+
+    #[test]
+    fn native_pool_maps_only_session_and_preserves_original_conflicts() {
+        let real = "11111111-1111-4111-8111-111111111111";
+        let target = "22222222-2222-4222-8222-222222222222";
+        let original = serde_json::json!({"metadata":{"user_id":serde_json::json!({"session_id":real,"device_id":"synthetic","extra":"kept"}).to_string()},
+            "system":[{"type":"text","text":"合成 billing 原文"}],"messages":[{"role":"user","content":"合成历史"}],"thread":{"previous_message_id":"msg_original"}});
+        let headers = vec![
+            ("X-Claude-Code-Session-Id".into(), real.into()),
+            ("x-claude-code-prompt-id".into(), target.into()),
+            ("x-claude-code-agent-id".into(), "child-original".into()),
+            (
+                "x-claude-code-parent-agent-id".into(),
+                "parent-original".into(),
+            ),
+        ];
+        let rewrite = UpstreamSessionRewrite {
+            message: Some(UpstreamSessionPoolResolve {
+                real_session_id: real.into(),
+                upstream_session_id: Some(target.into()),
+                action: UpstreamSessionPoolAction::Mapped,
+                active_count: 1,
+                oldest_last_seen_ms: None,
+                newest_last_seen_ms: None,
+            }),
+            ..Default::default()
+        };
+        let (mapped, outgoing, context) =
+            map_native_session(&original, &headers, &rewrite).unwrap();
+        assert_eq!(context, serde_json::json!({}), "显式子代理身份保持原来源");
+        assert_eq!(
+            extract_session_id_from_body(&mapped).as_deref(),
+            Some(target)
+        );
+        assert_eq!(
+            extract_session_id_from_body(&original).as_deref(),
+            Some(real)
+        );
+        for field in ["system", "messages", "thread"] {
+            assert_eq!(mapped[field], original[field]);
+        }
+        let user: Value =
+            serde_json::from_str(mapped["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(user["device_id"], "synthetic");
+        assert_eq!(user["extra"], "kept");
+        assert_eq!(outgoing[0].1, target);
+        assert_eq!(&outgoing[1..], &headers[1..]);
+        for invalid in [
+            vec![("x-claude-code-session-id".into(), target.into())],
+            vec![headers[0].clone(), headers[0].clone()],
+            vec![("x-claude-code-session-id".into(), String::new())],
+        ] {
+            assert!(native_pool_session(&invalid, &original).is_none());
+            assert!(map_native_session(&original, &invalid, &rewrite).is_err());
+        }
+        let head_only = serde_json::json!({"messages":[]});
+        let (mapped, outgoing, context) =
+            map_native_session(&head_only, &headers, &rewrite).unwrap();
+        assert_eq!(context, serde_json::json!({}));
+        assert_eq!(mapped.as_ref(), &head_only);
+        assert_eq!(
+            native_pool_session(&outgoing, &mapped).as_deref(),
+            Some(target)
+        );
+        assert!(native_pool_session(&[], &head_only).is_none());
+        let main_headers = vec![headers[0].clone()];
+        let (_, _, context) = map_native_session(&original, &main_headers, &rewrite).unwrap();
+        assert_eq!(context["agentKind"], "main");
+        assert_eq!(
+            context["agentId"], real,
+            "隐式主代理 ID 仍指向真实会话，供子代理关联"
+        );
+        let incomplete_child = vec![
+            headers[0].clone(),
+            ("x-claude-code-request-class".into(), "subagent".into()),
+        ];
+        let (_, _, context) = map_native_session(&head_only, &incomplete_child, &rewrite).unwrap();
+        assert_eq!(
+            context,
+            serde_json::json!({}),
+            "缺失子代理身份继续交原校验拒绝"
+        );
+        let (same, same_headers, _) =
+            map_native_session(&original, &headers, &UpstreamSessionRewrite::default()).unwrap();
+        assert_eq!(same.as_ref(), &original);
+        assert_eq!(same_headers.as_ref(), headers);
     }
 
     fn cli_bg_status_classifier_headers() -> HashMap<String, String> {
@@ -9651,6 +9942,7 @@ mod tests {
         use crate::service::runtime_transport::{SenderConfig, TransportBinding, sender_router};
         use std::env::{temp_dir, var};
         use std::fs;
+        use tokio::time::{Instant as TokioInstant, sleep as tokio_sleep};
 
         let unlimited = var("CCRB_TEST_UNLIMITED").as_deref() == Ok("1");
         let root = temp_dir().join(format!("cc2api-native-gateway-{}", Uuid::new_v4()));
@@ -9662,9 +9954,20 @@ mod tests {
         )
         .await;
         let mut account = create_gateway_account(&service, "gateway@example.test", 3, 0).await;
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "request_diagnostics_log_mode".into(),
+                "debug".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_request_log_mode().await.unwrap();
         account.account_uuid = Some("11111111-1111-4111-8111-111111111111".into());
         account.request_backend = "native293".into();
         account.setup_token = "synthetic-bearer-a".into();
+        account.upstream_session_pool_enabled = true;
+        account.upstream_session_pool_size = 1;
         store.update(&account).await.unwrap();
         reqwest::Client::builder().no_proxy().build().unwrap().post(format!("{}/identity", var("CCRB_TEST_CONTROL").unwrap().trim_end_matches('/')))
             .json(&serde_json::json!({"device_id":account.device_id,"account_uuid":account.account_uuid})).send().await.unwrap().error_for_status().unwrap();
@@ -9718,6 +10021,96 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
+        let control = var("CCRB_TEST_CONTROL").unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let before: Value = client
+            .get(&control)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        service.native_prewarmer.start_with_retries([5, 3600, 7200]);
+        let deadline = TokioInstant::now() + Duration::from_secs(45);
+        let prepared_pid = loop {
+            let status = service.native_preparation_status(account.id);
+            if status["state"] == "ready" {
+                break status["pid"].as_u64().unwrap();
+            }
+            assert!(TokioInstant::now() < deadline, "准备状态: {status}");
+            tokio_sleep(Duration::from_millis(20)).await;
+        };
+        let after: Value = client
+            .get(&control)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            before["messages"], after["messages"],
+            "完整网关预热保持零模型调用"
+        );
+        // 阻塞一次在途绑定读取，合并的新环境提示必须在原任务失败后继续处理。
+        for (skip, mode) in [(0, "fail"), (1, "generation")] {
+            client
+                .post(format!("{}/binding/arm", control.trim_end_matches('/')))
+                .json(&json!({"skip":skip,"mode":mode}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let previous_id =
+                service.native_preparation_status(account.id)["preparation_id"].clone();
+            service.account_svc.notify_native_change(account.id, false);
+            let deadline = TokioInstant::now() + Duration::from_secs(10);
+            loop {
+                let state: Value = client
+                    .get(&control)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if state["binding_waiting"] == true {
+                    break;
+                }
+                assert!(TokioInstant::now() < deadline, "绑定故障夹具未进入等待");
+                tokio_sleep(Duration::from_millis(10)).await;
+            }
+            if mode == "fail" {
+                service.account_svc.notify_native_change(account.id, false);
+                service.account_svc.notify_native_change(account.id, false);
+                tokio_sleep(Duration::from_millis(30)).await;
+            }
+            client
+                .post(format!("{}/binding/release", control.trim_end_matches('/')))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let deadline = TokioInstant::now() + Duration::from_secs(10);
+            loop {
+                let state = service.native_preparation_status(account.id);
+                if mode == "fail"
+                    && state["state"] == "ready"
+                    && state["preparation_id"] != previous_id
+                {
+                    assert_eq!(state["pid"].as_u64(), Some(prepared_pid));
+                    break;
+                }
+                if mode == "generation" && state["state"] == "failed" {
+                    break;
+                }
+                assert!(TokioInstant::now() < deadline, "通知/迟到代次回归: {state}");
+                tokio_sleep(Duration::from_millis(10)).await;
+            }
+        }
         for (label, expected) in [("gateway-normal", 200), ("gateway-error", 401)] {
             let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":label},{"type":"text","text":"synthetic-client-gateway"}]}]})), None).await;
             assert!(response.headers().get("x-v3-native-observation").is_none());
@@ -9735,6 +10128,14 @@ mod tests {
         axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
+        let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,
+            "messages":[{"role":"user","content":"gateway-mapped-main"}],
+            "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=12345; cc_prompt_id=55555555-5555-4555-8555-555555555555; cc_turn_origin=human;"}],
+            "metadata":{"user_id":serde_json::json!({"device_id":"c".repeat(64),"account_uuid":"44444444-4444-4444-8444-444444444444","session_id":"33333333-3333-4333-8333-333333333333"}).to_string()}})), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let mut agent = request(
             serde_json::json!({"model":"claude-sonnet-4-6","stream":true,"max_tokens":64,
             "messages":[{"role":"user","content":"gateway-agent"},
@@ -9746,7 +10147,10 @@ mod tests {
         for (name, value) in [
             ("x-claude-code-request-class", "subagent"),
             ("x-claude-code-agent-id", "child-fixture"),
-            ("x-claude-code-parent-agent-id", "parent-fixture"),
+            (
+                "x-claude-code-parent-agent-id",
+                "33333333-3333-4333-8333-333333333333",
+            ),
             ("x-claude-code-agent-type", "Explore"),
             (
                 "x-claude-code-session-id",
@@ -9770,13 +10174,18 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("toolu_returned"));
         assert!(String::from_utf8_lossy(&bytes).contains("message_stop"));
         let queue = service.account_svc.get_or_create_queue(account.id, 3).await;
+        assert!(
+            fs::metadata(format!("/proc/{prepared_pid}/exe")).is_ok(),
+            "业务复用准备好的物理进程"
+        );
+        assert_eq!(fs::read_dir(root.join("workers")).unwrap().count(), 1);
         assert_eq!(queue.runtime_gate.snapshot()["active"], 0);
         assert_eq!(
             fs::read_to_string(root.join("evidence.jsonl"))
                 .unwrap()
                 .lines()
                 .count(),
-            4
+            5
         );
         let diagnostics = service.diagnostics_store().unwrap();
         diagnostics.flush().await.unwrap();
@@ -9787,7 +10196,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(page.total, 4);
+        assert_eq!(page.total, 5);
         let records: Vec<serde_json::Value> = fs::read_to_string(root.join("evidence.jsonl"))
             .unwrap()
             .lines()
@@ -9796,6 +10205,12 @@ mod tests {
         for request in page.items {
             assert_eq!(request.attempt_count, 1);
             let detail = diagnostics.detail(&request.request_id).await.unwrap();
+            if detail.attempts[0].sessions.mapping_action.as_deref() == Some("mapped") {
+                assert_ne!(
+                    detail.attempts[0].sessions.real_session_hash,
+                    detail.attempts[0].sessions.upstream_session_hash
+                );
+            }
             assert!(
                 records
                     .iter()
@@ -9836,6 +10251,105 @@ mod tests {
                 Some("claude-sonnet-4-6")
             );
         }
+        account.setup_token = "synthetic-bearer-b".into();
+        service.account_svc.update_account(&account).await.unwrap();
+        let deadline = TokioInstant::now() + Duration::from_secs(45);
+        let rotated_pid = loop {
+            let status = service.native_preparation_status(account.id);
+            if status["state"] == "ready"
+                && status["pid"]
+                    .as_u64()
+                    .is_some_and(|pid| pid != prepared_pid)
+            {
+                break status["pid"].as_u64().unwrap();
+            }
+            assert!(TokioInstant::now() < deadline, "凭据轮换准备状态: {status}");
+            tokio_sleep(Duration::from_millis(20)).await;
+        };
+        assert!(fs::metadata(format!("/proc/{prepared_pid}/exe")).is_err());
+        let environment = fs::read(format!("/proc/{rotated_pid}/environ")).unwrap();
+        assert!(
+            environment
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == b"CLAUDE_CODE_OAUTH_TOKEN=synthetic-bearer-b")
+        );
+        let observed: Value = client
+            .get(&control)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            observed["messages"].as_array().unwrap().len()
+                - before["messages"].as_array().unwrap().len(),
+            5,
+            "凭据更新后重新准备保持零额外模型调用"
+        );
+        service
+            .settings_store
+            .upsert_many(&HashMap::from([(
+                "request_diagnostics_log_mode".into(),
+                "info".into(),
+            )]))
+            .await
+            .unwrap();
+        service.reload_request_log_mode().await.unwrap();
+        let captures_before = fs::read_dir(&capture_directory).unwrap().count();
+        let queue = service
+            .account_svc
+            .get_or_create_queue(account.id, account.concurrency)
+            .await;
+        let held = queue.acquire(Duration::from_secs(1), 6).await.unwrap();
+        let queued_request = request(
+            json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"gateway-info"}]}),
+        );
+        let (response, ()) = tokio::join!(service.handle_request(queued_request, None), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while queue.waiting_count() == 0 {
+                    tokio_sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "request_diagnostics_log_mode".into(),
+                    "debug".into(),
+                )]))
+                .await
+                .unwrap();
+            service.reload_request_log_mode().await.unwrap();
+            drop(held);
+        });
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers()["x-cc2api-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let diagnostics = service.diagnostics_store().unwrap();
+        diagnostics.flush().await.unwrap();
+        let detail = diagnostics.detail(&request_id).await.unwrap();
+        assert_eq!(detail.request.log_mode, Some(RequestLogMode::Info));
+        assert_eq!(detail.attempts[0].log_mode, Some(RequestLogMode::Info));
+        assert_eq!(
+            detail.attempts[0].capture_status.as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(
+            fs::read_dir(&capture_directory).unwrap().count(),
+            captures_before,
+            "排队时切换模式仍保持 info 完整内容零落盘"
+        );
+        assert!(
+            fs::metadata(format!("/proc/{rotated_pid}/exe")).is_ok(),
+            "日志模式切换复用当前暖进程"
+        );
         sender.abort();
         let _ = sender.await;
         fs::remove_dir_all(root).unwrap();
@@ -18339,10 +18853,48 @@ data: {"type":"message_delta","delta":{"safeguard_results":[{"type":"dangerous_t
         }
     }
 
-    #[test]
-    fn cli_bg_summary_only_policy_disables_full_capture() {
-        assert!(RequestCapturePolicy::Configured.allows_full_capture());
+    #[tokio::test]
+    async fn cli_bg_summary_only_policy_disables_full_capture() {
+        assert!(!RequestCapturePolicy::Configured.allows_full_capture());
         assert!(!RequestCapturePolicy::SummaryOnly.allows_full_capture());
+        diagnostics::CURRENT_LOG_MODE
+            .scope(RequestLogMode::Debug, async {
+                assert!(RequestCapturePolicy::Configured.allows_full_capture());
+                assert!(!RequestCapturePolicy::SummaryOnly.allows_full_capture());
+            })
+            .await;
+    }
+
+    /// 读取失败保留已生效模式，历史非法设置沿安全默认值处理。
+    #[tokio::test]
+    async fn request_log_mode_reload_preserves_effective_cache_on_failure() {
+        use sqlx::any::AnyPoolOptions;
+        let mut service = test_gateway_service().await;
+        assert_eq!(service.request_log_mode().await, RequestLogMode::Info);
+        for (raw, expected) in [
+            ("debug", RequestLogMode::Debug),
+            ("invalid", RequestLogMode::Info),
+            ("debug", RequestLogMode::Debug),
+        ] {
+            service
+                .settings_store
+                .upsert_many(&HashMap::from([(
+                    "request_diagnostics_log_mode".into(),
+                    raw.into(),
+                )]))
+                .await
+                .unwrap();
+            service.reload_request_log_mode().await.unwrap();
+            assert_eq!(service.request_log_mode().await, expected);
+        }
+        let closed = AnyPoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        closed.close().await;
+        service.settings_store = Arc::new(SettingsStore::new(closed));
+        assert!(service.reload_request_log_mode().await.is_err());
+        assert_eq!(service.request_log_mode().await, RequestLogMode::Debug);
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub const DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS: &str =
     "claude-fable-5,claude-opus-5,claude-opus-4-8,claude-opus-4-7";
 /// 429 请求观测日志默认关闭,避免默认记录用户请求内容。
 pub const DEFAULT_LOG_429_REQUEST_ENABLED: &str = "false";
+/// 请求诊断默认只保存摘要，完整内容由管理员显式开启。
+pub const DEFAULT_REQUEST_DIAGNOSTICS_LOG_MODE: &str = "info";
 /// 非流式 `/v1/messages` 请求观测日志默认关闭,避免默认记录用户请求内容。
 pub const DEFAULT_LOG_NON_STREAM_REQUEST_ENABLED: &str = "false";
 /// 非流式单消息探针缓存默认关闭,避免升级后改变上游请求行为。

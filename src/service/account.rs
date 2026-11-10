@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{
+    Mutex as AsyncMutex, MutexGuard, OwnedSemaphorePermit, RwLock, Semaphore, broadcast,
+};
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -619,6 +621,7 @@ impl AccountQueue {
 
 /// 统一账号硬资格、凭据及并发；v3 按需装配持久调度。
 pub struct AccountService {
+    native_changes: broadcast::Sender<(i64, bool)>,
     credential_gates: Mutex<HashMap<i64, Arc<CredentialGate>>>,
     scheduler: Option<Arc<V3Scheduler>>,
     v3_settings_lock: AsyncMutex<()>,
@@ -758,6 +761,7 @@ impl AccountService {
         oauth_token_url: String,
     ) -> Self {
         Self {
+            native_changes: broadcast::channel(128).0,
             store,
             cache,
             oauth_token_url,
@@ -789,6 +793,20 @@ impl AccountService {
     /// @return 非 v3 为 None。
     pub fn scheduler(&self) -> Option<&Arc<V3Scheduler>> {
         self.scheduler.as_ref()
+    }
+
+    /// 订阅账号原生准备事件，事件只含归属与失效标记。
+    /// @return 有界广播接收器。
+    pub(crate) fn subscribe_native_changes(&self) -> broadcast::Receiver<(i64, bool)> {
+        self.native_changes.subscribe()
+    }
+
+    /// 发布准备通知，实际消费者重新读取账号及当前凭据。
+    /// @param id 已持久化账号 ID。
+    /// @param invalidate 是否取消正在使用旧快照的准备。
+    /// @return 无返回值。
+    pub(crate) fn notify_native_change(&self, id: i64, invalidate: bool) {
+        let _ = self.native_changes.send((id, invalidate));
     }
 
     /// 从数据库加载评分权重到内存缓存，启动时和更新设置后调用。
@@ -1014,6 +1032,7 @@ impl AccountService {
         if let Some(scheduler) = &self.scheduler {
             scheduler.account_updated(a.id);
         }
+        self.notify_native_change(a.id, true);
         Ok(())
     }
 
@@ -1046,6 +1065,20 @@ impl AccountService {
         if let Some(scheduler) = &self.scheduler {
             scheduler.account_updated(account.id);
         }
+        if fields.iter().any(|field| {
+            matches!(
+                *field,
+                "request_backend"
+                    | "status"
+                    | "concurrency"
+                    | "device_id"
+                    | "account_uuid"
+                    | "organization_uuid"
+                    | "email"
+            )
+        }) {
+            self.notify_native_change(account.id, true);
+        }
         Ok(())
     }
 
@@ -1064,10 +1097,11 @@ impl AccountService {
         if let Some(scheduler) = &self.scheduler {
             scheduler.store.delete_account(id).await?;
             scheduler.forget_account(id);
-            Ok(())
         } else {
-            self.store.delete(id).await
+            self.store.delete(id).await?;
         }
+        self.notify_native_change(id, true);
+        Ok(())
     }
 
     pub async fn get_account(&self, id: i64) -> Result<Account, AppError> {
@@ -2226,6 +2260,7 @@ impl AccountService {
                 ownership.as_ref(),
             )
             .await?;
+        self.notify_native_change(id, true);
         oauth_import_snapshot(self.store.get_by_id(id).await?)
     }
 }
@@ -2448,6 +2483,7 @@ impl AccountService {
                 if let Some(change) = &ownership_restore {
                     self.finish_owned_refresh(change).await?;
                 }
+                self.notify_native_change(id, true);
                 self.store.get_by_id(id).await
             }
             Err(err) => {
@@ -2496,7 +2532,9 @@ impl AccountService {
         id: i64,
         reset_at: chrono::DateTime<Utc>,
     ) -> Result<(), AppError> {
-        self.store.set_rate_limit(id, reset_at).await
+        self.store.set_rate_limit(id, reset_at).await?;
+        self.notify_native_change(id, true);
+        Ok(())
     }
 
     pub async fn disable_account(
@@ -2508,7 +2546,9 @@ impl AccountService {
     ) -> Result<(), AppError> {
         self.store
             .disable_account(id, status, reason, rate_limit_reset_at)
-            .await
+            .await?;
+        self.notify_native_change(id, true);
+        Ok(())
     }
 
     /// 因上游认证失败永久停用账号。
@@ -2517,7 +2557,9 @@ impl AccountService {
     /// @param reason 不包含凭据内容的认证失败原因。
     /// @return 更新成功时返回空值。
     pub async fn disable_for_auth_failure(&self, id: i64, reason: &str) -> Result<(), AppError> {
-        self.store.disable_for_auth_failure(id, reason).await
+        self.store.disable_for_auth_failure(id, reason).await?;
+        self.notify_native_change(id, true);
+        Ok(())
     }
 
     /// 仅停用永久凭据失败的原快照，避免迟到回调污染重授权。
@@ -2529,10 +2571,14 @@ impl AccountService {
         expected: &Account,
         reason: &str,
     ) -> Result<(), AppError> {
-        self.store
+        let changed = self
+            .store
             .disable_for_auth_failure_if_current(expected, reason)
-            .await
-            .map(|_| ())
+            .await?;
+        if changed {
+            self.notify_native_change(expected.id, true);
+        }
+        Ok(())
     }
 
     /// 只停用实际收到 401 的当前 OAuth 凭据。
@@ -2557,13 +2603,20 @@ impl AccountService {
             return Ok(false);
         }
         // 恢复可能已经轮换 RT，重读后仍按 AT/RT 条件落库，防止第二次并发变化。
-        self.store
+        let changed = self
+            .store
             .disable_for_auth_failure_if_current(&current, reason)
-            .await
+            .await?;
+        if changed {
+            self.notify_native_change(id, true);
+        }
+        Ok(changed)
     }
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
-        self.store.enable_account(id).await
+        self.store.enable_account(id).await?;
+        self.notify_native_change(id, true);
+        Ok(())
     }
 
     /// 处理上游返回 429 的情况。
@@ -4686,6 +4739,7 @@ mod tests {
     #[tokio::test]
     async fn ownership_return_is_atomic_idempotent_and_old_reply_cannot_reopen() {
         let (store, _settings, service, account, mut input) = ownership_fixture().await;
+        let mut native_changes = service.subscribe_native_changes();
         service
             .credential_handoff(account.id, &input)
             .await
@@ -4720,12 +4774,19 @@ mod tests {
             "local-latest-rt"
         );
         assert!(service.upstream_activity(account.id).await.is_err());
+        while native_changes.try_recv().is_ok() {}
         input.action = "finish".into();
         service
             .credential_handoff(account.id, &input)
             .await
             .unwrap();
         drop(service.upstream_activity(account.id).await.unwrap());
+        assert_eq!(native_changes.try_recv().unwrap(), (account.id, true));
+        service
+            .credential_handoff(account.id, &input)
+            .await
+            .unwrap();
+        assert_eq!(native_changes.try_recv().unwrap(), (account.id, true));
         let current = store.get_by_id(account.id).await.unwrap();
         store
             .update_oauth_tokens_if_current(

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::model::request_diagnostics::RequestLogMode;
 use crate::service::native_contract::NativeSubmission;
 
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -192,7 +193,11 @@ fn save(directory: &Path, submission: &NativeSubmission, payload: &Value) -> io:
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| Uuid::parse_str(name).is_ok())
         {
-            let metadata = fs::symlink_metadata(&path)?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if !metadata.is_file() {
                 return Err(io::ErrorKind::InvalidData.into());
             }
@@ -207,7 +212,12 @@ fn save(directory: &Path, submission: &NativeSubmission, payload: &Value) -> io:
         if count < FILE_LIMIT && total + bytes.len() as u64 <= STORAGE_LIMIT {
             break;
         }
-        fs::remove_file(path)?;
+        // 独立的按天清理可能已回收该旧文件，缺失仍代表空间已释放。
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         count -= 1;
         total -= length;
     }
@@ -237,6 +247,10 @@ pub(crate) async fn record(
     submission: &NativeSubmission,
     payload: &Value,
 ) -> String {
+    // 在克隆正文和申请磁盘写入之前执行同次模式门控。
+    if submission.log_mode != RequestLogMode::Debug {
+        return "disabled".into();
+    }
     let Some(directory) = directory else {
         return "disabled".into();
     };
@@ -267,11 +281,33 @@ pub(crate) async fn record(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn info_short_circuits_before_creating_capture_files() {
+        let mut submission = submission();
+        submission.log_mode = RequestLogMode::Info;
+        let root = std::env::temp_dir().join(format!("info-capture-{}", Uuid::new_v4()));
+        assert_eq!(
+            record(root.to_str(), &submission, &json!({"body":"无效采集输入"})).await,
+            "disabled"
+        );
+        assert!(!root.exists());
+        let mut value = serde_json::to_value(&submission).unwrap();
+        value.as_object_mut().unwrap().remove("log_mode");
+        assert_eq!(
+            serde_json::from_value::<NativeSubmission>(value.clone())
+                .unwrap()
+                .log_mode,
+            RequestLogMode::Info
+        );
+        value["log_mode"] = json!("trace");
+        assert!(serde_json::from_value::<NativeSubmission>(value).is_err());
+    }
+
     fn submission() -> NativeSubmission {
         serde_json::from_value(json!({
             "request":{"account_id":7,"environment_id":"synthetic","generation":1,"request_id":Uuid::new_v4().to_string(),
                 "deadline_unix_ms":1,"method":"POST","target_url":"https://api.anthropic.com/v1/messages","headers":[],"preserve_header_casing":false},
-            "input":{"body":{"metadata":{"access_token":"echo-secret"}}},"bearer":"synthetic-bearer",
+            "log_mode":"debug","input":{"body":{"metadata":{"access_token":"echo-secret"}}},"bearer":"synthetic-bearer",
             "device_id":"a".repeat(64),"account_uuid":null,"organization_uuid":null,"email":"fixture@example.test","concurrency":2
         })).unwrap()
     }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::time::Instant;
 
 use crate::error::AppError;
+use crate::service::native_contract::{NativePreparationControl, NativePreparationStatus};
 pub use crate::service::native_contract::{
     NativeSenderConfig, NativeSubmission, POOL_MEMORY_MIB, WORKER_MEMORY_MIB,
 };
@@ -23,6 +24,36 @@ pub(crate) fn verify_distribution(_config: &NativeSenderConfig) -> Result<File, 
 pub struct NativePool;
 
 impl NativePool {
+    /// 在能力查询时明确拒绝不支持的平台。
+    /// @param config 部署配置。
+    /// @return 受控平台错误。
+    pub(crate) fn verify(&self, config: &NativeSenderConfig) -> Result<(), AppError> {
+        verify_distribution(config).map(|_| ())
+    }
+
+    /// 在准备阶段明确拒绝不支持的平台。
+    /// @param config sender 配置。
+    /// @param identity 账号启动身份。
+    /// @param deadline 准备截止。
+    /// @return 受控平台错误。
+    pub(crate) async fn prepare(
+        self: &Arc<Self>,
+        _config: SenderConfig,
+        _identity: NativeSubmission,
+        _deadline: Instant,
+    ) -> Result<NativePreparationStatus, AppError> {
+        Err(AppError::ServiceUnavailable(
+            "原生运行时需要 Linux x64 平台".into(),
+        ))
+    }
+
+    /// 其它平台没有可取消的原生准备。
+    /// @param control 控制标识。
+    /// @return false。
+    pub(crate) fn cancel_preparation(&self, _control: &NativePreparationControl) -> bool {
+        false
+    }
+
     /// 在创建任何作业之前拒绝不支持的平台。
     /// @param config 当前 sender 配置。
     /// @param submission 受信任网关的冻结请求。

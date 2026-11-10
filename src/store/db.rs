@@ -2,6 +2,7 @@ use crate::service::version_profile::ClaudeCodeProfile;
 use crate::store::diagnostics_store::DiagnosticsStore;
 use crate::store::scheduling_store::SchedulingStore;
 use crate::store::settings_store::DEFAULT_MESSAGE_TOP_FIELD_FILTER_ENABLED;
+use crate::store::settings_store::DEFAULT_REQUEST_DIAGNOSTICS_LOG_MODE;
 use crate::store::settings_store::V3_SCHEDULING_DEFAULTS;
 use crate::store::usage_store::UsageStore;
 use sqlx::{AnyConnection, AnyPool};
@@ -381,6 +382,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             crate::store::settings_store::DEFAULT_INTERCEPT_ASSISTANT_PREFILL_MODELS,
         ),
         // 429 请求观测默认关闭,开启后只输出脱敏和截断后的请求信息。
+        ("request_diagnostics_log_mode", DEFAULT_REQUEST_DIAGNOSTICS_LOG_MODE),
         (
             "log_429_request_enabled",
             crate::store::settings_store::DEFAULT_LOG_429_REQUEST_ENABLED,
@@ -1394,6 +1396,25 @@ mod tests {
                 .unwrap();
             assert_eq!(value, stored.unwrap_or("true"));
         }
+    }
+
+    /// 新旧库仅补缺失模式，重复迁移保留管理员显式 debug。
+    #[tokio::test]
+    async fn migrate_request_log_mode_preserves_explicit_debug() {
+        let pool = make_sqlite_pool().await;
+        migrate(&pool, "sqlite").await.unwrap();
+        let read = || {
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM settings WHERE key='request_diagnostics_log_mode'",
+            )
+        };
+        assert_eq!(read().fetch_one(&pool).await.unwrap(), "info");
+        sqlx::query("UPDATE settings SET value='debug' WHERE key='request_diagnostics_log_mode'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate(&pool, "sqlite").await.unwrap();
+        assert_eq!(read().fetch_one(&pool).await.unwrap(), "debug");
     }
 
     #[tokio::test]

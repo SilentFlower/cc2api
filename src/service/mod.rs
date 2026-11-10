@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod gateway;
 mod native_capture;
 mod native_contract;
+mod native_prewarm;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod native_runtime;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]

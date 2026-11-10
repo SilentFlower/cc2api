@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
@@ -18,7 +19,23 @@ const QUEUE_CAPACITY: usize = 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 const FILTER: &str = "WHERE ($1=0 OR r.account_id=$1 OR EXISTS(SELECT 1 FROM request_diagnostic_attempts a WHERE a.request_id=r.request_id AND a.account_id=$1))
  AND ($2='' OR r.request_id=$2 OR r.response_request_id=$2 OR EXISTS(SELECT 1 FROM request_diagnostic_attempts a WHERE a.request_id=r.request_id AND a.upstream_request_id=$2))
- AND ($3='' OR r.outcome=$3) AND ($4='' OR r.started_at >= $4) AND ($5='' OR r.started_at < $5)";
+ AND ($3='' OR r.outcome=$3) AND ($4='' OR r.started_at >= $4) AND ($5='' OR r.started_at < $5)
+ AND (r.started_at >= $6 OR $7 LIKE '%\"' || r.request_id || '\"%')";
+
+/// 当前进程真实请求的保留许可，终结与异常 Drop 均释放。
+pub(crate) struct ActiveDiagnostic {
+    active: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for ActiveDiagnostic {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
 
 /// 一次无正文的诊断写入；尝试完成时同时保证父请求存在。
 pub(crate) struct DiagnosticEvent {
@@ -38,6 +55,7 @@ pub struct DiagnosticsStore {
     dropped: Arc<AtomicU64>,
     failures: Arc<AtomicU64>,
     observation_failures: AtomicU64,
+    active: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DiagnosticsStore {
@@ -50,6 +68,8 @@ impl DiagnosticsStore {
         let failures = Arc::new(AtomicU64::new(0));
         let writer_pool = pool.clone();
         let writer_failures = failures.clone();
+        let active = Arc::new(Mutex::new(HashSet::new()));
+        let writer_active = active.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             loop {
@@ -65,7 +85,7 @@ impl DiagnosticsStore {
                         None => break,
                     },
                     _ = interval.tick() => {
-                        if prune(&writer_pool, Utc::now()).await.is_err() {
+                        if prune(&writer_pool, Utc::now(), &writer_active).await.is_err() {
                             writer_failures.fetch_add(1, Ordering::Relaxed);
                             warn!("请求诊断历史清理失败");
                         }
@@ -79,6 +99,21 @@ impl DiagnosticsStore {
             dropped,
             failures,
             observation_failures: AtomicU64::new(0),
+            active,
+        }
+    }
+
+    /// 在首条记录入队前登记真实请求，历史 unfinished 记录不产生许可。
+    /// @param id 当前网关生成的内部请求 UUID。
+    /// @return 随请求终结释放的许可。
+    pub(crate) fn track_request(&self, id: &str) -> ActiveDiagnostic {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id.to_owned());
+        ActiveDiagnostic {
+            active: self.active.clone(),
+            id: id.to_owned(),
         }
     }
 
@@ -184,6 +219,8 @@ impl DiagnosticsStore {
             return Err(AppError::BadRequest("诊断时间范围无效".into()));
         }
         let account = query.account_id.unwrap_or(0);
+        let cutoff = retention_cutoff(Utc::now());
+        let active = active_json(&self.active);
         let sql = format!("SELECT CAST(COUNT(*) AS BIGINT) FROM request_diagnostics r {FILTER}");
         let total: i64 = sqlx::query_scalar(&sql)
             .bind(account)
@@ -191,11 +228,13 @@ impl DiagnosticsStore {
             .bind(&outcome)
             .bind(&since)
             .bind(&until)
+            .bind(&cutoff)
+            .bind(&active)
             .fetch_one(&self.pool)
             .await
             .map_err(|_| unavailable())?;
         let sql = format!(
-            "SELECT r.summary_json FROM request_diagnostics r {FILTER} ORDER BY r.started_at DESC,r.request_id DESC LIMIT $6 OFFSET $7"
+            "SELECT r.summary_json FROM request_diagnostics r {FILTER} ORDER BY r.started_at DESC,r.request_id DESC LIMIT $8 OFFSET $9"
         );
         let rows = sqlx::query(&sql)
             .bind(account)
@@ -203,6 +242,8 @@ impl DiagnosticsStore {
             .bind(&outcome)
             .bind(&since)
             .bind(&until)
+            .bind(&cutoff)
+            .bind(&active)
             .bind(i64::from(page_size))
             .bind(i64::from(page - 1) * i64::from(page_size))
             .fetch_all(&self.pool)
@@ -230,8 +271,10 @@ impl DiagnosticsStore {
     /// @return 请求详情；不存在时返回 NotFound。
     pub async fn detail(&self, request_id: &str) -> Result<DiagnosticDetail, AppError> {
         let value: Option<String> =
-            sqlx::query_scalar("SELECT summary_json FROM request_diagnostics WHERE request_id=$1")
+            sqlx::query_scalar("SELECT summary_json FROM request_diagnostics r WHERE request_id=$1 AND (started_at >= $2 OR $3 LIKE '%\"' || r.request_id || '\"%')")
                 .bind(request_id)
+                .bind(retention_cutoff(Utc::now()))
+                .bind(active_json(&self.active))
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|_| unavailable())?;
@@ -308,13 +351,29 @@ async fn write_event(pool: &AnyPool, event: &DiagnosticEvent) -> Result<(), sqlx
     tx.commit().await
 }
 
-async fn prune(pool: &AnyPool, now: DateTime<Utc>) -> Result<(), sqlx::Error> {
-    let cutoff = (now - ChronoDuration::days(8)).to_rfc3339_opts(SecondsFormat::Millis, true);
+fn retention_cutoff(now: DateTime<Utc>) -> String {
+    (now - ChronoDuration::days(7)).to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn active_json(active: &Mutex<HashSet<String>>) -> String {
+    // 请求 ID 为内部标准 UUID；JSON 引号分隔成员，SQL 参数保持固定字符串类型。
+    serde_json::to_string(&*active.lock().unwrap_or_else(|error| error.into_inner()))
+        .unwrap_or_default()
+}
+
+async fn prune(
+    pool: &AnyPool,
+    now: DateTime<Utc>,
+    active: &Mutex<HashSet<String>>,
+) -> Result<(), sqlx::Error> {
+    let cutoff = retention_cutoff(now);
+    let active = active_json(active);
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM request_diagnostic_attempts WHERE request_id IN (SELECT request_id FROM request_diagnostics WHERE started_at < $1)")
-        .bind(&cutoff).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM request_diagnostics WHERE started_at < $1")
+    sqlx::query("DELETE FROM request_diagnostic_attempts WHERE request_id IN (SELECT request_id FROM request_diagnostics WHERE started_at < $1 AND $2 NOT LIKE '%\"' || request_id || '\"%')")
+        .bind(&cutoff).bind(&active).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM request_diagnostics WHERE started_at < $1 AND $2 NOT LIKE '%\"' || request_id || '\"%'")
         .bind(cutoff)
+        .bind(active)
         .execute(&mut *tx)
         .await?;
     tx.commit().await
@@ -336,6 +395,7 @@ mod tests {
     fn request(at: DateTime<Utc>) -> RequestDiagnostic {
         let request_id = Uuid::new_v4().to_string();
         RequestDiagnostic {
+            log_mode: None,
             request_id: request_id.clone(),
             started_at: at.to_rfc3339_opts(SecondsFormat::Millis, true),
             finished_at: Some(at.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -350,6 +410,7 @@ mod tests {
 
     fn attempt(request: &RequestDiagnostic) -> AttemptDiagnostic {
         AttemptDiagnostic {
+            log_mode: None,
             capture_status: None,
             attempt_id: Uuid::new_v4().to_string(),
             request_id: request.request_id.clone(),
@@ -389,8 +450,8 @@ mod tests {
         DiagnosticsStore::migrate(&pool).await.unwrap();
         // 用未来一天作为裁剪参考，使后台真实时钟不会影响精确边界断言。
         let now = Utc::now() + ChronoDuration::days(1);
-        let old = request(now - ChronoDuration::days(8) - ChronoDuration::seconds(1));
-        let mut boundary = request(now - ChronoDuration::days(8));
+        let old = request(now - ChronoDuration::days(7) - ChronoDuration::seconds(1));
+        let mut boundary = request(now - ChronoDuration::days(7));
         boundary.account_id = None;
         boundary.attempt_count = 0;
         let current = request(now);
@@ -463,7 +524,7 @@ mod tests {
         )
         .await
         .unwrap();
-        prune(&pool, now).await.unwrap();
+        prune(&pool, now, &Default::default()).await.unwrap();
         let store = DiagnosticsStore::new(pool.clone());
         store.flush().await.unwrap();
         let by_id = store
@@ -550,12 +611,73 @@ mod tests {
         reader.close().await;
     }
 
-    /// 验证 SQLite 独立连接、重启、重复终结、查询和八天保留。
+    /// 验证 SQLite 独立连接、重启、重复终结、查询和七天保留。
     #[tokio::test]
     async fn sqlite_diagnostics_storage_contract() {
         let path = std::env::temp_dir().join(format!("cc2api-diagnostics-{}.db", Uuid::new_v4()));
         storage_contract(&format!("sqlite:{}?mode=rwc", path.display())).await;
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 真实许可保护在途请求，结束后隐藏并回收，重启遗留 unfinished 按时间处理。
+    #[tokio::test]
+    async fn retention_protects_live_requests_and_expires_stale_unfinished_records() {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        DiagnosticsStore::migrate(&pool).await.unwrap();
+        let store = DiagnosticsStore::new(pool.clone());
+        store.flush().await.unwrap();
+        let now = Utc::now();
+        let mut live = request(now - ChronoDuration::days(8));
+        live.finished_at = None;
+        live.outcome = "in_progress".into();
+        let stale = request(now - ChronoDuration::days(8));
+        let guard = store.track_request(&live.request_id);
+        for item in [&live, &stale] {
+            write_event(
+                &pool,
+                &DiagnosticEvent {
+                    request: item.clone(),
+                    attempt: Some(attempt(item)),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            store.list(DiagnosticQuery::default()).await.unwrap().total,
+            1
+        );
+        assert!(matches!(
+            store.detail(&stale.request_id).await,
+            Err(AppError::NotFound)
+        ));
+        prune(&pool, now, &store.active).await.unwrap();
+        assert_eq!(
+            store.detail(&live.request_id).await.unwrap().attempts.len(),
+            1
+        );
+        drop(guard);
+        assert!(matches!(
+            store.detail(&live.request_id).await,
+            Err(AppError::NotFound)
+        ));
+        prune(&pool, now, &store.active).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(COUNT(*) AS BIGINT) FROM request_diagnostic_attempts"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        drop(store);
+        pool.close().await;
     }
 
     /// 在独立临时 PostgreSQL 上执行完全相同的存储契约。

@@ -3,9 +3,43 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// 请求入口冻结的内容记录级别；历史私有作业默认只保存摘要。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestLogMode {
+    #[default]
+    Info,
+    Debug,
+}
+
+impl RequestLogMode {
+    /// 返回管理设置使用的稳定字符串。
+    /// @return info 或 debug。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+
+    /// 解析管理端字符串，未知值由调用边界明确处理。
+    /// @param value 设置中的原始字符串。
+    /// @return 已知模式或 None。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            _ => None,
+        }
+    }
+}
+
 /// 一次已鉴权 messages 请求的诊断摘要；不包含请求或响应正文。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestDiagnostic {
+    /// 本次实际模式；旧记录保持未知。
+    #[serde(default)]
+    pub log_mode: Option<RequestLogMode>,
     pub request_id: String,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -137,6 +171,9 @@ impl From<[Option<u64>; 6]> for DiagnosticTokens {
 /// 一次真实发送尝试，包括重试和未完整返回的流。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttemptDiagnostic {
+    /// 与根请求同次冻结的模式；历史缺失保持未知。
+    #[serde(default)]
+    pub log_mode: Option<RequestLogMode>,
     /// 私有正文采集状态；旧记录为空。
     #[serde(default)]
     pub capture_status: Option<String>,

@@ -1,6 +1,7 @@
 //! 原生 sender 的跨平台私有合同；平台执行实现由 native_runtime 选择。
 
 use crate::error::AppError;
+use crate::model::request_diagnostics::RequestLogMode;
 use crate::service::runtime_transport::PreparedRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +27,9 @@ pub struct NativeSenderConfig {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSubmission {
+    /// 仅由受信任网关冻结，不从调用方信封读取。
+    #[serde(default)]
+    pub log_mode: RequestLogMode,
     pub request: PreparedRequest,
     pub input: Value,
     pub bearer: String,
@@ -34,6 +38,49 @@ pub struct NativeSubmission {
     pub organization_uuid: Option<String>,
     pub email: String,
     pub concurrency: i32,
+}
+
+/// 零模型准备的账号身份与绑定；秘密仅在受鉴权私有接口传递。
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePreparation {
+    pub account_id: i64,
+    pub environment_id: String,
+    pub generation: u64,
+    pub preparation_id: String,
+    pub deadline_unix_ms: u64,
+    pub bearer: String,
+    pub device_id: String,
+    pub account_uuid: Option<String>,
+    pub organization_uuid: Option<String>,
+    pub email: String,
+    pub concurrency: i32,
+}
+
+/// 取消操作只携带准备归属，不能取消其它代次或业务请求。
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePreparationControl {
+    pub account_id: i64,
+    pub environment_id: String,
+    pub generation: u64,
+    pub preparation_id: String,
+}
+
+/// 实际进程握手后的准备结果；busy 表示当前业务持有全部暖进程。
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePreparationStatus {
+    pub state: String,
+    pub account_id: i64,
+    pub environment_id: String,
+    pub generation: u64,
+    pub preparation_id: String,
+    pub version: String,
+    pub raw_input_protocol: u32,
+    pub pid: Option<u32>,
+    pub idle_workers: usize,
+    pub reused: bool,
 }
 
 impl NativeSenderConfig {

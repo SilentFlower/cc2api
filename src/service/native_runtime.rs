@@ -1,6 +1,7 @@
 //! 固定 293 原生请求池；私有 IPC 只负责单次执行，业务准入由网关持有。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -26,7 +27,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_socks::{TargetAddr, tcp::Socks5Stream};
@@ -34,14 +35,19 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::error::AppError;
+#[cfg(test)]
+use crate::model::request_diagnostics::RequestLogMode;
 use crate::model::request_diagnostics::{
     DiagnosticParameters, NATIVE_OBSERVATION_HEADER, NativeRequestObservation,
 };
+use crate::service::native_contract::{NativePreparationControl, NativePreparationStatus};
 pub use crate::service::native_contract::{
     NativeSenderConfig, NativeSubmission, POOL_MEMORY_MIB, WORKER_MEMORY_MIB,
 };
 use crate::service::rewriter::extract_session_id_from_body;
-use crate::service::runtime_transport::{SenderConfig, validate_request};
+use crate::service::runtime_transport::{
+    CLOCK_SKEW_MS, REQUEST_BUDGET_MS, SenderConfig, validate_request,
+};
 
 const LAUNCHER_SHA256: &str = "a6998db0128cb3d0a9862f3b72e9e359e434840c9be4d57b69d56092847fd800";
 const IMAGE_SHA256: &str = "ea2cc610928260ca76054fc1818c7c83bb95efe183b06ce98e3d6be7dc31b9b1";
@@ -68,8 +74,8 @@ fn digest_file(file: &mut File) -> io::Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-/// 核验已登记的 Linux x64 分发文件。@param config 冻结部署配置。@return 只读执行句柄。
-pub(crate) fn verify_distribution(config: &NativeSenderConfig) -> Result<File, AppError> {
+// 能力查询与新进程启动共用资源校验，暖路径仍逐次检查预算。
+fn validate_distribution_config(config: &NativeSenderConfig) -> Result<(), AppError> {
     if config.max_workers == 0
         || (config.memory_mib != 0
             && config.max_workers as u64
@@ -79,6 +85,14 @@ pub(crate) fn verify_distribution(config: &NativeSenderConfig) -> Result<File, A
     {
         return Err(unavailable());
     }
+    Ok(())
+}
+
+/// 完整核验新进程使用的登记分发体，返回精确只读句柄。
+/// @param config 冻结的部署配置。
+/// @return 经完整摘要验证的文件。
+pub(crate) fn verify_distribution(config: &NativeSenderConfig) -> Result<File, AppError> {
+    validate_distribution_config(config)?;
     let mut file = OpenOptions::new()
         .read(true)
         .open(&config.binary_path)
@@ -94,6 +108,69 @@ pub(crate) fn verify_distribution(config: &NativeSenderConfig) -> Result<File, A
     Ok(file)
 }
 
+/// 完整核验时冻结的文件身份，包含无法通过恢复 mtime 隐去的 ctime。
+#[derive(PartialEq, Eq)]
+struct DistributionIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl From<fs::Metadata> for DistributionIdentity {
+    fn from(value: fs::Metadata) -> Self {
+        Self {
+            dev: value.dev(),
+            ino: value.ino(),
+            len: value.len(),
+            mode: value.mode(),
+            uid: value.uid(),
+            gid: value.gid(),
+            mtime: (value.mtime(), value.mtime_nsec()),
+            ctime: (value.ctime(), value.ctime_nsec()),
+        }
+    }
+}
+
+/// 仅缓存最后一份已核验且保持打开的分发体，大小恒定有界。
+struct VerifiedDistribution {
+    path: PathBuf,
+    identity: DistributionIdentity,
+    file: File,
+}
+
+fn validate_worker_identity(
+    config: &SenderConfig,
+    submission: &NativeSubmission,
+) -> Result<usize, AppError> {
+    if config.allowed_origin != "https://api.anthropic.com" {
+        return Err(unavailable());
+    }
+    let native = config.native.as_ref().ok_or_else(unavailable)?;
+    validate_distribution_config(native)?;
+    let slots = usize::try_from(submission.concurrency)
+        .ok()
+        .and_then(|v| v.checked_mul(2))
+        .filter(|v| *v > 0 && *v <= native.max_workers)
+        .ok_or_else(unavailable)?;
+    if submission.bearer.is_empty()
+        || submission.device_id.len() != 64
+        || !submission
+            .device_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || submission.input["request_id"] != submission.request.request_id
+        || submission.input["schema_version"] != 1
+    {
+        return Err(unavailable());
+    }
+    Ok(slots)
+}
+
 /// 池的当前代次与物理进程计数，仅在短互斥区内变更。
 #[derive(Default)]
 struct PoolState {
@@ -103,12 +180,30 @@ struct PoolState {
     reaper_running: bool,
 }
 
+/// 撤销与准备共用完整归属，旧代控制不会影响新环境中的同名标识。
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct PreparationKey {
+    account_id: i64,
+    environment_id: String,
+    generation: u64,
+    id: String,
+}
+
+/// 活动控制信号与有界的短期撤销记录。
+enum PreparationState {
+    Active(oneshot::Sender<()>),
+    Cancelled(Instant),
+}
+
 /// 一个账号 sender 的按需进程池；互斥锁只保护本地所有权变更。
 pub struct NativePool {
     state: Mutex<PoolState>,
     generation: tokio::sync::Mutex<()>,
     image: tokio::sync::Mutex<Option<Arc<File>>>,
     idle_timeout: Duration,
+    verified: Mutex<Option<VerifiedDistribution>>,
+    warmup: RwLock<()>,
+    preparations: Mutex<HashMap<PreparationKey, PreparationState>>,
 }
 
 impl Default for NativePool {
@@ -119,6 +214,26 @@ impl Default for NativePool {
             generation: tokio::sync::Mutex::new(()),
             image: tokio::sync::Mutex::new(None),
             idle_timeout: Duration::from_secs(60),
+            verified: Mutex::new(None),
+            warmup: RwLock::new(()),
+            preparations: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// 准备完成、异常或 future 取消时移除相应控制登记。
+struct PreparationLease {
+    pool: Weak<NativePool>,
+    key: PreparationKey,
+}
+
+impl Drop for PreparationLease {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut pending = pool.preparations.lock().unwrap();
+            if matches!(pending.get(&self.key), Some(PreparationState::Active(_))) {
+                pending.remove(&self.key);
+            }
         }
     }
 }
@@ -715,6 +830,177 @@ impl Worker {
 }
 
 impl NativePool {
+    /// 暖能力检查复用已核验文件，每次重新核对路径和完整文件身份。
+    /// @param config 当前部署配置，预算每次独立验证。
+    /// @return 文件与登记身份相同，否则明确拒绝。
+    pub(crate) fn verify(&self, config: &NativeSenderConfig) -> Result<(), AppError> {
+        validate_distribution_config(config)?;
+        let path = fs::canonicalize(&config.binary_path).map_err(|_| unavailable())?;
+        let identity = DistributionIdentity::from(fs::metadata(&path).map_err(|_| unavailable())?);
+        let mut cached = self.verified.lock().unwrap();
+        if let Some(verified) = cached.as_ref() {
+            if verified.path == path
+                && verified.identity == identity
+                && DistributionIdentity::from(verified.file.metadata().map_err(|_| unavailable())?)
+                    == identity
+            {
+                return Ok(());
+            }
+        }
+        // 先失效再摘要，核验失败后不能继续借用旧缓存。
+        *cached = None;
+        let file = verify_distribution(config)?;
+        let verified = DistributionIdentity::from(file.metadata().map_err(|_| unavailable())?);
+        if verified != identity
+            || DistributionIdentity::from(fs::metadata(&path).map_err(|_| unavailable())?)
+                != verified
+            || fs::canonicalize(&config.binary_path).map_err(|_| unavailable())? != path
+        {
+            return Err(unavailable());
+        }
+        *cached = Some(VerifiedDistribution {
+            path,
+            identity: verified,
+            file,
+        });
+        Ok(())
+    }
+
+    /// 准备一个可复用进程，全程不写入模型作业指令。
+    /// @param config 接收边界冻结的 sender 配置。
+    /// @param identity 仅用于共享启动身份和绑定校验的内部结构，input 不执行。
+    /// @param deadline 接收时冻结的单调截止。
+    /// @return ready 的实际 PID 与空闲数量，或业务占用时的 busy。
+    pub(crate) async fn prepare(
+        self: &Arc<Self>,
+        config: SenderConfig,
+        identity: NativeSubmission,
+        deadline: Instant,
+    ) -> Result<NativePreparationStatus, AppError> {
+        validate_worker_identity(&config, &identity)?;
+        if Instant::now() >= deadline {
+            return Err(unavailable());
+        }
+        let id = identity.request.request_id.clone();
+        let key = PreparationKey {
+            account_id: identity.request.account_id,
+            environment_id: identity.request.environment_id.clone(),
+            generation: identity.request.generation,
+            id: id.clone(),
+        };
+        let (cancel, mut cancellation) = oneshot::channel();
+        {
+            let mut pending = self.preparations.lock().unwrap();
+            pending.retain(|_, state| !matches!(state, PreparationState::Cancelled(until) if *until <= Instant::now()));
+            if pending.contains_key(&key) {
+                return Err(AppError::ServiceUnavailable(
+                    "原生准备已撤销或正在执行".into(),
+                ));
+            }
+            if pending.len() >= 256
+                || pending
+                    .values()
+                    .filter(|state| matches!(state, PreparationState::Active(_)))
+                    .count()
+                    >= 16
+            {
+                return Err(unavailable());
+            }
+            pending.insert(key.clone(), PreparationState::Active(cancel));
+        }
+        let _lease = PreparationLease {
+            pool: Arc::downgrade(self),
+            key,
+        };
+        let operation = async {
+            let _warmup = self.warmup.write().await;
+            let prior: Vec<String> = {
+                let state = self.state.lock().unwrap();
+                if state.live > 0 && state.idle.is_empty() {
+                    return Ok(NativePreparationStatus {
+                        state: "busy".into(),
+                        account_id: identity.request.account_id,
+                        environment_id: identity.request.environment_id.clone(),
+                        generation: identity.request.generation,
+                        preparation_id: id.clone(),
+                        version: "2.1.293".into(),
+                        raw_input_protocol: 1,
+                        pid: None,
+                        idle_workers: 0,
+                        reused: false,
+                    });
+                }
+                state.idle.iter().map(|worker| worker.id.clone()).collect()
+            };
+            let (key, mut worker) = self.checkout(&config, &identity, deadline).await?;
+            let pid = worker
+                .child
+                .as_ref()
+                .and_then(Child::id)
+                .ok_or_else(unavailable)?;
+            let reused = prior.contains(&worker.id);
+            // 发布 idle 与取消登记共用线性化点，撤销后的完成结果不能重新留池。
+            let registration = self.preparations.lock().unwrap();
+            if !matches!(
+                registration.get(&_lease.key),
+                Some(PreparationState::Active(_))
+            ) {
+                return Err(AppError::ServiceUnavailable("原生准备已撤销".into()));
+            }
+            let mut state = self.state.lock().unwrap();
+            if state.key != key {
+                return Err(unavailable());
+            }
+            worker.idle_since = Instant::now();
+            state.idle.push(worker);
+            Ok(NativePreparationStatus {
+                state: "ready".into(),
+                account_id: identity.request.account_id,
+                environment_id: identity.request.environment_id.clone(),
+                generation: identity.request.generation,
+                preparation_id: id.clone(),
+                version: "2.1.293".into(),
+                raw_input_protocol: 1,
+                pid: Some(pid),
+                idle_workers: state.idle.len(),
+                reused,
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = &mut cancellation => Err(AppError::ServiceUnavailable("原生准备已取消".into())),
+            result = timeout_at(deadline, operation) => result.map_err(|_| unavailable())?,
+        }
+    }
+
+    /// 登记本环境准备的撤销，覆盖取消先于准备到达的竞态。
+    /// @param control 已验证账号和代次的控制标识。
+    /// @return 撤销已保存时为 true，容量满时失败关闭。
+    pub(crate) fn cancel_preparation(&self, control: &NativePreparationControl) -> bool {
+        let now = Instant::now();
+        let key = PreparationKey {
+            account_id: control.account_id,
+            environment_id: control.environment_id.clone(),
+            generation: control.generation,
+            id: control.preparation_id.clone(),
+        };
+        let mut pending = self.preparations.lock().unwrap();
+        pending.retain(
+            |_, state| !matches!(state, PreparationState::Cancelled(until) if *until <= now),
+        );
+        if pending.len() >= 256 && !pending.contains_key(&key) {
+            return false;
+        }
+        // 保留请求预算、时钟偏差及取消传输宽限，迟到准备仍会被同一撤销记录拒绝。
+        let until = now + Duration::from_millis(REQUEST_BUDGET_MS + CLOCK_SKEW_MS + 5_000);
+        if let Some(PreparationState::Active(cancel)) =
+            pending.insert(key, PreparationState::Cancelled(until))
+        {
+            let _ = cancel.send(());
+        }
+        true
+    }
+
     /// 用一个弱引用任务回收过期空闲进程，保留最近使用的一个暖进程。
     fn schedule_idle_reap(self: &Arc<Self>) {
         {
@@ -775,27 +1061,8 @@ impl NativePool {
         submission: &NativeSubmission,
         deadline: Instant,
     ) -> Result<(String, Worker), AppError> {
-        if config.allowed_origin != "https://api.anthropic.com" {
-            return Err(unavailable());
-        }
+        let slots = validate_worker_identity(config, submission)?;
         let generation = self.generation.lock().await;
-        let native = config.native.as_ref().ok_or_else(unavailable)?;
-        let slots = usize::try_from(submission.concurrency)
-            .ok()
-            .and_then(|v| v.checked_mul(2))
-            .filter(|v| *v > 0 && *v <= native.max_workers)
-            .ok_or_else(unavailable)?;
-        if submission.bearer.is_empty()
-            || submission.device_id.len() != 64
-            || !submission
-                .device_id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || submission.input["request_id"] != submission.request.request_id
-            || submission.input["schema_version"] != 1
-        {
-            return Err(unavailable());
-        }
         let key = format!(
             "{:x}",
             Sha256::digest(
@@ -904,10 +1171,15 @@ impl NativePool {
         tokio::spawn(async move {
             let mut reply = Some(reply);
             let operation = async {
+                // 业务等待正在进行的零模型准备，随后从同一 idle 集合复用其结果。
+                let warmup = timeout_at(deadline, pool.warmup.read())
+                    .await
+                    .map_err(|_| unavailable())?;
                 let (key, mut worker) =
                     timeout_at(deadline, pool.checkout(&config, &submission, deadline))
                         .await
                         .map_err(|_| unavailable())??;
+                drop(warmup);
                 let result = tokio::select! {
                     result = worker.execute(&submission, config.native_capture_dir.as_deref(), &mut reply, &chunks, deadline) => result,
                     _ = chunks.closed() => {
@@ -959,6 +1231,174 @@ mod tests {
     use futures_util::future::join_all;
     use reqwest::Client;
     use std::env::{temp_dir, var};
+    use std::fs::FileTimes;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn queued_preparation_cancels_without_process_or_model_job() {
+        let pool = Arc::new(NativePool::default());
+        let id = Uuid::new_v4().to_string();
+        let config = SenderConfig {
+            native: Some(NativeSenderConfig {
+                binary_path: "/missing".into(),
+                work_root: "/tmp/synthetic-preparation".into(),
+                memory_mib: 0,
+                max_workers: 2,
+            }),
+            native_capture_dir: None,
+            binding: TransportBinding {
+                account_id: 7,
+                environment_id: "synthetic".into(),
+                generation: 1,
+                endpoint: "http://localhost:8091".into(),
+                secret: "synthetic-secret".into(),
+                release_id: "synthetic".into(),
+            },
+            proxy_url: String::new(),
+            allowed_origin: "https://api.anthropic.com".into(),
+            evidence_file: None,
+            quota_identity: String::new(),
+        };
+        let identity = NativeSubmission {
+            log_mode: RequestLogMode::Info,
+            request: PreparedRequest {
+                account_id: 7,
+                environment_id: "synthetic".into(),
+                generation: 1,
+                request_id: id.clone(),
+                deadline_unix_ms: now_ms() + 10_000,
+                method: "POST".into(),
+                target_url: "https://api.anthropic.com/v1/messages".into(),
+                headers: Vec::new(),
+                preserve_header_casing: false,
+                tls_profile: Default::default(),
+            },
+            input: json!({"schema_version":1,"request_id":id}),
+            bearer: "synthetic-bearer".into(),
+            device_id: "a".repeat(64),
+            account_uuid: None,
+            organization_uuid: None,
+            email: "fixture@example.test".into(),
+            concurrency: 1,
+        };
+        let held = pool.warmup.write().await;
+        let reusable_identity = identity.clone();
+        let reusable_config = config.clone();
+        let key = PreparationKey {
+            account_id: 7,
+            environment_id: "synthetic".into(),
+            generation: 1,
+            id: id.clone(),
+        };
+        let clone = pool.clone();
+        let preparing = tokio::spawn(async move {
+            clone
+                .prepare(config, identity, Instant::now() + Duration::from_secs(2))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !pool.preparations.lock().unwrap().contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut control = NativePreparationControl {
+            account_id: 7,
+            environment_id: "synthetic".into(),
+            generation: 1,
+            preparation_id: Uuid::new_v4().to_string(),
+        };
+        let early_id = control.preparation_id.clone();
+        assert!(pool.cancel_preparation(&control));
+        assert!(
+            matches!(
+                pool.preparations.lock().unwrap().get(&key),
+                Some(PreparationState::Active(_))
+            ),
+            "其它准备的撤销保持归属隔离"
+        );
+        control.preparation_id = id.clone();
+        assert!(pool.cancel_preparation(&control));
+        assert!(preparing.await.unwrap().is_err());
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                pool.prepare(
+                    reusable_config.clone(),
+                    reusable_identity.clone(),
+                    Instant::now() + Duration::from_secs(1)
+                )
+            )
+            .await
+            .unwrap()
+            .is_err(),
+            "已撤销准备的迟到重放在取得启动锁之前拒绝"
+        );
+        let mut early = reusable_identity.clone();
+        early.request.request_id = early_id.clone();
+        early.input["request_id"] = json!(early_id);
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                pool.prepare(
+                    reusable_config.clone(),
+                    early,
+                    Instant::now() + Duration::from_secs(1)
+                )
+            )
+            .await
+            .unwrap()
+            .is_err(),
+            "取消先到时也阻止之后到达的准备"
+        );
+        let mut new_identity = reusable_identity;
+        new_identity.request.generation = 2;
+        let mut new_config = reusable_config;
+        new_config.binding.generation = 2;
+        let new_key = PreparationKey {
+            generation: 2,
+            ..key.clone()
+        };
+        let clone = pool.clone();
+        let next = tokio::spawn(async move {
+            clone
+                .prepare(
+                    new_config,
+                    new_identity,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !pool.preparations.lock().unwrap().contains_key(&new_key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pool.cancel_preparation(&control));
+        assert!(
+            matches!(
+                pool.preparations.lock().unwrap().get(&new_key),
+                Some(PreparationState::Active(_))
+            ),
+            "旧代撤销不能影响新代的同名准备"
+        );
+        control.generation = 2;
+        assert!(pool.cancel_preparation(&control));
+        assert!(next.await.unwrap().is_err());
+        drop(held);
+        assert_eq!(pool.state.lock().unwrap().live, 0);
+        assert!(
+            !pool
+                .preparations
+                .lock()
+                .unwrap()
+                .values()
+                .any(|state| matches!(state, PreparationState::Active(_)))
+        );
+    }
 
     #[test]
     fn native_budget_is_explicit_and_covers_weighted_capacity() {
@@ -1052,6 +1492,7 @@ mod tests {
         let make = |label: &str, bearer: &str| {
             let id = Uuid::new_v4().to_string();
             NativeSubmission {
+                log_mode: RequestLogMode::Debug,
                 request: PreparedRequest {
                     account_id: 7,
                     environment_id: config.binding.environment_id.clone(),
@@ -1094,6 +1535,115 @@ mod tests {
             pool.submit(config.clone(), wrong_identity).await,
             Err(AppError::ServiceUnavailable(_))
         ));
+        let mut cancelling = make("cancelled-initialization", "synthetic-bearer-a");
+        cancelling.input = json!({"schema_version":1,"request_id":cancelling.request.request_id});
+        let control = NativePreparationControl {
+            account_id: config.binding.account_id,
+            environment_id: config.binding.environment_id.clone(),
+            generation: config.binding.generation,
+            preparation_id: cancelling.request.request_id.clone(),
+        };
+        let clone = pool.clone();
+        let initializing_config = config.clone();
+        let initializing = tokio::spawn(async move {
+            clone
+                .prepare(
+                    initializing_config,
+                    cancelling,
+                    Instant::now() + Duration::from_secs(120),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(10), async {
+            while pool.state.lock().unwrap().live == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pool.cancel_preparation(&control));
+        assert!(initializing.await.unwrap().is_err());
+        timeout(Duration::from_secs(5), async {
+            while pool.state.lock().unwrap().live != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut preparation = make("zero-model-preparation", "synthetic-bearer-a");
+        preparation.input = json!({"schema_version":1,"request_id":preparation.request.request_id});
+        let status = pool
+            .prepare(
+                config.clone(),
+                preparation.clone(),
+                Instant::now() + Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.state, "ready");
+        assert!(!status.reused);
+        assert_eq!(status.idle_workers, 1);
+        let repeated = pool
+            .prepare(
+                config.clone(),
+                preparation,
+                Instant::now() + Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        assert!(repeated.reused);
+        assert_eq!(status.pid, repeated.pid);
+        let native = config.native.as_ref().unwrap();
+        let cold = Instant::now();
+        pool.verify(native).unwrap();
+        let cold_us = cold.elapsed().as_micros();
+        let warm = Instant::now();
+        for _ in 0..20 {
+            pool.verify(native).unwrap();
+        }
+        println!(
+            "{}",
+            json!({"native_distribution_verify":{"cold_us":cold_us,"warm_mean_us":warm.elapsed().as_micros()/20}})
+        );
+        let copied = root.join("verify-copy");
+        fs::copy(&native.binary_path, &copied).unwrap();
+        let mut mutable = native.clone();
+        mutable.binary_path = copied.to_string_lossy().into_owned();
+        pool.verify(&mutable).unwrap();
+        let modified = fs::metadata(&copied).unwrap().modified().unwrap();
+        let mut tampered = OpenOptions::new().write(true).open(&copied).unwrap();
+        tampered.write_all(&[0]).unwrap();
+        tampered
+            .set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(
+            pool.verify(&mutable).is_err(),
+            "同长度且恢复 mtime 的原地修改仍由 ctime 与完整摘要拒绝"
+        );
+        fs::copy(&native.binary_path, &copied).unwrap();
+        pool.verify(&mutable).unwrap();
+        fs::set_permissions(&copied, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(pool.verify(&mutable).is_err(), "权限变化使缓存立即失效");
+        fs::remove_file(&copied).unwrap();
+        fs::copy(&native.binary_path, &copied).unwrap();
+        pool.verify(&mutable).unwrap();
+        pool.verify(native).unwrap();
+        let observed: Value = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(var("CCRB_TEST_CONTROL").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            observed["messages"].as_array().unwrap().len(),
+            0,
+            "真实准备和重复准备均为零模型调用"
+        );
         let mut invalid = make("invalid", "synthetic-bearer-a");
         invalid.input["body"]["unsupported"] = json!(true);
         let response = pool.submit(config.clone(), invalid).await.unwrap();
