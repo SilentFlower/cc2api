@@ -41,7 +41,7 @@ pub use crate::service::native_contract::{
     NativeSenderConfig, NativeSubmission, POOL_MEMORY_MIB, WORKER_MEMORY_MIB,
 };
 use crate::service::rewriter::extract_session_id_from_body;
-use crate::service::runtime_transport::{SenderConfig, now_ms, validate_request};
+use crate::service::runtime_transport::{SenderConfig, validate_request};
 
 const LAUNCHER_SHA256: &str = "a6998db0128cb3d0a9862f3b72e9e359e434840c9be4d57b69d56092847fd800";
 const IMAGE_SHA256: &str = "ea2cc610928260ca76054fc1818c7c83bb95efe183b06ce98e3d6be7dc31b9b1";
@@ -367,6 +367,7 @@ impl Worker {
         submission: &NativeSubmission,
         lease: WorkerLease,
         execution_image: Option<Arc<File>>,
+        deadline: Instant,
     ) -> Result<Self, AppError> {
         let native = config.native.as_ref().ok_or_else(unavailable)?;
         let image = native.verify()?;
@@ -465,12 +466,9 @@ impl Worker {
             _lease: Some(lease),
             _proxy: proxy,
         };
-        let ready = timeout(
-            Duration::from_millis(submission.request.deadline_unix_ms.saturating_sub(now_ms())),
-            worker.next(),
-        )
-        .await
-        .map_err(|_| unavailable())??;
+        let ready = timeout_at(deadline, worker.next())
+            .await
+            .map_err(|_| unavailable())??;
         let pid = worker
             .child
             .as_ref()
@@ -513,7 +511,12 @@ impl Worker {
         submission: &NativeSubmission,
         response: &mut Option<oneshot::Sender<Result<Response, AppError>>>,
         chunks: &mpsc::Sender<Result<Bytes, io::Error>>,
+        deadline: Instant,
     ) -> Result<bool, AppError> {
+        // 启动已消耗同一份预算；到期后必须在写入业务指令前结束。
+        if Instant::now() >= deadline {
+            return Err(unavailable());
+        }
         let id = &submission.request.request_id;
         self.send("request_input", Some(id), Some(&submission.input))
             .await?;
@@ -523,8 +526,6 @@ impl Worker {
         let mut terminal = false;
         let mut reusable = false;
         let mut observation: Option<NativeRequestObservation> = None;
-        let header_deadline = Instant::now()
-            + Duration::from_millis(submission.request.deadline_unix_ms.saturating_sub(now_ms()));
         loop {
             let frame = if headers_seen {
                 timeout(
@@ -534,7 +535,7 @@ impl Worker {
                 .await
                 .map_err(|_| protocol_error())??
             } else {
-                timeout_at(header_deadline, self.next())
+                timeout_at(deadline, self.next())
                     .await
                     .map_err(|_| protocol_error())??
             };
@@ -767,8 +768,8 @@ impl NativePool {
         self: &Arc<Self>,
         config: &SenderConfig,
         submission: &NativeSubmission,
+        deadline: Instant,
     ) -> Result<(String, Worker), AppError> {
-        validate_request(&submission.request, config)?;
         if config.allowed_origin != "https://api.anthropic.com" {
             return Err(unavailable());
         }
@@ -848,10 +849,10 @@ impl NativePool {
         let mut cached = self.image.lock().await;
         let worker = if let Some(image) = cached.clone() {
             drop(cached);
-            Worker::start(config, submission, lease, Some(image)).await?
+            Worker::start(config, submission, lease, Some(image), deadline).await?
         } else {
             // 只让首个进程解压；其它启动者等待封存映像后并行exec。
-            let worker = Worker::start(config, submission, lease, None).await?;
+            let worker = Worker::start(config, submission, lease, None, deadline).await?;
             *cached = Some(
                 worker
                     .execution_image
@@ -874,15 +875,36 @@ impl NativePool {
         config: SenderConfig,
         submission: NativeSubmission,
     ) -> Result<Response, AppError> {
+        let deadline = validate_request(&submission.request, &config)?;
+        self.submit_validated(config, submission, deadline).await
+    }
+
+    /// 使用接收边界已校验的信封及单调截止执行一次请求。
+    /// @param config 已冻结的账号 sender 配置。
+    /// @param submission 已核对归属、目标及期限的原始信封。
+    /// @param deadline 接收时冻结的截止，启动和首响应共享同一预算。
+    /// @return 单次执行响应或受控错误。
+    pub(crate) async fn submit_validated(
+        self: &Arc<Self>,
+        config: SenderConfig,
+        submission: NativeSubmission,
+        deadline: Instant,
+    ) -> Result<Response, AppError> {
+        if Instant::now() >= deadline {
+            return Err(unavailable());
+        }
         let (reply, receive) = oneshot::channel();
         let (chunks, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
         let pool = self.clone();
         tokio::spawn(async move {
             let mut reply = Some(reply);
             let operation = async {
-                let (key, mut worker) = pool.checkout(&config, &submission).await?;
+                let (key, mut worker) =
+                    timeout_at(deadline, pool.checkout(&config, &submission, deadline))
+                        .await
+                        .map_err(|_| unavailable())??;
                 let result = tokio::select! {
-                    result = worker.execute(&submission, &mut reply, &chunks) => result,
+                    result = worker.execute(&submission, &mut reply, &chunks, deadline) => result,
                     _ = chunks.closed() => {
                         let _ = timeout(Duration::from_millis(200), worker.send("request_cancel", Some(&submission.request.request_id), None)).await;
                         Err(protocol_error())
@@ -927,7 +949,7 @@ impl NativePool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::runtime_transport::{PreparedRequest, TransportBinding};
+    use crate::service::runtime_transport::{PreparedRequest, TransportBinding, now_ms};
     use axum::body::to_bytes;
     use futures_util::future::join_all;
     use reqwest::Client;
@@ -1069,6 +1091,27 @@ mod tests {
         assert_eq!(response.status(), 422);
         to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(pool.state.lock().unwrap().idle.len(), 1);
+        // 已就绪的暖进程也必须沿原截止拒绝投递，避免启动后重新授予首响应预算。
+        let expired = make("expired-before-send", "synthetic-bearer-a");
+        let deadline = validate_request(&expired.request, &config).unwrap();
+        let (_, mut worker) = pool.checkout(&config, &expired, deadline).await.unwrap();
+        let (reply, _receive) = oneshot::channel();
+        let mut reply = Some(reply);
+        let (chunks, _receiver) = mpsc::channel(8);
+        assert!(matches!(
+            worker
+                .execute(
+                    &expired,
+                    &mut reply,
+                    &chunks,
+                    Instant::now() - Duration::from_millis(1)
+                )
+                .await,
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        assert!(reply.is_some());
+        worker.retire().await;
+        assert_eq!(pool.state.lock().unwrap().live, 0);
         for (label, count) in [("parallel-3", 3), ("parallel-6", 6)] {
             let operations = (0..count).map(|_| {
                 let pool = pool.clone();

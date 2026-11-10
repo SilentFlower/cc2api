@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use uuid::Uuid;
 
 use axum::Json;
@@ -37,6 +37,8 @@ use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
 
 const META_HEADER: &str = "x-v3-request";
 const ERROR_HEADER: &str = "x-v3-transport-error";
+const REQUEST_BUDGET_MS: u64 = 120_000;
+const CLOCK_SKEW_MS: u64 = 5_000;
 
 /// 由调度器登记的单账号传输实例；秘密仅用于服务间鉴权。
 #[derive(Clone, Deserialize, Serialize)]
@@ -352,7 +354,7 @@ impl PreparedTransport {
             submission.request.environment_id = binding.environment_id;
             submission.request.generation = binding.generation;
             submission.request.deadline_unix_ms =
-                now_ms() + ttfb_timeout.as_millis().min(120_000) as u64;
+                now_ms() + ttfb_timeout.as_millis().min(REQUEST_BUDGET_MS as u128) as u64;
             let response = client
                 .post(format!(
                     "{}/internal/native/messages",
@@ -547,18 +549,30 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// 核对私有请求归属、时限和允许目标。@param prepared 冻结元信息。@param config 当前账号绑定。@return 校验结果。
+/// 核对私有请求归属、时限和目标，并冻结本次单调截止。
+/// @param prepared 冻结元信息。
+/// @param config 当前账号绑定。
+/// @return 剩余预算不超过120秒的单调截止；过期或超出时钟偏差时拒绝。
 pub(crate) fn validate_request(
     prepared: &PreparedRequest,
     config: &SenderConfig,
-) -> Result<(), AppError> {
+) -> Result<Instant, AppError> {
+    let monotonic_now = Instant::now();
+    validate_request_at(prepared, config, now_ms()).map(|budget| monotonic_now + budget)
+}
+
+fn validate_request_at(
+    prepared: &PreparedRequest,
+    config: &SenderConfig,
+    wall_now_ms: u64,
+) -> Result<Duration, AppError> {
     let url = reqwest::Url::parse(&prepared.target_url)
         .map_err(|_| AppError::BadRequest("invalid upstream URL".into()))?;
     let allowed = reqwest::Url::parse(&config.allowed_origin)
         .map_err(|_| AppError::ServiceUnavailable("invalid allowed origin".into()))?;
     if Uuid::parse_str(&prepared.request_id).is_err()
-        || prepared.deadline_unix_ms <= now_ms()
-        || prepared.deadline_unix_ms > now_ms() + 120_000
+        || prepared.deadline_unix_ms <= wall_now_ms
+        || prepared.deadline_unix_ms > wall_now_ms.saturating_add(REQUEST_BUDGET_MS + CLOCK_SKEW_MS)
         || prepared.account_id != config.binding.account_id
         || prepared.environment_id != config.binding.environment_id
         || prepared.generation != config.binding.generation
@@ -574,7 +588,13 @@ pub(crate) fn validate_request(
             "runtime request binding or target mismatch".into(),
         ));
     }
-    Ok(())
+    // 跨进程的墙钟可能回拨；偏差只用于接纳，实际等待仍钳制为原预算。
+    Ok(Duration::from_millis(
+        prepared
+            .deadline_unix_ms
+            .saturating_sub(wall_now_ms)
+            .min(REQUEST_BUDGET_MS),
+    ))
 }
 
 async fn status(
@@ -610,12 +630,12 @@ async fn forward(State(state): State<SenderState>, headers: HeaderMap, body: Byt
                 .map_err(|_| AppError::BadRequest("invalid runtime request".into()))?;
             let prepared: PreparedRequest = serde_json::from_slice(&bytes)
                 .map_err(|_| AppError::BadRequest("invalid runtime request".into()))?;
-            validate_request(&prepared, &config)?;
+            let deadline = validate_request(&prepared, &config)?;
             state.active.fetch_add(1, Ordering::SeqCst);
             let guard = ActiveRequest(state.active.clone());
             submitted = true;
-            let upstream = timeout(
-                Duration::from_millis(prepared.deadline_unix_ms.saturating_sub(now_ms())),
+            let upstream = timeout_at(
+                deadline,
                 send_direct(&config.proxy_url, &prepared, body.to_vec()),
             )
             .await
@@ -687,7 +707,7 @@ async fn native_forward(
     let operation = async {
         let config = read_config(&state.config_path)?;
         authenticate(&headers, &config)?;
-        validate_request(&submission.request, &config)?;
+        let deadline = validate_request(&submission.request, &config)?;
         let target = reqwest::Url::parse(&submission.request.target_url)
             .map_err(|_| AppError::BadRequest("原生目标无效".into()))?;
         if submission.request.method != "POST"
@@ -709,7 +729,7 @@ async fn native_forward(
         submitted = true;
         let response = state
             .native_pool
-            .submit(config.clone(), submission.clone())
+            .submit_validated(config.clone(), submission.clone(), deadline)
             .await?;
         // 共用额度证据格式，进程池和响应流由同一活动许可覆盖。
         {
@@ -1179,6 +1199,25 @@ mod tests {
             preserve_header_casing: true,
         };
         assert!(validate_request(&prepared, &config).is_ok());
+        // 真实宿主采集到约1.3秒回拨；相同合法信封在接收时仍应保持有界预算。
+        let issued = 1_800_000_000_000;
+        prepared.deadline_unix_ms = issued + 120_000;
+        assert_eq!(
+            validate_request_at(&prepared, &config, issued - 1275).unwrap(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            validate_request_at(&prepared, &config, issued - CLOCK_SKEW_MS).unwrap(),
+            Duration::from_secs(120)
+        );
+        assert!(validate_request_at(&prepared, &config, issued - CLOCK_SKEW_MS - 1).is_err());
+        assert!(validate_request_at(&prepared, &config, issued + 120_000).is_err());
+        assert!(validate_request_at(&prepared, &config, issued + 120_001).is_err());
+        assert_eq!(
+            validate_request_at(&prepared, &config, issued + 119_000).unwrap(),
+            Duration::from_secs(1)
+        );
+        prepared.deadline_unix_ms = now_ms() + 30_000;
         prepared.generation = 1;
         assert!(validate_request(&prepared, &config).is_err());
         prepared.generation = 2;

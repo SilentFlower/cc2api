@@ -3,6 +3,7 @@
 use axum::response::Response;
 use std::fs::File;
 use std::sync::Arc;
+use tokio::time::Instant;
 
 use crate::error::AppError;
 pub use crate::service::native_contract::{
@@ -28,8 +29,23 @@ impl NativePool {
     /// @return 受控 503。
     pub async fn submit(
         self: &Arc<Self>,
+        config: SenderConfig,
+        submission: NativeSubmission,
+    ) -> Result<Response, AppError> {
+        self.submit_validated(config, submission, Instant::now())
+            .await
+    }
+
+    /// 接收已核验请求时同样在创建作业前拒绝不支持的平台。
+    /// @param config 当前 sender 配置。
+    /// @param submission 已核验的冻结请求。
+    /// @param deadline 接收边界冻结的单调截止。
+    /// @return 受控 503。
+    pub(crate) async fn submit_validated(
+        self: &Arc<Self>,
         _config: SenderConfig,
         _submission: NativeSubmission,
+        _deadline: Instant,
     ) -> Result<Response, AppError> {
         Err(AppError::ServiceUnavailable(
             "原生运行时需要 Linux x64 平台".into(),
