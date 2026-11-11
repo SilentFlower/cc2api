@@ -2,7 +2,8 @@
 
 use claude_code_gateway::service::access_policy::AccessPolicy;
 use claude_code_gateway::service::version_profile::profile_for_key;
-use claude_code_gateway::store::db::migrate;
+// 本组验证旧迁移的画像回填合同；版本台账与重复执行由迁移模块独立覆盖。
+use claude_code_gateway::store::database_schema::migrate_legacy as migrate;
 use claude_code_gateway::store::settings_store::SettingsStore;
 use serde_json::Value;
 use sqlx::AnyPool;

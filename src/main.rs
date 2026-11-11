@@ -8,11 +8,26 @@ use claude_code_gateway::store::scheduling_store::SchedulingStore;
 use claude_code_gateway::tlsfp;
 
 use std::env;
+use std::process::exit;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() {
+    let arguments: Vec<String> = env::args().collect();
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == "database-migrations")
+    {
+        match store::database_migrations::maintenance(&arguments).await {
+            Ok(value) => println!("{value}"),
+            Err(reason) => {
+                eprintln!("{reason}");
+                exit(1);
+            }
+        }
+        return;
+    }
     service::system_update::validate_startup().expect("部署维护状态无效，请先恢复更新服务");
     let cfg = config::Config::load();
 

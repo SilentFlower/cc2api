@@ -121,21 +121,7 @@ impl DiagnosticsStore {
     /// @param pool 数据库连接池。
     /// @return 迁移结果。
     pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
-        for sql in [
-            "CREATE TABLE IF NOT EXISTS request_diagnostics (
-                request_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
-                response_request_id TEXT, account_id BIGINT, outcome TEXT NOT NULL, summary_json TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS request_diagnostic_attempts (
-                attempt_id TEXT PRIMARY KEY, request_id TEXT NOT NULL REFERENCES request_diagnostics(request_id) ON DELETE CASCADE,
-                ordinal BIGINT NOT NULL, account_id BIGINT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
-                upstream_request_id TEXT, summary_json TEXT NOT NULL)",
-            "CREATE INDEX IF NOT EXISTS request_diagnostics_time ON request_diagnostics(started_at,request_id)",
-            "CREATE INDEX IF NOT EXISTS request_diagnostics_response_id ON request_diagnostics(response_request_id)",
-            "CREATE INDEX IF NOT EXISTS request_diagnostic_attempts_request ON request_diagnostic_attempts(request_id,ordinal)",
-            "CREATE INDEX IF NOT EXISTS request_diagnostic_attempts_account ON request_diagnostic_attempts(account_id,request_id)",
-            "CREATE INDEX IF NOT EXISTS request_diagnostic_attempts_upstream ON request_diagnostic_attempts(upstream_request_id)",
-        ] { sqlx::query(sql).execute(pool).await?; }
-        Ok(())
+        super::database_schema::migrate_diagnostics(pool).await
     }
 
     /// 尝试入队，队列饱和时只记录失败计数，不阻塞转发。

@@ -23,6 +23,7 @@ let controller: AbortController | undefined;
 let failures = 0;
 
 const phases: Record<string, string> = {
+  snapshotting: '保存数据库快照', migrating: '执行数据库迁移', restoring_data: '正在恢复数据库',
   preparing: '下载与校验', prepared: '候选已准备', draining: '等待在途完成', switching: '切换平台服务',
   verifying: '验证新版本', committing: '保存安装结果', cleaning: '回收旧制品', succeeded: '更新完成',
   succeeded_cleanup_pending: '更新完成，清理待重试', restoring: '正在恢复原版本', restored: '已恢复原版本',
@@ -234,6 +235,12 @@ onUnmounted(() => { alive = false; clearTimeout(timer); controller?.abort(); dia
           </div>
         </div>
         <p class="break-all text-sm text-[#8c8475]">目标：{{ progress.target_release }}</p>
+        <p v-if="progress.database_snapshot" class="text-sm text-[#8c8475]">
+          数据库快照{{ progress.database_snapshot.state === 'verified' ? '已校验' : '状态：' + progress.database_snapshot.state }} · {{ (progress.database_snapshot.bytes / 1024 / 1024).toFixed(1) }} MiB
+        </p>
+        <p v-for="(migration, database) in progress.database_migrations ?? {}" :key="database" class="text-sm text-[#8c8475]">
+          {{ database === 'bench' ? '平台数据库' : '网关数据库' }} · 目标版本 {{ migration.target_version }} · {{ migration.state === 'completed' ? '迁移完成' : migration.state === 'running' ? '正在迁移' : '未知状态：' + migration.state }}
+        </p>
         <p v-if="status.busy" class="text-sm">维护期间新工作暂缓，在途工作自然结束后继续。</p>
         <ul v-if="progress.blockers?.length" class="space-y-1 rounded-lg bg-[#f9f6f1] p-4 text-sm">
           <li v-for="blocker in progress.blockers" :key="blocker" class="break-words">{{ blocker }}</li>
@@ -252,10 +259,17 @@ onUnmounted(() => { alive = false; clearTimeout(timer); controller?.abort(); dia
           <div class="min-w-0"><h3 class="break-all font-semibold">{{ release.release }}</h3><p class="mt-1 text-xs text-[#8c8475]">{{ release.published_at }}</p></div>
           <Button :disabled="status.busy || writing || catalog?.fresh === false || !release.data_compatible || release.release === status.current_release"
             @click="confirm('install', release.release, release.manifest_sha256, release.account_changed)">
-            {{ release.release === status.current_release ? '当前版本' : catalog?.fresh === false ? '请先检查更新' : release.data_compatible ? '安装更新' : '需要专项维护' }}
+            {{ release.release === status.current_release ? '当前版本' : catalog?.fresh === false ? '请先检查更新' : release.data_compatible ? '安装更新' : '兼容验证待补齐' }}
           </Button>
         </div>
         <p class="whitespace-pre-wrap break-words text-sm">{{ release.changes }}</p>
+        <p v-if="release.compatibility_reason" class="text-sm text-amber-800">
+          {{ release.compatibility_reason === 'migration_evidence_missing' ? '此来源版本的升级与回退演练证据待发布端补齐。' : '此版本的数据兼容声明待发布端验证。' }}
+        </p>
+        <p v-if="release.migrations?.length" class="text-sm text-[#8c8475]">包含已验证的数据库迁移，安装前自动保存两库快照。</p>
+        <p v-for="migration in release.migrations ?? []" :key="migration.database" class="text-xs text-[#8c8475]">
+          {{ migration.database === 'bench' ? '平台数据库' : '网关数据库' }} → 版本 {{ migration.target_version }} · {{ migration.steps }} 项登记
+        </p>
         <p class="text-xs text-[#8c8475]">{{ release.account_changed ? `预计重建 ${runningEnvironments} 个运行环境，已停止环境保留原状态。` : '兼容的账号运行环境继续复用。' }}</p>
       </Card>
       <p v-if="!catalog?.releases.length" class="rounded-xl border border-dashed p-6 text-center text-sm text-[#8c8475]">{{ catalog?.checking ? '正在检查受信版本…' : '等待检查可用版本' }}</p>

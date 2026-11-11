@@ -1,0 +1,15 @@
+{
+  "database": "gateway",
+  "schema_version": 1,
+  "steps": [
+    {
+      "checksum": "bebdd3afece19f85701ec51d1129c8f9e3efd8c02aaabd76e14d2a417e6aed59",
+      "engine": "sqlite",
+      "id": "gateway.baseline.1",
+      "kind": "schema",
+      "predecessor": 0,
+      "rollback_mode": "compatible",
+      "version": 1
+    }
+  ]
+}

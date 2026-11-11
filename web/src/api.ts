@@ -303,12 +303,15 @@ export interface SystemUpdateOperation {
   error?: string | null
   blockers?: string[]
   cancel_requested?: boolean
+  database_snapshot?: { state: string; completed_at: string; bytes: number } | null
+  database_migrations?: Record<string, { state: string; target_version: number }> | null
   cleanup?: { status: string; removed: string[]; retained?: string[] } | null
 }
 
 /** 已安装底座的实际组件及恢复入口。 */
 export interface SystemUpdateStatus {
   installed: boolean
+  migration_capability?: boolean
   message?: string
   revision?: string
   current_release?: string
@@ -331,6 +334,8 @@ export interface SystemUpdateRelease {
   manifest_sha256: string
   data_compatible: boolean
   account_changed: boolean
+  compatibility_reason?: 'data_contract_unverified' | 'migration_evidence_missing' | null
+  migrations?: Array<{ database: string; target_version: number; steps: number }>
 }
 
 /** 目录状态与最近受信发行。 */

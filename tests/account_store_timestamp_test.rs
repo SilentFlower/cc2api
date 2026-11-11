@@ -15,6 +15,7 @@ use claude_code_gateway::model::credential_ownership::{
 };
 use claude_code_gateway::service::account::AccountService;
 use claude_code_gateway::store::account_store::AccountStore;
+use claude_code_gateway::store::database_schema::migrate_legacy;
 use claude_code_gateway::store::db::{init_db, migrate};
 use claude_code_gateway::store::memory::MemoryStore;
 use claude_code_gateway::store::settings_store::SettingsStore;
@@ -162,7 +163,8 @@ async fn setup() -> Arc<AccountStore> {
 /// @param driver 数据库类型。
 /// @return 无；默认值丢失、迁移覆盖或 SQL 映射错误时测试失败。
 async fn usage_limits_storage_contract(pool: &AnyPool, driver: &str) {
-    migrate(pool, driver).await.unwrap();
+    // 旧库夹具先使用原初始化，随后由正式入口为完整升级结果登记台账。
+    migrate_legacy(pool, driver).await.unwrap();
     let store = AccountStore::new(pool.clone(), driver.into());
     let mut account = new_account("usage-limits-storage@example.invalid");
     store.create(&mut account).await.unwrap();

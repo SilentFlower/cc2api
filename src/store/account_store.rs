@@ -1071,6 +1071,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::database_schema::migrate_legacy;
     use sqlx::any::AnyPoolOptions;
 
     async fn make_store(driver: &str) -> AccountStore {
@@ -1087,9 +1088,8 @@ mod tests {
     #[tokio::test]
     async fn historical_backend_migration_and_account_updates_are_independent() {
         let store = make_store("sqlite").await;
-        crate::store::db::migrate(&store.pool, "sqlite")
-            .await
-            .unwrap();
+        // 历史夹具模拟引入版本台账前的数据库，后续再由正式入口登记基线。
+        migrate_legacy(&store.pool, "sqlite").await.unwrap();
         sqlx::query("ALTER TABLE accounts DROP COLUMN request_backend")
             .execute(&store.pool)
             .await

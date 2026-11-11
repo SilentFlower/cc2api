@@ -47,33 +47,7 @@ impl UsageStore {
     /// @param pool 应用数据库连接池。
     /// @return 迁移成功或数据库错误。
     pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
-        for statement in [
-            "CREATE TABLE IF NOT EXISTS usage_records (
-                record_id TEXT PRIMARY KEY,
-                account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-                started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
-                model TEXT NOT NULL,
-                input_tokens BIGINT NOT NULL,
-                output_tokens BIGINT NOT NULL,
-                cache_read_tokens BIGINT NOT NULL,
-                cache_write_tokens BIGINT NOT NULL,
-                cache_write_5m_tokens BIGINT NOT NULL,
-                cache_write_1h_tokens BIGINT NOT NULL,
-                cost_usd DOUBLE PRECISION,
-                partial BIGINT NOT NULL,
-                price_version TEXT NOT NULL
-            )",
-            "CREATE INDEX IF NOT EXISTS usage_records_account_time ON usage_records(account_id, started_at)",
-            "CREATE INDEX IF NOT EXISTS usage_records_time ON usage_records(started_at)",
-            "CREATE TABLE IF NOT EXISTS usage_stats_meta (id BIGINT PRIMARY KEY, recorded_since TEXT NOT NULL)",
-        ] {
-            sqlx::query(statement).execute(pool).await?;
-        }
-        sqlx::query("INSERT INTO usage_stats_meta(id, recorded_since) VALUES(1, $1) ON CONFLICT(id) DO NOTHING")
-            .bind(timestamp(Utc::now()))
-            .execute(pool).await?;
-        Ok(())
+        super::database_schema::migrate_usage(pool).await
     }
 
     /// 记录一次调用，唯一键保证重复 finalize 不会重复计数。

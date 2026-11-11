@@ -1,5 +1,7 @@
 pub mod account_store;
 pub mod cache;
+pub mod database_migrations;
+pub mod database_schema;
 pub mod db;
 pub mod diagnostics_store;
 pub mod memory;

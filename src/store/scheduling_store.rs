@@ -55,15 +55,7 @@ impl SchedulingStore {
     /// @param pool 已初始化的数据库池。
     /// @return 迁移成功或数据库错误。
     pub async fn migrate(pool: &AnyPool) -> Result<(), SqlxError> {
-        for statement in [
-            "CREATE TABLE IF NOT EXISTS gateway_session_bindings (session_key TEXT PRIMARY KEY, account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, revision TEXT NOT NULL, created_at_ms BIGINT NOT NULL, last_seen_at_ms BIGINT NOT NULL, expires_at_ms BIGINT NOT NULL)",
-            "CREATE INDEX IF NOT EXISTS gateway_bindings_account_expiry ON gateway_session_bindings(account_id, expires_at_ms)",
-            "CREATE INDEX IF NOT EXISTS gateway_bindings_expiry ON gateway_session_bindings(expires_at_ms)",
-            "CREATE TABLE IF NOT EXISTS gateway_account_send_state (account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, last_admitted_at_ms BIGINT NOT NULL)",
-        ] {
-            sqlx::query(statement).execute(pool).await?;
-        }
-        Ok(())
+        super::database_schema::migrate_scheduling(pool).await
     }
 
     /// 只读取得尚未过期的绑定，不延长有效期。
