@@ -36,7 +36,7 @@ use crate::model::account::Account;
 use crate::model::request_diagnostics::RequestLogMode;
 use crate::service::native_contract::{
     NativeKernelPreparation, NativeKernelTarget, NativePreparation, NativePreparationControl,
-    NativePreparationStatus,
+    NativePreparationStatus, NativeReadinessStatus,
 };
 use crate::service::native_runtime::{NativePool, NativeSenderConfig, NativeSubmission};
 use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
@@ -391,6 +391,51 @@ impl PreparedTransport {
         preparation: NativePreparation,
     ) -> Result<NativePreparationStatus, AppError> {
         self.prepare_native_target(preparation, None).await
+    }
+
+    /// 只读取已绑定 sender 的当前身份就绪状态。
+    /// @param identity 当前权威账号身份，绑定由此 transport 冻结。
+    /// @return 新鲜安全状态；不支持或检查失败时明确报错。
+    pub(crate) async fn native_readiness(
+        &self,
+        mut identity: NativePreparation,
+    ) -> Result<NativeReadinessStatus, AppError> {
+        let PreparedRoute::V3 { client, binding } = &self.route else {
+            return Err(AppError::ServiceUnavailable(
+                "原生检查需要 V3 sender".into(),
+            ));
+        };
+        identity.account_id = self.account_id;
+        identity.environment_id = binding.environment_id.clone();
+        identity.generation = binding.generation;
+        let status: NativeReadinessStatus = client
+            .post(format!(
+                "{}/internal/native/readiness",
+                binding.endpoint.trim_end_matches('/')
+            ))
+            .bearer_auth(&binding.secret)
+            .json(&identity)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生检查通道不可用".into()))?
+            .error_for_status()
+            .map_err(|_| AppError::ServiceUnavailable("原生检查失败或能力不支持".into()))?
+            .json()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("原生检查回执无效".into()))?;
+        if status.account_id != self.account_id
+            || status.environment_id != binding.environment_id
+            || status.generation != binding.generation
+            || !matches!(
+                status.state.as_str(),
+                "ready" | "busy" | "preparing" | "unprepared" | "failed"
+            )
+            || (status.state == "ready" && (status.pid.is_none() || status.idle_workers == 0))
+        {
+            return Err(AppError::ServiceUnavailable("原生检查回执归属不符".into()));
+        }
+        Ok(status)
     }
 
     /// 以已核验的同部署绑定预热精确候选，不向上游提交业务。
@@ -944,6 +989,36 @@ async fn native_prepare(
     prepare_sender(&state, &headers, preparation, None).await
 }
 
+/// 在私有鉴权和精确绑定内只检查原生池，页面检查不触发进程启动。
+/// @param state sender 状态。
+/// @param headers 服务鉴权头。
+/// @param preparation 当前身份和检查截止。
+/// @return 实时进程状态。
+async fn native_readiness(
+    State(state): State<SenderState>,
+    headers: HeaderMap,
+    Json(preparation): Json<NativePreparation>,
+) -> Result<Json<NativeReadinessStatus>, AppError> {
+    let config = read_config(&state.config_path)?;
+    authenticate(&headers, &config)?;
+    if state.evidence_error.load(Ordering::SeqCst) {
+        return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
+    }
+    let identity = preparation_identity(preparation, &config);
+    let deadline = validate_request(&identity.request, &config)?;
+    let status = timeout_at(deadline, state.native_pool.readiness(&config, &identity))
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("原生检查超时".into()))??;
+    if serde_json::to_vec(&read_config(&state.config_path)?).ok()
+        != serde_json::to_vec(&config).ok()
+    {
+        return Err(AppError::ServiceUnavailable(
+            "原生检查期间环境配置已变化".into(),
+        ));
+    }
+    Ok(Json(status))
+}
+
 /// 专用切换预热在 sender 内排除已入场流和迟到的普通准备。
 /// @param state sender 状态。
 /// @param headers 私有服务鉴权。
@@ -994,7 +1069,31 @@ async fn prepare_sender(
             .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?,
     )?;
     // 这里只借用既有绑定与截止校验结构；input 没有业务正文，也不会进入 execute。
-    let identity = NativeSubmission {
+    let identity = preparation_identity(preparation, &config);
+    let deadline = validate_request(&identity.request, &config)?;
+    let status = if target.is_some() {
+        state
+            .native_pool
+            .prepare_switch(config.clone(), identity, deadline)
+            .await?
+    } else {
+        state
+            .native_pool
+            .prepare(config.clone(), identity, deadline)
+            .await?
+    };
+    let current = read_config(&state.config_path)?;
+    if serde_json::to_vec(&current).ok() != serde_json::to_vec(&config).ok() {
+        return Err(AppError::ServiceUnavailable(
+            "原生准备期间环境配置已变化".into(),
+        ));
+    }
+    Ok(Json(status))
+}
+
+/// 准备和只读检查使用同一身份信封，避免字段映射分叉。
+fn preparation_identity(preparation: NativePreparation, config: &SenderConfig) -> NativeSubmission {
+    NativeSubmission {
         log_mode: RequestLogMode::Info,
         request: PreparedRequest {
             account_id: preparation.account_id,
@@ -1015,26 +1114,7 @@ async fn prepare_sender(
         organization_uuid: preparation.organization_uuid,
         email: preparation.email,
         concurrency: preparation.concurrency,
-    };
-    let deadline = validate_request(&identity.request, &config)?;
-    let status = if target.is_some() {
-        state
-            .native_pool
-            .prepare_switch(config.clone(), identity, deadline)
-            .await?
-    } else {
-        state
-            .native_pool
-            .prepare(config.clone(), identity, deadline)
-            .await?
-    };
-    let current = read_config(&state.config_path)?;
-    if serde_json::to_vec(&current).ok() != serde_json::to_vec(&config).ok() {
-        return Err(AppError::ServiceUnavailable(
-            "原生准备期间环境配置已变化".into(),
-        ));
     }
-    Ok(Json(status))
 }
 
 /// 只取消本账号及当前环境代次的准备。
@@ -1154,6 +1234,7 @@ pub fn sender_router(config_path: String) -> Router {
         .route("/internal/send", post(forward))
         .route("/internal/native/status", get(native_status))
         .route("/internal/native/prepare", post(native_prepare))
+        .route("/internal/native/readiness", post(native_readiness))
         .route(
             "/internal/native/prepare-switch",
             post(native_prepare_switch),

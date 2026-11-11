@@ -186,6 +186,12 @@ onUnmounted(() => { mounted = false; listGeneration++; detailGeneration++; listC
           <p v-if="!attempts.length && !detailLoading && !detailError">此请求没有已记录的上游尝试。</p>
           <div v-for="attempt in attempts" :key="attempt.attempt_id" class="flex flex-wrap gap-3 items-center">
             <span>尝试 {{ attempt.ordinal }} · 账号 {{ attempt.account_id }} · {{ attempt.status_code ?? '未知状态' }} · {{ modeLabel(attempt.log_mode) }} · {{ captureLabel(attempt.capture_status) }}</span>
+            <div v-if="attempt.runtime" class="w-full rounded-md border bg-white p-3 space-y-1" data-native-runtime>
+              <p>原生进程：{{ attempt.runtime.warm_hit ? '命中热进程' : '本次等待初始化' }} · PID {{ attempt.runtime.worker_pid }}</p>
+              <p>准备等待 {{ attempt.runtime.preparation_wait_ms }} ms · 获取进程 {{ attempt.runtime.checkout_ms }} ms · 进程启动 {{ attempt.runtime.worker_start_ms == null ? '沿用现有进程' : `${attempt.runtime.worker_start_ms} ms` }}</p>
+              <p>本地准备合计 {{ attempt.runtime.prepared_ms }} ms（包含上述等待，计至组装完成）</p>
+            </div>
+            <p v-else-if="attempt.profile_selection === 'native293_cc_prepared'" class="w-full text-[#8c8475]">原生进程复用与本地阶段：未观测</p>
             <Button v-if="attempt.profile_selection === 'native293_cc_prepared' && attempt.log_mode !== 'info'" variant="outline" :disabled="detailLoading" @click="inspect(attempt)">查看 CC 组装后内容</Button>
           </div>
           <section v-if="capture" class="space-y-3">

@@ -715,6 +715,19 @@ impl GatewayService {
         self.native_prewarmer.status(account_id)
     }
 
+    /// 查询当前原生进程池，不发模型作业或唤醒休眠账号。
+    /// @param account_id 已授权账号 ID。
+    /// @return 新鲜就绪状态。
+    pub async fn inspect_native_preparation(&self, account_id: i64) -> JsonValue {
+        self.native_prewarmer.inspect(account_id).await
+    }
+
+    /// 为环境列表批量提供最近巡检快照。
+    /// @return 含检查时间与过期语义的状态数组。
+    pub fn native_preparation_snapshots(&self) -> Vec<JsonValue> {
+        self.native_prewarmer.statuses()
+    }
+
     /// 读取当前账号页的两个用量窗口，不触发上游请求。
     /// @param accounts 当前页账号及额度缓存。
     /// @return 按账号 ID 索引的本地用量统计。
@@ -10056,6 +10069,50 @@ mod tests {
             before["messages"], after["messages"],
             "完整网关预热保持零模型调用"
         );
+        // 真实终止热进程后，状态查询保持零启动；周期巡检独立恢复就绪。
+        use tokio::process::Command;
+        let killed = Command::new("/bin/kill")
+            .args(["-KILL", &prepared_pid.to_string()])
+            .status()
+            .await
+            .unwrap();
+        assert!(killed.success());
+        let check_deadline = TokioInstant::now() + Duration::from_secs(5);
+        loop {
+            let checked = service.inspect_native_preparation(account.id).await;
+            if checked["state"] != "ready" || checked["pid"].as_u64() != Some(prepared_pid) {
+                break;
+            }
+            // kill 返回只表示信号已送出，等待实际进程退出后再检查就绪失效。
+            assert!(
+                TokioInstant::now() < check_deadline,
+                "退出检查状态: {checked}"
+            );
+            tokio_sleep(Duration::from_millis(20)).await;
+        }
+        let old_pid = prepared_pid;
+        let deadline = TokioInstant::now() + Duration::from_secs(45);
+        let prepared_pid = loop {
+            let state = service.native_preparation_status(account.id);
+            if state["state"] == "ready" && state["pid"].as_u64().is_some_and(|pid| pid != old_pid)
+            {
+                break state["pid"].as_u64().unwrap();
+            }
+            assert!(TokioInstant::now() < deadline, "周期恢复状态: {state}");
+            tokio_sleep(Duration::from_millis(20)).await;
+        };
+        let recovered: Value = client
+            .get(&control)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            before["messages"], recovered["messages"],
+            "周期故障恢复零模型调用"
+        );
         // 阻塞一次在途绑定读取，合并的新环境提示必须在原任务失败后继续处理。
         for (skip, mode) in [(0, "fail"), (1, "generation")] {
             client
@@ -10208,6 +10265,11 @@ mod tests {
         for request in page.items {
             assert_eq!(request.attempt_count, 1);
             let detail = diagnostics.detail(&request.request_id).await.unwrap();
+            let runtime = detail.attempts[0].runtime.as_ref().expect("实际进程观察");
+            assert!(runtime.warm_hit);
+            assert_eq!(runtime.worker_pid as u64, prepared_pid);
+            assert!(runtime.worker_start_ms.is_none());
+            assert!(runtime.prepared_ms >= runtime.preparation_wait_ms);
             if detail.attempts[0].sessions.mapping_action.as_deref() == Some("mapped") {
                 assert_ne!(
                     detail.attempts[0].sessions.real_session_hash,

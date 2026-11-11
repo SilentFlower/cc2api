@@ -101,6 +101,23 @@ pub struct NativePreparationStatus {
     pub image_sha256: Option<String>,
 }
 
+/// 当前身份对应的实时池状态；只携带安全观测，不启动模型作业。
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReadinessStatus {
+    pub state: String,
+    pub account_id: i64,
+    pub environment_id: String,
+    pub generation: u64,
+    pub kernel_generation: Option<String>,
+    pub release: Option<NativeReleaseRef>,
+    pub checked_at_ms: u64,
+    pub idle_workers: usize,
+    pub live_workers: usize,
+    pub pid: Option<u32>,
+    pub reason: Option<String>,
+}
+
 /// 仅由受信切换协调器指定的预期版本和操作代次。
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

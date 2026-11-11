@@ -275,6 +275,7 @@ fn prepare_observation(account: &Account, body: Value) -> Option<AttemptTrace> {
                 .and_then(Value::as_str)
                 .map(|value| identity_hash(account.id, "message", value));
             let record = AttemptDiagnostic {
+                runtime: None,
                 log_mode: state.request.log_mode,
                 capture_status: None,
                 attempt_id: Uuid::new_v4().to_string(),
@@ -328,6 +329,21 @@ pub(crate) fn prepare_native_attempt(
     attempt_id: &str,
 ) -> Option<AttemptTrace> {
     if Uuid::parse_str(attempt_id).is_err()
+        || observation.runtime.as_ref().is_some_and(|runtime| {
+            Uuid::parse_str(&runtime.worker_id).is_err()
+                || runtime.worker_pid == 0
+                || runtime
+                    .kernel_generation
+                    .as_ref()
+                    .is_some_and(|id| Uuid::parse_str(id).is_err())
+                || runtime
+                    .preparation_wait_ms
+                    .saturating_add(runtime.checkout_ms)
+                    > runtime.prepared_ms.saturating_add(2)
+                || runtime
+                    .worker_start_ms
+                    .is_some_and(|elapsed| elapsed > runtime.checkout_ms.saturating_add(2))
+        })
         || observation.schema_version != 1
         || observation.body_sha256.len() != 64
         || !observation
@@ -369,6 +385,7 @@ pub(crate) fn prepare_native_attempt(
     record.profile_selection = "native293_cc_prepared".into();
     record.parameters = observation.parameters;
     record.capture_status = observation.capture_status;
+    record.runtime = observation.runtime;
     Some(attempt)
 }
 

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout_at};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -84,6 +84,11 @@ impl NativePrewarmer {
             let startup = Instant::now();
             let retries = retry_seconds.map(|seconds| startup + Duration::from_secs(seconds));
             let mut retry_index = 0;
+            let mut inspections =
+                interval_at(startup + Duration::from_secs(20), Duration::from_secs(20));
+            inspections.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut failures: HashMap<i64, (u32, Instant)> = HashMap::new();
+            let mut scan_after = 0;
             loop {
                 while jobs.len() < PREPARE_PARALLELISM {
                     let Some(id) = pending.iter().copied().find(|id| !active.contains_key(id))
@@ -92,22 +97,40 @@ impl NativePrewarmer {
                     };
                     pending.remove(&id);
                     let preparation_id = Uuid::new_v4().to_string();
-                    states.lock().unwrap().insert(
-                        id,
-                        json!({"state":"preparing","preparation_id":preparation_id}),
-                    );
+                    states
+                        .lock()
+                        .unwrap()
+                        .entry(id)
+                        .or_insert_with(|| json!({"state":"preparing"}))["checking"] = json!(true);
                     let (cancel, cancellation) = oneshot::channel();
                     active.insert(id, Some(cancel));
                     let accounts = accounts.clone();
                     jobs.spawn(async move {
                         let result =
-                            prepare_one(accounts, id, preparation_id.clone(), cancellation).await;
+                            check_one(accounts, id, preparation_id.clone(), cancellation, true)
+                                .await;
                         (id, preparation_id, result)
                     });
                 }
                 // select 的禁用分支仍会构造 future，取值必须在最后一次补偿后保持有效。
                 let retry_deadline = retries.get(retry_index).copied().unwrap_or(retries[2]);
                 tokio::select! {
+                    _ = inspections.tick() => {
+                        if let Ok(mut items) = accounts.list_accounts().await {
+                            // 队列有界时轮转扫描起点，避免高 ID 的运行账号一直被前批挤出。
+                            items.sort_by_key(|account| (account.id <= scan_after, account.id));
+                            for account in items {
+                                if pending.len() >= QUEUE_LIMIT { break; }
+                                if account.status == AccountStatus::Active && account.request_backend == "native293"
+                                    && !active.contains_key(&account.id)
+                                    && !pending.contains(&account.id)
+                                    && failures.get(&account.id).is_none_or(|(_, next)| Instant::now() >= *next) {
+                                    pending.insert(account.id);
+                                    scan_after = account.id;
+                                }
+                            }
+                        }
+                    }
                     _ = &mut stopping => {
                         for cancel in active.values_mut().filter_map(Option::take) { let _ = cancel.send(()); }
                         // 留出私有取消与进程收口时间，超时后 Drop 继续隔离子进程。
@@ -131,8 +154,10 @@ impl NativePrewarmer {
                     }
                     event = events.recv() => match event {
                         Ok((id, invalidate)) => {
+                            failures.remove(&id);
                             if invalidate {
                                 if let Some(cancel) = active.get_mut(&id).and_then(Option::take) { let _ = cancel.send(()); }
+                                states.lock().unwrap().insert(id, json!({"state":"preparing","reason":"invalidated"}));
                             }
                             // 在途任务结束后仍消费一次新提示，环境重建的唯一通知不能丢失。
                             if pending.len() < QUEUE_LIMIT || pending.contains(&id) { pending.insert(id); }
@@ -154,6 +179,17 @@ impl NativePrewarmer {
                             let mut result = if cancelled { json!({"state":"cancelled","reason":"invalidated"}) }
                                 else { result.unwrap_or_else(|_| json!({"state":"failed","reason":"preparation_failed"})) };
                             result["preparation_id"] = json!(preparation_id);
+                            result["account_id"] = json!(id);
+                            result["checking"] = json!(false);
+                            if matches!(result["state"].as_str(), Some("failed" | "unknown")) {
+                                let count = failures.get(&id).map_or(1, |(count, _)| count.saturating_add(1));
+                                let delay = 20_u64.saturating_mul(1 << count.min(4)).min(300);
+                                failures.insert(id, (count, Instant::now() + Duration::from_secs(delay)));
+                            } else { failures.remove(&id); }
+                            let previous = states.lock().unwrap().get(&id).and_then(|value| value.get("last_preparation")).cloned();
+                            if result.get("last_preparation").is_none() {
+                                if let Some(previous) = previous { result["last_preparation"] = previous; }
+                            }
                             states.lock().unwrap().insert(id, result);
                         }
                     }
@@ -166,12 +202,56 @@ impl NativePrewarmer {
     /// @param id 当前账号 ID。
     /// @return 受控状态摘要。
     pub(crate) fn status(&self, id: i64) -> Value {
-        self.states
+        let mut status = self
+            .states
             .lock()
             .unwrap()
             .get(&id)
             .cloned()
-            .unwrap_or_else(|| json!({"state":"unprepared"}))
+            .unwrap_or_else(|| json!({"state":"unprepared"}));
+        if status["state"] == "ready"
+            && status["checked_at_ms"]
+                .as_u64()
+                .is_none_or(|checked| now_ms().saturating_sub(checked) > 45_000)
+        {
+            status["state"] = json!("unknown");
+            status["reason"] = json!("check_expired");
+        }
+        status
+    }
+
+    /// 批量读取最近巡检快照，统一应用新鲜度规则。
+    /// @return 按账号归属的安全状态数组。
+    pub(crate) fn statuses(&self) -> Vec<Value> {
+        let ids: Vec<i64> = self.states.lock().unwrap().keys().copied().collect();
+        ids.into_iter()
+            .map(|id| {
+                let mut status = self.status(id);
+                status["account_id"] = json!(id);
+                status
+            })
+            .collect()
+    }
+
+    /// 主动状态读取只做本地检查，恢复统一交给有界后台协调器。
+    /// @param id 已授权账号 ID。
+    /// @return 当前身份对应的安全观测或明确未知状态。
+    pub(crate) async fn inspect(&self, id: i64) -> Value {
+        let (_cancel, cancellation) = oneshot::channel();
+        let result = check_one(
+            self.accounts.clone(),
+            id,
+            Uuid::new_v4().to_string(),
+            cancellation,
+            false,
+        )
+        .await;
+        let mut result =
+            result.unwrap_or_else(|_| json!({"state":"unknown","reason":"check_failed"}));
+        if let Some(previous) = self.status(id).get("last_preparation") {
+            result["last_preparation"] = previous.clone();
+        }
+        result
     }
 }
 
@@ -183,11 +263,12 @@ impl Drop for NativePrewarmer {
     }
 }
 
-async fn prepare_one(
+async fn check_one(
     accounts: Arc<AccountService>,
     id: i64,
     preparation_id: String,
     mut cancellation: oneshot::Receiver<()>,
+    allow_prepare: bool,
 ) -> Result<Value, AppError> {
     let _update_activity = system_update::admission()?;
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -200,7 +281,7 @@ async fn prepare_one(
         .as_array()
         .is_some_and(|holders| holders.iter().any(|holder| holder["exclusive"] == true))
     {
-        return Ok(json!({"state":"cancelled","reason":"maintenance"}));
+        return Ok(json!({"state":"maintenance","reason":"maintenance"}));
     }
     let Some(transport) = prepare_existing(&account).await? else {
         return Ok(json!({"state":"sleeping"}));
@@ -231,13 +312,22 @@ async fn prepare_one(
     if !matches_identity(&account, &preparation) {
         return Ok(json!({"state":"cancelled","reason":"identity_changed"}));
     }
+    let mut last_readiness = None;
     let result = tokio::select! {
         biased;
         _ = &mut cancellation => None,
         _ = queue.runtime_gate.wait_exclusive() => None,
         _ = activity.closed() => None,
         result = timeout_at(deadline, async {
-            let status = transport.prepare_native(preparation.clone()).await?;
+            let current = transport.native_readiness(preparation.clone()).await?;
+            let mut status = serde_json::to_value(current).map_err(|_| AppError::Internal("检查状态编码失败".into()))?;
+            last_readiness = Some(status.clone());
+            if allow_prepare && matches!(status["state"].as_str(), Some("unprepared" | "failed")) {
+                let prepared = transport.prepare_native(preparation.clone()).await?;
+                let current = transport.native_readiness(preparation.clone()).await?;
+                status = serde_json::to_value(current).map_err(|_| AppError::Internal("检查状态编码失败".into()))?;
+                status["last_preparation"] = serde_json::to_value(prepared).map_err(|_| AppError::Internal("准备状态编码失败".into()))?;
+            }
             // sender 回执只代表原绑定；发布前重新读取运行环境和权威身份。
             let current_transport = prepare_existing(&account).await?;
             let current_account = accounts.get_account(id).await?;
@@ -249,15 +339,27 @@ async fn prepare_one(
         }) => Some(result),
     };
     match result {
-        Some(Ok(Ok(status))) => {
-            serde_json::to_value(status).map_err(|_| AppError::Internal("准备状态编码失败".into()))
-        }
+        Some(Ok(Ok(status))) => Ok(status),
         other => {
             let cancelled = other.is_none();
-            transport.cancel_native_preparation(&preparation_id).await?;
-            Ok(
-                json!({"state":if cancelled {"cancelled"} else {"failed"},"reason":if cancelled {"invalidated"} else {"preparation_failed"}}),
-            )
+            if allow_prepare {
+                transport.cancel_native_preparation(&preparation_id).await?;
+            }
+            let mut failure = json!({"state":if cancelled {"cancelled"} else if allow_prepare {"failed"} else {"unknown"},
+                "reason":if cancelled {"invalidated"} else if allow_prepare {"preparation_failed"} else {"check_failed"}});
+            if let Some(observation) = last_readiness {
+                // 失败只沿用本次检查的归属和时间，禁止沿用旧 ready 或进程数量。
+                for key in [
+                    "account_id",
+                    "environment_id",
+                    "generation",
+                    "kernel_generation",
+                    "checked_at_ms",
+                ] {
+                    failure[key] = observation[key].clone();
+                }
+            }
+            Ok(failure)
         }
     }
 }

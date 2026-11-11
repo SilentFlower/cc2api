@@ -410,6 +410,7 @@ mod tests {
 
     fn attempt(request: &RequestDiagnostic) -> AttemptDiagnostic {
         AttemptDiagnostic {
+            runtime: None,
             log_mode: None,
             capture_status: None,
             attempt_id: Uuid::new_v4().to_string(),

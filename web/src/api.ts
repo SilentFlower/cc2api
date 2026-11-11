@@ -379,8 +379,21 @@ export interface DiagnosticRequest {
   attempt_count: number
 }
 
+/** 原生请求实际复用的进程及本地阶段观测。 */
+export interface NativeRuntimeObservation {
+  worker_id: string
+  worker_pid: number
+  kernel_generation: string | null
+  warm_hit: boolean
+  preparation_wait_ms: number
+  checkout_ms: number
+  worker_start_ms: number | null
+  prepared_ms: number
+}
+
 /** 单次实际提交及私有采集状态。 */
 export interface DiagnosticAttempt {
+  runtime?: NativeRuntimeObservation | null
   log_mode?: 'info' | 'debug' | null
   attempt_id: string
   account_id: number

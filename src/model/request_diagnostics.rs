@@ -74,6 +74,22 @@ pub(crate) struct NativeRequestObservation {
     pub body_sha256: String,
     #[serde(default)]
     pub capture_status: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<NativeRuntimeObservation>,
+}
+
+/// 原生请求实际使用的进程与本地阶段计时，所有耗时来自单调时钟。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRuntimeObservation {
+    pub worker_id: String,
+    pub worker_pid: u32,
+    pub kernel_generation: Option<String>,
+    pub warm_hit: bool,
+    pub preparation_wait_ms: u64,
+    pub checkout_ms: u64,
+    pub worker_start_ms: Option<u64>,
+    pub prepared_ms: u64,
 }
 
 /// 仅在网关与 sender 之间传递的原生观察头，消费后移除。
@@ -171,6 +187,9 @@ impl From<[Option<u64>; 6]> for DiagnosticTokens {
 /// 一次真实发送尝试，包括重试和未完整返回的流。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttemptDiagnostic {
+    /// 历史缺失表示未观测，不能使用当前运行时状态补写。
+    #[serde(default)]
+    pub runtime: Option<NativeRuntimeObservation>,
     /// 与根请求同次冻结的模式；历史缺失保持未知。
     #[serde(default)]
     pub log_mode: Option<RequestLogMode>,

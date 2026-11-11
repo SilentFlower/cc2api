@@ -161,6 +161,10 @@ pub fn build_router(
             get(native_preparation_status).post(request_native_preparation),
         )
         .route(
+            "/admin/native-preparations",
+            get(native_preparation_snapshots),
+        )
+        .route(
             "/admin/accounts/:id/scheduling/sessions",
             get(account_scheduling_sessions),
         )
@@ -2271,7 +2275,16 @@ async fn native_preparation_status(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.account_svc.get_account(id).await?;
-    Ok(Json(state.gateway_svc.native_preparation_status(id)))
+    Ok(Json(state.gateway_svc.inspect_native_preparation(id).await))
+}
+
+/// 环境列表批量读取最近检查状态，避免逐账号串行访问 sender。
+/// @param state 已通过管理鉴权的共享服务。
+/// @return 安全状态快照数组。
+async fn native_preparation_snapshots(
+    State(state): State<AppState>,
+) -> Json<Vec<serde_json::Value>> {
+    Json(state.gateway_svc.native_preparation_snapshots())
 }
 
 /// 分页查询已鉴权业务请求的白名单诊断。

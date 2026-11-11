@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tokio::time::Instant;
 
 use crate::error::AppError;
-use crate::service::native_contract::{NativePreparationControl, NativePreparationStatus};
+use crate::service::native_contract::{
+    NativePreparationControl, NativePreparationStatus, NativeReadinessStatus,
+};
 pub use crate::service::native_contract::{
     NativeSenderConfig, NativeSubmission, POOL_MEMORY_MIB, WORKER_MEMORY_MIB,
 };
@@ -24,6 +26,20 @@ pub(crate) fn verify_distribution(_config: &NativeSenderConfig) -> Result<File, 
 pub struct NativePool;
 
 impl NativePool {
+    /// 在实时检查阶段明确拒绝不支持的平台。
+    /// @param config sender 配置。
+    /// @param identity 当前账号身份。
+    /// @return 受控平台错误。
+    pub(crate) async fn readiness(
+        self: &Arc<Self>,
+        _config: &SenderConfig,
+        _identity: &NativeSubmission,
+    ) -> Result<NativeReadinessStatus, AppError> {
+        Err(AppError::ServiceUnavailable(
+            "原生运行时需要 Linux x64 平台".into(),
+        ))
+    }
+
     /// 在能力查询时明确拒绝不支持的平台。
     /// @param config 部署配置。
     /// @return 受控平台错误。
