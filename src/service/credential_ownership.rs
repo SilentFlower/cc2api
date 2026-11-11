@@ -349,6 +349,25 @@ impl AccountService {
         Ok(permit)
     }
 
+    /// 保护零模型切换预热期间的凭据归属；调用方另行核对内核维护租约。
+    /// @param id 当前账号。
+    /// @return 凭据归属许可，不进入上游请求或刷新路径。
+    pub(crate) async fn native_kernel_credentials(
+        &self,
+        id: i64,
+    ) -> Result<CredentialActivity, AppError> {
+        let permit = self.credential_gate(id).enter()?;
+        if self
+            .store
+            .credential_ownership(id)
+            .await?
+            .is_some_and(|value| !value.gateway_ready())
+        {
+            return Err(unavailable());
+        }
+        Ok(permit)
+    }
+
     /// 批量提供不含令牌的凭据归属。@return 管理列表及调度使用的记录。
     pub async fn credential_ownerships(
         &self,

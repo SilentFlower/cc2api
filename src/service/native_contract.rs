@@ -12,11 +12,23 @@ pub const POOL_MEMORY_MIB: u64 = 256;
 /// 每个独立进程的堆和缓冲预算；共享代码计入池基础份额。
 pub const WORKER_MEMORY_MIB: u64 = 192;
 
+/// 只读发布目录中的精确制品引用。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReleaseRef {
+    pub release: String,
+    pub launcher_sha256: String,
+}
+
 /// 部署侧冻结的原生池配置；预算必须与 sender 的 cgroup 上限一致。
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSenderConfig {
     pub binary_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<NativeReleaseRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_generation: Option<String>,
     pub work_root: String,
     /// 显式零表示账号无限内存，正数沿用加权容量公式。
     pub memory_mib: u64,
@@ -81,6 +93,28 @@ pub struct NativePreparationStatus {
     pub pid: Option<u32>,
     pub idle_workers: usize,
     pub reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<NativeReleaseRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_sha256: Option<String>,
+}
+
+/// 仅由受信切换协调器指定的预期版本和操作代次。
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeKernelTarget {
+    pub release: Option<NativeReleaseRef>,
+    pub kernel_generation: String,
+}
+
+/// sender 的专用零模型切换预热信封。
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeKernelPreparation {
+    pub target: NativeKernelTarget,
+    pub identity: NativePreparation,
 }
 
 impl NativeSenderConfig {

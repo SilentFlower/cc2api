@@ -45,6 +45,7 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 ml-kem = "0.2.3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 sha2 = "0.10"
+ring = "0.17"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 rand = "0.8"
 hex = "0.4"

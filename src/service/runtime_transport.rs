@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 use tokio::time::{Instant, timeout, timeout_at};
 use uuid::Uuid;
 
@@ -34,7 +35,8 @@ use crate::error::AppError;
 use crate::model::account::Account;
 use crate::model::request_diagnostics::RequestLogMode;
 use crate::service::native_contract::{
-    NativePreparation, NativePreparationControl, NativePreparationStatus,
+    NativeKernelPreparation, NativeKernelTarget, NativePreparation, NativePreparationControl,
+    NativePreparationStatus,
 };
 use crate::service::native_runtime::{NativePool, NativeSenderConfig, NativeSubmission};
 use crate::tlsfp::{TlsProfileId, get_request_client_for_profile};
@@ -384,7 +386,45 @@ impl PreparedTransport {
     /// @return 真实握手后的准备状态。
     pub(crate) async fn prepare_native(
         &self,
+        preparation: NativePreparation,
+    ) -> Result<NativePreparationStatus, AppError> {
+        self.prepare_native_target(preparation, None).await
+    }
+
+    /// 以已核验的同部署绑定预热精确候选，不向上游提交业务。
+    /// @param binding 调度器持锁读取的 sender 绑定。
+    /// @param preparation 当前账号身份。
+    /// @param target 候选发布及操作代次。
+    /// @return 真实握手回执。
+    pub(crate) async fn probe_native_kernel(
+        binding: TransportBinding,
+        preparation: NativePreparation,
+        target: NativeKernelTarget,
+    ) -> Result<NativePreparationStatus, AppError> {
+        validate_binding(
+            &binding,
+            preparation.account_id,
+            &std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default(),
+            &std::env::var("V3_RELEASE").unwrap_or_default(),
+        )?;
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|_| AppError::ServiceUnavailable("切换准备通道不可用".into()))?;
+        Self {
+            account_id: binding.account_id,
+            route: PreparedRoute::V3 { client, binding },
+        }
+        .prepare_native_target(preparation, Some(target))
+        .await
+    }
+
+    async fn prepare_native_target(
+        &self,
         mut preparation: NativePreparation,
+        target: Option<NativeKernelTarget>,
     ) -> Result<NativePreparationStatus, AppError> {
         let PreparedRoute::V3 { client, binding } = &self.route else {
             return Err(AppError::ServiceUnavailable(
@@ -394,13 +434,27 @@ impl PreparedTransport {
         preparation.account_id = self.account_id;
         preparation.environment_id = binding.environment_id.clone();
         preparation.generation = binding.generation;
-        let response = client
+        let path = if target.is_some() {
+            "prepare-switch"
+        } else {
+            "prepare"
+        };
+        let request = client
             .post(format!(
-                "{}/internal/native/prepare",
+                "{}/internal/native/{path}",
                 binding.endpoint.trim_end_matches('/')
             ))
-            .bearer_auth(&binding.secret)
-            .json(&preparation)
+            .bearer_auth(&binding.secret);
+        let request = if let Some(target) = &target {
+            request.json(&NativeKernelPreparation {
+                target: target.clone(),
+                identity: preparation.clone(),
+            })
+        } else {
+            request.json(&preparation)
+        };
+        let response = request
+            .timeout(Duration::from_secs(110))
             .send()
             .await
             .map_err(|_| AppError::ServiceUnavailable("原生准备通道不可用".into()))?
@@ -417,6 +471,12 @@ impl PreparedTransport {
             || status.version != "2.1.293"
             || status.raw_input_protocol != 1
             || !matches!(status.state.as_str(), "ready" | "busy")
+            || target.as_ref().is_some_and(|target| {
+                status.release != target.release
+                    || status.kernel_generation.as_deref()
+                        != Some(target.kernel_generation.as_str())
+                    || status.state != "ready"
+            })
             || (status.state == "ready" && (status.pid.is_none() || status.idle_workers == 0))
         {
             return Err(AppError::ServiceUnavailable("原生准备回执归属不符".into()));
@@ -662,6 +722,7 @@ fn validate_binding(
 struct SenderState {
     config_path: String,
     native_pool: Arc<NativePool>,
+    native_transition: Arc<RwLock<()>>,
     active: Arc<AtomicU64>,
     evidence_error: Arc<AtomicBool>,
     evidence_lock: Arc<Mutex<()>>,
@@ -850,7 +911,8 @@ async fn native_status(
         return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
     }
     Ok(Json(
-        serde_json::json!({"raw_input_protocol":1,"version":"2.1.293","environment_id":config.binding.environment_id,"generation":config.binding.generation}),
+        serde_json::json!({"raw_input_protocol":1,"version":"2.1.293","environment_id":config.binding.environment_id,"generation":config.binding.generation,
+            "release":config.native.as_ref().and_then(|native| native.release.as_ref())}),
     ))
 }
 
@@ -864,10 +926,52 @@ async fn native_prepare(
     headers: HeaderMap,
     Json(preparation): Json<NativePreparation>,
 ) -> Result<Json<NativePreparationStatus>, AppError> {
+    let _guard = state.native_transition.read().await;
+    prepare_sender(&state, &headers, preparation, None).await
+}
+
+/// 专用切换预热在 sender 内排除已入场流和迟到的普通准备。
+/// @param state sender 状态。
+/// @param headers 私有服务鉴权。
+/// @param input 精确操作代次、内核引用和账号身份。
+/// @return 候选真实预热结果。
+async fn native_prepare_switch(
+    State(state): State<SenderState>,
+    headers: HeaderMap,
+    Json(input): Json<NativeKernelPreparation>,
+) -> Result<Json<NativePreparationStatus>, AppError> {
     let config = read_config(&state.config_path)?;
     authenticate(&headers, &config)?;
+    let _transition = timeout(Duration::from_secs(10), state.native_transition.write())
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("发送器仍有原生请求或准备".into()))?;
+    prepare_sender(&state, &headers, input.identity, Some(input.target)).await
+}
+
+async fn prepare_sender(
+    state: &SenderState,
+    headers: &HeaderMap,
+    preparation: NativePreparation,
+    target: Option<NativeKernelTarget>,
+) -> Result<Json<NativePreparationStatus>, AppError> {
+    let config = read_config(&state.config_path)?;
+    authenticate(headers, &config)?;
     if state.evidence_error.load(Ordering::SeqCst) {
         return Err(AppError::ServiceUnavailable("账号证据写入异常".into()));
+    }
+    if let Some(target) = &target {
+        let native = config
+            .native
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("未配置原生运行时".into()))?;
+        if state.active.load(Ordering::SeqCst) != 0
+            || native.release != target.release
+            || native.kernel_generation.as_deref() != Some(target.kernel_generation.as_str())
+        {
+            return Err(AppError::ServiceUnavailable(
+                "候选内核或发送器活动状态已变化".into(),
+            ));
+        }
     }
     state.native_pool.verify(
         config
@@ -899,10 +1003,17 @@ async fn native_prepare(
         concurrency: preparation.concurrency,
     };
     let deadline = validate_request(&identity.request, &config)?;
-    let status = state
-        .native_pool
-        .prepare(config.clone(), identity, deadline)
-        .await?;
+    let status = if target.is_some() {
+        state
+            .native_pool
+            .prepare_switch(config.clone(), identity, deadline)
+            .await?
+    } else {
+        state
+            .native_pool
+            .prepare(config.clone(), identity, deadline)
+            .await?
+    };
     let current = read_config(&state.config_path)?;
     if serde_json::to_vec(&current).ok() != serde_json::to_vec(&config).ok() {
         return Err(AppError::ServiceUnavailable(
@@ -944,6 +1055,7 @@ async fn native_forward(
 ) -> Response {
     let mut submitted = false;
     let operation = async {
+        let transition = state.native_transition.clone().read_owned().await;
         let config = read_config(&state.config_path)?;
         authenticate(&headers, &config)?;
         let deadline = validate_request(&submission.request, &config)?;
@@ -987,8 +1099,13 @@ async fn native_forward(
         }
         let (parts, body) = response.into_parts();
         let stream = unfold(
-            (body.into_data_stream(), guard),
-            |(mut stream, guard)| async move { stream.next().await.map(|item| (item, (stream, guard))) },
+            (body.into_data_stream(), guard, transition),
+            |(mut stream, guard, transition)| async move {
+                stream
+                    .next()
+                    .await
+                    .map(|item| (item, (stream, guard, transition)))
+            },
         );
         Ok::<Response, AppError>(Response::from_parts(parts, Body::from_stream(stream)))
     };
@@ -1024,6 +1141,10 @@ pub fn sender_router(config_path: String) -> Router {
         .route("/internal/native/status", get(native_status))
         .route("/internal/native/prepare", post(native_prepare))
         .route(
+            "/internal/native/prepare-switch",
+            post(native_prepare_switch),
+        )
+        .route(
             "/internal/native/prepare/cancel",
             post(native_prepare_cancel),
         )
@@ -1033,6 +1154,7 @@ pub fn sender_router(config_path: String) -> Router {
         .with_state(SenderState {
             config_path,
             native_pool: Arc::new(NativePool::default()),
+            native_transition: Arc::new(RwLock::new(())),
             active: Arc::new(AtomicU64::new(0)),
             evidence_error: Arc::new(AtomicBool::new(false)),
             evidence_lock: Arc::new(Mutex::new(())),

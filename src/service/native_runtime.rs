@@ -44,6 +44,7 @@ use crate::service::native_contract::{NativePreparationControl, NativePreparatio
 pub use crate::service::native_contract::{
     NativeSenderConfig, NativeSubmission, POOL_MEMORY_MIB, WORKER_MEMORY_MIB,
 };
+use crate::service::native_release::ReleaseArtifact;
 use crate::service::rewriter::extract_session_id_from_body;
 use crate::service::runtime_transport::{
     CLOCK_SKEW_MS, REQUEST_BUDGET_MS, SenderConfig, validate_request,
@@ -93,15 +94,32 @@ fn validate_distribution_config(config: &NativeSenderConfig) -> Result<(), AppEr
 /// @return 经完整摘要验证的文件。
 pub(crate) fn verify_distribution(config: &NativeSenderConfig) -> Result<File, AppError> {
     validate_distribution_config(config)?;
+    verify_artifact(&artifact(config)?)
+}
+
+fn artifact(config: &NativeSenderConfig) -> Result<ReleaseArtifact, AppError> {
+    match &config.release {
+        Some(reference) => ReleaseArtifact::signed(reference),
+        None => Ok(ReleaseArtifact {
+            path: PathBuf::from(&config.binary_path),
+            launcher_sha256: LAUNCHER_SHA256.into(),
+            launcher_bytes: 27_387_960,
+            image_sha256: IMAGE_SHA256.into(),
+            image_bytes: IMAGE_BYTES,
+        }),
+    }
+}
+
+fn verify_artifact(artifact: &ReleaseArtifact) -> Result<File, AppError> {
     let mut file = OpenOptions::new()
         .read(true)
-        .open(&config.binary_path)
+        .open(&artifact.path)
         .map_err(|_| unavailable())?;
     let metadata = file.metadata().map_err(|_| unavailable())?;
     if !metadata.is_file()
-        || metadata.len() != 27_387_960
+        || metadata.len() != artifact.launcher_bytes
         || metadata.mode() & 0o022 != 0
-        || digest_file(&mut file).map_err(|_| unavailable())? != LAUNCHER_SHA256
+        || digest_file(&mut file).map_err(|_| unavailable())? != artifact.launcher_sha256
     {
         return Err(unavailable());
     }
@@ -140,6 +158,7 @@ impl From<fs::Metadata> for DistributionIdentity {
 struct VerifiedDistribution {
     path: PathBuf,
     identity: DistributionIdentity,
+    sha256: String,
     file: File,
 }
 
@@ -199,7 +218,7 @@ enum PreparationState {
 pub struct NativePool {
     state: Mutex<PoolState>,
     generation: tokio::sync::Mutex<()>,
-    image: tokio::sync::Mutex<Option<Arc<File>>>,
+    image: tokio::sync::Mutex<Option<(String, Arc<File>)>>,
     idle_timeout: Duration,
     verified: Mutex<Option<VerifiedDistribution>>,
     warmup: RwLock<()>,
@@ -263,6 +282,7 @@ struct Worker {
     idle_since: Instant,
     _lease: Option<WorkerLease>,
     _proxy: NativeProxy,
+    image_sha256: String,
 }
 
 /// 原生 TLS 字节通过有鉴权的本地 CONNECT 转到现有 SOCKS 代理。
@@ -486,7 +506,8 @@ impl Worker {
         deadline: Instant,
     ) -> Result<Self, AppError> {
         let native = config.native.as_ref().ok_or_else(unavailable)?;
-        let image = native.verify()?;
+        let artifact = artifact(native)?;
+        let image = verify_artifact(&artifact)?;
         let proxy = NativeProxy::create(&config.proxy_url).await?;
         fs::create_dir_all(&native.work_root).map_err(|_| unavailable())?;
         fs::set_permissions(&native.work_root, fs::Permissions::from_mode(0o700))
@@ -578,6 +599,7 @@ impl Worker {
             root,
             _image: image,
             execution_image: execution_image.clone(),
+            image_sha256: String::new(),
             idle_since: Instant::now(),
             _lease: Some(lease),
             _proxy: proxy,
@@ -598,11 +620,14 @@ impl Worker {
             return Err(unavailable());
         }
         let mut executable = File::open(format!("/proc/{pid}/exe")).map_err(|_| unavailable())?;
-        if executable.metadata().map_err(|_| unavailable())?.len() != IMAGE_BYTES
-            || digest_file(&mut executable).map_err(|_| unavailable())? != IMAGE_SHA256
-        {
+        if executable.metadata().map_err(|_| unavailable())?.len() != artifact.image_bytes {
             return Err(unavailable());
         }
+        let actual_digest = digest_file(&mut executable).map_err(|_| unavailable())?;
+        if actual_digest != artifact.image_sha256 {
+            return Err(unavailable());
+        }
+        worker.image_sha256 = actual_digest;
         // FD在fcntl期间保持打开；四项封存保证缓存映像不能被修改或解除保护。
         let seals = unsafe { fcntl(executable.as_raw_fd(), F_GET_SEALS) };
         let required_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
@@ -835,11 +860,13 @@ impl NativePool {
     /// @return 文件与登记身份相同，否则明确拒绝。
     pub(crate) fn verify(&self, config: &NativeSenderConfig) -> Result<(), AppError> {
         validate_distribution_config(config)?;
-        let path = fs::canonicalize(&config.binary_path).map_err(|_| unavailable())?;
+        let artifact = artifact(config)?;
+        let path = fs::canonicalize(&artifact.path).map_err(|_| unavailable())?;
         let identity = DistributionIdentity::from(fs::metadata(&path).map_err(|_| unavailable())?);
         let mut cached = self.verified.lock().unwrap();
         if let Some(verified) = cached.as_ref() {
-            if verified.path == path
+            if verified.sha256 == artifact.launcher_sha256
+                && verified.path == path
                 && verified.identity == identity
                 && DistributionIdentity::from(verified.file.metadata().map_err(|_| unavailable())?)
                     == identity
@@ -849,20 +876,47 @@ impl NativePool {
         }
         // 先失效再摘要，核验失败后不能继续借用旧缓存。
         *cached = None;
-        let file = verify_distribution(config)?;
+        let file = verify_artifact(&artifact)?;
         let verified = DistributionIdentity::from(file.metadata().map_err(|_| unavailable())?);
         if verified != identity
             || DistributionIdentity::from(fs::metadata(&path).map_err(|_| unavailable())?)
                 != verified
-            || fs::canonicalize(&config.binary_path).map_err(|_| unavailable())? != path
+            || fs::canonicalize(&artifact.path).map_err(|_| unavailable())? != path
         {
             return Err(unavailable());
         }
         *cached = Some(VerifiedDistribution {
             path,
             identity: verified,
+            sha256: artifact.launcher_sha256,
             file,
         });
+        Ok(())
+    }
+
+    async fn retire_for_switch(&self, deadline: Instant) -> Result<(), AppError> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(8));
+        let old_idle = loop {
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.live == state.idle.len() {
+                    break std::mem::take(&mut state.idle);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(unavailable());
+            }
+            sleep_until(deadline.min(Instant::now() + Duration::from_millis(20))).await;
+        };
+        // Drop 把物理许可交给 wait 任务，切换预热超时也不会提前归还。
+        drop(old_idle);
+        while self.state.lock().unwrap().live != 0 {
+            if Instant::now() >= deadline {
+                return Err(unavailable());
+            }
+            sleep_until(deadline.min(Instant::now() + Duration::from_millis(20))).await;
+        }
+        *self.image.lock().await = None;
         Ok(())
     }
 
@@ -876,6 +930,32 @@ impl NativePool {
         config: SenderConfig,
         identity: NativeSubmission,
         deadline: Instant,
+    ) -> Result<NativePreparationStatus, AppError> {
+        self.prepare_internal(config, identity, deadline, false)
+            .await
+    }
+
+    /// 等旧代物理进程收口后，启动切换使用的零模型暖进程。
+    /// @param config 已验证切换选择的 sender 配置。
+    /// @param identity 当前账号和绑定。
+    /// @param deadline 本轮预热截止。
+    /// @return 真实新代回执，旧进程未收口时返回准备错误。
+    pub(crate) async fn prepare_switch(
+        self: &Arc<Self>,
+        config: SenderConfig,
+        identity: NativeSubmission,
+        deadline: Instant,
+    ) -> Result<NativePreparationStatus, AppError> {
+        self.prepare_internal(config, identity, deadline, true)
+            .await
+    }
+
+    async fn prepare_internal(
+        self: &Arc<Self>,
+        config: SenderConfig,
+        identity: NativeSubmission,
+        deadline: Instant,
+        switching: bool,
     ) -> Result<NativePreparationStatus, AppError> {
         validate_worker_identity(&config, &identity)?;
         if Instant::now() >= deadline {
@@ -914,6 +994,9 @@ impl NativePool {
         };
         let operation = async {
             let _warmup = self.warmup.write().await;
+            if switching {
+                self.retire_for_switch(deadline).await?;
+            }
             let prior: Vec<String> = {
                 let state = self.state.lock().unwrap();
                 if state.live > 0 && state.idle.is_empty() {
@@ -928,6 +1011,15 @@ impl NativePool {
                         pid: None,
                         idle_workers: 0,
                         reused: false,
+                        image_sha256: None,
+                        release: config
+                            .native
+                            .as_ref()
+                            .and_then(|native| native.release.clone()),
+                        kernel_generation: config
+                            .native
+                            .as_ref()
+                            .and_then(|native| native.kernel_generation.clone()),
                     });
                 }
                 state.idle.iter().map(|worker| worker.id.clone()).collect()
@@ -947,6 +1039,7 @@ impl NativePool {
             ) {
                 return Err(AppError::ServiceUnavailable("原生准备已撤销".into()));
             }
+            let image_sha256 = worker.image_sha256.clone();
             let mut state = self.state.lock().unwrap();
             if state.key != key {
                 return Err(unavailable());
@@ -964,6 +1057,15 @@ impl NativePool {
                 pid: Some(pid),
                 idle_workers: state.idle.len(),
                 reused,
+                image_sha256: Some(image_sha256),
+                release: config
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.release.clone()),
+                kernel_generation: config
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.kernel_generation.clone()),
             })
         };
         tokio::select! {
@@ -1118,20 +1220,31 @@ impl NativePool {
         let lease = WorkerLease {
             pool: Arc::downgrade(self),
         };
+        // 即使执行体相同，新分发文件也须实际经过加载器一次。
+        let distribution_sha256 =
+            artifact(config.native.as_ref().ok_or_else(unavailable)?)?.launcher_sha256;
         let mut cached = self.image.lock().await;
-        let worker = if let Some(image) = cached.clone() {
+        if cached
+            .as_ref()
+            .is_some_and(|(digest, _)| digest != &distribution_sha256)
+        {
+            *cached = None;
+        }
+        let worker = if let Some((_, image)) = cached.as_ref() {
+            let image = image.clone();
             drop(cached);
             Worker::start(config, submission, lease, Some(image), deadline).await?
         } else {
             // 只让首个进程解压；其它启动者等待封存映像后并行exec。
             let worker = Worker::start(config, submission, lease, None, deadline).await?;
-            *cached = Some(
+            *cached = Some((
+                distribution_sha256,
                 worker
                     .execution_image
                     .as_ref()
                     .ok_or_else(unavailable)?
                     .clone(),
-            );
+            ));
             drop(cached);
             worker
         };
@@ -1203,7 +1316,11 @@ impl NativePool {
                 }
                 result.map(|_| ())
             };
-            let result = tokio::select! { result = operation => result, _ = chunks.closed() => Err(protocol_error()) };
+            let result = tokio::select! {
+                biased;
+                _ = chunks.closed() => Err(protocol_error()),
+                result = operation => result,
+            };
             if let Err(error) = result {
                 if let Some(reply) = reply.take() {
                     let _ = reply.send(Err(error));
@@ -1240,6 +1357,8 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         let config = SenderConfig {
             native: Some(NativeSenderConfig {
+                kernel_generation: None,
+                release: None,
                 binary_path: "/missing".into(),
                 work_root: "/tmp/synthetic-preparation".into(),
                 memory_mib: 0,
@@ -1403,6 +1522,8 @@ mod tests {
     #[test]
     fn native_budget_is_explicit_and_covers_weighted_capacity() {
         let config = NativeSenderConfig {
+            kernel_generation: None,
+            release: None,
             binary_path: "/missing".into(),
             work_root: "/tmp/native".into(),
             memory_mib: 1407,
@@ -1470,6 +1591,8 @@ mod tests {
         let root = temp_dir().join(format!("cc2api-native-{}", Uuid::new_v4()));
         let config = SenderConfig {
             native: Some(NativeSenderConfig {
+                kernel_generation: None,
+                release: None,
                 binary_path: var("CCRB_TEST_BINARY").unwrap(),
                 work_root: root.to_string_lossy().into_owned(),
                 memory_mib: if unlimited { 0 } else { 1536 },
@@ -1797,6 +1920,42 @@ mod tests {
             normal * 3 + 4
         );
         assert_eq!(evidence["parallel_peak"], normal * 2);
+        let old_pid = pool.state.lock().unwrap().idle[0]
+            .child
+            .as_ref()
+            .unwrap()
+            .id()
+            .unwrap();
+        // 用额外物理许可模拟 HTTP 已退出、进程尚未收口，同时保留一个暖进程。
+        pool.state.lock().unwrap().live += 1;
+        let retiring = WorkerLease {
+            pool: Arc::downgrade(&pool),
+        };
+        let mut probe = make("switch-wait-physical-retirement", "synthetic-bearer-b");
+        probe.input = json!({"schema_version":1,"request_id":probe.request.request_id});
+        let mut switched = config.clone();
+        switched.native.as_mut().unwrap().kernel_generation = Some(Uuid::new_v4().to_string());
+        let prepare =
+            pool.prepare_switch(switched, probe, Instant::now() + Duration::from_secs(20));
+        tokio::pin!(prepare);
+        assert!(
+            timeout(Duration::from_millis(100), &mut prepare)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            pool.state.lock().unwrap().idle[0]
+                .child
+                .as_ref()
+                .unwrap()
+                .id(),
+            Some(old_pid)
+        );
+        assert_eq!(pool.state.lock().unwrap().live, 2);
+        drop(retiring);
+        let status = prepare.await.unwrap();
+        assert_ne!(status.pid, Some(old_pid));
+        assert!(fs::metadata(format!("/proc/{old_pid}/exe")).is_err());
         let idle = std::mem::take(&mut pool.state.lock().unwrap().idle);
         for worker in idle {
             worker.retire().await;

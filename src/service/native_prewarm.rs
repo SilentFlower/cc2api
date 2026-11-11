@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinSet;
@@ -14,8 +15,12 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::service::account::AccountService;
-use crate::service::native_contract::NativePreparation;
-use crate::service::runtime_transport::{now_ms, prepare_existing};
+use crate::service::native_contract::{
+    NativeKernelTarget, NativePreparation, NativePreparationStatus,
+};
+use crate::service::runtime_transport::{
+    PreparedTransport, TransportBinding, now_ms, prepare_existing,
+};
 
 const QUEUE_LIMIT: usize = 128;
 const PREPARE_PARALLELISM: usize = 2;
@@ -253,6 +258,88 @@ async fn prepare_one(
             )
         }
     }
+}
+
+/// 调度器持有排他维护时，核对当前身份并对精确候选做零模型准备。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeKernelProbe {
+    owner: String,
+    lease_generation: String,
+    binding: TransportBinding,
+    target: NativeKernelTarget,
+}
+
+/// 在已声明的账号维护租约中准备精确内核，继续使用当前凭据归属。
+/// @param accounts 权威账号服务。
+/// @param id 网关账号 ID。
+/// @param input 调度器冻结的租约、绑定和候选。
+/// @return 核对过的实际 worker 回执。
+pub(crate) async fn probe_kernel(
+    accounts: &AccountService,
+    id: i64,
+    input: NativeKernelProbe,
+) -> Result<NativePreparationStatus, AppError> {
+    if input
+        .owner
+        .strip_prefix("kernel:")
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .is_none()
+        || Uuid::parse_str(&input.target.kernel_generation).is_err()
+    {
+        return Err(AppError::BadRequest("内核切换归属无效".into()));
+    }
+    let _activity = accounts.native_kernel_credentials(id).await?;
+    let account = accounts.get_account(id).await?;
+    if account.request_backend != "native293" || account.status != AccountStatus::Active {
+        return Err(AppError::ServiceUnavailable("账号的原生后端未启用".into()));
+    }
+    let queue = accounts.get_or_create_queue(id, account.concurrency).await;
+    let owns_lease = || {
+        let snapshot = queue.runtime_gate.snapshot();
+        let lease = &snapshot["lease"];
+        snapshot["active"] == 0
+            && lease["exclusive"] == true
+            && lease["owner"] == input.owner
+            && lease["generation"] == input.lease_generation
+            && matches!(lease["phase"].as_str(), Some("claimed" | "reconcile"))
+    };
+    if !owns_lease() {
+        return Err(AppError::ServiceUnavailable(
+            "账号尚未排空或维护租约已变化".into(),
+        ));
+    }
+    let bearer = match account.auth_type {
+        AccountAuthType::SetupToken => account.setup_token.clone(),
+        AccountAuthType::Oauth => account.access_token.clone(),
+    };
+    let preparation = NativePreparation {
+        account_id: id,
+        environment_id: String::new(),
+        generation: 0,
+        preparation_id: Uuid::new_v4().to_string(),
+        deadline_unix_ms: now_ms().saturating_add(100_000),
+        bearer,
+        device_id: account.device_id.clone(),
+        account_uuid: account.account_uuid.clone(),
+        organization_uuid: account.organization_uuid.clone(),
+        email: account.email.clone(),
+        concurrency: account.concurrency,
+    };
+    let result =
+        PreparedTransport::probe_native_kernel(input.binding, preparation.clone(), input.target)
+            .await?;
+    let current = accounts.get_account(id).await?;
+    if !owns_lease()
+        || !matches_identity(&current, &preparation)
+        || current.proxy_url != account.proxy_url
+        || current.auth_type != account.auth_type
+    {
+        return Err(AppError::ServiceUnavailable(
+            "预热期间账号或维护归属已变化".into(),
+        ));
+    }
+    Ok(result)
 }
 
 fn matches_identity(account: &Account, preparation: &NativePreparation) -> bool {

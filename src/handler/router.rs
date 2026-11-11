@@ -39,6 +39,8 @@ use crate::service::gateway::{
     AutoModeClassifierMode, BootstrapModelOptionsMode, CliBgStatusClassifierMode, GatewayService,
     parse_bootstrap_additional_model_options,
 };
+use crate::service::native_contract::NativePreparationStatus;
+use crate::service::native_prewarm::{NativeKernelProbe, probe_kernel};
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::rewriter::{
@@ -159,6 +161,10 @@ pub fn build_router(
         .route(
             "/admin/runtime/accounts/:id/lease",
             get(runtime_lease_status).post(runtime_lease_update),
+        )
+        .route(
+            "/admin/runtime/accounts/:id/native-kernel-probe",
+            post(native_kernel_probe),
         )
         .route(
             "/admin/runtime/accounts/:id/config",
@@ -694,6 +700,22 @@ async fn runtime_lease_update(
     snapshot["waiting"] = serde_json::json!(queue.waiting_count());
     Ok(Json(snapshot))
 }
+/// 只有当前租约的调度器可以触发切换预热；不刷新上游凭据。
+/// @param state 网关账号服务。
+/// @param id 当前账号 ID。
+/// @param headers 可信调度服务证明。
+/// @param input 维护租约、冻结绑定和候选。
+/// @return 与账号、绑定和候选匹配的实际进程回执。
+pub(crate) async fn native_kernel_probe(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(input): Json<NativeKernelProbe>,
+) -> Result<Json<NativePreparationStatus>, AppError> {
+    require_v3_credential_service(&headers)?;
+    probe_kernel(&state.account_svc, id, input).await.map(Json)
+}
+
 const MIN_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 60;
 const MAX_OAUTH_CREDENTIAL_VALIDITY_SECONDS: i64 = 7200;
 

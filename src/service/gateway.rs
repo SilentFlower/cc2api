@@ -9981,6 +9981,8 @@ mod tests {
         };
         let config = SenderConfig {
             native: Some(NativeSenderConfig {
+                kernel_generation: None,
+                release: None,
                 binary_path: var("CCRB_TEST_BINARY").unwrap(),
                 work_root: root.join("workers").to_string_lossy().into_owned(),
                 memory_mib: if unlimited { 0 } else { 1536 },
@@ -10350,6 +10352,130 @@ mod tests {
             fs::metadata(format!("/proc/{rotated_pid}/exe")).is_ok(),
             "日志模式切换复用当前暖进程"
         );
+        if let Ok(digest) = var("CCRB_TEST_SWITCH_DIGEST") {
+            use crate::handler::router::{AppState, native_kernel_probe};
+            use axum::Json;
+            use axum::extract::{Path, State};
+            let pool = AnyPoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let service = Arc::new(service);
+            let app = AppState {
+                gateway_svc: service.clone(),
+                account_svc: service.account_svc.clone(),
+                token_tester: Arc::new(TokenTester::new()),
+                token_store: Arc::new(TokenStore::new(pool.clone(), "sqlite".into())),
+                settings_store: service.settings_store.clone(),
+                prime_log_store: Arc::new(PrimeLogStore::new(pool)),
+                oauth_flow_svc: Arc::new(OAuthFlowService::new()),
+                telemetry_svc: service.telemetry_svc.clone(),
+                admin_password: "synthetic".into(),
+            };
+            let flow = service
+                .handle_request(
+                    request(json!({"model":"claude-sonnet-4-6","stream":true,
+                "max_tokens":64,"messages":[{"role":"user","content":"gateway-kernel-long"}]})),
+                    None,
+                )
+                .await;
+            assert_eq!(flow.status(), StatusCode::OK);
+            let owner = format!("kernel:{}", Uuid::new_v4());
+            let lease = queue.runtime_gate.prepare(&owner).unwrap();
+            assert_eq!(queue.runtime_gate.snapshot()["active"], 1);
+            assert!(
+                queue
+                    .runtime_gate
+                    .update(&owner, &lease.generation, "claim")
+                    .is_err()
+            );
+            assert!(!queue.runtime_gate.enter(Duration::from_millis(20)).await);
+            client
+                .post(format!("{control}kernel/release"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let output = axum::body::to_bytes(flow.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output).contains("fixture-complete"));
+            let config_path = root.join("sender.json");
+            let mut config = config.clone();
+            let target = Some(super::super::native_contract::NativeReleaseRef {
+                release: var("CCRB_TEST_SWITCH_RELEASE").unwrap(),
+                launcher_sha256: digest,
+            });
+            let mut previous_pid = rotated_pid as u32;
+            for (index, selection) in [target, None].into_iter().enumerate() {
+                let lease = if index == 0 {
+                    lease.clone()
+                } else {
+                    queue.runtime_gate.prepare(&owner).unwrap()
+                };
+                queue
+                    .runtime_gate
+                    .update(&owner, &lease.generation, "claim")
+                    .unwrap();
+                let generation = Uuid::new_v4().to_string();
+                let native = config.native.as_mut().unwrap();
+                native.release = selection.clone();
+                native.kernel_generation = Some(generation.clone());
+                let temporary = root.join("sender-next.json");
+                fs::write(&temporary, serde_json::to_vec(&config).unwrap()).unwrap();
+                fs::rename(temporary, &config_path).unwrap();
+                let before: Value = client
+                    .get(&control)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-v3-service-token",
+                    var("V3_INTERNAL_TOKEN").unwrap().parse().unwrap(),
+                );
+                let result = native_kernel_probe(State(app.clone()), Path(account.id), headers, Json(
+                    serde_json::from_value(json!({"owner":owner,"lease_generation":lease.generation,
+                        "binding":config.binding,"target":{"release":selection,"kernel_generation":generation}})).unwrap(),
+                )).await.unwrap().0;
+                assert_eq!(result.release, selection);
+                let pid = result.pid.unwrap();
+                assert_ne!(pid, previous_pid);
+                assert!(fs::metadata(format!("/proc/{previous_pid}/exe")).is_err());
+                assert!(fs::metadata(format!("/proc/{pid}/exe")).is_ok());
+                previous_pid = pid;
+                let after: Value = client
+                    .get(&control)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(before["messages"], after["messages"], "切换预热零模型");
+                queue
+                    .runtime_gate
+                    .update(&owner, &lease.generation, "release")
+                    .unwrap();
+                let response = service
+                    .handle_request(
+                        request(json!({"model":"claude-sonnet-4-6","stream":false,
+                    "max_tokens":64,"messages":[{"role":"user","content":"gateway-kernel-next"}]})),
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert!(fs::metadata(format!("/proc/{pid}/exe")).is_ok());
+            }
+        }
         sender.abort();
         let _ = sender.await;
         fs::remove_dir_all(root).unwrap();

@@ -327,6 +327,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "ring",
  "rust-embed",
  "rustls",
  "rustls-pki-types",

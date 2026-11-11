@@ -47,6 +47,20 @@ impl NativePool {
         ))
     }
 
+    /// 在切换预热阶段明确拒绝不支持的平台。
+    /// @param config sender 配置。
+    /// @param identity 当前账号绑定。
+    /// @param deadline 准备截止。
+    /// @return 受控平台错误。
+    pub(crate) async fn prepare_switch(
+        self: &Arc<Self>,
+        config: SenderConfig,
+        identity: NativeSubmission,
+        deadline: Instant,
+    ) -> Result<NativePreparationStatus, AppError> {
+        self.prepare(config, identity, deadline).await
+    }
+
     /// 其它平台没有可取消的原生准备。
     /// @param control 控制标识。
     /// @return false。
@@ -91,6 +105,8 @@ mod tests {
     #[test]
     fn unsupported_platform_is_explicit_before_execution() {
         let config = NativeSenderConfig {
+            kernel_generation: None,
+            release: None,
             binary_path: "/missing".into(),
             work_root: "/missing".into(),
             memory_mib: 2432,
