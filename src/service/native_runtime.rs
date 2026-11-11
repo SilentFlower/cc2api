@@ -49,8 +49,8 @@ use crate::service::runtime_transport::{
     CLOCK_SKEW_MS, REQUEST_BUDGET_MS, SenderConfig, validate_request,
 };
 
-const LAUNCHER_SHA256: &str = "a6998db0128cb3d0a9862f3b72e9e359e434840c9be4d57b69d56092847fd800";
-const IMAGE_SHA256: &str = "ea2cc610928260ca76054fc1818c7c83bb95efe183b06ce98e3d6be7dc31b9b1";
+const LAUNCHER_SHA256: &str = "423a6a848c84e09bcc73a8b7be481ed4ead44a6644cef94bbf47d2009d3f6b80";
+const IMAGE_SHA256: &str = "22f26d7803f80630968caf21b6170cf9bb94d87bea6f5eef678464f3bb0d3ecd";
 const IMAGE_BYTES: u64 = 112_839_864;
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 fn unavailable() -> AppError {
