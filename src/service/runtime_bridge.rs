@@ -279,6 +279,8 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
             "" | "/"
                 | "/index.html"
                 | "/app.js"
+                | "/environments.js"
+                | "/environments.css"
                 | "/projects.js"
                 | "/style.css"
                 | "/vendor/xterm.js"
@@ -608,6 +610,28 @@ mod tests {
         assert!(browser_path_allowed(&Method::GET, "/projects.js"));
         assert!(!browser_path_allowed(&Method::POST, "/projects.js"));
         assert!(!browser_path_allowed(&Method::POST, "/app.js"));
+    }
+
+    /// 环境页静态资源仅接受精确只读路径，拼写近似和写方法继续拒绝。
+    /// @return 白名单与资源请求方式一致。
+    #[test]
+    fn environment_assets_are_exact_and_read_only() {
+        for path in ["/environments.js", "/environments.css"] {
+            assert!(browser_path_allowed(&Method::GET, path));
+            assert!(browser_path_allowed(&Method::HEAD, path));
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(!browser_path_allowed(&method, path));
+            }
+        }
+        for path in [
+            "/environment.js",
+            "/environments.js/extra",
+            "/nested/environments.css",
+            "/%65nvironments.js",
+            "/environments.css/../internal/v3/session",
+        ] {
+            assert!(!browser_path_allowed(&Method::GET, path));
+        }
     }
 
     /// 项目模式仅增加管理资源，编码穿越和内部服务入口继续拒绝。
