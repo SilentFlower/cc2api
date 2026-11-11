@@ -9992,6 +9992,7 @@ mod tests {
             proxy_url: var("CCRB_TEST_PROXY").unwrap(),
             allowed_origin: "https://api.anthropic.com".into(),
             evidence_file: Some(root.join("evidence.jsonl").to_string_lossy().into_owned()),
+            native_adaptive_prewarm: false,
             native_capture_dir: Some(
                 var("CCRB_TEST_CAPTURE_DIR")
                     .unwrap_or_else(|_| root.join("captures").to_string_lossy().into_owned()),

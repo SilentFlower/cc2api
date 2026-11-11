@@ -84,6 +84,8 @@ pub struct SenderConfig {
     pub native: Option<NativeSenderConfig>,
     #[serde(default)]
     pub native_capture_dir: Option<String>,
+    #[serde(default)]
+    pub native_adaptive_prewarm: bool,
     pub binding: TransportBinding,
     pub proxy_url: String,
     pub allowed_origin: String,
@@ -1223,6 +1225,7 @@ mod tests {
             allowed_origin: "https://api.anthropic.com".into(),
             evidence_file: None,
             native_capture_dir: None,
+            native_adaptive_prewarm: false,
             quota_identity: String::new(),
         };
         let path = temp_dir().join(format!("sender-tls-{}.json", Uuid::new_v4()));
@@ -1553,6 +1556,7 @@ mod tests {
             allowed_origin: "https://api.anthropic.com".into(),
             evidence_file: None,
             native_capture_dir: None,
+            native_adaptive_prewarm: false,
             quota_identity: String::new(),
         };
         let mut prepared = PreparedRequest {

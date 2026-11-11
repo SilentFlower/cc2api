@@ -27,7 +27,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_socks::{TargetAddr, tcp::Socks5Stream};
@@ -197,6 +197,34 @@ struct PoolState {
     live: usize,
     idle: Vec<Worker>,
     reaper_running: bool,
+    spare: Option<SparePreparation>,
+}
+
+/// 当前代次唯一的后台补位；丢弃撤销端会收口尚未就绪的进程。
+struct SparePreparation {
+    ready: watch::Receiver<()>,
+    _cancel: oneshot::Sender<()>,
+}
+
+/// 启动 worker 所需的账号字段；后台补位不持有业务信封。
+struct WorkerIdentity {
+    bearer: String,
+    device_id: String,
+    account_uuid: Option<String>,
+    organization_uuid: Option<String>,
+    email: String,
+}
+
+impl From<&NativeSubmission> for WorkerIdentity {
+    fn from(submission: &NativeSubmission) -> Self {
+        Self {
+            bearer: submission.bearer.clone(),
+            device_id: submission.device_id.clone(),
+            account_uuid: submission.account_uuid.clone(),
+            organization_uuid: submission.organization_uuid.clone(),
+            email: submission.email.clone(),
+        }
+    }
 }
 
 /// 撤销与准备共用完整归属，旧代控制不会影响新环境中的同名标识。
@@ -500,7 +528,7 @@ impl Worker {
 
     async fn start(
         config: &SenderConfig,
-        submission: &NativeSubmission,
+        identity: &WorkerIdentity,
         lease: WorkerLease,
         execution_image: Option<Arc<File>>,
         deadline: Instant,
@@ -521,12 +549,12 @@ impl Worker {
                 fs::create_dir(root.join(name)).map_err(|_| unavailable())?;
             }
             // 固定 293 的 ce().oauthAccount 与 tI() 分别读取账号 UUID 和 64 位 userID。
-            let identity = json!({"userID":submission.device_id,"oauthAccount":{
-                "accountUuid":submission.account_uuid,"organizationUuid":submission.organization_uuid,
-                "emailAddress":submission.email}});
+            let profile = json!({"userID":identity.device_id,"oauthAccount":{
+                "accountUuid":identity.account_uuid,"organizationUuid":identity.organization_uuid,
+                "emailAddress":identity.email}});
             fs::write(
                 root.join("config/.claude.json"),
-                serde_json::to_vec(&identity).map_err(|_| unavailable())?,
+                serde_json::to_vec(&profile).map_err(|_| unavailable())?,
             )
             .map_err(|_| unavailable())?;
             // 共享的是封存的代码映像；每轮exec仍创建独立堆、环境和SDK。
@@ -555,7 +583,7 @@ impl Worker {
                 .env("DISABLE_AUTOUPDATER", "1")
                 .env("DISABLE_TELEMETRY", "1")
                 .env("DISABLE_ERROR_REPORTING", "1")
-                .env("CLAUDE_CODE_OAUTH_TOKEN", &submission.bearer)
+                .env("CLAUDE_CODE_OAUTH_TOKEN", &identity.bearer)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -896,6 +924,7 @@ impl NativePool {
 
     async fn retire_for_switch(&self, deadline: Instant) -> Result<(), AppError> {
         let deadline = deadline.min(Instant::now() + Duration::from_secs(8));
+        self.state.lock().unwrap().spare.take();
         let old_idle = loop {
             {
                 let mut state = self.state.lock().unwrap();
@@ -1024,7 +1053,7 @@ impl NativePool {
                 }
                 state.idle.iter().map(|worker| worker.id.clone()).collect()
             };
-            let (key, mut worker) = self.checkout(&config, &identity, deadline).await?;
+            let (key, mut worker) = self.checkout(&config, &identity, deadline, false).await?;
             let pid = worker
                 .child
                 .as_ref()
@@ -1162,14 +1191,26 @@ impl NativePool {
         config: &SenderConfig,
         submission: &NativeSubmission,
         deadline: Instant,
+        business: bool,
     ) -> Result<(String, Worker), AppError> {
         let slots = validate_worker_identity(config, submission)?;
-        let generation = self.generation.lock().await;
+        let prepare_spare =
+            business && config.native_adaptive_prewarm && submission.concurrency >= 2;
+        // 调度策略变化不改变已就绪进程的身份，避免启用预热本身触发换代。
+        let identity_config = if config.native_adaptive_prewarm {
+            Cow::Owned(SenderConfig {
+                native_adaptive_prewarm: false,
+                ..config.clone()
+            })
+        } else {
+            Cow::Borrowed(config)
+        };
+        let mut generation = self.generation.lock().await;
         let key = format!(
             "{:x}",
             Sha256::digest(
                 serde_json::to_vec(&(
-                    config,
+                    identity_config.as_ref(),
                     &submission.bearer,
                     &submission.device_id,
                     &submission.account_uuid,
@@ -1185,6 +1226,7 @@ impl NativePool {
             let mut state = self.state.lock().unwrap();
             retired = if state.key != key {
                 state.key = key.clone();
+                state.spare.take();
                 std::mem::take(&mut state.idle)
             } else {
                 Vec::new()
@@ -1195,7 +1237,28 @@ impl NativePool {
             worker.retire().await;
         }
         loop {
-            let candidate = self.state.lock().unwrap().idle.pop();
+            let (candidate, preparing) = {
+                let mut state = self.state.lock().unwrap();
+                let candidate = state.idle.pop();
+                let preparing = if candidate.is_none() {
+                    state.spare.as_ref().map(|spare| spare.ready.clone())
+                } else {
+                    None
+                };
+                (candidate, preparing)
+            };
+            if let Some(mut preparing) = preparing {
+                // 等待者不持有代次锁，补位失败后可沿原 checkout 路径启动。
+                drop(generation);
+                let _ = timeout_at(deadline, preparing.changed())
+                    .await
+                    .map_err(|_| unavailable())?;
+                generation = self.generation.lock().await;
+                if self.state.lock().unwrap().key != key {
+                    return Err(unavailable());
+                }
+                continue;
+            }
             let Some(mut worker) = candidate else {
                 break;
             };
@@ -1205,6 +1268,15 @@ impl NativePool {
                 .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
             // 空闲时的 EOF、部分帧或迟到事件都先隔离，不能写入下一作业后再发现旧归属。
             if alive && worker.stdout.fill_buf().now_or_never().is_none() {
+                if prepare_spare {
+                    self.start_spare(
+                        config,
+                        submission,
+                        &key,
+                        worker.execution_image.clone(),
+                        deadline,
+                    );
+                }
                 return Ok((key, worker));
             }
             worker.retire().await;
@@ -1217,6 +1289,7 @@ impl NativePool {
             state.live += 1;
         }
         drop(generation);
+        let identity = WorkerIdentity::from(submission);
         let lease = WorkerLease {
             pool: Arc::downgrade(self),
         };
@@ -1233,10 +1306,10 @@ impl NativePool {
         let worker = if let Some((_, image)) = cached.as_ref() {
             let image = image.clone();
             drop(cached);
-            Worker::start(config, submission, lease, Some(image), deadline).await?
+            Worker::start(config, &identity, lease, Some(image), deadline).await?
         } else {
             // 只让首个进程解压；其它启动者等待封存映像后并行exec。
-            let worker = Worker::start(config, submission, lease, None, deadline).await?;
+            let worker = Worker::start(config, &identity, lease, None, deadline).await?;
             *cached = Some((
                 distribution_sha256,
                 worker
@@ -1248,7 +1321,88 @@ impl NativePool {
             drop(cached);
             worker
         };
+        if prepare_spare {
+            self.start_spare(
+                config,
+                submission,
+                &key,
+                worker.execution_image.clone(),
+                deadline,
+            );
+        }
         Ok((key, worker))
+    }
+
+    /// 使用已加载的映像补位，业务请求无需等待本次握手。
+    fn start_spare(
+        self: &Arc<Self>,
+        config: &SenderConfig,
+        submission: &NativeSubmission,
+        key: &str,
+        image: Option<Arc<File>>,
+        deadline: Instant,
+    ) {
+        let Some(image) = image else { return };
+        let (done, ready) = watch::channel(());
+        let (cancel, cancelled) = oneshot::channel();
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.key != key || state.live != 1 || state.spare.is_some() {
+                return;
+            }
+            // 先登记并占用物理许可；并发 checkout 只能复用这一轮补位。
+            state.live += 1;
+            state.spare = Some(SparePreparation {
+                ready: ready.clone(),
+                _cancel: cancel,
+            });
+        }
+        let pool = self.clone();
+        let lease = WorkerLease {
+            pool: Arc::downgrade(self),
+        };
+        let config = config.clone();
+        let identity = WorkerIdentity::from(submission);
+        let key = key.to_owned();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let worker = tokio::select! {
+                biased;
+                _ = cancelled => None,
+                result = timeout_at(deadline, Worker::start(&config, &identity, lease, Some(image), deadline)) => {
+                    result.ok().and_then(Result::ok)
+                }
+            };
+            let mut worker = worker;
+            let mut outcome = "cancelled";
+            {
+                let mut state = pool.state.lock().unwrap();
+                if state.key == key
+                    && state
+                        .spare
+                        .as_ref()
+                        .is_some_and(|spare| spare.ready.same_channel(&ready))
+                {
+                    state.spare.take();
+                    outcome = "failed";
+                    if let Some(mut worker) = worker.take() {
+                        worker.idle_since = Instant::now();
+                        state.idle.push(worker);
+                        outcome = "ready";
+                    }
+                }
+            }
+            drop(worker);
+            drop(done);
+            pool.schedule_idle_reap();
+            tracing::info!(
+                account_id = config.binding.account_id,
+                generation = config.binding.generation,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                outcome,
+                "原生第二 worker 预热"
+            );
+        });
     }
 
     /// 在有界通道中执行一次原生请求，响应取消会终止本次物理进程。
@@ -1288,10 +1442,12 @@ impl NativePool {
                 let warmup = timeout_at(deadline, pool.warmup.read())
                     .await
                     .map_err(|_| unavailable())?;
-                let (key, mut worker) =
-                    timeout_at(deadline, pool.checkout(&config, &submission, deadline))
-                        .await
-                        .map_err(|_| unavailable())??;
+                let (key, mut worker) = timeout_at(
+                    deadline,
+                    pool.checkout(&config, &submission, deadline, true),
+                )
+                .await
+                .map_err(|_| unavailable())??;
                 drop(warmup);
                 let result = tokio::select! {
                     result = worker.execute(&submission, config.native_capture_dir.as_deref(), &mut reply, &chunks, deadline) => result,
@@ -1365,6 +1521,7 @@ mod tests {
                 max_workers: 2,
             }),
             native_capture_dir: None,
+            native_adaptive_prewarm: false,
             binding: TransportBinding {
                 account_id: 7,
                 environment_id: "synthetic".into(),
@@ -1610,6 +1767,7 @@ mod tests {
             allowed_origin: "https://api.anthropic.com".into(),
             evidence_file: None,
             native_capture_dir: Some(root.join("captures").to_string_lossy().into_owned()),
+            native_adaptive_prewarm: false,
             quota_identity: String::new(),
         };
         let make = |label: &str, bearer: &str| {
@@ -1751,6 +1909,52 @@ mod tests {
         fs::copy(&native.binary_path, &copied).unwrap();
         pool.verify(&mutable).unwrap();
         pool.verify(native).unwrap();
+        let mut adaptive = config.clone();
+        adaptive.native_adaptive_prewarm = true;
+        let first = make("first-warm-worker", "synthetic-bearer-a");
+        let second = make("second-warm-worker", "synthetic-bearer-a");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (key, mut first_worker) = pool
+            .checkout(&adaptive, &first, deadline, true)
+            .await
+            .unwrap();
+        assert_eq!(first_worker.child.as_ref().and_then(Child::id), status.pid);
+        let second_pid = {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(state.live, 2, "首条 checkout 已为补位保留唯一物理许可");
+            assert!(state.spare.is_some() || state.idle.len() == 1);
+            state
+                .idle
+                .first()
+                .and_then(|worker| worker.child.as_ref().and_then(Child::id))
+        };
+        let (second_key, mut second_worker) = pool
+            .checkout(&adaptive, &second, deadline, true)
+            .await
+            .unwrap();
+        assert_eq!(key, second_key);
+        let pid = second_worker.child.as_ref().and_then(Child::id);
+        assert_ne!(pid, status.pid);
+        if second_pid.is_some() {
+            assert_eq!(pid, second_pid);
+        }
+        {
+            let mut state = pool.state.lock().unwrap();
+            assert_eq!(state.live, 2, "第二次 checkout 没有重复启动");
+            assert!(state.spare.is_none());
+            first_worker.idle_since = Instant::now();
+            second_worker.idle_since = first_worker.idle_since;
+            state.idle.extend([second_worker, first_worker]);
+        }
+        pool.schedule_idle_reap();
+        timeout(Duration::from_secs(8), async {
+            while pool.state.lock().unwrap().live != 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.state.lock().unwrap().idle.len(), 1);
         let observed: Value = Client::builder()
             .no_proxy()
             .build()
@@ -1776,7 +1980,10 @@ mod tests {
         // 已就绪的暖进程也必须沿原截止拒绝投递，避免启动后重新授予首响应预算。
         let expired = make("expired-before-send", "synthetic-bearer-a");
         let deadline = validate_request(&expired.request, &config).unwrap();
-        let (_, mut worker) = pool.checkout(&config, &expired, deadline).await.unwrap();
+        let (_, mut worker) = pool
+            .checkout(&config, &expired, deadline, false)
+            .await
+            .unwrap();
         let (reply, _receive) = oneshot::channel();
         let mut reply = Some(reply);
         let (chunks, _receiver) = mpsc::channel(8);
