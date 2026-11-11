@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() {
+    service::system_update::validate_startup().expect("部署维护状态无效，请先恢复更新服务");
     let cfg = config::Config::load();
 
     // 初始化日志

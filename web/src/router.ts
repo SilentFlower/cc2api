@@ -44,6 +44,7 @@ const router = createRouter({
         { path: 'requests', name: 'requests', component: () => import('./components/RequestDiagnostics.vue') },
         { path: 'tokens', name: 'tokens', component: () => import('./components/Tokens.vue') },
         { path: 'settings', name: 'settings', component: () => import('./components/Settings.vue') },
+        { path: 'updates', name: 'updates', component: () => import('./components/SystemUpdates.vue') },
         { path: 'environments', name: 'environments', component: () => import('./components/Environments.vue') },
       ],
     },

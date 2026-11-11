@@ -257,7 +257,7 @@ pub async fn prepare(
         .build()
         .map_err(|_| AppError::ServiceUnavailable("v3 bridge unavailable".into()))?;
     let deployment = std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default();
-    let release = std::env::var("V3_RELEASE").unwrap_or_default();
+    let release = configured_account_release();
     prepare_from_runtime(
         account,
         client,
@@ -315,7 +315,7 @@ pub(crate) async fn prepare_existing(
         &binding,
         account.id,
         &std::env::var("V3_DEPLOYMENT_ID").unwrap_or_default(),
-        &std::env::var("V3_RELEASE").unwrap_or_default(),
+        &configured_account_release(),
     )?;
     Ok(Some(PreparedTransport {
         account_id: account.id,
@@ -673,6 +673,18 @@ pub async fn send(
         .await?
         .submit(prepared, body, ttfb_timeout)
         .await
+}
+
+/// 获取底座已明确配置的账号来源；legacy 继续使用联合发布身份。
+/// @return 当前账号镜像的精确来源批次。
+fn configured_account_release() -> String {
+    if !std::env::var("V3_UPDATE_GATE_DIR")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return std::env::var("V3_ACCOUNT_RELEASE").unwrap_or_default();
+    }
+    std::env::var("V3_RELEASE").unwrap_or_default()
 }
 
 /// 按调度器的短 DNS 名核对部署归属，防止旧前缀条件拒绝合法账号环境。

@@ -15,6 +15,7 @@ use crate::service::rewriter::{
     ordered_anthropic_headers,
 };
 use crate::service::runtime_transport::{self, PreparedRequest};
+use crate::service::system_update;
 use crate::store::prime_log_store::{PrimeLogEntry, PrimeLogStore};
 use crate::store::settings_store::{DEFAULT_MESSAGE_BODY_ORDER_FINGERPRINT_ENABLED, SettingsStore};
 
@@ -427,6 +428,20 @@ impl PrimePollerService {
         model: &str,
         message_body_order_fingerprint_enabled: bool,
     ) -> PrimeOutcome {
+        let _update_activity = match system_update::admission() {
+            Ok(activity) => activity,
+            Err(_) => {
+                return PrimeOutcome {
+                    success: false,
+                    error_message: "平台维护中，预热等待下次计划".into(),
+                    duration_ms: 0,
+                    passive_usage: None,
+                    usage_observation_kind: UsageObservationKind::Allowed,
+                    status: None,
+                    failed_access_token: None,
+                };
+            }
+        };
         let started = Instant::now();
         let _credential_activity = match self.account_svc.upstream_activity(account.id).await {
             Ok(permit) => permit,

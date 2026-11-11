@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::model::account::{AccountAuthType, AccountStatus};
 use crate::service::account::AccountService;
+use crate::service::system_update;
 
 /// 账户间隔,避免瞬间打爆 Anthropic usage 端点。
 const PER_ACCOUNT_GAP: Duration = Duration::from_millis(500);
@@ -46,6 +47,9 @@ impl UsagePollerService {
     }
 
     async fn tick(&self) {
+        let Ok(_update_activity) = system_update::admission() else {
+            return;
+        };
         let accounts = match self.account_svc.list_accounts().await {
             Ok(list) => list,
             Err(e) => {

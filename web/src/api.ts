@@ -2,6 +2,17 @@ const BASE = ''
 
 let authToken = ''
 
+/** 管理请求错误，保留冲突状态供操作确认窗口处理。 */
+export class ApiError extends Error {
+  readonly status: number
+  /** @param status 实际 HTTP 状态。@param message 用户可读错误。@return 错误实例。 */
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 export function setAuth(token: string) {
   authToken = token
 }
@@ -18,7 +29,10 @@ async function request<T>(method: string, path: string, body?: unknown, signal?:
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || res.statusText)
+    const detail = typeof err.error === 'string' ? err.error
+      : typeof err.error?.message === 'string' ? err.error.message
+      : typeof err.detail === 'string' ? err.detail : res.statusText
+    throw new ApiError(res.status, detail)
   }
   return res.json()
 }
@@ -278,6 +292,65 @@ export interface PrimeLogEntry {
 
 export type SettingsMap = Record<string, string>
 
+/** 一次持久系统更新操作的公开进度。 */
+export interface SystemUpdateOperation {
+  operation_id: string
+  action: 'prepare' | 'install' | 'rollback'
+  phase: string
+  target_release: string
+  created_at: string
+  updated_at: string
+  error?: string | null
+  blockers?: string[]
+  cancel_requested?: boolean
+  cleanup?: { status: string; removed: string[]; retained?: string[] } | null
+}
+
+/** 已安装底座的实际组件及恢复入口。 */
+export interface SystemUpdateStatus {
+  installed: boolean
+  message?: string
+  revision?: string
+  current_release?: string
+  deployment?: string
+  components?: Record<'control' | 'account', { release: string; reference: string; content_sha256: string }>
+  environments?: Array<{ environment_id: string; name: string; release: string | null; running: boolean; verified: boolean }>
+  busy?: boolean
+  operation?: SystemUpdateOperation | null
+  history?: Array<{ release: string; manifest_sha256: string; installed_at?: string; rollback_available: boolean }>
+  checked_at?: string | null
+  check_error?: string | null
+}
+
+/** 可安装的已验签发行摘要。 */
+export interface SystemUpdateRelease {
+  release: string
+  sequence: number[]
+  published_at: string
+  changes: string
+  manifest_sha256: string
+  data_compatible: boolean
+  account_changed: boolean
+}
+
+/** 目录状态与最近受信发行。 */
+export interface SystemUpdateCatalog {
+  fresh: boolean
+  releases: SystemUpdateRelease[]
+  checking: boolean
+  checked_at?: string | null
+  check_error?: string | null
+}
+
+/** 点击安装时冻结的现场、目标及等待期限。 */
+export interface SystemUpdateRequest {
+  operation_id: string
+  expected_revision: string
+  target_release: string
+  target_manifest_sha256: string
+  drain_timeout_seconds: number
+}
+
 type RawSettingsMap = Record<string, unknown>
 
 /** 将历史或代理返回的非字符串 settings 值规整为前端表单契约使用的字符串。 */
@@ -334,6 +407,16 @@ export interface NativeCapture {
 }
 
 export const api = {
+  /** 读取系统更新底座及实际安装。@param signal 取消信号。@return 更新状态。 */
+  systemUpdateStatus: (signal?: AbortSignal) => request<SystemUpdateStatus>('GET', '/runtime/api/system-updates/status', undefined, signal),
+  /** 读取已验证目录。@param signal 取消信号。@return 版本缓存。 */
+  systemUpdateReleases: (signal?: AbortSignal) => request<SystemUpdateCatalog>('GET', '/runtime/api/system-updates/releases', undefined, signal),
+  /** 请求后台检查，安装由独立操作触发。@return 检查状态。 */
+  systemUpdateCheck: () => request<{ checking: boolean }>('POST', '/runtime/api/system-updates/check', {}),
+  /** 提交冻结组合。@param action 受支持动作。@param body 冻结参数。@return 持久操作。 */
+  systemUpdateInstall: (action: 'install' | 'rollback', body: SystemUpdateRequest) => request<SystemUpdateOperation>('POST', `/runtime/api/system-updates/${action}`, body),
+  /** 原操作取消或恢复。@param id 原操作。@param action 受控动作。@param revision 当前现场版本。@return 操作状态。 */
+  systemUpdateControl: (id: string, action: 'cancel' | 'recover', revision: string) => request<SystemUpdateOperation>('POST', `/runtime/api/system-updates/operations/${encodeURIComponent(id)}/${action}`, { expected_revision: revision }),
   /** 分页读取请求诊断。@param query 已编码筛选。@return 请求列表与采集健康。 */
   requestDiagnostics: (query: string, signal?: AbortSignal) => request<{ items: DiagnosticRequest[]; total: number; health: Record<string, number> }>('GET', `/admin/request-diagnostics?${query}`, undefined, signal),
   /** 读取请求尝试详情。@param id 请求 UUID。@return 摘要与尝试列表。 */

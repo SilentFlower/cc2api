@@ -47,6 +47,7 @@ use crate::service::rewriter::{
     CacheControlTtlRewrite, ClaudeCodeContextSanitizerMode, MessageCacheControlRewrite,
 };
 use crate::service::runtime_bridge;
+use crate::service::system_update;
 use crate::service::telemetry::TelemetryService;
 use crate::service::v3_scheduling::{PhaseCounts, SchedulingConfig, now_ms};
 use crate::service::version_profile::{
@@ -129,6 +130,7 @@ pub fn build_router(
         .route("/login", get(spa_handler))
         .route("/tokens", get(spa_handler))
         .route("/settings", get(spa_handler))
+        .route("/updates", get(spa_handler))
         .route("/environments", get(spa_handler));
 
     // 前端静态资源
@@ -138,6 +140,14 @@ pub fn build_router(
 
     // 管理 API（密码认证，完整路径注册）
     let admin_routes = Router::new()
+        .route(
+            "/admin/runtime/system-update/status",
+            get(system_update_status),
+        )
+        .route(
+            "/admin/runtime/system-update/ack",
+            post(system_update_status),
+        )
         .route("/admin/accounts", get(list_accounts).post(create_account))
         .route(
             "/admin/accounts/:id",
@@ -249,10 +259,17 @@ pub fn build_router(
         .route("/api/hello", get(hello_get).head(hello_head))
         .route("/v1/messages/count_tokens", post(gateway_count_tokens))
         .fallback(gateway_fallback)
+        .layer(middleware::from_fn(system_update::middleware))
         .with_state(state)
 }
 
 // --- Handlers ---
+
+/// 读取双端维护接管证明；管理员鉴权沿用管理路由。
+/// @return 精确 epoch 和完整响应生命周期内的进程活动数。
+async fn system_update_status() -> Result<Json<Value>, AppError> {
+    Ok(Json(system_update::snapshot()?))
+}
 
 const CLAUDE_CODE_HELLO_BODY: &[u8] = br#"{"message": "hello"}"#;
 
@@ -663,6 +680,14 @@ async fn runtime_lease_update(
     {
         return Err(AppError::BadRequest("v3 runtime is not configured".into()));
     }
+    let _update_activity = if matches!(
+        input.operation.as_str(),
+        "prepare" | "prepare-cli" | "prepare-cli-shared"
+    ) {
+        Some(system_update::cli_admission(id, &input.owner).await?)
+    } else {
+        None
+    };
     let account = state.account_svc.get_account(id).await?;
     if matches!(
         input.operation.as_str(),
@@ -1278,6 +1303,19 @@ async fn resolve_oauth_credentials(
     Path(id): Path<i64>,
     Json(req): Json<ResolveOAuthCredentialsRequest>,
 ) -> Result<Json<ResolveOAuthCredentialsResponse>, AppError> {
+    let account = state.account_svc.get_account(id).await?;
+    let queue = state
+        .account_svc
+        .get_or_create_queue(id, account.concurrency)
+        .await;
+    let _update_activity = system_update::continuation(|| {
+        let snapshot = queue.runtime_gate.snapshot();
+        snapshot["active"].as_u64().unwrap_or(0) > 0
+            || !snapshot["lease"].is_null()
+            || snapshot["holders"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+    })?;
     let min_validity_seconds =
         normalize_oauth_credential_validity_seconds(req.min_validity_seconds)?;
     let snapshot = state

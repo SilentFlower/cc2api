@@ -10,11 +10,13 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Error as ReqwestError};
+use serde_json::{Value, json};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::handler::router::AppState;
@@ -22,6 +24,53 @@ use crate::service::runtime_lease::RuntimeLease;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 核对维护前已经登记的 CLI 作业，拒绝旧 owner 的迟到重放。
+/// @param account_id 原账号。
+/// @param owner 原执行来源。
+/// @return 运行时仍拥有原作业时为 true。
+pub async fn update_admitted(account_id: i64, owner: &str) -> Result<bool, AppError> {
+    let (base, token, client) = config()?;
+    let response = client
+        .post(format!("{base}/internal/v3/system-updates/admitted"))
+        .bearer_auth(token)
+        .json(&json!({"account_id":account_id,"owner":owner}))
+        .timeout(STATUS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("原任务登记暂不可核对".into()))?
+        .error_for_status()
+        .map_err(|_| AppError::ServiceUnavailable("原任务登记核对失败".into()))?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("原任务登记格式无效".into()))?;
+    Ok(value["admitted"] == true)
+}
+
+/// 核对原控制请求仍被调度器实际持有，用于完成维护前开始的有限事务。
+/// @param admission_id 私有活动身份。
+/// @return 原活动实际存在时为 true。
+pub async fn update_control_admitted(admission_id: &str) -> Result<bool, AppError> {
+    let (base, token, client) = config()?;
+    let response = client
+        .post(format!(
+            "{base}/internal/v3/system-updates/admitted-control"
+        ))
+        .bearer_auth(token)
+        .json(&json!({"admission_id":admission_id}))
+        .timeout(STATUS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("原控制活动暂不可核对".into()))?
+        .error_for_status()
+        .map_err(|_| AppError::ServiceUnavailable("原控制活动核对失败".into()))?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("原控制活动格式无效".into()))?;
+    Ok(value["admitted"] == true)
+}
 /// 只共享连接池，认证材料始终在单次请求上设置，不进入默认头或缓存。
 static MANAGEMENT_CLIENT: LazyLock<Result<Client, ReqwestError>> = LazyLock::new(|| {
     Client::builder()
@@ -248,6 +297,25 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
     let Some(api_path) = path.strip_prefix("/api/") else {
         return false;
     };
+    if let Some(rest) = api_path.strip_prefix("system-updates/") {
+        return match *method {
+            Method::GET => {
+                matches!(rest, "status" | "releases")
+                    || rest
+                        .strip_prefix("operations/")
+                        .is_some_and(|value| Uuid::parse_str(value).is_ok())
+            }
+            Method::POST => {
+                matches!(rest, "check" | "prepare" | "install" | "rollback")
+                    || rest.strip_prefix("operations/").is_some_and(|value| {
+                        value.split_once('/').is_some_and(|(id, action)| {
+                            Uuid::parse_str(id).is_ok() && matches!(action, "cancel" | "recover")
+                        })
+                    })
+            }
+            _ => false,
+        };
+    }
     matches!(
         *method,
         Method::GET | Method::POST | Method::PUT | Method::DELETE
@@ -279,6 +347,9 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
 /// @param path 不含查询字符串的管理路径。
 /// @return 普通状态读取的期限，其它请求沿用既有生命周期。
 fn status_timeout(method: &Method, path: &str) -> Option<Duration> {
+    if *method == Method::GET && path.starts_with("/api/system-updates/") {
+        return Some(STATUS_TIMEOUT);
+    }
     (*method == Method::GET
         && matches!(
             path,

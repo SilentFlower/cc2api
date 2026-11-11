@@ -21,6 +21,7 @@ use crate::service::native_contract::{
 use crate::service::runtime_transport::{
     PreparedTransport, TransportBinding, now_ms, prepare_existing,
 };
+use crate::service::system_update;
 
 const QUEUE_LIMIT: usize = 128;
 const PREPARE_PARALLELISM: usize = 2;
@@ -188,6 +189,7 @@ async fn prepare_one(
     preparation_id: String,
     mut cancellation: oneshot::Receiver<()>,
 ) -> Result<Value, AppError> {
+    let _update_activity = system_update::admission()?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let account = accounts.get_account(id).await?;
     if account.status != AccountStatus::Active || account.request_backend != "native293" {

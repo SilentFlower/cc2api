@@ -56,6 +56,11 @@ onMounted(loadDashboard);
           </div>
           <nav class="flex flex-wrap items-center gap-1">
             <router-link
+              :to="{ name: 'updates' }"
+              class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'updates' ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium' : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
+            >系统更新</router-link>
+            <router-link
               :to="{ name: 'environments' }"
               class="px-3 py-1.5 text-sm rounded-lg transition-colors"
               :class="route.name === 'environments'
@@ -108,7 +113,7 @@ onMounted(loadDashboard);
     <!-- bench 自己管理内容滚动；外层只分配导航下方的空间，避免双重滚动和宽度压缩。 -->
     <main :class="route.name === 'environments' ? 'flex-1 min-h-0 w-full overflow-hidden' : 'max-w-7xl mx-auto px-6 py-6 space-y-6'">
       <!-- 统计卡片 -->
-      <div v-if="dashboard && route.name !== 'environments'" class="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div v-if="dashboard && !['environments', 'updates'].includes(String(route.name))" class="grid grid-cols-2 md:grid-cols-5 gap-4">
         <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
           <CardContent class="py-3 px-4">
             <p class="text-[#8c8475] text-xs mb-1">总账号</p>
