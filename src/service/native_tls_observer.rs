@@ -39,6 +39,26 @@ pub(super) struct NativeTlsSlot {
 }
 
 impl NativeTlsSlot {
+    /// 只读核对当前采集槽。@return 实际状态和受控缺口；不启动帮助进程。
+    pub(super) fn status(&self) -> (&'static str, Option<&'static str>) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return ("unavailable", Some("WORKER_UNAVAILABLE"));
+        }
+        if let Some(observer) = state.ready.as_mut() {
+            return if matches!(observer.child.try_wait(), Ok(None)) {
+                ("ready", None)
+            } else {
+                ("unavailable", Some("OBSERVER_FAILED"))
+            };
+        }
+        if state.starting || state.reason == "CAPTURE_PREPARING" {
+            ("preparing", Some("CAPTURE_PREPARING"))
+        } else {
+            ("unavailable", Some(state.reason))
+        }
+    }
+
     /// 绑定已验证物理进程。@param pid 实际PID。@param worker_id 物理代次。@param image 精确SHA。@return 后台预备槽。
     pub(super) fn new(pid: u32, worker_id: &str, image: &str) -> Self {
         let path = var("CCRB_TLS_OBSERVER").ok();
@@ -320,7 +340,7 @@ impl NativeTlsObserver {
                 image,
             ])
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("LANG", "C.UTF-8")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -430,6 +450,30 @@ mod tests {
     use tokio::runtime::Builder;
     use tokio::time::sleep;
     use uuid::Uuid;
+
+    /// 能力状态核对帮助进程实际存活，退出后旧ready立即失效。@return 无。
+    #[tokio::test]
+    async fn status_checks_live_observer_and_closed_slot() {
+        let directory = temp_dir().join(format!("native-status-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let script = directory.join("observer.py");
+        fs::write(&script, "import json,sys\nprint(json.dumps({'schema_version':1,'ready':True,'capture_id':'capture','worker_id':'worker'}),flush=True)\nsys.stdin.buffer.read()\n").unwrap();
+        let slot = NativeTlsSlot::new(1, "worker", "image");
+        let observer =
+            NativeTlsObserver::start(1, "worker", "capture", "image", script.to_str().unwrap())
+                .await
+                .unwrap();
+        slot.state.lock().unwrap().ready = Some(observer);
+        assert_eq!(slot.status(), ("ready", None));
+        let mut observer = slot.state.lock().unwrap().ready.take().unwrap();
+        observer.child.kill().await.unwrap();
+        observer.child.wait().await.unwrap();
+        slot.state.lock().unwrap().ready = Some(observer);
+        assert_eq!(slot.status(), ("unavailable", Some("OBSERVER_FAILED")));
+        slot.close();
+        assert_eq!(slot.status(), ("unavailable", Some("WORKER_UNAVAILABLE")));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     /// 慢启动期间业务即时取用，反复请求合并为每worker一个在途启动。@return 无。
     #[tokio::test]

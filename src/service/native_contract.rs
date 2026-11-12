@@ -122,6 +122,9 @@ pub struct NativeReadinessStatus {
     pub live_workers: usize,
     pub pid: Option<u32>,
     pub reason: Option<String>,
+    /// 当前环境的实际TLS槽；旧发送器缺字段时保留兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_observer: Option<serde_json::Value>,
 }
 
 /// 仅由受信切换协调器指定的预期版本和操作代次。

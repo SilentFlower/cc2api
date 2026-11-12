@@ -1145,6 +1145,41 @@ impl Worker {
 }
 
 impl NativePool {
+    /// 汇总当前闲置worker的真实TLS槽。@param config 当前绑定配置。@return 安全能力摘要，不创建进程。
+    pub(crate) fn tls_status(&self, config: &SenderConfig) -> Value {
+        let mut result = json!({"state":"preparing","reason":"CAPTURE_PREPARING",
+            "checked_at_ms":now_ms(),"protocol_version":1,"image_admitted":null});
+        if config.native_capture_dir.is_none() {
+            result["state"] = json!("disabled");
+            result["reason"] = Value::Null;
+            return result;
+        }
+        if std::env::var_os("CCRB_TLS_OBSERVER").is_none() {
+            result["state"] = json!("unavailable");
+            result["reason"] = json!("OBSERVER_NOT_CONFIGURED");
+            return result;
+        }
+        let mut state = self.state.lock().unwrap();
+        for worker in &mut state.idle {
+            if !worker.reusable() {
+                continue;
+            }
+            if let Some(slot) = &worker.tls_observer {
+                let (status, reason) = slot.status();
+                result["state"] = json!(status);
+                result["reason"] = json!(reason);
+                result["image_admitted"] = json!(
+                    worker.image_sha256
+                        == "af4cea9e21aa959c5e39c389173ba30ebb19b354b67acfe99164946450e9776d"
+                );
+                if status == "ready" {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
     /// 检查当前身份的实时可复用进程，检查过程不投递模型或启动进程。
     /// @param config 当前 sender 配置。
     /// @param identity 已验证绑定的账号身份。
@@ -1177,6 +1212,7 @@ impl NativePool {
             live_workers: 0,
             pid: None,
             reason: None,
+            tls_observer: None,
         };
         {
             let mut state = self.state.lock().unwrap();
@@ -1219,6 +1255,7 @@ impl NativePool {
             worker.retire().await;
         }
         result.live_workers = self.state.lock().unwrap().live;
+        result.tls_observer = Some(self.tls_status(config));
         Ok(result)
     }
 

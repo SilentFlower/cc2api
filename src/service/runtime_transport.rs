@@ -971,7 +971,8 @@ async fn native_status(
     }
     Ok(Json(
         serde_json::json!({"raw_input_protocol":1,"version":"2.1.293","environment_id":config.binding.environment_id,"generation":config.binding.generation,
-            "release":config.native.as_ref().and_then(|native| native.release.as_ref())}),
+            "release":config.native.as_ref().and_then(|native| native.release.as_ref()),
+            "tls_observer":state.native_pool.tls_status(&config)}),
     ))
 }
 
