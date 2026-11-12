@@ -39,6 +39,12 @@ pub struct NativeSenderConfig {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSubmission {
+    /// 网关按本次全局设置冻结的已有缓存TTL策略；省略表示 off。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_rewrite: Option<String>,
+    /// 网关在映射前冻结的有界脱敏入口预览；缺失表示本次未采集。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_capture: Option<Value>,
     /// 仅由受信任网关冻结，不从调用方信封读取。
     #[serde(default)]
     pub log_mode: RequestLogMode,

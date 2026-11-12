@@ -26,6 +26,7 @@ pub mod runtime_bridge;
 pub mod runtime_lease;
 pub mod runtime_transport;
 pub mod session_hello_probe;
+pub(crate) mod stream_error;
 pub mod system_update;
 pub mod telemetry;
 pub mod usage;

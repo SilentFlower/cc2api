@@ -3592,6 +3592,9 @@ impl GatewayService {
         bind_session: bool,
     ) -> Result<Response, AppError> {
         validate_native_account_features(account, headers, body_map)?;
+        let log_mode = diagnostics::current_log_mode();
+        let ingress_headers = headers;
+        let ingress_body = body_map;
         let pool_session = native_pool_session(headers, body_map);
         let original_session =
             extract_session_id_from_body(body_map).or_else(|| pool_session.clone());
@@ -3637,6 +3640,8 @@ impl GatewayService {
             self.account_svc.resolve_upstream_token(account.id),
         )
         .await??;
+        let ingress_capture =
+            super::native_capture::ingress(log_mode, ingress_headers, body, ingress_body, &bearer);
         let transport = await_preparation(
             scheduling,
             runtime_transport::prepare(
@@ -3665,7 +3670,15 @@ impl GatewayService {
         // 映射副本直接移入信封，大正文无需在 json! 中再次完整序列化和复制。
         input["body"] = native_body.into_owned();
         let submission = NativeSubmission {
-            log_mode: diagnostics::current_log_mode(),
+            cache_ttl_rewrite: Some(
+                self.cache_control_ttl_rewrite
+                    .read()
+                    .await
+                    .as_str()
+                    .to_string(),
+            ),
+            ingress_capture,
+            log_mode,
             request: PreparedRequest {
                 account_id: account.id,
                 environment_id: String::new(),
@@ -3700,6 +3713,9 @@ impl GatewayService {
         if let Some(permit) = permit {
             permit.submitted();
         }
+        info!(request_id = ?diagnostics::current_request_id(), native_job_id = %id,
+            account_id = account.id, layer = "gateway", reason = "native_submission",
+            "已提交本次原生作业");
         let native_started = Instant::now();
         let mut response = match transport
             .submit_native(submission, UPSTREAM_TTFB_TIMEOUT)
@@ -5130,6 +5146,7 @@ fn safe_header_log_value(name: &str, value: &str) -> String {
 struct StreamForwardState<S> {
     upstream: S,
     account_id: String,
+    request_id: Option<String>,
     upstream_request_id: Option<String>,
     config: StreamStabilityConfig,
     stream_start: std::time::Instant,
@@ -5137,8 +5154,33 @@ struct StreamForwardState<S> {
     last_keepalive_at: Option<std::time::Instant>,
     max_gap_ms: u128,
     chunk_count: u64,
+    byte_count: u64,
     first_chunk_seen: bool,
     done: bool,
+}
+
+impl<S> StreamForwardState<S> {
+    fn log_end(
+        &self,
+        reason: &'static str,
+        error: Option<super::stream_error::StreamErrorSummary>,
+    ) {
+        info!(request_id = ?self.request_id, account_id = %self.account_id,
+            upstream_request_id = ?self.upstream_request_id, layer = "gateway", reason,
+            chunks = self.chunk_count, bytes = self.byte_count, max_gap_ms = self.max_gap_ms,
+            elapsed_ms = self.stream_start.elapsed().as_millis(),
+            last_chunk_ago_ms = self.last_chunk_at.map(|at| at.elapsed().as_millis()),
+            idle_timeout_ms = self.config.upstream_idle_timeout.as_millis(),
+            error_summary = ?error, "网关响应流收口观察");
+    }
+}
+
+impl<S> Drop for StreamForwardState<S> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.log_end("downstream_body_dropped", None);
+        }
+    }
 }
 
 fn stable_upstream_stream<S, E>(
@@ -5155,6 +5197,7 @@ where
         StreamForwardState {
             upstream,
             account_id,
+            request_id: diagnostics::current_request_id(),
             upstream_request_id,
             config,
             stream_start: std::time::Instant::now(),
@@ -5162,6 +5205,7 @@ where
             last_keepalive_at: None,
             max_gap_ms: 0,
             chunk_count: 0,
+            byte_count: 0,
             first_chunk_seen: false,
             done: false,
         },
@@ -5212,18 +5256,20 @@ where
                     Some((Ok(bytes), state))
                 }
                 Ok(Some(Err(e))) => {
-                    warn!(
-                        "upstream_stream_error account={} upstream_request_id={} chunks={} max_gap_ms={} error={}",
-                        state.account_id,
-                        state.upstream_request_id.as_deref().unwrap_or("unknown"),
-                        state.chunk_count,
-                        state.max_gap_ms,
-                        e
+                    state.log_end(
+                        "upstream_body_error",
+                        Some(super::stream_error::summarize(&e)),
                     );
+                    warn!(account_id = %state.account_id, upstream_request_id = ?state.upstream_request_id,
+                        "upstream_stream_error");
                     state.done = true;
                     Some((Err(std::io::Error::other(e)), state))
                 }
-                Ok(None) => None,
+                Ok(None) => {
+                    state.done = true;
+                    state.log_end("upstream_eof", None);
+                    None
+                }
                 Err(_elapsed) if state.config.keepalive_enabled && state.first_chunk_seen => {
                     let now = std::time::Instant::now();
                     let last_upstream_chunk = state.last_chunk_at.unwrap_or(state.stream_start);
@@ -5257,6 +5303,7 @@ fn upstream_stream_timeout_error<S>(state: &StreamForwardState<S>) -> std::io::E
     let wait_started_at = state.last_chunk_at.unwrap_or(state.stream_start);
     let wait_ms = now.duration_since(wait_started_at).as_millis();
     let request_id = state.upstream_request_id.as_deref().unwrap_or("unknown");
+    state.log_end("local_upstream_idle_timeout", None);
     if state.chunk_count == 0 {
         warn!(
             "upstream_first_byte_timeout account={} upstream_request_id={} wait_ms={} chunk_count=0 max_gap_ms={}",
@@ -5295,6 +5342,7 @@ fn extract_upstream_request_id(headers: &HeaderMap) -> Option<String> {
 fn record_upstream_stream_chunk<S>(state: &mut StreamForwardState<S>, bytes_len: usize) {
     let now = std::time::Instant::now();
     state.chunk_count += 1;
+    state.byte_count = state.byte_count.saturating_add(bytes_len as u64);
     state.first_chunk_seen = true;
     state.last_keepalive_at = None;
     if let Some(prev) = state.last_chunk_at {
@@ -10010,7 +10058,7 @@ mod tests {
                 var("CCRB_TEST_CAPTURE_DIR")
                     .unwrap_or_else(|_| root.join("captures").to_string_lossy().into_owned()),
             ),
-            quota_identity: "synthetic".into(),
+            quota_identity: String::new(),
         };
         let capture_directory = config.native_capture_dir.clone().unwrap();
         let path = root.join("sender.json");
@@ -10171,6 +10219,12 @@ mod tests {
                 tokio_sleep(Duration::from_millis(10)).await;
             }
         }
+        // 复现生产首条业务补写额度观察身份，已准备的物理进程必须继续复用。
+        let mut business_config = config.clone();
+        business_config.quota_identity = "synthetic-first-business-quota".into();
+        let temporary = root.join("sender-next.json");
+        fs::write(&temporary, serde_json::to_vec(&business_config).unwrap()).unwrap();
+        fs::rename(temporary, root.join("sender.json")).unwrap();
         for (label, expected) in [("gateway-normal", 200), ("gateway-error", 401)] {
             let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":label},{"type":"text","text":"synthetic-client-gateway"}]}]})), None).await;
             assert!(response.headers().get("x-v3-native-observation").is_none());
@@ -10182,6 +10236,7 @@ mod tests {
         }
         let response = service.handle_request(request(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,
             "messages":[{"role":"user","content":"gateway-native"}],
+            "settings":{"env":{"API_KEY":"synthetic-settings-secret"}},
             "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=12345; cc_prompt_id=11111111-1111-4111-8111-111111111111; cc_turn_origin=human;"}],
             "metadata":{"user_id":"{\"device_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"account_uuid\":\"44444444-4444-4444-8444-444444444444\",\"session_id\":\"22222222-2222-4222-8222-222222222222\"}"}})), None).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -10292,6 +10347,32 @@ mod tests {
             .unwrap();
             assert_eq!(snapshot["stage"], "cc_prepared");
             assert_eq!(snapshot["account_id"], account.id);
+            assert_eq!(snapshot["ingress"]["status"], "complete");
+            assert_eq!(snapshot["header_policy"]["status"], "complete");
+            assert_eq!(snapshot["stages"][3]["status"], "unavailable");
+            assert!(
+                snapshot["header_policy"]["decisions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["name"] == "cf-ray" && item["action"] == "drop")
+            );
+            let prepared_body: Value =
+                serde_json::from_str(snapshot["body"].as_str().unwrap()).unwrap();
+            let ingress_body: Value =
+                serde_json::from_str(snapshot["ingress"]["body"].as_str().unwrap()).unwrap();
+            assert!(!snapshot.to_string().contains("synthetic-settings-secret"));
+            if ingress_body.get("settings").is_some() {
+                assert!(prepared_body.get("settings").is_none());
+                assert!(
+                    snapshot["body_changes"]["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["path"] == "/settings" && item["action"] == "removed")
+                );
+            }
+
             let viewed = runtime_bridge::native_capture(account.id, &detail.attempts[0].attempt_id)
                 .await
                 .unwrap();
@@ -10525,6 +10606,22 @@ mod tests {
                     .runtime_gate
                     .update(&owner, &lease.generation, "release")
                     .unwrap();
+                // 激活和回滚的真实预热之后，再补写观察配置，首条业务仍须命中该PID。
+                config.quota_identity = format!("synthetic-after-switch-{index}");
+                let temporary = root.join("sender-next.json");
+                fs::write(&temporary, serde_json::to_vec(&config).unwrap()).unwrap();
+                fs::rename(temporary, &config_path).unwrap();
+                if var("CCRB_TEST_SWITCH_TTL_REWRITE").as_deref() == Ok("1") {
+                    service
+                        .settings_store
+                        .upsert_many(&HashMap::from([(
+                            "cache_control_ttl_rewrite".into(),
+                            if index == 0 { "1h" } else { "off" }.into(),
+                        )]))
+                        .await
+                        .unwrap();
+                    service.reload_cache_control_ttl_rewrite().await.unwrap();
+                }
                 let response = service
                     .handle_request(
                         request(json!({"model":"claude-sonnet-4-6","stream":false,
@@ -10533,9 +10630,39 @@ mod tests {
                     )
                     .await;
                 assert_eq!(response.status(), StatusCode::OK);
+                let request_id = response.headers()["x-cc2api-request-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
                 axum::body::to_bytes(response.into_body(), 1024 * 1024)
                     .await
                     .unwrap();
+                let diagnostics = service.diagnostics_store().unwrap();
+                diagnostics.flush().await.unwrap();
+                let detail = diagnostics.detail(&request_id).await.unwrap();
+                let runtime = detail.attempts[0].runtime.as_ref().unwrap();
+                assert!(runtime.warm_hit);
+                assert_eq!(runtime.worker_pid, pid);
+                assert!(runtime.worker_start_ms.is_none());
+                if index == 0 && var("CCRB_TEST_SWITCH_TTL_REWRITE").as_deref() == Ok("1") {
+                    let observed: Value = client
+                        .get(&control)
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let ttls =
+                        observed["messages"].as_array().unwrap().last().unwrap()["cache_ttls"]
+                            .as_array()
+                            .unwrap();
+                    assert!(!ttls.is_empty());
+                    assert!(
+                        ttls.iter().all(|ttl| ttl == "1h"),
+                        "现有设置必须到达实际原生出站"
+                    );
+                }
                 assert!(fs::metadata(format!("/proc/{pid}/exe")).is_ok());
             }
         }
@@ -18443,6 +18570,90 @@ mod tests {
     fn truncate_log_text_handles_zero_limit() {
         assert_eq!(truncate_log_text("hello", 0), "");
         assert_eq!(truncate_log_text("hello", 3), "hel...<truncated>");
+    }
+
+    #[tokio::test]
+    async fn stable_stream_logs_distinguish_body_error_timeout_eof_and_drop() {
+        let (subscriber, output) = crate::service::stream_error::test_support::capture();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let config = StreamStabilityConfig {
+            keepalive_enabled: false,
+            keepalive_interval: Duration::from_millis(10),
+            upstream_idle_timeout: Duration::from_millis(20),
+        };
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        tx.send(Ok(Bytes::from_static(b"private response text")))
+            .await
+            .unwrap();
+        tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "http://user:synthetic-secret@proxy.example/private",
+        )))
+        .await
+        .unwrap();
+        let mut stream = Box::pin(stable_upstream_stream(
+            ReceiverStream::new(rx),
+            "1".into(),
+            Some("req_error".into()),
+            config,
+        ));
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            "private response text"
+        );
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+        drop(tx);
+
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut stream = Box::pin(stable_upstream_stream(
+            ReceiverStream::new(rx),
+            "1".into(),
+            Some("req_timeout".into()),
+            config,
+        ));
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(stream);
+        drop(tx);
+
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        tx.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+        let mut stream = Box::pin(stable_upstream_stream(
+            ReceiverStream::new(rx),
+            "1".into(),
+            Some("req_drop".into()),
+            config,
+        ));
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+        assert!(tx.is_closed());
+
+        let stream = futures_util::stream::empty::<Result<Bytes, std::io::Error>>();
+        let mut stream = Box::pin(stable_upstream_stream(
+            stream,
+            "1".into(),
+            Some("req_eof".into()),
+            config,
+        ));
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for reason in [
+            "upstream_body_error",
+            "local_upstream_idle_timeout",
+            "downstream_body_dropped",
+            "upstream_eof",
+        ] {
+            assert!(logs.contains(reason), "缺少结束原因 {reason}: {logs}");
+        }
+        assert!(logs.contains("ConnectionReset"));
+        assert!(logs.contains("bytes=3"));
+        assert_eq!(logs.matches("downstream_body_dropped").count(), 1);
+        assert!(!logs.contains("synthetic-secret"));
+        assert!(!logs.contains("private response text"));
     }
 
     #[tokio::test]

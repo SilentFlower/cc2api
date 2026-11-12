@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue';
+import NativeStageDetails from './NativeStageDetails.vue';
 import { api, type DiagnosticRequest, type DiagnosticAttempt, type NativeCapture } from '../api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -133,11 +134,6 @@ function modeLabel(value?: string | null): string {
   return value === 'info' ? 'info（摘要）' : value === 'debug' ? 'debug（脱敏内容）' : '历史模式未知';
 }
 
-/** 格式化完整 JSON，截断正文保持原样。@param body 脱敏正文。@return 展示文本。 */
-function bodyText(body: string): string {
-  try { return JSON.stringify(JSON.parse(body), null, 2); } catch { return body; }
-}
-
 /** 显示持久化的采集状态。@param status 尝试采集状态。@return 中文标签。 */
 function captureLabel(status?: string | null): string {
   return ({ saved: '已采集', disabled: '采集关闭', dropped: '采集繁忙，已丢弃', failed: '采集失败', timeout: '采集超时，保存结果待核对' } as Record<string, string>)[status ?? ''] ?? '采集状态缺失';
@@ -161,7 +157,7 @@ onUnmounted(() => { mounted = false; listGeneration++; detailGeneration++; listC
       <Input v-model="correlation" placeholder="请求 ID / 响应关联 ID" class="max-w-sm" aria-label="请求关联 ID" />
       <Button type="submit" :disabled="loading">查询 / 刷新</Button>
     </form>
-    <p class="text-xs text-[#8c8475]">日志保留 7 天。info 保存摘要；debug 为已开启采集的原生账号追加脱敏请求头和正文。模式对后续请求生效。每账号最多 50 份、100 MiB，正文最多 2 MiB。</p>
+    <p class="text-xs text-[#8c8475]">日志保留 7 天。info 保存摘要；debug 为已开启采集的原生账号追加脱敏阶段原文及处理明细。模式对后续请求生效。每账号最多 50 份、100 MiB，正文最多 2 MiB。</p>
     <p v-if="Object.values(health).some(value => value > 0)" class="text-amber-700">诊断采集健康：{{ health }}</p>
     <p v-if="error" role="alert" class="text-red-700">{{ error }}</p>
     <div class="overflow-auto rounded-xl border border-[#e8e2d9] bg-white">
@@ -173,7 +169,7 @@ onUnmounted(() => { mounted = false; listGeneration++; detailGeneration++; listC
     <div class="flex gap-3 items-center"><Button variant="outline" :disabled="loading || page <= 1" @click="load(page - 1)">上一页</Button><span>{{ page }} / {{ Math.max(1, Math.ceil(total / 20)) }} · {{ total }} 条</span><Button variant="outline" :disabled="loading || page * 20 >= total" @click="load(page + 1)">下一页</Button></div>
     <Dialog :open="dialogOpen" @update:open="setDialogOpen">
       <DialogContent class="sm:max-w-5xl max-h-[85vh] flex flex-col" @close-auto-focus="restoreFocus">
-        <DialogHeader><DialogTitle class="break-all pr-5">请求详情 · {{ selected?.request_id }}</DialogTitle><DialogDescription>本次请求 {{ modeLabel(selected?.log_mode) }} · CC 组装后采集</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle class="break-all pr-5">请求详情 · {{ selected?.request_id }}</DialogTitle><DialogDescription>本次请求 {{ modeLabel(selected?.log_mode) }} · 请求分阶段诊断</DialogDescription></DialogHeader>
         <div class="min-h-0 overflow-auto space-y-3 text-sm">
           <p v-if="detailLoading" role="status">读取中…</p>
           <p v-if="detailError" role="alert" class="text-red-700">{{ detailError }}</p>
@@ -192,19 +188,12 @@ onUnmounted(() => { mounted = false; listGeneration++; detailGeneration++; listC
               <p>本地准备合计 {{ attempt.runtime.prepared_ms }} ms（包含上述等待，计至组装完成）</p>
             </div>
             <p v-else-if="attempt.profile_selection === 'native293_cc_prepared'" class="w-full text-[#8c8475]">原生进程复用与本地阶段：未观测</p>
-            <Button v-if="attempt.profile_selection === 'native293_cc_prepared' && attempt.log_mode !== 'info'" variant="outline" :disabled="detailLoading" @click="inspect(attempt)">查看 CC 组装后内容</Button>
+            <Button v-if="attempt.profile_selection === 'native293_cc_prepared' && attempt.log_mode !== 'info'" variant="outline" :disabled="detailLoading" @click="inspect(attempt)">查看请求处理详情</Button>
           </div>
           <section v-if="capture" class="space-y-3">
-            <h4 class="font-semibold">CC 组装后 · {{ selectedAttempt }}</h4>
+            <h4 class="font-semibold">请求处理详情 · {{ selectedAttempt }}</h4>
             <p v-if="capture.message" role="status">{{ capture.message }}</p>
-            <template v-if="capture.snapshot">
-              <p class="text-xs text-[#8c8475]">原正文 {{ capture.snapshot.original_body_bytes }} 字节 · SHA256 {{ capture.snapshot.original_body_sha256 }}</p>
-              <p v-if="capture.snapshot.body_truncated || capture.snapshot.headers_truncated" role="status" class="text-amber-700">内容已截断。正文：{{ capture.snapshot.body_truncated ? '已截断' : '完整' }}，请求头：{{ capture.snapshot.headers_truncated ? '已截断' : '完整' }}。</p>
-              <h5 class="font-medium">请求头</h5>
-              <div class="overflow-auto"><table class="w-full text-left"><tbody><tr v-for="(header, index) in capture.snapshot.headers" :key="index" class="border-b align-top"><th class="p-2 whitespace-nowrap font-mono font-normal">{{ header[0] }}</th><td class="p-2 break-all whitespace-pre-wrap font-mono">{{ header[1] }}</td></tr></tbody></table></div>
-              <h5 class="font-medium">请求正文</h5>
-              <pre class="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-[#f7f4ef] p-3 text-xs">{{ bodyText(capture.snapshot.body) }}</pre>
-            </template>
+            <NativeStageDetails v-if="capture.snapshot" :key="selectedAttempt" :snapshot="capture.snapshot" />
           </section>
         </div>
       </DialogContent>

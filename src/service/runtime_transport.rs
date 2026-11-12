@@ -1094,6 +1094,8 @@ async fn prepare_sender(
 /// 准备和只读检查使用同一身份信封，避免字段映射分叉。
 fn preparation_identity(preparation: NativePreparation, config: &SenderConfig) -> NativeSubmission {
     NativeSubmission {
+        cache_ttl_rewrite: None,
+        ingress_capture: None,
         log_mode: RequestLogMode::Info,
         request: PreparedRequest {
             account_id: preparation.account_id,

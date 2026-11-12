@@ -35,7 +35,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::error::AppError;
-#[cfg(test)]
 use crate::model::request_diagnostics::RequestLogMode;
 use crate::model::request_diagnostics::{
     DiagnosticParameters, NATIVE_OBSERVATION_HEADER, NativeRequestObservation,
@@ -48,7 +47,7 @@ pub use crate::service::native_contract::{
     NativeSenderConfig, NativeSubmission, POOL_MEMORY_MIB, WORKER_MEMORY_MIB,
 };
 use crate::service::native_release::ReleaseArtifact;
-use crate::service::rewriter::extract_session_id_from_body;
+use crate::service::rewriter::{CacheControlTtlRewrite, extract_session_id_from_body};
 use crate::service::runtime_transport::{
     CLOCK_SKEW_MS, REQUEST_BUDGET_MS, SenderConfig, now_ms, validate_request,
 };
@@ -169,6 +168,7 @@ fn validate_worker_identity(
     config: &SenderConfig,
     submission: &NativeSubmission,
 ) -> Result<usize, AppError> {
+    CacheControlTtlRewrite::parse(submission.cache_ttl_rewrite.as_deref().unwrap_or("off"))?;
     if config.allowed_origin != "https://api.anthropic.com" {
         return Err(unavailable());
     }
@@ -199,20 +199,17 @@ fn pool_identity(
     submission: &NativeSubmission,
 ) -> Result<(String, usize), AppError> {
     let slots = validate_worker_identity(config, submission)?;
-    // 调度策略变化不改变已就绪进程的身份，避免启用预热本身触发换代。
-    let identity_config = if config.native_adaptive_prewarm {
-        Cow::Owned(SenderConfig {
-            native_adaptive_prewarm: false,
-            ..config.clone()
-        })
-    } else {
-        Cow::Borrowed(config)
+    // 额度观察身份在首条业务才补写，它不参与进程启动，不能使已预热的进程换代。
+    let identity_config = SenderConfig {
+        native_adaptive_prewarm: false,
+        quota_identity: String::new(),
+        ..config.clone()
     };
     let key = format!(
         "{:x}",
         Sha256::digest(
             serde_json::to_vec(&(
-                identity_config.as_ref(),
+                &identity_config,
                 &submission.bearer,
                 &submission.device_id,
                 &submission.account_uuid,
@@ -358,6 +355,7 @@ impl Drop for WorkerLease {
 /// 一个物理进程的私有管道、目录、映像和生命周期归属。
 struct Worker {
     id: String,
+    cache_ttl_rewrite_supported: bool,
     child: Option<Child>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -371,6 +369,47 @@ struct Worker {
     ready_at: Instant,
     started_at: Instant,
     startup_ms: u64,
+}
+
+/// 生命周期结束时保留本层原因，取消 future 时也留下可关联的观察。
+struct NativeExecutionLog {
+    job_id: String,
+    worker_id: String,
+    worker_pid: Option<u32>,
+    account_id: i64,
+    generation: u64,
+    started: Instant,
+    last_event: Option<Instant>,
+    last_chunk: Option<Instant>,
+    chunks: u64,
+    bytes: u64,
+    headers_seen: bool,
+    reason: &'static str,
+}
+
+impl Drop for NativeExecutionLog {
+    fn drop(&mut self) {
+        tracing::info!(native_job_id = %self.job_id, worker_id = %self.worker_id,
+            worker_pid = self.worker_pid, account_id = self.account_id, generation = self.generation,
+            layer = "native_sender", reason = self.reason, headers_seen = self.headers_seen,
+            chunks = self.chunks, bytes = self.bytes, elapsed_ms = self.started.elapsed().as_millis(),
+            last_event_ago_ms = self.last_event.map(|at| at.elapsed().as_millis()),
+            last_chunk_ago_ms = self.last_chunk.map(|at| at.elapsed().as_millis()),
+            "原生请求执行已收口");
+    }
+}
+
+/// 只投影固定运行时已定义的受控错误码，未知值保持 unknown。
+fn native_error_code(payload: &Value) -> &'static str {
+    match payload["code"].as_str() {
+        Some("request_timeout") => "request_timeout",
+        Some("runtime_protocol") => "runtime_protocol",
+        Some("native_configuration") => "native_configuration",
+        Some("native_construction") => "native_construction",
+        Some("native_identity") => "native_identity",
+        Some("unsupported_parameter") => "unsupported_parameter",
+        _ => "unknown",
+    }
 }
 
 /// 原生 TLS 字节通过有鉴权的本地 CONNECT 转到现有 SOCKS 代理。
@@ -388,7 +427,7 @@ impl Drop for NativeProxy {
 }
 
 impl NativeProxy {
-    async fn create(proxy: &str) -> Result<Self, AppError> {
+    async fn create(proxy: &str, worker_id: &str) -> Result<Self, AppError> {
         if proxy.is_empty() {
             return Ok(Self {
                 url: String::new(),
@@ -414,6 +453,7 @@ impl NativeProxy {
             listener.local_addr().map_err(|_| unavailable())?
         );
         let authorization = format!("Basic {}", STANDARD.encode(format!("ccrb:{secret}")));
+        let worker_id = worker_id.to_string();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -421,7 +461,8 @@ impl NativeProxy {
                     next = listener.accept() => {
                         let Ok((socket, _)) = next else { break; };
                         let parsed = parsed.clone(); let authorization = authorization.clone();
-                        connections.spawn(async move { let _ = native_socks_tunnel(socket, parsed, authorization).await; });
+                        let worker_id = worker_id.clone();
+                        connections.spawn(async move { let _ = native_socks_tunnel(socket, parsed, authorization, &worker_id).await; });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
@@ -438,7 +479,11 @@ async fn native_socks_tunnel(
     mut socket: TcpStream,
     proxy: Url,
     authorization: String,
+    worker_id: &str,
 ) -> Result<(), AppError> {
+    let tunnel_id = Uuid::new_v4();
+    let started = Instant::now();
+    let mut phase = "connect_request";
     let operation = async {
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
@@ -467,6 +512,7 @@ async fn native_socks_tunnel(
         {
             return Err(unavailable());
         }
+        phase = "proxy_resolution";
         let endpoint = (
             proxy.host_str().ok_or_else(unavailable)?,
             proxy.port().unwrap_or(1080),
@@ -489,25 +535,49 @@ async fn native_socks_tunnel(
         let password = percent_decode_str(proxy.password().unwrap_or(""))
             .decode_utf8()
             .map_err(|_| unavailable())?;
+        phase = "socks_connect";
         let stream = if user.is_empty() {
             Socks5Stream::connect(endpoint, target).await
         } else {
             Socks5Stream::connect_with_password(endpoint, target, &user, &password).await
         }
-        .map_err(|_| unavailable())?;
+        .map_err(|error| {
+            tracing::warn!(worker_id, %tunnel_id, layer = "native_proxy", reason = "socks_connect_error",
+                error_summary = ?super::stream_error::summarize(&error), "SOCKS连接失败");
+            unavailable()
+        })?;
+        phase = "connect_response";
         socket
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .map_err(|_| unavailable())?;
         Ok::<_, AppError>(stream.into_inner())
     };
-    let mut target = timeout(Duration::from_secs(15), operation)
-        .await
-        .map_err(|_| unavailable())??;
+    let mut target = match timeout(Duration::from_secs(15), operation).await {
+        Ok(Ok(target)) => target,
+        failure => {
+            tracing::warn!(worker_id, %tunnel_id, layer = "native_proxy", phase,
+                reason = if failure.is_err() { "local_connect_timeout" } else { "connect_failed" },
+                elapsed_ms = started.elapsed().as_millis(), "原生代理握手结束");
+            return Err(unavailable());
+        }
+    };
+    tracing::info!(worker_id, %tunnel_id, layer = "native_proxy", reason = "tunnel_established",
+        elapsed_ms = started.elapsed().as_millis(), "原生代理隧道已建立");
     // 仅复制原生 TLS 密文；SDK 保持证书校验、CCH 及唯一模型发送所有权。
-    copy_bidirectional(&mut socket, &mut target)
-        .await
-        .map_err(|_| protocol_error())?;
+    match copy_bidirectional(&mut socket, &mut target).await {
+        Ok((sent, received)) => {
+            tracing::info!(worker_id, %tunnel_id, layer = "native_proxy", reason = "tunnel_eof",
+                sent_bytes = sent, received_bytes = received, elapsed_ms = started.elapsed().as_millis(),
+                "代理隧道双向复制已结束");
+        }
+        Err(error) => {
+            tracing::warn!(worker_id, %tunnel_id, layer = "native_proxy", reason = "tunnel_io_error",
+                elapsed_ms = started.elapsed().as_millis(),
+                error_summary = ?super::stream_error::summarize(&error), "代理隧道复制失败");
+            return Err(protocol_error());
+        }
+    }
     Ok(())
 }
 
@@ -542,6 +612,7 @@ impl Worker {
         kind: &str,
         request_id: Option<&str>,
         input: Option<&Value>,
+        cache_ttl_rewrite: Option<&str>,
     ) -> Result<(), AppError> {
         let mut frame = json!({"schema_version":2,"worker_id":self.id,"type":kind});
         if let Some(id) = request_id {
@@ -549,6 +620,9 @@ impl Worker {
         }
         if let Some(input) = input {
             frame["input"] = input.clone();
+        }
+        if let Some(mode) = cache_ttl_rewrite {
+            frame["cache_ttl_rewrite"] = json!(mode);
         }
         let mut bytes = serde_json::to_vec(&frame).map_err(|_| protocol_error())?;
         bytes.push(b'\n');
@@ -561,8 +635,20 @@ impl Worker {
     async fn next(&mut self) -> Result<Value, AppError> {
         let mut bytes = Vec::new();
         loop {
-            let available = self.stdout.fill_buf().await.map_err(|_| protocol_error())?;
+            let available = self.stdout.fill_buf().await.map_err(|error| {
+                tracing::warn!(worker_id = %self.id, reason = "ipc_read_error",
+                    error_summary = ?super::stream_error::summarize(&error), "原生IPC读取失败");
+                protocol_error()
+            })?;
             if available.is_empty() {
+                let exit = self
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.try_wait().ok())
+                    .flatten();
+                tracing::warn!(worker_id = %self.id, reason = "ipc_eof",
+                    exit_code = exit.as_ref().and_then(|status| status.code()),
+                    process_exited = exit.is_some(), "原生IPC已关闭");
                 return Err(protocol_error());
             }
             let count = available
@@ -571,6 +657,7 @@ impl Worker {
                 .map(|i| i + 1)
                 .unwrap_or(available.len());
             if bytes.len() + count > FRAME_LIMIT {
+                tracing::warn!(worker_id = %self.id, reason = "ipc_frame_limit", "原生IPC帧超限");
                 return Err(protocol_error());
             }
             bytes.extend_from_slice(&available[..count]);
@@ -579,8 +666,12 @@ impl Worker {
                 break;
             }
         }
-        let frame: Value = serde_json::from_slice(&bytes).map_err(|_| protocol_error())?;
+        let frame: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            tracing::warn!(worker_id = %self.id, reason = "ipc_invalid_json", "原生IPC帧解析失败");
+            protocol_error()
+        })?;
         if frame["schema_version"] != 2 || frame["worker_id"] != self.id {
+            tracing::warn!(worker_id = %self.id, reason = "ipc_binding_mismatch", "原生IPC归属校验失败");
             return Err(protocol_error());
         }
         Ok(frame)
@@ -597,11 +688,11 @@ impl Worker {
         let native = config.native.as_ref().ok_or_else(unavailable)?;
         let artifact = artifact(native)?;
         let image = verify_artifact(&artifact)?;
-        let proxy = NativeProxy::create(&config.proxy_url).await?;
+        let id = Uuid::new_v4().to_string();
+        let proxy = NativeProxy::create(&config.proxy_url, &id).await?;
         fs::create_dir_all(&native.work_root).map_err(|_| unavailable())?;
         fs::set_permissions(&native.work_root, fs::Permissions::from_mode(0o700))
             .map_err(|_| unavailable())?;
-        let id = Uuid::new_v4().to_string();
         let root = Path::new(&native.work_root).join(&id);
         fs::create_dir(&root).map_err(|_| unavailable())?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|_| unavailable())?;
@@ -682,6 +773,7 @@ impl Worker {
         let stdout = BufReader::new(child.stdout.take().ok_or_else(unavailable)?);
         let mut worker = Self {
             id,
+            cache_ttl_rewrite_supported: false,
             child: Some(child),
             stdin,
             stdout,
@@ -708,9 +800,12 @@ impl Worker {
             || ready["version"] != "2.1.293"
             || ready["raw_input_protocol"] != 1
             || ready["pid"].as_u64() != Some(pid as u64)
+            || (ready.get("cache_ttl_rewrite_protocol").is_some()
+                && ready["cache_ttl_rewrite_protocol"] != 1)
         {
             return Err(unavailable());
         }
+        worker.cache_ttl_rewrite_supported = ready["cache_ttl_rewrite_protocol"] == 1;
         let mut executable = File::open(format!("/proc/{pid}/exe")).map_err(|_| unavailable())?;
         if executable.metadata().map_err(|_| unavailable())?.len() != artifact.image_bytes {
             return Err(unavailable());
@@ -764,199 +859,253 @@ impl Worker {
             return Err(unavailable());
         }
         let id = &submission.request.request_id;
-        self.send("request_input", Some(id), Some(&submission.input))
-            .await?;
-        let mut policy = false;
-        let mut prepared = false;
-        let mut headers_seen = false;
-        let mut terminal = false;
-        let mut reusable = false;
-        let mut observation: Option<NativeRequestObservation> = None;
-        loop {
-            let frame = if headers_seen {
-                timeout(
-                    Duration::from_secs(if terminal { 3 } else { 120 }),
-                    self.next(),
-                )
-                .await
-                .map_err(|_| protocol_error())??
-            } else {
-                timeout_at(deadline, self.next())
-                    .await
-                    .map_err(|_| protocol_error())??
-            };
-            if frame["request_id"] != *id {
-                return Err(protocol_error());
+        let mut stream_log = NativeExecutionLog {
+            job_id: id.clone(),
+            worker_id: self.id.clone(),
+            worker_pid: self.child.as_ref().and_then(Child::id),
+            account_id: submission.request.account_id,
+            generation: submission.request.generation,
+            started: received,
+            last_event: None,
+            last_chunk: None,
+            chunks: 0,
+            bytes: 0,
+            headers_seen: false,
+            reason: "execution_future_dropped",
+        };
+        let result = async {
+            let cache_ttl = CacheControlTtlRewrite::parse(submission.cache_ttl_rewrite.as_deref().unwrap_or("off"))?;
+            if cache_ttl != CacheControlTtlRewrite::Off && !self.cache_ttl_rewrite_supported {
+                stream_log.reason = "cache_ttl_capability_missing";
+                return Err(AppError::ServiceUnavailable("当前内核缺少缓存TTL策略能力，请先激活配套候选内核".into()));
             }
-            if frame["type"] == "worker_idle" {
-                if !terminal {
+            self.send("request_input", Some(id), Some(&submission.input),
+                self.cache_ttl_rewrite_supported.then_some(cache_ttl.as_str()))
+                .await?;
+            let mut policy = false;
+            let mut header_policy = None;
+            let mut prepared = false;
+            let mut headers_seen = false;
+            let mut terminal = false;
+            let mut reusable = false;
+            let mut observation: Option<NativeRequestObservation> = None;
+            loop {
+                let frame = if headers_seen {
+                    timeout(
+                        Duration::from_secs(if terminal { 3 } else { 120 }),
+                        self.next(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        stream_log.reason = if terminal { "worker_idle_timeout" } else { "native_event_timeout" };
+                        protocol_error()
+                    })??
+                } else {
+                    timeout_at(deadline, self.next())
+                        .await
+                        .map_err(|_| { stream_log.reason = "native_response_deadline"; protocol_error() })??
+                };
+                let previous_event_gap_ms = stream_log.last_event.map(|at| at.elapsed().as_millis());
+                stream_log.last_event = Some(Instant::now());
+                if frame["request_id"] != *id {
                     return Err(protocol_error());
                 }
-                return if !reusable && headers_seen {
-                    Err(protocol_error())
-                } else {
-                    Ok(reusable)
-                };
-            }
-            if frame["type"] != "request_event" || terminal {
-                return Err(protocol_error());
-            }
-            let payload = &frame["payload"];
-            if payload["type"] != "error" && payload["attempt"] != 1 {
-                return Err(protocol_error());
-            }
-            match payload["type"].as_str() {
-                Some("header_policy") if !policy && !prepared && !headers_seen => {
-                    let decisions = payload["decisions"].as_array().ok_or_else(protocol_error)?;
-                    for decision in decisions {
-                        let obj = decision.as_object().ok_or_else(protocol_error)?;
-                        if obj.len() != 3
-                            || !decision["name"].is_string()
-                            || !decision["reason"].is_string()
-                            || !matches!(
-                                decision["action"].as_str(),
-                                Some("keep" | "drop" | "runtime" | "context")
-                            )
+                if frame["type"] == "worker_idle" {
+                    if !terminal {
+                        return Err(protocol_error());
+                    }
+                    return if !reusable && headers_seen {
+                        Err(protocol_error())
+                    } else {
+                        Ok(reusable)
+                    };
+                }
+                if frame["type"] != "request_event" || terminal {
+                    return Err(protocol_error());
+                }
+                let payload = &frame["payload"];
+                if payload["type"] != "error" && payload["attempt"] != 1 {
+                    return Err(protocol_error());
+                }
+                match payload["type"].as_str() {
+                    Some("header_policy") if !policy && !prepared && !headers_seen => {
+                        let decisions = payload["decisions"].as_array().ok_or_else(protocol_error)?;
+                        for decision in decisions {
+                            let obj = decision.as_object().ok_or_else(protocol_error)?;
+                            if obj.len() != 3
+                                || !decision["name"].is_string()
+                                || !decision["reason"].is_string()
+                                || !matches!(
+                                    decision["action"].as_str(),
+                                    Some("keep" | "drop" | "runtime" | "context")
+                                )
+                            {
+                                return Err(protocol_error());
+                            }
+                        }
+                        // 只记录动作计数；策略来自二进制，头值及任意调用方文本不进入普通日志。
+                        tracing::debug!(request_id = %id, source = "native_header_policy", decisions = decisions.len(), "原生头部策略已完成");
+                        if submission.log_mode == RequestLogMode::Debug && capture_dir.is_some() {
+                            header_policy = Some(super::native_capture::header_policy(decisions));
+                        }
+                        policy = true;
+                    }
+                    Some("cc_prepared") if policy && !prepared && !headers_seen => {
+                        runtime.prepared_ms = received.elapsed().as_millis() as u64;
+                        let body = payload["body"].as_str().ok_or_else(protocol_error)?;
+                        if payload["body_bytes"].as_u64() != Some(body.len() as u64)
+                            || payload["body_sha256"]
+                                != format!("{:x}", Sha256::digest(body.as_bytes()))
+                            || !payload["headers"].is_array()
                         {
                             return Err(protocol_error());
                         }
+                        prepared = true;
+                        let value: Value = serde_json::from_str(body).map_err(|_| protocol_error())?;
+                        let capture_status = super::native_capture::record(
+                            capture_dir,
+                            submission,
+                            payload,
+                            header_policy.as_ref(),
+                        )
+                        .await;
+                        observation = Some(NativeRequestObservation {
+                            runtime: Some(runtime.clone()),
+                            capture_status: Some(capture_status),
+                            schema_version: 1,
+                            parameters: DiagnosticParameters::from_request(&value),
+                            session_id: extract_session_id_from_body(&value)
+                                .filter(|id| id.len() <= 512),
+                            previous_message_id: value
+                                .pointer("/thread/previous_message_id")
+                                .and_then(Value::as_str)
+                                .filter(|id| id.len() <= 512)
+                                .map(str::to_owned),
+                            body_sha256: payload["body_sha256"]
+                                .as_str()
+                                .ok_or_else(protocol_error)?
+                                .to_owned(),
+                        });
                     }
-                    // 只记录动作计数；策略来自二进制，头值及任意调用方文本不进入普通日志。
-                    tracing::debug!(request_id = %id, source = "native_header_policy", decisions = decisions.len(), "原生头部策略已完成");
-                    policy = true;
-                }
-                Some("cc_prepared") if policy && !prepared && !headers_seen => {
-                    runtime.prepared_ms = received.elapsed().as_millis() as u64;
-                    let body = payload["body"].as_str().ok_or_else(protocol_error)?;
-                    if payload["body_bytes"].as_u64() != Some(body.len() as u64)
-                        || payload["body_sha256"]
-                            != format!("{:x}", Sha256::digest(body.as_bytes()))
-                        || !payload["headers"].is_array()
-                    {
-                        return Err(protocol_error());
-                    }
-                    prepared = true;
-                    let value: Value = serde_json::from_str(body).map_err(|_| protocol_error())?;
-                    let capture_status =
-                        super::native_capture::record(capture_dir, submission, payload).await;
-                    observation = Some(NativeRequestObservation {
-                        runtime: Some(runtime.clone()),
-                        capture_status: Some(capture_status),
-                        schema_version: 1,
-                        parameters: DiagnosticParameters::from_request(&value),
-                        session_id: extract_session_id_from_body(&value)
-                            .filter(|id| id.len() <= 512),
-                        previous_message_id: value
-                            .pointer("/thread/previous_message_id")
-                            .and_then(Value::as_str)
-                            .filter(|id| id.len() <= 512)
-                            .map(str::to_owned),
-                        body_sha256: payload["body_sha256"]
-                            .as_str()
-                            .ok_or_else(protocol_error)?
-                            .to_owned(),
-                    });
-                }
-                Some("response_headers") if prepared && !headers_seen => {
-                    let status = payload["status"]
-                        .as_u64()
-                        .filter(|status| (200..=599).contains(status))
-                        .ok_or_else(protocol_error)?;
-                    let pairs: Vec<(String, String)> =
-                        serde_json::from_value(payload["headers"].clone())
-                            .map_err(|_| protocol_error())?;
-                    let mut result = Response::new(Body::empty());
-                    *result.status_mut() =
-                        StatusCode::from_u16(status as u16).map_err(|_| protocol_error())?;
-                    for (name, value) in pairs {
-                        // Bun 返回的是逻辑字节，长度/压缩及逐跳传输头由当前 HTTP 边界重建。
-                        if matches!(
-                            name.to_ascii_lowercase().as_str(),
-                            "content-length"
-                                | "content-encoding"
-                                | "transfer-encoding"
-                                | "connection"
-                                | "keep-alive"
-                                | "proxy-authenticate"
-                                | "proxy-authorization"
-                                | "trailer"
-                                | "upgrade"
-                                | "x-v3-transport-error"
-                                | NATIVE_OBSERVATION_HEADER
-                        ) {
-                            continue;
-                        }
-                        result.headers_mut().append(
-                            HeaderName::from_bytes(name.as_bytes())
-                                .map_err(|_| protocol_error())?,
-                            HeaderValue::from_str(&value).map_err(|_| protocol_error())?,
-                        );
-                    }
-                    if let Some(observation) = &observation {
-                        let value = STANDARD
-                            .encode(serde_json::to_vec(observation).map_err(|_| protocol_error())?);
-                        result.headers_mut().insert(
-                            NATIVE_OBSERVATION_HEADER,
-                            HeaderValue::from_str(&value).map_err(|_| protocol_error())?,
-                        );
-                    }
-                    if let Some(sender) = response.take() {
-                        sender.send(Ok(result)).map_err(|_| protocol_error())?;
-                    }
-                    headers_seen = true;
-                }
-                Some("response_chunk") if headers_seen => {
-                    let data = payload["data_b64"].as_str().ok_or_else(protocol_error)?;
-                    let bytes = STANDARD.decode(data).map_err(|_| protocol_error())?;
-                    if STANDARD.encode(&bytes) != data {
-                        return Err(protocol_error());
-                    }
-                    chunks
-                        .send(Ok(Bytes::from(bytes)))
-                        .await
-                        .map_err(|_| protocol_error())?;
-                }
-                Some("completed") if headers_seen => {
-                    reusable = matches!(payload["state"].as_str(), Some("success" | "http_error"));
-                    terminal = true;
-                }
-                Some("error") => {
-                    let status = payload["status"]
-                        .as_u64()
-                        .filter(|s| (400..=599).contains(s))
-                        .unwrap_or(502);
-                    if let Some(sender) = response.take() {
-                        let error_body = json!({"error":{"type":"native_request_error","message":"原生请求校验或执行失败","code":payload["code"].as_str().filter(|code| code.len() <= 64 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).unwrap_or("native_error")}}).to_string();
+                    Some("response_headers") if prepared && !headers_seen => {
+                        let status = payload["status"]
+                            .as_u64()
+                            .filter(|status| (200..=599).contains(status))
+                            .ok_or_else(protocol_error)?;
+                        let pairs: Vec<(String, String)> =
+                            serde_json::from_value(payload["headers"].clone())
+                                .map_err(|_| protocol_error())?;
                         let mut result = Response::new(Body::empty());
                         *result.status_mut() =
                             StatusCode::from_u16(status as u16).map_err(|_| protocol_error())?;
-                        result
-                            .headers_mut()
-                            .insert("content-type", HeaderValue::from_static("application/json"));
-                        if let Some(observation) = &observation {
-                            let value = STANDARD.encode(
-                                serde_json::to_vec(observation).map_err(|_| protocol_error())?,
+                        for (name, value) in pairs {
+                            // Bun 返回的是逻辑字节，长度/压缩及逐跳传输头由当前 HTTP 边界重建。
+                            if matches!(
+                                name.to_ascii_lowercase().as_str(),
+                                "content-length"
+                                    | "content-encoding"
+                                    | "transfer-encoding"
+                                    | "connection"
+                                    | "keep-alive"
+                                    | "proxy-authenticate"
+                                    | "proxy-authorization"
+                                    | "trailer"
+                                    | "upgrade"
+                                    | "x-v3-transport-error"
+                                    | NATIVE_OBSERVATION_HEADER
+                            ) {
+                                continue;
+                            }
+                            result.headers_mut().append(
+                                HeaderName::from_bytes(name.as_bytes())
+                                    .map_err(|_| protocol_error())?,
+                                HeaderValue::from_str(&value).map_err(|_| protocol_error())?,
                             );
+                        }
+                        if let Some(observation) = &observation {
+                            let value = STANDARD
+                                .encode(serde_json::to_vec(observation).map_err(|_| protocol_error())?);
                             result.headers_mut().insert(
                                 NATIVE_OBSERVATION_HEADER,
                                 HeaderValue::from_str(&value).map_err(|_| protocol_error())?,
                             );
                         }
-                        let _ = sender.send(Ok(result));
+                        if let Some(sender) = response.take() {
+                            sender.send(Ok(result)).map_err(|_| protocol_error())?;
+                        }
+                        headers_seen = true;
+                        stream_log.headers_seen = true;
+                    }
+                    Some("response_chunk") if headers_seen => {
+                        let data = payload["data_b64"].as_str().ok_or_else(protocol_error)?;
+                        let bytes = STANDARD.decode(data).map_err(|_| protocol_error())?;
+                        if STANDARD.encode(&bytes) != data {
+                            return Err(protocol_error());
+                        }
+                        stream_log.chunks += 1;
+                        stream_log.last_chunk = Some(Instant::now());
+                        stream_log.bytes = stream_log.bytes.saturating_add(bytes.len() as u64);
                         chunks
-                            .send(Ok(Bytes::from(error_body)))
+                            .send(Ok(Bytes::from(bytes)))
                             .await
                             .map_err(|_| protocol_error())?;
                     }
-                    terminal = true;
-                    reusable = !prepared;
-                    if headers_seen {
-                        return Err(protocol_error());
+                    Some("completed") if headers_seen => {
+                        reusable = matches!(payload["state"].as_str(), Some("success" | "http_error"));
+                        terminal = true;
                     }
+                    Some("error") => {
+                        stream_log.reason = "native_error_event";
+                        tracing::warn!(native_job_id = %id, worker_id = %self.id,
+                            layer = "native_sender", reason = "native_error_event",
+                            headers_seen, previous_event_gap_ms, error_code = native_error_code(payload),
+                            error_sha256 = %format!("{:x}", Sha256::digest(payload["error"].as_str().unwrap_or("").as_bytes())),
+                            "固定运行时返回错误事件");
+                        let status = payload["status"]
+                            .as_u64()
+                            .filter(|s| (400..=599).contains(s))
+                            .unwrap_or(502);
+                        if let Some(sender) = response.take() {
+                            let error_body = json!({"error":{"type":"native_request_error","message":"原生请求校验或执行失败","code":payload["code"].as_str().filter(|code| code.len() <= 64 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).unwrap_or("native_error")}}).to_string();
+                            let mut result = Response::new(Body::empty());
+                            *result.status_mut() =
+                                StatusCode::from_u16(status as u16).map_err(|_| protocol_error())?;
+                            result
+                                .headers_mut()
+                                .insert("content-type", HeaderValue::from_static("application/json"));
+                            if let Some(observation) = &observation {
+                                let value = STANDARD.encode(
+                                    serde_json::to_vec(observation).map_err(|_| protocol_error())?,
+                                );
+                                result.headers_mut().insert(
+                                    NATIVE_OBSERVATION_HEADER,
+                                    HeaderValue::from_str(&value).map_err(|_| protocol_error())?,
+                                );
+                            }
+                            let _ = sender.send(Ok(result));
+                            chunks
+                                .send(Ok(Bytes::from(error_body)))
+                                .await
+                                .map_err(|_| protocol_error())?;
+                        }
+                        terminal = true;
+                        reusable = !prepared;
+                        if headers_seen {
+                            return Err(protocol_error());
+                        }
+                    }
+                    _ => return Err(protocol_error()),
                 }
-                _ => return Err(protocol_error()),
             }
+        }.await;
+        if stream_log.reason == "execution_future_dropped" {
+            stream_log.reason = if result.is_ok() {
+                "native_completed"
+            } else {
+                "native_protocol_error"
+            };
         }
+        result
     }
 }
 
@@ -1621,7 +1770,7 @@ impl NativePool {
                 let result = tokio::select! {
                     result = worker.execute(&submission, config.native_capture_dir.as_deref(), &mut reply, &chunks, deadline, received, runtime) => result,
                     _ = chunks.closed() => {
-                        let _ = timeout(Duration::from_millis(200), worker.send("request_cancel", Some(&submission.request.request_id), None)).await;
+                        let _ = timeout(Duration::from_millis(200), worker.send("request_cancel", Some(&submission.request.request_id), None, None)).await;
                         Err(protocol_error())
                     }
                 };
@@ -1643,7 +1792,13 @@ impl NativePool {
             };
             let result = tokio::select! {
                 biased;
-                _ = chunks.closed() => Err(protocol_error()),
+                _ = chunks.closed() => {
+                    tracing::info!(native_job_id = %submission.request.request_id,
+                        account_id = submission.request.account_id, generation = submission.request.generation,
+                        layer = "native_sender", reason = "downstream_body_closed",
+                        elapsed_ms = received.elapsed().as_millis(), "下游释放原生响应流");
+                    Err(protocol_error())
+                },
                 result = operation => result,
             };
             if let Err(error) = result {
@@ -1675,6 +1830,120 @@ mod tests {
     use std::env::{temp_dir, var};
     use std::fs::FileTimes;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn native_execution_logs_error_event_eof_and_deadline() {
+        let (subscriber, output) = crate::service::stream_error::test_support::capture();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for scenario in ["error", "eof", "deadline", "ttl", "unsupported-ttl"] {
+            let worker_id = Uuid::new_v4().to_string();
+            let job_id = Uuid::new_v4().to_string();
+            let frame = json!({"schema_version":2,"worker_id":worker_id,"request_id":job_id,
+                "type":"request_event","payload":{"type":"error","error":"synthetic-private-error-secret",
+                "code":"request_timeout","status":502}});
+            let idle = json!({"schema_version":2,"worker_id":worker_id,"request_id":job_id,"type":"worker_idle"});
+            // 直接驱动私有事件读取路径，合成进程只写受控帧，不启动任何模型或原生构造。
+            let mut child = Command::new("python3").args(["-u", "-c",
+                "import sys,time,json; command=json.loads(sys.stdin.readline()); mode=sys.argv[1]; assert mode!='ttl' or command['cache_ttl_rewrite']=='1h'; time.sleep(2) if mode=='deadline' else None; print(sys.argv[2],flush=True) if mode in ('error','ttl') else None; print(sys.argv[3],flush=True) if mode in ('error','ttl') else None"])
+                .arg(scenario).arg(frame.to_string()).arg(idle.to_string())
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            let root = temp_dir().join(format!("native-log-test-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let pid = child.id().unwrap();
+            let mut worker = Worker {
+                cache_ttl_rewrite_supported: scenario == "ttl",
+                id: worker_id.clone(),
+                stdin: child.stdin.take().unwrap(),
+                stdout: BufReader::new(child.stdout.take().unwrap()),
+                child: Some(child),
+                root,
+                _image: File::open("/dev/null").unwrap(),
+                execution_image: None,
+                idle_since: Instant::now(),
+                _lease: None,
+                _proxy: NativeProxy {
+                    url: String::new(),
+                    task: None,
+                },
+                image_sha256: String::new(),
+                ready_at: Instant::now(),
+                started_at: Instant::now(),
+                startup_ms: 0,
+            };
+            let submission = NativeSubmission {
+                cache_ttl_rewrite: scenario.contains("ttl").then(|| "1h".into()),
+                ingress_capture: None,
+                log_mode: RequestLogMode::Info,
+                request: PreparedRequest {
+                    account_id: 7,
+                    environment_id: "synthetic-env".into(),
+                    generation: 2,
+                    request_id: job_id.clone(),
+                    deadline_unix_ms: 0,
+                    method: "POST".into(),
+                    target_url: String::new(),
+                    headers: Vec::new(),
+                    preserve_header_casing: false,
+                    tls_profile: Default::default(),
+                },
+                input: json!({"request_id":job_id}),
+                bearer: "synthetic-bearer".into(),
+                device_id: String::new(),
+                account_uuid: None,
+                organization_uuid: None,
+                email: String::new(),
+                concurrency: 1,
+            };
+            let (reply, receive) = oneshot::channel();
+            let mut reply = Some(reply);
+            let (chunks, _receiver) = mpsc::channel(8);
+            let result = worker
+                .execute(
+                    &submission,
+                    None,
+                    &mut reply,
+                    &chunks,
+                    Instant::now()
+                        + Duration::from_millis(if scenario == "deadline" { 30 } else { 1000 }),
+                    Instant::now(),
+                    NativeRuntimeObservation {
+                        worker_id,
+                        worker_pid: pid,
+                        kernel_generation: None,
+                        warm_hit: true,
+                        preparation_wait_ms: 0,
+                        checkout_ms: 0,
+                        worker_start_ms: None,
+                        prepared_ms: 0,
+                    },
+                )
+                .await;
+            if matches!(scenario, "error" | "ttl") {
+                assert!(result.unwrap());
+                assert_eq!(receive.await.unwrap().unwrap().status(), 502);
+            } else {
+                assert!(result.is_err());
+            }
+            worker.retire().await;
+        }
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for reason in [
+            "native_error_event",
+            "ipc_eof",
+            "native_response_deadline",
+            "cache_ttl_capability_missing",
+        ] {
+            assert!(logs.contains(reason), "缺少结束原因 {reason}");
+        }
+        assert!(logs.contains("request_timeout"));
+        assert!(logs.contains("native_job_id="));
+        assert!(!logs.contains("synthetic-private-error-secret"));
+        assert!(!logs.contains("synthetic-bearer"));
+        assert_eq!(
+            native_error_code(&json!({"code":"synthetic-private-error-secret"})),
+            "unknown"
+        );
+    }
 
     /// 用同一正文对比冷请求、稳定热请求与零模型准备后的首轮。
     async fn benchmark_readiness(
@@ -1713,7 +1982,9 @@ mod tests {
                         .unwrap()
                         .pid;
                 }
-                let response = benchmark.submit(config.clone(), submission).await.unwrap();
+                let mut business_config = config.clone();
+                business_config.quota_identity = "synthetic-first-business-quota".into();
+                let response = benchmark.submit(business_config, submission).await.unwrap();
                 assert_eq!(response.status(), 200);
                 let observation: NativeRequestObservation = serde_json::from_slice(
                     &STANDARD
@@ -1780,6 +2051,8 @@ mod tests {
             quota_identity: String::new(),
         };
         let identity = NativeSubmission {
+            cache_ttl_rewrite: None,
+            ingress_capture: None,
             log_mode: RequestLogMode::Info,
             request: PreparedRequest {
                 account_id: 7,
@@ -1804,6 +2077,37 @@ mod tests {
         // 旧身份仍在忙时，新身份必须进入真实准备；缺失制品应明确失败而非沿用 busy。
         let busy = Arc::new(NativePool::default());
         let old_key = pool_identity(&config, &identity).unwrap().0;
+        let mut invalid_policy = identity.clone();
+        invalid_policy.cache_ttl_rewrite = Some("invalid".into());
+        assert!(matches!(
+            pool_identity(&config, &invalid_policy),
+            Err(AppError::BadRequest(_))
+        ));
+        let mut policy_only = identity.clone();
+        policy_only.cache_ttl_rewrite = Some("1h".into());
+        assert_eq!(
+            old_key,
+            pool_identity(&config, &policy_only).unwrap().0,
+            "逐请求TTL设置必须复用同一暖池身份"
+        );
+        let mut observation_only = config.clone();
+        observation_only.quota_identity = "synthetic-quota-observation".into();
+        observation_only.native_adaptive_prewarm = true;
+        assert_eq!(
+            old_key,
+            pool_identity(&observation_only, &identity).unwrap().0,
+            "首次额度观察补写及备用开关必须保留已就绪进程"
+        );
+        let mut other_proxy = config.clone();
+        other_proxy.proxy_url = "http://127.0.0.1:19091".into();
+        assert_ne!(old_key, pool_identity(&other_proxy, &identity).unwrap().0);
+        let mut other_binding = config.clone();
+        other_binding.binding.generation += 1;
+        assert_ne!(old_key, pool_identity(&other_binding, &identity).unwrap().0);
+        let mut other_kernel = config.clone();
+        other_kernel.native.as_mut().unwrap().kernel_generation = Some(Uuid::new_v4().to_string());
+        assert_ne!(old_key, pool_identity(&other_kernel, &identity).unwrap().0);
+
         {
             let mut state = busy.state.lock().unwrap();
             state.key = old_key.clone();
@@ -1972,9 +2276,12 @@ mod tests {
     #[tokio::test]
     async fn socks_adapter_rejects_other_roles_and_targets_before_proxy_connection() {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = NativeProxy::create(&format!("socks5h://{}", upstream.local_addr().unwrap()))
-            .await
-            .unwrap();
+        let proxy = NativeProxy::create(
+            &format!("socks5h://{}", upstream.local_addr().unwrap()),
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .unwrap();
         let address = Url::parse(&proxy.url).unwrap();
         for (target, credential) in [
             ("api.anthropic.com:443", "wrong"),
@@ -2049,6 +2356,8 @@ mod tests {
         let make = |label: &str, bearer: &str| {
             let id = Uuid::new_v4().to_string();
             NativeSubmission {
+                cache_ttl_rewrite: None,
+                ingress_capture: None,
                 log_mode: RequestLogMode::Debug,
                 request: PreparedRequest {
                     account_id: 7,

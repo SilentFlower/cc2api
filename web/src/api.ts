@@ -409,12 +409,47 @@ export interface DiagnosticAttempt {
   outcome: string
 }
 
+/** 阶段证据的来源与完整性。 */
+export interface NativeCaptureStage {
+  stage: string
+  source: string
+  representation: string
+  status: string
+  note?: string
+}
+
+/** 原始逻辑字节对应的脱敏预览，哈希保持实际观测语义。 */
+export interface NativeCapturePreview {
+  headers: [string, string][]
+  body: string
+  body_truncated: boolean
+  headers_truncated: boolean
+  original_body_bytes: number
+  original_body_sha256: string
+}
+
 /** 已脱敏的 CC 组装后快照。 */
 export interface NativeCapture {
   state: string
   message?: string
   snapshot?: {
     stage: 'cc_prepared'
+    ingress?: NativeCapturePreview
+    stages?: NativeCaptureStage[]
+    header_policy?: {
+      source: string
+      status: string
+      observed_count?: number
+      stored_count?: number
+      note?: string
+      decisions: { name: string; action: 'keep' | 'drop' | 'runtime' | 'context'; reason: string }[]
+    }
+    body_changes?: {
+      source: string
+      status: string
+      note?: string
+      items: { path: string; action: 'added' | 'removed' | 'changed'; reason: string }[]
+    }
     headers: [string, string][]
     body: string
     body_truncated: boolean
