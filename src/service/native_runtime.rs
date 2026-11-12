@@ -52,8 +52,8 @@ use crate::service::runtime_transport::{
     CLOCK_SKEW_MS, REQUEST_BUDGET_MS, SenderConfig, now_ms, validate_request,
 };
 
-const LAUNCHER_SHA256: &str = "423a6a848c84e09bcc73a8b7be481ed4ead44a6644cef94bbf47d2009d3f6b80";
-const IMAGE_SHA256: &str = "22f26d7803f80630968caf21b6170cf9bb94d87bea6f5eef678464f3bb0d3ecd";
+const LAUNCHER_SHA256: &str = "64c61cae565e9097de18cf61a35f46e7595f633cb14f7d6b8c6609fcd294ce89";
+const IMAGE_SHA256: &str = "af4cea9e21aa959c5e39c389173ba30ebb19b354b67acfe99164946450e9776d";
 const IMAGE_BYTES: u64 = 112_839_864;
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 fn unavailable() -> AppError {
@@ -105,7 +105,7 @@ fn artifact(config: &NativeSenderConfig) -> Result<ReleaseArtifact, AppError> {
         None => Ok(ReleaseArtifact {
             path: PathBuf::from(&config.binary_path),
             launcher_sha256: LAUNCHER_SHA256.into(),
-            launcher_bytes: 27_387_960,
+            launcher_bytes: 27_388_048,
             image_sha256: IMAGE_SHA256.into(),
             image_bytes: IMAGE_BYTES,
         }),
