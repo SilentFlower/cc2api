@@ -378,6 +378,9 @@ export interface DiagnosticRequest {
   log_mode?: 'info' | 'debug' | null
   request_id: string
   started_at: string
+  finished_at?: string | null
+  response_request_id?: string | null
+  error_stage?: string | null
   status_code: number | null
   account_id: number | null
   outcome: string
@@ -407,6 +410,26 @@ export interface DiagnosticAttempt {
   capture_status?: string | null
   status_code: number | null
   outcome: string
+  request_id?: string
+  profile_version?: string
+  started_at?: string
+  finished_at?: string | null
+  duration_ms?: number | null
+  ttft_ms?: number | null
+  first_output_ms?: number | null
+  response_model?: string | null
+  upstream_request_id?: string | null
+  error_stage?: string | null
+  error_type?: string | null
+  retry_reason?: string | null
+  stop_reason?: string | null
+  partial?: boolean
+  parameters?: { model: string | null; max_tokens: number | null; thinking_type: string | null;
+    thinking_budget: number | null; effort: string | null; stream: boolean | null; tools_count: number | null }
+  sessions?: { real_session_hash: string | null; upstream_session_hash: string | null;
+    mapping_action: string | null; previous_message_hash: string | null }
+  tokens?: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens: number | null;
+    cache_write_tokens: number | null; cache_write_5m_tokens: number | null; cache_write_1h_tokens: number | null }
 }
 
 /** 阶段证据的来源与完整性。 */

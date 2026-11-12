@@ -299,6 +299,14 @@ fn browser_path_allowed(method: &Method, path: &str) -> bool {
     let Some(api_path) = path.strip_prefix("/api/") else {
         return false;
     };
+    if let Some(environment) = api_path
+        .strip_prefix("environments/")
+        .and_then(|value| value.strip_suffix("/content-capture"))
+    {
+        return matches!(*method, Method::GET | Method::POST)
+            && environment.len() == 32
+            && environment.bytes().all(|value| value.is_ascii_hexdigit());
+    }
     if let Some(rest) = api_path.strip_prefix("system-updates/") {
         return match *method {
             Method::GET => {
@@ -610,6 +618,23 @@ mod tests {
         assert!(browser_path_allowed(&Method::GET, "/projects.js"));
         assert!(!browser_path_allowed(&Method::POST, "/projects.js"));
         assert!(!browser_path_allowed(&Method::POST, "/app.js"));
+    }
+
+    /// 采集开关只开放精确环境资源和读写方法。
+    #[test]
+    fn content_capture_bridge_is_scoped_to_one_environment() {
+        let path = format!("/api/environments/{}/content-capture", "a".repeat(32));
+        assert!(browser_path_allowed(&Method::GET, &path));
+        assert!(browser_path_allowed(&Method::POST, &path));
+        for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!browser_path_allowed(&method, &path));
+        }
+        for environment in ["short", "../internal", "invalid-environment-identifier-xx"] {
+            assert!(!browser_path_allowed(
+                &Method::POST,
+                &format!("/api/environments/{environment}/content-capture")
+            ));
+        }
     }
 
     /// 环境页静态资源仅接受精确只读路径，拼写近似和写方法继续拒绝。

@@ -5,7 +5,7 @@ const { toasts, dismiss } = useToast();
 </script>
 
 <template>
-  <div class="min-h-screen bg-[#f9f6f1]">
+  <div class="min-h-screen bg-background">
     <router-view />
 
     <!-- Toast 容器 -->
