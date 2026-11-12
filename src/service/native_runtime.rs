@@ -354,6 +354,7 @@ impl Drop for WorkerLease {
 
 /// 一个物理进程的私有管道、目录、映像和生命周期归属。
 struct Worker {
+    tls_observer: Option<super::native_tls_observer::NativeTlsSlot>,
     id: String,
     cache_ttl_rewrite_supported: bool,
     child: Option<Child>,
@@ -583,6 +584,9 @@ async fn native_socks_tunnel(
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        if let Some(slot) = &self.tls_observer {
+            slot.close();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             let root = self.root.clone();
@@ -599,6 +603,9 @@ impl Drop for Worker {
 
 impl Worker {
     async fn retire(mut self) {
+        if let Some(slot) = &self.tls_observer {
+            slot.close();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -772,6 +779,7 @@ impl Worker {
         let stdin = child.stdin.take().ok_or_else(unavailable)?;
         let stdout = BufReader::new(child.stdout.take().ok_or_else(unavailable)?);
         let mut worker = Self {
+            tls_observer: None,
             id,
             cache_ttl_rewrite_supported: false,
             child: Some(child),
@@ -832,6 +840,15 @@ impl Worker {
             worker.execution_image = Some(Arc::new(executable));
         }
         worker.ready_at = Instant::now();
+        if config.native_capture_dir.is_some() {
+            let slot = super::native_tls_observer::NativeTlsSlot::new(
+                pid,
+                &worker.id,
+                &worker.image_sha256,
+            );
+            slot.warm();
+            worker.tls_observer = Some(slot);
+        }
         worker.startup_ms = started.elapsed().as_millis() as u64;
         Ok(worker)
     }
@@ -873,12 +890,21 @@ impl Worker {
             headers_seen: false,
             reason: "execution_future_dropped",
         };
+        let mut tls_capture = None;
         let result = async {
             let cache_ttl = CacheControlTtlRewrite::parse(submission.cache_ttl_rewrite.as_deref().unwrap_or("off"))?;
             if cache_ttl != CacheControlTtlRewrite::Off && !self.cache_ttl_rewrite_supported {
                 stream_log.reason = "cache_ttl_capability_missing";
                 return Err(AppError::ServiceUnavailable("当前内核缺少缓存TTL策略能力，请先激活配套候选内核".into()));
             }
+            if submission.log_mode == RequestLogMode::Debug {
+                if let Some(directory) = capture_dir {
+                    tls_capture = Some(super::native_tls_observer::NativeTlsCapture::take(directory, submission, &self.id, self.tls_observer.as_ref()));
+                }
+            } else if let Some(slot) = &self.tls_observer {
+                slot.clear();
+            }
+            if Instant::now() >= deadline { return Err(unavailable()); }
             self.send("request_input", Some(id), Some(&submission.input),
                 self.cache_ttl_rewrite_supported.then_some(cache_ttl.as_str()))
                 .await?;
@@ -914,6 +940,7 @@ impl Worker {
                     if !terminal {
                         return Err(protocol_error());
                     }
+                    if let Some(slot) = &self.tls_observer { slot.warm(); }
                     return if !reusable && headers_seen {
                         Err(protocol_error())
                     } else {
@@ -962,13 +989,19 @@ impl Worker {
                         }
                         prepared = true;
                         let value: Value = serde_json::from_str(body).map_err(|_| protocol_error())?;
-                        let capture_status = super::native_capture::record(
+                        let mut initial = None;
+                        if let Some(capture) = tls_capture.as_mut() {
+                            capture.prepared(payload, header_policy.as_ref());
+                            let mut pending = payload.clone();
+                            pending["_wire_final"] = capture.pending();
+                            initial = Some(pending);
+                        }
+                        let capture_status = super::native_capture::record_queued(
                             capture_dir,
                             submission,
-                            payload,
+                            initial.as_ref().unwrap_or(payload),
                             header_policy.as_ref(),
-                        )
-                        .await;
+                        );
                         observation = Some(NativeRequestObservation {
                             runtime: Some(runtime.clone()),
                             capture_status: Some(capture_status),
@@ -988,6 +1021,7 @@ impl Worker {
                         });
                     }
                     Some("response_headers") if prepared && !headers_seen => {
+                        if let Some(capture) = tls_capture.take() { capture.background(); }
                         let status = payload["status"]
                             .as_u64()
                             .filter(|status| (200..=599).contains(status))
@@ -1055,6 +1089,7 @@ impl Worker {
                         terminal = true;
                     }
                     Some("error") => {
+                        if let Some(capture) = tls_capture.take() { capture.background(); }
                         stream_log.reason = "native_error_event";
                         tracing::warn!(native_job_id = %id, worker_id = %self.id,
                             layer = "native_sender", reason = "native_error_event",
@@ -1851,6 +1886,7 @@ mod tests {
             fs::create_dir(&root).unwrap();
             let pid = child.id().unwrap();
             let mut worker = Worker {
+                tls_observer: None,
                 cache_ttl_rewrite_supported: scenario == "ttl",
                 id: worker_id.clone(),
                 stdin: child.stdin.take().unwrap(),
@@ -2326,13 +2362,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "需要 CCRB_TEST_BINARY、CCRB_TEST_PROXY、CCRB_TEST_CA_FILE 和独立网络夹具"]
     async fn native_real_binary() {
+        use std::collections::BTreeSet;
+
         let unlimited = var("CCRB_TEST_UNLIMITED").as_deref() == Ok("1");
         let normal = if unlimited { 2 } else { 3 };
         let root = temp_dir().join(format!("cc2api-native-{}", Uuid::new_v4()));
         let config = SenderConfig {
             native: Some(NativeSenderConfig {
                 kernel_generation: None,
-                release: None,
+                release: var("CCRB_TEST_RELEASE_REF")
+                    .ok()
+                    .map(|value| serde_json::from_str(&value).unwrap()),
                 binary_path: var("CCRB_TEST_BINARY").unwrap(),
                 work_root: root.to_string_lossy().into_owned(),
                 memory_mib: if unlimited { 0 } else { 1536 },
@@ -2384,6 +2424,140 @@ mod tests {
             idle_timeout: Duration::from_secs(2),
             ..Default::default()
         });
+        if var("CCRB_TEST_TLS_ONLY").as_deref() == Ok("1") {
+            let mut config = config.clone();
+            config.native_capture_dir = Some(
+                root.join("environment/flows/api/cc-prepared")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            let mut workers = Vec::new();
+            for _ in 0..6 {
+                let identity = make("readiness-latency", "synthetic-bearer-a");
+                let (_, worker) = pool
+                    .checkout(
+                        &config,
+                        &identity,
+                        Instant::now() + Duration::from_secs(30),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                workers.push(worker);
+            }
+            pool.state.lock().unwrap().idle.extend(workers);
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let ready = pool.state.lock().unwrap().idle.iter().all(|worker| {
+                        worker
+                            .tls_observer
+                            .as_ref()
+                            .is_some_and(|slot| slot.is_ready())
+                    });
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut ids = Vec::new();
+            let operations = (0..6)
+                .map(|_| {
+                    let mut submission = make("parallel-6", "synthetic-bearer-a");
+                    submission.input["body"]["model"] = json!("claude-haiku-4-5");
+                    ids.push(submission.request.request_id.clone());
+                    let pool = pool.clone();
+                    let config = config.clone();
+                    async move {
+                        let response = pool.submit(config, submission).await.unwrap();
+                        assert_eq!(response.status(), 200);
+                        to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    }
+                })
+                .collect::<Vec<_>>();
+            join_all(operations).await;
+            let directory = Path::new(config.native_capture_dir.as_ref().unwrap());
+            let mut snapshots = Vec::new();
+            for id in &ids {
+                let path = directory.join(format!("{id}.json"));
+                let snapshot = timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(bytes) = fs::read(&path) {
+                            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                                if value["wire_final"]["reason"] != "CAPTURE_PENDING" {
+                                    break value;
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    snapshot["wire_final"]["complete"], true,
+                    "{}",
+                    snapshot["wire_final"]
+                );
+                assert_eq!(snapshot["wire_final"]["request_id"], *id);
+                assert!(!snapshot.to_string().contains("synthetic-bearer-"));
+                if let Ok(python) = var("CCRB_TEST_CAPTURE_PYTHON") {
+                    let checked = Command::new(python).args(["-c", "import sys;from pathlib import Path;from native_capture import read_capture;read_capture(Path(sys.argv[1]),7,sys.argv[2])"])
+                        .arg(root.join("environment")).arg(id).env("PYTHONPATH",var("CCRB_TEST_ORCHESTRATOR").unwrap()).status().await.unwrap();
+                    assert!(checked.success());
+                }
+                snapshots.push(snapshot);
+            }
+            let evidence: Value = Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(var("CCRB_TEST_CONTROL").unwrap())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut pids = BTreeSet::new();
+            for snapshot in &snapshots {
+                let wire = &snapshot["wire_final"];
+                let client = wire["headers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|pair| {
+                        pair[0]
+                            .as_str()
+                            .unwrap()
+                            .eq_ignore_ascii_case("x-client-request-id")
+                    })
+                    .unwrap()[1]
+                    .as_str()
+                    .unwrap();
+                assert_eq!(
+                    wire["body_sha256"],
+                    evidence["tls_bodies"][client]["sha256"]
+                );
+                assert_eq!(
+                    wire["observed_body_bytes"],
+                    evidence["tls_bodies"][client]["bytes"]
+                );
+                pids.insert(wire["worker_pid"].as_u64().unwrap());
+            }
+            assert_eq!(pids.len(), 6);
+            if let Ok(path) = var("CCRB_TEST_CAPTURE_FIXTURE") {
+                fs::write(path, serde_json::to_vec(&snapshots[0]).unwrap()).unwrap();
+            }
+            let idle = std::mem::take(&mut pool.state.lock().unwrap().idle);
+            for worker in idle {
+                worker.retire().await;
+            }
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
         if var("CCRB_TEST_READINESS_BENCH_ONLY").as_deref() == Ok("1") {
             benchmark_readiness(&config, &make).await;
             fs::remove_dir_all(root).unwrap();
@@ -2507,7 +2681,17 @@ mod tests {
         fs::copy(&native.binary_path, &copied).unwrap();
         let mut mutable = native.clone();
         mutable.binary_path = copied.to_string_lossy().into_owned();
-        pool.verify(&mutable).unwrap();
+        // 签名发布从冻结目录解析实际路径；副本校验显式沿相同已验收身份。
+        let verify_copy = || {
+            if native.release.is_some() {
+                let mut identity = artifact(native)?;
+                identity.path = copied.clone();
+                verify_artifact(&identity).map(|_| ())
+            } else {
+                pool.verify(&mutable)
+            }
+        };
+        verify_copy().unwrap();
         let modified = fs::metadata(&copied).unwrap().modified().unwrap();
         let mut tampered = OpenOptions::new().write(true).open(&copied).unwrap();
         tampered.write_all(&[0]).unwrap();
@@ -2515,16 +2699,16 @@ mod tests {
             .set_times(FileTimes::new().set_modified(modified))
             .unwrap();
         assert!(
-            pool.verify(&mutable).is_err(),
+            verify_copy().is_err(),
             "同长度且恢复 mtime 的原地修改仍由 ctime 与完整摘要拒绝"
         );
         fs::copy(&native.binary_path, &copied).unwrap();
-        pool.verify(&mutable).unwrap();
+        verify_copy().unwrap();
         fs::set_permissions(&copied, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(pool.verify(&mutable).is_err(), "权限变化使缓存立即失效");
+        assert!(verify_copy().is_err(), "权限变化使缓存立即失效");
         fs::remove_file(&copied).unwrap();
         fs::copy(&native.binary_path, &copied).unwrap();
-        pool.verify(&mutable).unwrap();
+        verify_copy().unwrap();
         pool.verify(native).unwrap();
         let mut adaptive = config.clone();
         adaptive.native_adaptive_prewarm = true;

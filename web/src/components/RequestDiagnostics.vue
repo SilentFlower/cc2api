@@ -81,8 +81,17 @@ async function inspect(attempt: DiagnosticAttempt): Promise<void> {
   const { version, signal } = begin();
   capture.value = null; selectedAttempt.value = attempt.attempt_id;
   try {
-    const result = await api.nativeCapture(requestId, attempt.attempt_id, signal);
-    if (version === detailGeneration && dialogOpen.value) capture.value = result;
+    // 后台副本允许晚于业务响应；只重读同次私有证据，沿原取消代次阻止迟到覆盖。
+    for (let poll = 0; poll < 6; poll++) {
+      const result = await api.nativeCapture(requestId, attempt.attempt_id, signal);
+      if (version !== detailGeneration || !dialogOpen.value || signal.aborted) return;
+      capture.value = result;
+      const pending = result.snapshot?.wire_final?.reason === 'CAPTURE_PENDING'
+        || (attempt.capture_status === 'queued' && result.state === 'missing');
+      if (!pending || poll === 5) break;
+      await new Promise(resolve => setTimeout(resolve, 500));
+      if (version !== detailGeneration || !dialogOpen.value || signal.aborted) return;
+    }
   } catch (cause) {
     if (version === detailGeneration && !signal.aborted) detailError.value = cause instanceof Error ? cause.message : '采集内容读取失败';
   } finally { if (version === detailGeneration) detailLoading.value = false; }
@@ -136,7 +145,7 @@ function modeLabel(value?: string | null): string {
 
 /** 显示持久化的采集状态。@param status 尝试采集状态。@return 中文标签。 */
 function captureLabel(status?: string | null): string {
-  return ({ saved: '已采集', disabled: '采集关闭', dropped: '采集繁忙，已丢弃', failed: '采集失败', timeout: '采集超时，保存结果待核对' } as Record<string, string>)[status ?? ''] ?? '采集状态缺失';
+  return ({ queued: '后台采集已排队', saved: '已采集', disabled: '采集关闭', dropped: '采集繁忙，已丢弃', failed: '采集失败', timeout: '采集超时，保存结果待核对' } as Record<string, string>)[status ?? ''] ?? '采集状态缺失';
 }
 
 onMounted(() => { void load(); void loadMode(); });

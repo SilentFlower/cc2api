@@ -10001,7 +10001,7 @@ mod tests {
         use crate::service::native_runtime::NativeSenderConfig;
         use crate::service::runtime_bridge;
         use crate::service::runtime_transport::{SenderConfig, TransportBinding, sender_router};
-        use std::env::{temp_dir, var};
+        use std::env::{temp_dir, var, var_os};
         use std::fs;
         use tokio::time::{Instant as TokioInstant, sleep as tokio_sleep};
 
@@ -10043,7 +10043,9 @@ mod tests {
         let config = SenderConfig {
             native: Some(NativeSenderConfig {
                 kernel_generation: None,
-                release: None,
+                release: var("CCRB_TEST_RELEASE_REF")
+                    .ok()
+                    .map(|value| serde_json::from_str(&value).unwrap()),
                 binary_path: var("CCRB_TEST_BINARY").unwrap(),
                 work_root: root.join("workers").to_string_lossy().into_owned(),
                 memory_mib: if unlimited { 0 } else { 1536 },
@@ -10336,20 +10338,56 @@ mod tests {
                     .iter()
                     .any(|record| record["request_id"] == detail.attempts[0].attempt_id)
             );
-            assert_eq!(detail.attempts[0].capture_status.as_deref(), Some("saved"));
-            let snapshot: serde_json::Value = serde_json::from_slice(
-                &fs::read(format!(
-                    "{capture_directory}/{}.json",
-                    detail.attempts[0].attempt_id
-                ))
-                .unwrap(),
-            )
+            assert_eq!(detail.attempts[0].capture_status.as_deref(), Some("queued"));
+            let snapshot_path =
+                format!("{capture_directory}/{}.json", detail.attempts[0].attempt_id);
+            let snapshot: Value = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    if let Ok(bytes) = fs::read(&snapshot_path) {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                            if value["wire_final"]["reason"] != "CAPTURE_PENDING" {
+                                break value;
+                            }
+                        }
+                    }
+                    tokio_sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
             .unwrap();
             assert_eq!(snapshot["stage"], "cc_prepared");
             assert_eq!(snapshot["account_id"], account.id);
             assert_eq!(snapshot["ingress"]["status"], "complete");
             assert_eq!(snapshot["header_policy"]["status"], "complete");
-            assert_eq!(snapshot["stages"][3]["status"], "unavailable");
+            if var_os("CCRB_TLS_OBSERVER").is_some() && snapshot["wire_final"]["complete"] == true {
+                assert_eq!(
+                    snapshot["stages"][3]["status"], "complete",
+                    "{}",
+                    snapshot["wire_final"]
+                );
+                assert_eq!(snapshot["wire_final"]["source"], "native_tls_uprobe");
+                assert_eq!(
+                    snapshot["wire_final"]["request_id"],
+                    detail.attempts[0].attempt_id
+                );
+                assert_eq!(snapshot["wire_final"]["worker_pid"], prepared_pid);
+                assert!(snapshot["wire_final"]["flushed"].is_null());
+                assert!(
+                    snapshot["wire_final"]["headers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|pair| pair[0] == "Host")
+                );
+                assert!(!snapshot.to_string().contains("synthetic-bearer-"));
+            } else {
+                assert_eq!(snapshot["stages"][3]["status"], "unavailable");
+                assert!(matches!(
+                    snapshot["wire_final"]["reason"].as_str(),
+                    Some("OBSERVER_NOT_CONFIGURED" | "CAPTURE_PREPARING")
+                ));
+            }
+
             assert!(
                 snapshot["header_policy"]["decisions"]
                     .as_array()

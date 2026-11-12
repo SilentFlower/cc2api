@@ -1,19 +1,22 @@
 //! 按账号保存有界的 CC 组装后快照，完整内容只通过管理员接口读取。
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use libc::{O_NOFOLLOW, O_NONBLOCK};
 use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tokio::task::{JoinHandle, spawn_blocking};
 use uuid::Uuid;
 
 use crate::model::request_diagnostics::RequestLogMode;
@@ -294,6 +297,15 @@ fn snapshot(submission: &NativeSubmission, payload: &Value) -> io::Result<Value>
     let mut secrets = vec![submission.bearer.clone()];
     collect(&submission.input, &mut secrets);
     collect(&body_value, &mut secrets);
+    if let Some(wire) = payload.get("_wire_final") {
+        collect(&wire["headers"], &mut secrets);
+        if let Some(body) = wire["body"]
+            .as_str()
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        {
+            collect(&body, &mut secrets);
+        }
+    }
     for (name, value) in &pairs {
         if sensitive(name) {
             add_secret(value, &mut secrets);
@@ -421,7 +433,260 @@ fn snapshot(submission: &NativeSubmission, payload: &Value) -> io::Result<Value>
         {"stage":"cc_prepared","source":"native_cc_prepared","representation":"json_before_native_transport","status":if truncated || headers_truncated {"truncated"} else {"complete"},"note":"原生最终传输前的中间值"},
         {"stage":"wire_final","source":"unavailable","representation":"unavailable","status":"unavailable","note":"平台本次未取得独立最终TLS写出采集"}
     ]);
+    if let Some(wire) = payload.get("_wire_final") {
+        append_wire(&mut value, wire, &secrets)?;
+        if wire["complete"] == true && wire["body_truncated"] == false {
+            if let Some(after) = wire["body"]
+                .as_str()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            {
+                let mut changes = body_changes(&body_value, &after);
+                let mut clipped = false;
+                for item in changes["items"].as_array_mut().unwrap() {
+                    let cleaned = text(item["path"].as_str().unwrap_or(""), &secrets);
+                    let (path, cut) = prefix(&cleaned, 2048);
+                    clipped |= cut;
+                    item["path"] = json!(path);
+                    item["reason"] = json!("原生组装与TLS接受正文的实际字段差异");
+                }
+                if clipped {
+                    changes["status"] = json!("truncated");
+                }
+                value["final_body_changes"] = changes;
+            }
+        }
+        if wire["complete"] == true {
+            let final_pairs: Vec<(String, String)> =
+                serde_json::from_value(wire["headers"].clone())?;
+            let group = |pairs: &[(String, String)]| {
+                let mut fields = BTreeMap::<String, Vec<String>>::new();
+                for (name, value) in pairs {
+                    fields
+                        .entry(name.to_ascii_lowercase())
+                        .or_default()
+                        .push(value.clone());
+                }
+                fields
+            };
+            let before = group(&pairs);
+            let after = group(&final_pairs);
+            let names: BTreeSet<_> = before.keys().chain(after.keys()).collect();
+            let mut items = Vec::new();
+            let mut truncated = false;
+            let mut bytes = 0;
+            for name in names {
+                if before.get(name) == after.get(name) {
+                    continue;
+                }
+                let action = if !before.contains_key(name) {
+                    "added"
+                } else if !after.contains_key(name) {
+                    "removed"
+                } else {
+                    "changed"
+                };
+                let cleaned = text(name, &secrets);
+                let (name, clipped) = prefix(&cleaned, 4096);
+                if items.len() >= 128 || bytes + name.len() > HEADER_LIMIT {
+                    truncated = true;
+                    break;
+                }
+                bytes += name.len();
+                truncated |= clipped;
+                items.push(
+                    json!({"name":name,"action":action,"reason":"原生组装与TLS接受头的实际差异"}),
+                );
+            }
+            value["final_header_changes"] = json!({"source":"observed_diff","status":if truncated {"truncated"} else {"complete"},"items":items});
+        }
+    }
     Ok(value)
+}
+
+/// 对最终证据做独立白名单投影与共同预算分配。@param value 同次快照。@param wire 私有观测。@param secrets 已登记秘密。@return 归属后的有界快照或类型错误。
+fn append_wire(value: &mut Value, wire: &Value, secrets: &[String]) -> io::Result<()> {
+    let complete = wire["complete"]
+        .as_bool()
+        .ok_or(io::ErrorKind::InvalidData)?;
+    let status = wire["status"].as_str().ok_or(io::ErrorKind::InvalidData)?;
+    let original = wire["body"].as_str().ok_or(io::ErrorKind::InvalidData)?;
+    let pairs: Vec<(String, String)> = serde_json::from_value(wire["headers"].clone())?;
+    let truncated = wire["body_truncated"]
+        .as_bool()
+        .ok_or(io::ErrorKind::InvalidData)?;
+    let header_truncated = wire["headers_truncated"]
+        .as_bool()
+        .ok_or(io::ErrorKind::InvalidData)?;
+    if wire["source"] != "native_tls_uprobe"
+        || wire["representation"] != "http_entity_from_tls_accepted_write"
+        || !matches!(status, "complete" | "incomplete" | "unavailable")
+        || (status == "complete") != complete
+        || (complete && !wire["reason"].is_null())
+        || !wire["flushed"].is_null()
+        || original.len() > BODY_LIMIT
+        || pairs.len() > 4096
+        || pairs
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum::<usize>()
+            > HEADER_LIMIT
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    if complete {
+        let bytes = wire["observed_body_bytes"]
+            .as_u64()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let hash = wire["body_sha256"]
+            .as_str()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        if bytes < original.len() as u64
+            || (!truncated && bytes != original.len() as u64)
+            || hash.len() != 64
+            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || (!truncated && hash != format!("{:x}", Sha256::digest(original.as_bytes())))
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+    } else if !wire["observed_body_bytes"].is_null() || !wire["body_sha256"].is_null() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    // 仅连续的HTTP前缀可以截断展示；其余不完整证据清空原文，避免事件缺口绕过整串凭据脱敏。
+    let unsafe_preview = !complete && wire["reason"].as_str() != Some("HTTP_PARTIAL");
+    let original = if unsafe_preview { "" } else { original };
+    let preview_pairs = if unsafe_preview { &[][..] } else { &pairs[..] };
+    // 预览在帮助进程内限长。去掉末尾未闭合字符串，防止未知秘密的残片越过脱敏器。
+    let mut quote = None;
+    let mut escaped = false;
+    if truncated || !complete {
+        for (index, byte) in original.bytes().enumerate() {
+            if escaped {
+                escaped = false;
+            } else if quote.is_some() && byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quote = if quote.is_some() { None } else { Some(index) };
+            }
+        }
+    }
+    let cleaned = redact_body(&original[..quote.unwrap_or(original.len())], secrets)?;
+    let (body, clipped) = prefix(&cleaned, BODY_LIMIT);
+    let (headers, headers_clipped) = redact_headers(preview_pairs, secrets);
+    let reason = wire["reason"].as_str().filter(|reason| {
+        matches!(
+            *reason,
+            "OBSERVER_NOT_CONFIGURED"
+                | "OBSERVER_CONFIGURATION"
+                | "OBSERVER_START_FAILED"
+                | "OBSERVER_CHANNEL"
+                | "OBSERVER_START_TIMEOUT"
+                | "OBSERVER_UNAVAILABLE"
+                | "OBSERVER_FRAME_INVALID"
+                | "OBSERVER_BINDING"
+                | "OBSERVER_FINISH_TIMEOUT"
+                | "IMAGE_NOT_ADMITTED"
+                | "IMAGE_MISMATCH"
+                | "WORKER_OWNERSHIP"
+                | "WORKER_UNAVAILABLE"
+                | "PROBE_ARTIFACT"
+                | "BPF_LOAD_FAILED"
+                | "RING_UNAVAILABLE"
+                | "PROBE_ATTACH_FAILED"
+                | "EVENT_INVALID"
+                | "EVENT_OWNERSHIP"
+                | "EVENT_SEQUENCE"
+                | "CONNECTION_LIMIT"
+                | "RING_FAILED"
+                | "PROBE_DETACH_FAILED"
+                | "COUNTS_UNAVAILABLE"
+                | "EVENT_LOSS"
+                | "REQUEST_AMBIGUOUS"
+                | "REQUEST_NOT_OBSERVED"
+                | "COMMAND_INVALID"
+                | "OBSERVER_FAILED"
+                | "CAPTURE_INTERRUPTED"
+                | "CAPTURE_PENDING"
+                | "CAPTURE_PREPARING"
+                | "HTTP_HEADER_LIMIT"
+                | "HTTP_UNSUPPORTED"
+                | "HTTP_INVALID"
+                | "HTTP_LENGTH_UNKNOWN"
+                | "HTTP_EXTRA_BYTES"
+                | "HTTP_PARTIAL"
+                | "BODY_ENCODING"
+        )
+    });
+    let mut final_value = json!({"source":"native_tls_uprobe","representation":"http_entity_from_tls_accepted_write",
+        "status":status,"reason":reason.or(if complete { None } else { Some("OBSERVER_FAILED") }),
+        "headers":headers,"body":body,"body_truncated":truncated || clipped || quote.is_some() || (unsafe_preview && !wire["body"].as_str().unwrap_or("").is_empty()),
+        "headers_truncated":header_truncated || headers_clipped || (unsafe_preview && !pairs.is_empty()),
+        "observed_body_bytes":wire["observed_body_bytes"],"body_sha256":wire["body_sha256"],
+        "original_body_bytes":wire["observed_body_bytes"],"original_body_sha256":wire["body_sha256"],
+        "complete":complete,"flushed":null});
+    if let (Some(bytes), Some(hash)) = (
+        wire["observed_http_bytes"].as_u64(),
+        wire["http_sha256"].as_str(),
+    ) {
+        if !complete
+            || bytes < wire["observed_body_bytes"].as_u64().unwrap_or(u64::MAX)
+            || hash.len() != 64
+            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        final_value["observed_http_bytes"] = json!(bytes);
+        final_value["http_sha256"] = json!(hash);
+    }
+    for field in [
+        "worker_pid",
+        "captured_at_ms",
+        "accepted_write_count",
+        "binding_generation",
+    ] {
+        if let Some(number) = wire[field].as_u64() {
+            final_value[field] = json!(number);
+        }
+    }
+    for field in ["worker_id", "request_id", "capture_id", "connection_id"] {
+        if let Some(raw) = wire[field].as_str().filter(|raw| raw.len() <= 128) {
+            final_value[field] = json!(text(raw, secrets));
+        }
+    }
+    let final_len = body.len();
+    let (prepared, clipped_prepared) = prefix(
+        value["body"].as_str().unwrap_or(""),
+        BODY_LIMIT.saturating_sub(final_len),
+    );
+    value["body"] = json!(prepared);
+    value["body_truncated"] = json!(value["body_truncated"] == true || clipped_prepared);
+    let remaining =
+        BODY_LIMIT.saturating_sub(final_len + value["body"].as_str().unwrap_or("").len());
+    let mut ingress_clipped = false;
+    if let Some(input) = value.get_mut("ingress") {
+        let (body, clipped) = prefix(input["body"].as_str().unwrap_or(""), remaining);
+        input["body"] = json!(body);
+        input["body_truncated"] = json!(input["body_truncated"] == true || clipped);
+        if clipped {
+            ingress_clipped = true;
+            input["status"] = json!("truncated");
+        }
+    }
+    for stage in value["stages"]
+        .as_array_mut()
+        .ok_or(io::ErrorKind::InvalidData)?
+    {
+        if stage["stage"] == "wire_final" {
+            *stage = json!({"stage":"wire_final","source":"native_tls_uprobe","representation":"http_entity_from_tls_accepted_write",
+                "status":if complete && (final_value["body_truncated"] == true || final_value["headers_truncated"] == true) {"truncated"} else {status},
+                "note":"原生TLS实际接受的HTTP明文；网络刷出与上游实收保持独立"});
+        } else if (stage["stage"] == "cc_prepared" && clipped_prepared)
+            || (stage["stage"] == "ingress" && ingress_clipped)
+        {
+            stage["status"] = json!("truncated");
+        }
+    }
+    value["wire_final"] = final_value;
+    Ok(())
 }
 
 fn save(directory: &Path, submission: &NativeSubmission, payload: &Value) -> io::Result<()> {
@@ -438,6 +703,41 @@ fn save(directory: &Path, submission: &NativeSubmission, payload: &Value) -> io:
     }
     #[cfg(unix)]
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    // 初始250ms慢写可能晚于最终采集完成；同一把锁内保留更完整的同请求证据。
+    let destination = directory.join(format!("{id}.json"));
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(O_NOFOLLOW | O_NONBLOCK);
+        match options.open(&destination) {
+            Ok(file) => {
+                if !file.metadata()?.is_file() {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let mut previous = Vec::new();
+                file.take(6 * 1024 * 1024 + 1).read_to_end(&mut previous)?;
+                if previous.len() <= 6 * 1024 * 1024 {
+                    if let Ok(previous) = serde_json::from_slice::<Value>(&previous) {
+                        let rank = |wire: &Value| match wire["status"].as_str() {
+                            Some("complete") => 3,
+                            Some("incomplete") => 2,
+                            Some("unavailable") => 1,
+                            _ => 0,
+                        };
+                        if previous["account_id"] == submission.request.account_id
+                            && previous["attempt_id"] == submission.request.request_id
+                            && rank(&previous["wire_final"]) > rank(&payload["_wire_final"])
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -507,22 +807,22 @@ fn save(directory: &Path, submission: &NativeSubmission, payload: &Value) -> io:
 /// @param submission 当前尝试的归属与已知凭据。
 /// @param payload 二进制输出的组装快照。
 /// @param policy 同次内核实际头部决策。
-/// @return disabled、saved、dropped、timeout 或 failed，供诊断详情显示。
-pub(crate) async fn record(
+/// @return 后台写入句柄，或disabled/dropped准入原因。
+fn schedule(
     directory: Option<&str>,
     submission: &NativeSubmission,
     payload: &Value,
     policy: Option<&Value>,
-) -> String {
+) -> Result<JoinHandle<io::Result<()>>, &'static str> {
     // 在克隆正文和申请磁盘写入之前执行同次模式门控。
     if submission.log_mode != RequestLogMode::Debug {
-        return "disabled".into();
+        return Err("disabled");
     }
     let Some(directory) = directory else {
-        return "disabled".into();
+        return Err("disabled");
     };
     let Ok(permit) = WRITERS.try_acquire() else {
-        return "dropped".into();
+        return Err("dropped");
     };
     let directory = directory.to_owned();
     let submission = submission.clone();
@@ -530,10 +830,42 @@ pub(crate) async fn record(
     if let Some(policy) = policy {
         payload["_header_policy"] = policy.clone();
     }
-    let write = tokio::task::spawn_blocking(move || {
+    let write = spawn_blocking(move || {
         let _permit = permit;
-        save(Path::new(&directory), &submission, &payload)
+        let result = save(Path::new(&directory), &submission, &payload);
+        if let Err(error) = &result {
+            tracing::warn!(request_id = %submission.request.request_id, account_id = submission.request.account_id,
+                layer = "native_tls_capture", reason = ?error.kind(), "原生私有采集保存失败");
+        }
+        result
     });
+    Ok(write)
+}
+
+/// 将私有快照排入有界后台写入。@param directory 私有目录。@param submission 当前归属。@param payload 原生快照。@param policy 同次决策。@return queued或即时拒绝原因。
+pub(crate) fn record_queued(
+    directory: Option<&str>,
+    submission: &NativeSubmission,
+    payload: &Value,
+    policy: Option<&Value>,
+) -> String {
+    match schedule(directory, submission, payload, policy) {
+        Ok(_) => "queued".into(),
+        Err(reason) => reason.into(),
+    }
+}
+
+/// 有界等待私有保存结果，适用于后台最终收口。@param directory 私有目录。@param submission 当前归属。@param payload 原生快照。@param policy 同次决策。@return 保存状态。
+pub(crate) async fn record(
+    directory: Option<&str>,
+    submission: &NativeSubmission,
+    payload: &Value,
+    policy: Option<&Value>,
+) -> String {
+    let write = match schedule(directory, submission, payload, policy) {
+        Ok(write) => write,
+        Err(reason) => return reason.into(),
+    };
     // 磁盘阻塞时及时交还模型响应，后台写入仍持有有界许可。
     let result = tokio::time::timeout(Duration::from_millis(250), write).await;
     if result.is_err() {
@@ -622,6 +954,107 @@ mod tests {
         let clipped = snapshot(&submission, &payload).unwrap();
         assert_eq!(clipped["body_truncated"], true);
         assert!(clipped["body"].as_str().unwrap().len() <= BODY_LIMIT);
+    }
+
+    /// 最终副本经脱敏保存，慢到的组装写入和缺证收口保持已有完整证据。@return 无。
+    #[test]
+    fn tls_final_is_redacted_bounded_and_monotonic() {
+        let submission = submission();
+        let directory = std::env::temp_dir().join(format!("native-wire-{}", Uuid::new_v4()));
+        let body = r#"{ "password": "synthetic-hidden", "text": "ok", "cch": "final" }"#;
+        let mut payload = json!({"headers":[["authorization","Bearer synthetic-native-token"]],"body":"{\"cch\":\"00000\"}",
+            "_wire_final":{"source":"native_tls_uprobe","representation":"http_entity_from_tls_accepted_write","status":"complete",
+            "complete":true,"flushed":null,"headers":[["Authorization","Bearer synthetic-native-token"],["Host","api.anthropic.com"]],
+            "body":body,"body_truncated":false,"headers_truncated":false,"observed_body_bytes":body.len(),
+            "body_sha256":format!("{:x}",Sha256::digest(body)),"reason":null}});
+        save(&directory, &submission, &payload).unwrap();
+        let path = directory.join(format!("{}.json", submission.request.request_id));
+        let bytes = fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["wire_final"]["headers"][0][1], "[REDACTED]");
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-hidden"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-native-token"));
+        assert_eq!(value["wire_final"]["observed_body_bytes"], body.len());
+        assert!(
+            value["final_body_changes"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["path"] == "/cch")
+        );
+        payload.as_object_mut().unwrap().remove("_wire_final");
+        save(&directory, &submission, &payload).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        payload["_wire_final"] = json!({"source":"native_tls_uprobe","representation":"http_entity_from_tls_accepted_write",
+            "status":"unavailable","complete":false,"flushed":null,"headers":[],"body":"","body_truncated":false,
+            "headers_truncated":false,"observed_body_bytes":null,"body_sha256":null,"reason":"CAPTURE_INTERRUPTED"});
+        save(&directory, &submission, &payload).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// 缺口不生成全量哈希，截断秘密残片及共同正文预算得到保护。@return 无。
+    #[test]
+    fn tls_partial_and_shared_budget_preserve_unknown_ranges() {
+        let submission = submission();
+        let partial = "{\"password\":\"synthetic-partial";
+        let mut payload = json!({"headers":[],"body":"{}","_wire_final":{
+            "source":"native_tls_uprobe","representation":"http_entity_from_tls_accepted_write","status":"incomplete",
+            "complete":false,"flushed":null,"reason":"HTTP_PARTIAL","headers":[],"body":partial,
+            "body_truncated":true,"headers_truncated":false,"observed_body_bytes":null,"body_sha256":null}});
+        let value = snapshot(&submission, &payload).unwrap();
+        assert!(!value.to_string().contains("synthetic-partial"));
+        assert!(value["wire_final"]["body_sha256"].is_null());
+        payload["_wire_final"]["body_sha256"] = json!("a".repeat(64));
+        assert!(snapshot(&submission, &payload).is_err());
+        payload["_wire_final"]["body_sha256"] = Value::Null;
+        payload["_wire_final"]["body"] = json!("x".repeat(BODY_LIMIT));
+        payload["_wire_final"]["reason"] = Value::Null;
+        payload["_wire_final"]["complete"] = json!(true);
+        payload["_wire_final"]["status"] = json!("complete");
+        payload["_wire_final"]["observed_body_bytes"] = json!(BODY_LIMIT);
+        payload["_wire_final"]["body_sha256"] =
+            json!(format!("{:x}", Sha256::digest("x".repeat(BODY_LIMIT))));
+        let value = snapshot(&submission, &payload).unwrap();
+        assert_eq!(value["body"], "");
+        assert_eq!(value["body_truncated"], true);
+        assert_eq!(
+            value["wire_final"]["body"].as_str().unwrap().len(),
+            BODY_LIMIT
+        );
+    }
+
+    /// 缺口后的合法JSON及扩展头也丢弃，持久文件排除凭据残片。@return 无。
+    #[test]
+    fn tls_discontinuous_previews_are_withheld_before_persistence() {
+        for reason in [
+            "EVENT_SEQUENCE",
+            "EVENT_LOSS",
+            "EVENT_INVALID",
+            "COUNTS_UNAVAILABLE",
+            "HTTP_EXTRA_BYTES",
+        ] {
+            let submission = submission();
+            let directory = std::env::temp_dir().join(format!("native-gap-{}", Uuid::new_v4()));
+            let payload = json!({"headers":[],"body":"{}","_wire_final":{
+                "source":"native_tls_uprobe","representation":"http_entity_from_tls_accepted_write",
+                "status":"incomplete","complete":false,"flushed":null,"reason":reason,
+                "headers":[["x-custom","synthetic-credential-prefix"]],
+                "body":"{\"text\":\"synthetic-credential-prefix\"}","body_truncated":false,
+                "headers_truncated":false,"observed_body_bytes":null,"body_sha256":null}});
+            save(&directory, &submission, &payload).unwrap();
+            let bytes = fs::read(directory.join(format!("{}.json", submission.request.request_id)))
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-credential-prefix"));
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["wire_final"]["body"], "");
+            assert_eq!(value["wire_final"]["headers"], json!([]));
+            assert_eq!(value["wire_final"]["body_truncated"], true);
+            assert_eq!(value["wire_final"]["headers_truncated"], true);
+            assert_eq!(value["wire_final"]["reason"], reason);
+            assert!(value["wire_final"]["body_sha256"].is_null());
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     /// 核对被过滤的入站凭据在正文和扩展头中重复出现时仍先脱敏。

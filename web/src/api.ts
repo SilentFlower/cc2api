@@ -428,6 +428,27 @@ export interface NativeCapturePreview {
   original_body_sha256: string
 }
 
+/** 原生TLS实际接受的实体证据；未知范围与网络刷出单独表示。 */
+export interface NativeTlsCapture extends Omit<NativeCapturePreview, 'original_body_bytes' | 'original_body_sha256'> {
+  source: 'native_tls_uprobe'
+  representation: 'http_entity_from_tls_accepted_write'
+  status: 'complete' | 'incomplete' | 'unavailable'
+  reason: string | null
+  original_body_bytes: number | null
+  original_body_sha256: string | null
+  observed_body_bytes: number | null
+  body_sha256: string | null
+  observed_http_bytes?: number
+  http_sha256?: string
+  complete: boolean
+  flushed: null
+  worker_id?: string
+  capture_id?: string
+  worker_pid?: number
+  connection_id?: string
+  binding_generation?: number
+}
+
 /** 已脱敏的 CC 组装后快照。 */
 export interface NativeCapture {
   state: string
@@ -435,6 +456,17 @@ export interface NativeCapture {
   snapshot?: {
     stage: 'cc_prepared'
     ingress?: NativeCapturePreview
+    wire_final?: NativeTlsCapture
+    final_body_changes?: {
+      source: string
+      status: string
+      items: { path: string; action: 'added' | 'removed' | 'changed'; reason: string }[]
+    }
+    final_header_changes?: {
+      source: string
+      status: string
+      items: { name: string; action: 'added' | 'removed' | 'changed'; reason: string }[]
+    }
     stages?: NativeCaptureStage[]
     header_policy?: {
       source: string
